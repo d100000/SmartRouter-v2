@@ -117,7 +117,7 @@ func RecordPolicyFailure(c *gin.Context, channelID int, err *types.NewAPIError, 
 	}
 	state.AddEvent(event)
 	event.Decision, event.Health = decision, "unchanged"
-	if source != "local" && c.GetBool("auto_ban") && ShouldDisableChannel(err) {
+	if source != "local" && c.GetBool("auto_ban") && shouldDisableFailedAttempt(c, err) {
 		event.Health = "channel_disable_requested"
 		if common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey) {
 			event.Health = "key_disable_requested"
@@ -177,6 +177,17 @@ func RecordRequestPolicyTermination(c *gin.Context, apiErr *types.NewAPIError) {
 	state.FinalLogged = true
 	events := state.Events()
 	if len(events) == 0 || events[len(events)-1].Decision.Action != "stop" {
-		state.AddEvent(PolicyEvent{ChannelID: c.GetInt("channel_id"), Status: apiErr.StatusCode, ErrorCode: string(apiErr.GetErrorCode()), Decision: PolicyDecision{Action: "stop", Reason: "request_failed", Source: "system"}, Health: "unchanged"})
+		reason := SchedulingRetryStopReason(c)
+		if reason == "" {
+			switch {
+			case len(c.GetStringSlice("use_channel")) > common.RetryTimes:
+				reason = "attempt_budget_exhausted"
+			case apiErr.GetErrorCode() == types.ErrorCodeGetChannelFailed:
+				reason = "channel_unavailable"
+			default:
+				reason = "request_failed"
+			}
+		}
+		state.AddEvent(PolicyEvent{ChannelID: c.GetInt("channel_id"), Status: apiErr.StatusCode, ErrorCode: string(apiErr.GetErrorCode()), Decision: PolicyDecision{Action: "stop", Reason: reason, Source: "system"}, Health: "unchanged"})
 	}
 }

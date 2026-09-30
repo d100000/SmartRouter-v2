@@ -9,9 +9,12 @@ import (
 )
 
 const (
-	activationThreshold = 50
-	longWindow          = 30 * time.Minute
-	shortWindow         = 5 * time.Minute
+	activationThreshold     = 50
+	longWindow              = 30 * time.Minute
+	shortWindow             = 5 * time.Minute
+	channelRampSuccesses    = 20
+	channelRampInitialShare = 0.05
+	failureCooldown         = 15 * time.Second
 )
 
 type dimension struct {
@@ -48,24 +51,39 @@ type windowCache struct {
 	short    Window
 }
 
+type healthBucket struct {
+	second    int64
+	attempts  int64
+	successes int64
+}
+
 type channelState struct {
-	registered      bool
-	outcomeVersion  uint64
-	windowCache     [4]windowCache
-	candidate       Candidate
-	pool            string
-	buckets         map[int64]*secondBucket
-	learningBuckets map[int64]*secondBucket
-	dispatches      map[int64]int64
-	inFlight        int
-	lastScore       time.Time
-	baseSuccess     float64
-	baseHealth      float64
-	latencyScore    [2]float64
-	recoveryLimit   float64
-	successSerial   int64
-	recoverySerial  int64
-	learningSince   time.Time
+	registered         bool
+	outcomeVersion     uint64
+	windowCache        [4]windowCache
+	candidate          Candidate
+	pool               string
+	buckets            map[int64]*secondBucket
+	learningBuckets    map[int64]*secondBucket
+	dispatches         map[int64]int64
+	inFlight           int
+	lastScore          time.Time
+	scoreVersion       uint64
+	baseSuccess        float64
+	baseHealth         float64
+	latencyScore       [2]float64
+	recoveryLimit      float64
+	learningSuccesses  int64
+	learningEpoch      uint64
+	learningSince      time.Time
+	cooldownUntil      time.Time
+	failureStreak      int
+	failureStreakSince time.Time
+	healthBuckets      []healthBucket
+	shortHealthCursor  int
+	longHealthCursor   int
+	healthLong         Window
+	healthShort        Window
 }
 
 type keyState struct {
@@ -111,10 +129,14 @@ func (e *Engine) state(key Key, now time.Time) *keyState {
 		for _, ch := range s.channels {
 			// Keep the dashboard history. Only the current learning epoch resets.
 			ch.learningSince = now
+			ch.learningEpoch++
 			ch.learningBuckets = make(map[int64]*secondBucket)
+			ch.healthBuckets = nil
+			ch.shortHealthCursor, ch.longHealthCursor = 0, 0
+			ch.healthLong, ch.healthShort = Window{}, Window{}
+			ch.learningSuccesses = 0
 			ch.lastScore = time.Time{}
 			ch.recoveryLimit = 1
-			ch.recoverySerial = ch.successSerial
 		}
 	}
 	if s.lastPrune.IsZero() || now.Sub(s.lastPrune) >= time.Minute {
@@ -387,7 +409,44 @@ func (e *Engine) ReplaceOverrides(key Key, overrides map[int]Override) error {
 func (e *Engine) RegisterCandidates(key Key, candidates []Candidate) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	s := e.state(key, e.now())
+	e.replaceCandidates(key, candidates, e.now())
+}
+
+// ReplaceCandidateMembership reconciles an authoritative complete metadata
+// snapshot atomically. Never pass a request's filtered candidates here. Removed
+// memberships release their limits, while leases retain their original pools.
+func (e *Engine) ReplaceCandidateMembership(candidates map[Key][]Candidate, channelMetadata ...Candidate) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.now()
+	for key := range e.states {
+		if _, present := candidates[key]; !present {
+			e.replaceCandidates(key, nil, now)
+		}
+	}
+	for key, members := range candidates {
+		e.replaceCandidates(key, members, now)
+	}
+	e.channelMetadata = make(map[int]Candidate)
+	for _, members := range candidates {
+		for _, candidate := range members {
+			if candidate.ID > 0 {
+				e.channelMetadata[candidate.ID] = candidate
+			}
+		}
+	}
+	// Channels with no current model/group ability may still be pinned by an
+	// original task. Their metadata establishes status without a pool member.
+	for _, candidate := range channelMetadata {
+		if candidate.ID > 0 {
+			e.channelMetadata[candidate.ID] = candidate
+		}
+	}
+	e.membershipManaged = true
+}
+
+func (e *Engine) replaceCandidates(key Key, candidates []Candidate, now time.Time) {
+	s := e.state(key, now)
 	present := make(map[int]bool, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.ID > 0 {
@@ -401,6 +460,16 @@ func (e *Engine) RegisterCandidates(key Key, candidates []Candidate) {
 		delete(e.pools[ch.pool].members, dimension{key: key, channelID: id})
 		ch.pool = ""
 		ch.registered = false
+		// A returning member must establish fresh channel-level confidence.
+		// Keep historical outcomes, any recovery ceiling, and fault cooldown.
+		ch.learningSince = now
+		ch.learningEpoch++
+		ch.learningBuckets = make(map[int64]*secondBucket)
+		ch.healthBuckets = nil
+		ch.shortHealthCursor, ch.longHealthCursor = 0, 0
+		ch.healthLong, ch.healthShort = Window{}, Window{}
+		ch.learningSuccesses = 0
+		ch.lastScore = time.Time{}
 	}
 	for _, candidate := range candidates {
 		if candidate.ID > 0 {
@@ -431,14 +500,63 @@ func validateOverride(channelID int, override Override) error {
 
 func isFinite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
 
+func (e *Engine) resolveCandidate(key Key, s *keyState, candidate Candidate) (*channelState, Candidate) {
+	if e.membershipManaged {
+		ch := s.channels[candidate.ID]
+		if ch == nil || !ch.registered {
+			candidate.Excluded = true
+			return ch, candidate
+		}
+		// Request candidates can be stale or filtered. They must not change the
+		// authoritative membership, channel status, or shared capacity pool.
+		excluded := candidate.Excluded
+		candidate = ch.candidate
+		ch, candidate = e.registerCandidate(key, s, candidate)
+		candidate.Excluded = candidate.Excluded || excluded
+		return ch, candidate
+	}
+	return e.registerCandidate(key, s, candidate)
+}
+
 func (e *Engine) registerCandidate(key Key, s *keyState, candidate Candidate) (*channelState, Candidate) {
 	ch := s.channels[candidate.ID]
 	if ch == nil {
 		ch = &channelState{buckets: make(map[int64]*secondBucket), learningBuckets: make(map[int64]*secondBucket), dispatches: make(map[int64]int64), recoveryLimit: 1}
 		s.channels[candidate.ID] = ch
+	} else if !ch.registered || (ch.candidate.Status == 1 && !ch.candidate.Excluded) != (candidate.Status == 1 && !candidate.Excluded) {
+		// Re-enabling an unavailable member requires fresh ramp evidence, while
+		// its observed health history and any fault cooldown remain intact.
+		ch.learningSuccesses = 0
+		ch.learningEpoch++
 	}
 	ch.registered = true
 	ch.candidate = candidate
+	candidate = configuredCandidate(s, ch, candidate)
+	member := dimension{key: key, channelID: candidate.ID}
+	if ch.pool != "" && ch.pool != candidate.CapacityKey {
+		delete(e.pools[ch.pool].members, member)
+	}
+	ch.pool = candidate.CapacityKey
+	pool := e.pools[ch.pool]
+	if pool == nil {
+		pool = &capacityPool{members: make(map[dimension]int)}
+		e.pools[ch.pool] = pool
+	}
+	if candidate.Status == 1 && !candidate.Excluded {
+		pool.members[member] = candidate.Capacity
+	} else {
+		delete(pool.members, member)
+	}
+	if capacity := poolCapacity(pool); capacity > 0 {
+		candidate.Capacity = capacity
+	}
+	return ch, candidate
+}
+
+func configuredCandidate(s *keyState, ch *channelState, candidate Candidate) Candidate {
+	if ch.cooldownUntil.After(candidate.CooldownUntil) {
+		candidate.CooldownUntil = ch.cooldownUntil
+	}
 	if candidate.Capacity <= 0 {
 		candidate.Capacity = s.config.DefaultCapacity
 	}
@@ -456,19 +574,7 @@ func (e *Engine) registerCandidate(key Key, s *keyState, candidate Candidate) (*
 	if candidate.CapacityKey == "" {
 		candidate.CapacityKey = fmt.Sprintf("channel:%d", candidate.ID)
 	}
-	member := dimension{key: key, channelID: candidate.ID}
-	if ch.pool != "" && ch.pool != candidate.CapacityKey {
-		delete(e.pools[ch.pool].members, member)
-	}
-	ch.pool = candidate.CapacityKey
-	pool := e.pools[ch.pool]
-	if pool == nil {
-		pool = &capacityPool{members: make(map[dimension]int)}
-		e.pools[ch.pool] = pool
-	}
-	pool.members[member] = candidate.Capacity
-	candidate.Capacity = poolCapacity(pool)
-	return ch, candidate
+	return candidate
 }
 
 func poolCapacity(pool *capacityPool) int {
@@ -491,7 +597,27 @@ func (e *Engine) ReserveCandidate(r *Request, candidate Candidate, stream bool) 
 	}
 	now := e.now()
 	s := e.state(r.Key, now)
-	_, candidate = e.registerCandidate(r.Key, s, candidate)
+	ch := s.channels[candidate.ID]
+	if e.membershipManaged && (ch == nil || !ch.registered || ch.candidate.Excluded) {
+		// Native fixed/origin-task routing can pin a channel outside its
+		// current model/group ability. Honor the latest channel status while
+		// avoiding a phantom capacity member from that exceptional request.
+		canonical, exists := e.channelMetadata[candidate.ID]
+		if !exists {
+			return nil, ErrNoEligibleChannel
+		}
+		canonical.Excluded = candidate.Excluded
+		if ch == nil {
+			ch = &channelState{buckets: make(map[int64]*secondBucket), learningBuckets: make(map[int64]*secondBucket), dispatches: make(map[int64]int64), recoveryLimit: 1}
+			s.channels[candidate.ID] = ch
+		}
+		candidate = configuredCandidate(s, ch, canonical)
+		if e.pools[candidate.CapacityKey] == nil {
+			e.pools[candidate.CapacityKey] = &capacityPool{members: make(map[dimension]int)}
+		}
+	} else {
+		_, candidate = e.resolveCandidate(r.Key, s, candidate)
+	}
 	if !e.eligible(candidate, now) {
 		return nil, ErrNoEligibleChannel
 	}
@@ -499,7 +625,8 @@ func (e *Engine) ReserveCandidate(r *Request, candidate Candidate, stream bool) 
 }
 
 func (e *Engine) reserve(r *Request, candidate Candidate, stream bool, now time.Time) *Attempt {
-	a := &Attempt{Candidate: candidate, StartedAt: now, request: r, pool: candidate.CapacityKey, stream: stream}
+	a := &Attempt{Candidate: candidate, StartedAt: now, request: r, pool: candidate.CapacityKey, stream: stream,
+		learningEpoch: e.states[r.Key].channels[candidate.ID].learningEpoch}
 	r.attempts[a] = true
 	// A reservation may fail local validation. Mark a channel attempted only
 	// when StartAttempt actually dispatches it upstream.
@@ -518,6 +645,9 @@ func (e *Engine) eligible(candidate Candidate, now time.Time) bool {
 	}
 	pool := e.pools[candidate.CapacityKey]
 	capacity := poolCapacity(pool)
+	if candidate.Capacity > 0 && (capacity == 0 || candidate.Capacity < capacity) {
+		capacity = candidate.Capacity
+	}
 	return capacity == 0 || pool.inFlight < capacity
 }
 
@@ -533,7 +663,9 @@ func (e *Engine) StartAttempt(a *Attempt, stream ...bool) {
 	a.started = true
 	a.StartedAt = e.now()
 	a.request.attempted[a.Candidate.ID] = true
-	e.states[a.request.Key].channels[a.Candidate.ID].dispatches[a.StartedAt.Unix()]++
+	if !a.request.businessAt.IsZero() {
+		e.states[a.request.Key].channels[a.Candidate.ID].dispatches[a.StartedAt.Unix()]++
+	}
 }
 
 func (e *Engine) FinishAttempt(a *Attempt, outcome Outcome) {
@@ -559,42 +691,100 @@ func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) {
 	s.inFlight--
 	ch.inFlight--
 	e.pools[a.pool].inFlight--
-	if !a.started || (!outcome.Success && !outcome.ChannelFailure) {
+	if !a.started || r.businessAt.IsZero() || (!outcome.Success && !outcome.ChannelFailure) {
 		return
 	}
 	second := now.Unix()
 	bucket := ch.buckets[second]
-	learning := ch.learningBuckets[second]
 	if bucket == nil {
 		bucket = &secondBucket{}
 		ch.buckets[second] = bucket
-		learning = bucket
-		ch.learningBuckets[second] = learning
-	} else if learning == nil {
-		// A reset can share a second with the last completed old attempt.
-		// Retain its history while giving new learning a genuinely empty epoch.
-		learning = &secondBucket{}
-		ch.learningBuckets[second] = learning
 	}
 	ch.outcomeVersion++
-	s.learningSamples++
 	streamIndex := 0
 	if a.stream {
 		streamIndex = 1
 	}
 	bucket.recordOutcome(outcome, streamIndex)
-	if learning != bucket {
-		learning.recordOutcome(outcome, streamIndex)
+	if outcome.Success || !outcome.CooldownFailure {
+		ch.failureStreak = 0
+	} else {
+		if ch.failureStreak == 0 || now.Sub(ch.failureStreakSince) > time.Minute {
+			ch.failureStreak, ch.failureStreakSince = 0, now
+		}
+		ch.failureStreak++
+		if ch.failureStreak >= 3 {
+			ch.cooldownUntil = now.Add(failureCooldown)
+			ch.failureStreak = 0
+		}
 	}
+	// Old leases still release normally and retain history, but cannot establish
+	// confidence for a new membership/learning epoch after metadata changed.
+	if a.learningEpoch != ch.learningEpoch {
+		return
+	}
+	learning := ch.learningBuckets[second]
+	if learning == nil {
+		learning = &secondBucket{}
+		ch.learningBuckets[second] = learning
+	}
+	learning.recordOutcome(outcome, streamIndex)
+	// Within a second, advance already-computed aggregates in constant time.
+	// Otherwise the next lookup rebuilds once for window expiry; completions
+	// and dashboard reads do not repeatedly rescan all 30 minutes of samples.
+	for i := range ch.windowCache {
+		cache := &ch.windowCache[i]
+		if !cache.valid || cache.second != second || cache.epoch != ch.learningSince.UnixNano() || cache.version+1 != ch.outcomeVersion {
+			continue
+		}
+		cache.long.recordOutcome(outcome, i%2 == streamIndex, cache.targetMS)
+		cache.short.recordOutcome(outcome, i%2 == streamIndex, cache.targetMS)
+		cache.version = ch.outcomeVersion
+	}
+	s.learningSamples++
+	ch.advanceHealth(now)
+	if len(ch.healthBuckets) == 0 || ch.healthBuckets[len(ch.healthBuckets)-1].second != second {
+		ch.healthBuckets = append(ch.healthBuckets, healthBucket{second: second})
+	}
+	healthBucket := &ch.healthBuckets[len(ch.healthBuckets)-1]
+	healthBucket.attempts++
 	if outcome.Success {
-		ch.successSerial++
+		healthBucket.successes++
+	}
+	ch.healthLong.recordOutcome(outcome, false, 0)
+	ch.healthShort.recordOutcome(outcome, false, 0)
+	_, health := successHealth(ch.healthLong, ch.healthShort)
+	if outcome.Success {
+		ch.learningSuccesses++
+		// Consume each success once, at completion. Reads and score refreshes
+		// cannot discard, duplicate, or defer recovery credit until after a failure.
+		ch.recoveryLimit = min(health, ch.recoveryLimit+0.02)
 	} else {
 		// Errors impose an immediate ceiling from current samples, never a
 		// multiplicative discount on an already discounted previous weight.
-		long, short := channelWindows(ch, now, true, a.stream, s.config.LatencyTargetMS)
-		_, health := successHealth(long, short)
 		ch.recoveryLimit = min(ch.recoveryLimit, health)
-		ch.recoverySerial = ch.successSerial
+	}
+}
+
+func (window *Window) recordOutcome(outcome Outcome, matchingTransport bool, targetMS float64) {
+	window.Attempts++
+	if !outcome.Success {
+		window.Failures++
+		if matchingTransport {
+			window.HealthSamples++
+		}
+		return
+	}
+	window.Successes++
+	if !matchingTransport || outcome.TTFT == nil || *outcome.TTFT <= 0 {
+		return
+	}
+	latencyMS := float64(*outcome.TTFT) / float64(time.Millisecond)
+	window.LatencySamples++
+	window.LatencySumMS += latencyMS
+	window.HealthSamples++
+	if math.Ceil(latencyMS) <= targetMS {
+		window.HealthySamples++
 	}
 }
 
@@ -625,8 +815,8 @@ func (e *Engine) ClearPenalty(key Key, channelID int) {
 	defer e.mu.Unlock()
 	s := e.state(key, e.now())
 	if ch := s.channels[channelID]; ch != nil {
+		ch.advanceHealth(e.now())
 		ch.recoveryLimit = 1
-		ch.recoverySerial = ch.successSerial
 		ch.lastScore = time.Time{}
 	}
 }

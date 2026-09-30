@@ -75,6 +75,21 @@ export const channelSchema = z.object({
 
 export type Channel = z.infer<typeof channelSchema>
 
+export interface ChannelRecentStat {
+  channel_id: number
+  requests: number
+  successes: number
+  success_rate: number | null
+}
+
+export interface ChannelRecentStats {
+  ready: boolean
+  refreshed_at: number
+  window_seconds: number
+  scope: 'instance'
+  items: ChannelRecentStat[]
+}
+
 // ============================================================================
 // Channel Settings Types
 // ============================================================================

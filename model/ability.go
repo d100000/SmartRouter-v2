@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -55,9 +56,16 @@ func GetEnabledModels() []string {
 }
 
 func GetAllEnableAbilities() []Ability {
-	var abilities []Ability
-	DB.Find(&abilities, "enabled = ?", true)
+	abilities, _ := LoadEnabledAbilities()
 	return abilities
+}
+
+// LoadEnabledAbilities supplies complete metadata with database errors retained,
+// so routing never publishes an empty authoritative snapshot after a read failure.
+func LoadEnabledAbilities() ([]Ability, error) {
+	var abilities []Ability
+	err := DB.Find(&abilities, "enabled = ?", true).Error
+	return abilities, err
 }
 
 func getPriority(group string, model string, retry int) (int, error) {
@@ -139,28 +147,42 @@ func GetChannel(
 			return ability.Priority == nil && targetPriority == 0 || ability.Priority != nil && *ability.Priority == targetPriority
 		})
 	}
-	channel := Channel{}
-	if len(abilities) > 0 {
-		// Randomly choose one
-		weightSum := uint(0)
-		for _, ability_ := range abilities {
-			weightSum += ability_.Weight + 10
-		}
-		// Randomly choose one
-		weight := common.GetRandomInt(int(weightSum))
-		for _, ability_ := range abilities {
-			weight -= int(ability_.Weight) + 10
-			//log.Printf("weight: %d, ability weight: %d", weight, *ability_.Weight)
-			if weight <= 0 {
-				channel.Id = ability_.ChannelId
-				break
-			}
-		}
-	} else {
+	if len(abilities) == 0 {
 		return nil, nil
 	}
+	weights := make([]uint, len(abilities))
+	for i, ability := range abilities {
+		weights[i] = ability.Weight
+	}
+	channel := Channel{Id: abilities[configuredWeightIndex(weights, rand.Float64())].ChannelId}
 	err = DB.First(&channel, "id = ?", channel.Id).Error
 	return &channel, err
+}
+
+// configuredWeightIndex implements the native static lottery for both channel
+// sources: exact configured proportions, with a uniform all-zero fallback.
+// A zero weight is not a disabled channel; it wins when all peers also weigh zero.
+func configuredWeightIndex(weights []uint, draw float64) int {
+	total := 0.0
+	for _, weight := range weights {
+		total += float64(weight)
+	}
+	if total == 0 {
+		return min(int(draw*float64(len(weights))), len(weights)-1)
+	}
+	threshold := draw * total
+	lastPositive := -1
+	for i, weight := range weights {
+		if weight == 0 {
+			continue
+		}
+		lastPositive = i
+		threshold -= float64(weight)
+		if threshold < 0 {
+			return i
+		}
+	}
+	return lastPositive
 }
 
 // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters

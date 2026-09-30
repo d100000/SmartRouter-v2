@@ -26,6 +26,7 @@ import { StatusBadgeTypeContext } from '@/components/status-badge'
 import { CHANNEL_STATUS } from '../constants'
 import { isTagAggregateRow, parseGroupsList } from '../lib'
 import type { Channel } from '../types'
+import { ChannelRecentStatsCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { useChannels } from './channels-provider'
 
@@ -150,21 +151,27 @@ function ChannelCardComponent({
         </StatusBadgeTypeContext.Provider>
 
         {/* Groups retain their compact, full-width footer. */}
-        <div className='min-w-0'>
-          {groups.length > 0 ? (
-            <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
-              {groups.map((g) => (
-                <GroupBadge
-                  key={g}
-                  group={g}
-                  label={sensitiveVisible ? undefined : SENSITIVE_MASK}
-                  size='sm'
-                />
-              ))}
-            </div>
-          ) : (
-            <span className='text-muted-foreground text-sm'>-</span>
-          )}
+        <div className='flex min-w-0 items-center justify-between gap-2'>
+          <div className='min-w-0'>
+            {groups.length > 0 ? (
+              <div className='-ml-1.5 flex min-w-0 flex-wrap gap-1'>
+                {groups.map((g) => (
+                  <GroupBadge
+                    key={g}
+                    group={g}
+                    label={sensitiveVisible ? undefined : SENSITIVE_MASK}
+                    size='sm'
+                  />
+                ))}
+              </div>
+            ) : (
+              <span className='text-muted-foreground text-sm'>-</span>
+            )}
+          </div>
+          <div className='flex shrink-0 items-center gap-1.5'>
+            <span className={labelClass}>{t('Last 10 minutes')}</span>
+            <ChannelRecentStatsCell channel={row.original} />
+          </div>
         </div>
       </div>
     </ChannelRowActionsLayoutContext.Provider>

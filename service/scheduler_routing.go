@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type schedulingRequest struct {
 	mu                        sync.Mutex
 	id                        string
 	requests                  map[scheduler.Key]*scheduler.Request
+	coldPriorities            map[scheduler.Key]int64
 	currentRequest            *scheduler.Request
 	attempt                   *scheduler.Attempt
 	confirmed                 bool
@@ -46,7 +48,7 @@ func schedulingState(c *gin.Context) *schedulingRequest {
 	if value, ok := c.Get(schedulerContextKey); ok {
 		return value.(*schedulingRequest)
 	}
-	state := &schedulingRequest{id: common.GetUUID(), requests: make(map[scheduler.Key]*scheduler.Request)}
+	state := &schedulingRequest{id: common.GetUUID(), requests: make(map[scheduler.Key]*scheduler.Request), coldPriorities: make(map[scheduler.Key]int64)}
 	c.Set(schedulerContextKey, state)
 	return state
 }
@@ -68,7 +70,7 @@ func schedulerRequestForGroup(c *gin.Context, group, modelName string) (*schedul
 }
 
 func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, filters []dto.ChannelFilter) (*model.Channel, error) {
-	if err := SyncSchedulingConfig(); err != nil {
+	if err := SyncSchedulingConfig(scheduler.Key{Group: group, Model: modelName}); err != nil {
 		return nil, err
 	}
 	channels, err := model.GetSatisfiedChannelCandidates(group, modelName, filters)
@@ -78,52 +80,64 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 	state, request := schedulerRequestForGroup(c, group, modelName)
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
 	active := scheduler.Default.IsActive(request.Key)
-	var targetPriority int64
-	if !active {
-		priorities := make([]int64, 0, len(channels))
-		for _, channel := range channels {
-			if !slices.Contains(priorities, channel.GetPriority()) {
-				priorities = append(priorities, channel.GetPriority())
-			}
-		}
-		slices.Sort(priorities)
-		targetPriority = priorities[len(priorities)-1-min(max(retry, 0), len(priorities)-1)]
-	}
+	priorities := make([]int64, 0, len(channels))
+	tiers := make(map[int64][]scheduler.Candidate)
 	candidates := make([]scheduler.Candidate, 0, len(channels))
 	byID := make(map[int]*model.Channel, len(channels))
 	for _, channel := range channels {
-		if !active && channel.GetPriority() != targetPriority {
-			continue
+		priority := channel.GetPriority()
+		if _, seen := tiers[priority]; !seen {
+			tiers[priority] = nil
+			priorities = append(priorities, priority)
 		}
 		if slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
 			continue
 		}
-		candidates = append(candidates, SchedulerCandidate(channel))
+		candidate := SchedulerCandidate(channel)
+		candidates = append(candidates, candidate)
+		tiers[priority] = append(tiers[priority], candidate)
 		byID[channel.Id] = channel
 	}
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 	var attempt *scheduler.Attempt
-	if !active && len(GetSchedulingConfig(request.Key).ChannelOverrides) == 0 {
-		// Keep the native priority tier and configured-weight lottery during
-		// cold start. The engine still checks shared capacity and cooldown.
-		native, nativeErr := model.GetRandomSatisfiedChannel(group, modelName, retry, filters)
-		if nativeErr != nil {
-			return nil, nativeErr
+	if active {
+		attempt, err = scheduler.Default.SelectAndReserve(request, candidates, stream, retry > 0 || len(c.GetStringSlice("use_channel")) > 0)
+	} else {
+		slices.Sort(priorities)
+		slices.Reverse(priorities)
+		start := min(max(retry, 0), len(priorities)-1)
+		state.mu.Lock()
+		previous, hasPrevious := state.coldPriorities[request.Key]
+		state.mu.Unlock()
+		if hasPrevious && retry > 0 {
+			// A dispatched fallback advances the next retry past its tier.
+			// At the final tier preserve native retry clamping, while the
+			// engine and request trail still exclude already attempted IDs.
+			next := len(priorities) - 1
+			for index, priority := range priorities {
+				if priority < previous {
+					next = index
+					break
+				}
+			}
+			start = next
 		}
-		if native != nil && byID[native.Id] != nil {
-			attempt, _ = scheduler.Default.ReserveCandidate(request, SchedulerCandidate(native), stream)
+		for _, priority := range priorities[start:] {
+			// Eligibility and reservation are atomic. Empty/full/cooling
+			// tiers consume no upstream attempt and immediately fall through.
+			attempt, err = scheduler.Default.SelectAndReserve(request, tiers[priority], stream, false)
+			if !errors.Is(err, scheduler.ErrNoEligibleChannel) {
+				break
+			}
 		}
 	}
-	if attempt == nil {
-		attempt, err = scheduler.Default.SelectAndReserve(request, candidates, stream, retry > 0 || len(c.GetStringSlice("use_channel")) > 0)
-		if err != nil {
-			if errors.Is(err, scheduler.ErrNoEligibleChannel) {
-				return nil, nil
-			}
-			return nil, err
+	if err != nil {
+		if errors.Is(err, scheduler.ErrNoEligibleChannel) {
+			return nil, nil
 		}
+		return nil, err
 	}
 	state.mu.Lock()
 	state.attempt, state.started, state.stream, state.ttft, state.pending = attempt, false, stream, nil, nil
@@ -171,6 +185,9 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 			}
 		}
 	}
+	if err := SyncSchedulingConfig(scheduler.Key{Group: group, Model: modelName}); err != nil {
+		return err
+	}
 	state, request := schedulerRequestForGroup(c, group, modelName)
 	if state.attempt != nil && state.currentRequest == request && state.attempt.Candidate.ID == channel.Id && !state.started {
 		return nil
@@ -200,6 +217,7 @@ func StartSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo) {
 	if state.attempt == nil || state.started {
 		return
 	}
+	state.coldPriorities[state.currentRequest.Key] = state.attempt.Candidate.Priority
 	scheduler.Default.TouchRequest(state.currentRequest)
 	state.stream = info.IsStream
 	scheduler.Default.StartAttempt(state.attempt, info.IsStream)
@@ -243,6 +261,9 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 		}
 		outcome.Success = classification == perfmetrics.OutcomeSuccess
 		outcome.ChannelFailure = classification == perfmetrics.OutcomeFailure
+		if outcome.ChannelFailure && c.Request.Context().Err() == nil && apiErr != nil {
+			outcome.CooldownFailure = apiErr.GetErrorCode() == types.ErrorCodeDoRequestFailed || apiErr.StatusCode == 429 || apiErr.StatusCode == 502 || apiErr.StatusCode == 503 || apiErr.StatusCode == 504
+		}
 		outcome.TTFT = state.ttft
 		if classification != perfmetrics.OutcomeIgnored && !state.confirmed {
 			scheduler.Default.ConfirmRequest(state.currentRequest)
@@ -270,16 +291,30 @@ func EndSchedulingRequest(c *gin.Context) {
 // SchedulingRetryAllowed protects output already sent to the caller and the
 // overall request deadline in addition to the existing native retry policy.
 func SchedulingRetryAllowed(c *gin.Context) bool {
-	if c.Request != nil && c.Request.Context().Err() != nil {
-		return false
+	return SchedulingRetryStopReason(c) == ""
+}
+
+// SchedulingRetryStopReason is deliberately compact for the existing policy
+// failure log; it never includes candidate details or request content.
+func SchedulingRetryStopReason(c *gin.Context) string {
+	if c.Request != nil {
+		if err := c.Request.Context().Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return "request_deadline_exceeded"
+			}
+			return "client_cancelled"
+		}
 	}
 	if c.Writer != nil && c.Writer.Written() && c.Writer.Status() != 101 {
-		return false
+		return "response_started"
 	}
 	state := schedulingState(c)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	return !state.output
+	if state.output {
+		return "response_started"
+	}
+	return ""
 }
 
 type schedulingResponseWriter struct {
@@ -291,6 +326,10 @@ func ObserveSchedulingResponse(c *gin.Context) {
 	if _, ok := c.Writer.(*schedulingResponseWriter); !ok && c.Writer != nil {
 		c.Writer = &schedulingResponseWriter{ResponseWriter: c.Writer, ctx: c}
 	}
+}
+
+func (w *schedulingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *schedulingResponseWriter) Write(body []byte) (int, error) {

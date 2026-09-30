@@ -1,6 +1,7 @@
 package jsplugin
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -25,22 +26,22 @@ func TestOAuth2JWTAuthCachesAndRefreshes(t *testing.T) {
 	original := acquireAccessToken
 	t.Cleanup(func() { acquireAccessToken = original; pluginAuthCache = sync.Map{} })
 	calls := 0
-	acquireAccessToken = func(_ vertexcore.Credentials, _ string) (string, error) {
+	acquireAccessToken = func(_ context.Context, _ vertexcore.Credentials, _ string) (string, error) {
 		calls++
 		return fmt.Sprintf("token-%d", calls), nil
 	}
 	credentials, err := common.Marshal(vertexcore.Credentials{ProjectID: "project", ClientEmail: "a@example.com", PrivateKey: "secret"})
 	require.NoError(t, err)
 	meta := pluginruntime.AuthMeta{Type: "oauth2_jwt"}
-	first, err := resolveAuth(meta, string(credentials), "")
+	first, err := resolveAuth(context.Background(), meta, string(credentials), "")
 	require.NoError(t, err)
-	second, err := resolveAuth(meta, string(credentials), "")
+	second, err := resolveAuth(context.Background(), meta, string(credentials), "")
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer token-1", first["authHeader"])
 	assert.Equal(t, first, second)
 	assert.Equal(t, 1, calls)
 	pluginAuthCache.Store(string(credentials)+"\x00", cachedAuth{expiresAt: time.Now().Add(-time.Second)})
-	refreshed, err := resolveAuth(meta, string(credentials), "")
+	refreshed, err := resolveAuth(context.Background(), meta, string(credentials), "")
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer token-2", refreshed["authHeader"])
 	assert.Equal(t, 2, calls)
@@ -50,7 +51,7 @@ func TestOAuth2JWTContextDoesNotExposeServiceAccountKey(t *testing.T) {
 	pluginAuthCache = sync.Map{}
 	original := acquireAccessToken
 	t.Cleanup(func() { acquireAccessToken = original; pluginAuthCache = sync.Map{} })
-	acquireAccessToken = func(_ vertexcore.Credentials, _ string) (string, error) {
+	acquireAccessToken = func(_ context.Context, _ vertexcore.Credentials, _ string) (string, error) {
 		return "access-token", nil
 	}
 	credentials, err := common.Marshal(vertexcore.Credentials{ProjectID: "project", ClientEmail: "a@example.com", PrivateKey: "secret"})
@@ -83,7 +84,7 @@ func TestUpstreamContextsUseGatewayBearerOnNewAPIChannels(t *testing.T) {
 	pluginAuthCache = sync.Map{}
 	original := acquireAccessToken
 	exchanges := 0
-	acquireAccessToken = func(_ vertexcore.Credentials, _ string) (string, error) {
+	acquireAccessToken = func(_ context.Context, _ vertexcore.Credentials, _ string) (string, error) {
 		exchanges++
 		return "access-token", nil
 	}
@@ -152,4 +153,86 @@ export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content/"+ctx
 		})
 	}
 	assert.Equal(t, 1, exchanges, "the vendor token exchange runs only for the oauth2_jwt vendor channel, never for a New API channel")
+}
+
+func TestOAuth2JWTSubmitContextCancelsColdTokenExchangeWithoutCachingError(t *testing.T) {
+	pluginAuthCache = sync.Map{}
+	original := acquireAccessToken
+	t.Cleanup(func() { acquireAccessToken = original; pluginAuthCache = sync.Map{} })
+	credentials, err := common.Marshal(vertexcore.Credentials{ProjectID: "project", ClientEmail: "test@example.com", PrivateKey: "test-only-private-key"})
+	require.NoError(t, err)
+	plugin, err := pluginruntime.NewRegistry().Register(`
+export const meta = {apiVersion:1,key:"oauth-cancel",name:"OAuth cancellation",version:"1.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task",auth:{type:"oauth2_jwt"}};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit"}}
+export function parseSubmitResponse(){return {taskId:"1"}}
+export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/query"}}
+export function parseTaskResult(){return {status:"SUCCESS"}}
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: string(credentials)}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	adaptor.Init(info)
+	deadline := time.Now().Add(time.Minute)
+	requestCtx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil).WithContext(requestCtx)
+	entered := make(chan context.Context, 1)
+	completed := make(chan map[string]any, 1)
+	abort := make(chan struct{})
+	workerDone := make(chan struct{})
+	t.Cleanup(func() {
+		close(abort)
+		<-workerDone
+	})
+	calls := 0
+	acquireAccessToken = func(ctx context.Context, _ vertexcore.Credentials, _ string) (string, error) {
+		calls++
+		entered <- ctx
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-abort:
+			return "", context.Canceled
+		}
+	}
+	go func() {
+		defer close(workerDone)
+		completed <- adaptor.submitContext(c, info)
+	}()
+	select {
+	case exchangeCtx := <-entered:
+		gotDeadline, present := exchangeCtx.Deadline()
+		assert.True(t, present)
+		assert.Equal(t, deadline, gotDeadline, "token exchange shares the submission budget")
+	case <-time.After(time.Second):
+		t.Fatal("cold token exchange did not start")
+	}
+	cancel()
+	select {
+	case result := <-completed:
+		assert.Equal(t, context.Canceled.Error(), result["authError"])
+		assert.NotContains(t, result, "authHeader")
+		assert.NotContains(t, result, "apiKey", "failed exchanges never expose the service-account private key")
+	case <-time.After(time.Second):
+		t.Fatal("token exchange did not stop when the submission was cancelled")
+	}
+	_, cached := pluginAuthCache.Load(string(credentials) + "\x00")
+	assert.False(t, cached, "a cancelled exchange must not populate the token cache")
+	acquireAccessToken = func(ctx context.Context, _ vertexcore.Credentials, _ string) (string, error) {
+		calls++
+		assert.NoError(t, ctx.Err())
+		return "fresh-token", nil
+	}
+	background, err := adaptor.queryContext(&model.Task{}, string(credentials), "https://provider.example", "")
+	require.NoError(t, err, "background queries keep an independent lifecycle after the caller is cancelled")
+	assert.Equal(t, "Bearer fresh-token", background["authHeader"])
+	c.Request = c.Request.WithContext(context.Background())
+	fresh := adaptor.submitContext(c, info)
+	assert.NotContains(t, fresh, "authError")
+	assert.Equal(t, "Bearer fresh-token", fresh["authHeader"])
+	assert.NotContains(t, fresh, "apiKey")
+	again := adaptor.submitContext(c, info)
+	assert.Equal(t, "Bearer fresh-token", again["authHeader"])
+	assert.Equal(t, 2, calls, "only successful exchanges populate the existing credential cache")
 }

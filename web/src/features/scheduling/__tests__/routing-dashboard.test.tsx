@@ -68,6 +68,7 @@ beforeEach(() => {
     started_at: 1727000000,
     refreshed_at: 1727000120,
     active: false,
+    phase: 'cold',
     activation_requests: 12,
     activation_threshold: 50,
     config: {
@@ -107,6 +108,11 @@ beforeEach(() => {
         capacity: 20,
         health_attainment: 0.6,
         health_score: 65,
+        health_baseline: 80,
+        recovery_limit: 65,
+        ramp_successes: 20,
+        ramp_progress: 1,
+        ramp_limited: false,
         avg_ttft_ms_5m: null,
         quality_score: 52,
         selection_probability: 0.4,
@@ -128,6 +134,11 @@ beforeEach(() => {
         capacity: 20,
         health_attainment: null,
         health_score: 100,
+        health_baseline: 100,
+        recovery_limit: 100,
+        ramp_successes: 0,
+        ramp_progress: 0,
+        ramp_limited: false,
         avg_ttft_ms_5m: null,
         quality_score: 80,
         selection_probability: 0,
@@ -161,6 +172,47 @@ afterEach(() => {
 })
 
 describe('routing dashboard interactions', () => {
+  test.each([
+    ['cold', 'Cold start'],
+    ['transition', 'Routing transition'],
+    ['dynamic', 'Mature dynamic routing'],
+  ] as const)(
+    'shows the backend learning stage for %s routing',
+    async (phase, label) => {
+      snapshot.phase = phase
+      snapshot.active = phase !== 'cold'
+      render(<Scheduling />, { wrapper: Wrapper })
+      expect(await screen.findByText(label)).toBeVisible()
+    }
+  )
+
+  test('new channel rollout and current health limits remain inspectable by keyboard', async () => {
+    const user = userEvent.setup()
+    snapshot.active = true
+    snapshot.phase = 'dynamic'
+    snapshot.channels[0].ramp_limited = true
+    snapshot.channels[0].ramp_progress = 0.25
+    snapshot.channels[0].ramp_successes = 5
+    render(<Scheduling />, { wrapper: Wrapper })
+    await user.click(await screen.findByRole('tab', { name: 'Groups' }))
+    expect(screen.getByText('Gradual rollout: 25%')).toBeVisible()
+    expect(
+      screen.getByRole('columnheader', { name: 'Initial configured weight' })
+    ).toBeVisible()
+    const healthDetails = screen.getByRole('button', {
+      name: 'Health details for Primary',
+    })
+    await user.tab()
+    await user.tab()
+    expect(healthDetails).toHaveFocus()
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      'Window baseline: 80%. Recovery limit: 65%.'
+    )
+    expect(healthDetails).toHaveAccessibleDescription(
+      'Window baseline: 80%. Recovery limit: 65%.'
+    )
+  })
+
   test('shows activation progress and all channel metrics while retaining missing latency as a dash', async () => {
     const user = userEvent.setup()
     render(<Scheduling />, { wrapper: Wrapper })
@@ -483,6 +535,9 @@ describe('routing dashboard interactions', () => {
     await user.click(
       screen.getByRole('button', { name: 'Remove downweighting for Primary' })
     )
+    expect(screen.getByRole('alertdialog')).toHaveTextContent(
+      'Failure history, disabled status, cooldowns and capacity limits remain in effect. Poor recent performance can still keep the weight low.'
+    )
     await user.click(screen.getByRole('button', { name: 'Recalculate weight' }))
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Weight recalculation failed'
@@ -512,7 +567,7 @@ describe('routing dashboard interactions', () => {
     const dialog = screen.getByRole('dialog')
     await user.type(
       within(dialog).getAllByRole('spinbutton', {
-        name: 'Configured weight',
+        name: 'Initial configured weight',
       })[0],
       '0'
     )

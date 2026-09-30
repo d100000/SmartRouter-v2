@@ -450,6 +450,7 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 }
 
 func BatchInsertChannels(channels []Channel) error {
+	defer invalidateRoutingMetadata()
 	if len(channels) == 0 {
 		return nil
 	}
@@ -479,6 +480,7 @@ func BatchInsertChannels(channels []Channel) error {
 }
 
 func BatchDeleteChannels(ids []int) (int64, error) {
+	defer invalidateRoutingMetadata()
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -546,6 +548,7 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
+	defer invalidateRoutingMetadata()
 	var err error
 	err = DB.Create(channel).Error
 	if err != nil {
@@ -556,6 +559,7 @@ func (channel *Channel) Insert() error {
 }
 
 func (channel *Channel) Update() error {
+	defer invalidateRoutingMetadata()
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
 		var keyStr string
@@ -625,6 +629,7 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
+	defer invalidateRoutingMetadata()
 	var err error
 	err = DB.Delete(channel).Error
 	if err != nil {
@@ -736,6 +741,7 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+	defer invalidateRoutingMetadata()
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -919,11 +925,13 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
+	defer invalidateRoutingMetadata()
 	result := DB.Where("status = ?", status).Delete(&Channel{})
 	return result.RowsAffected, result.Error
 }
 
 func DeleteDisabledChannel() (int64, error) {
+	defer invalidateRoutingMetadata()
 	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
 	return result.RowsAffected, result.Error
 }

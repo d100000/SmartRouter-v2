@@ -5,16 +5,21 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -582,4 +587,55 @@ func TestNewStreamScannerCallerLimit(t *testing.T) {
 	require.True(t, scanner.Scan())
 	assert.Equal(t, "data: ok", scanner.Text())
 	require.NoError(t, scanner.Err())
+}
+
+// budgetPipeWriter models a connected client that has stopped reading. net.Pipe
+// honors deadlines without an external server or wall-clock sleeps.
+type budgetPipeWriter struct {
+	gin.ResponseWriter
+	connection net.Conn
+}
+
+func (w *budgetPipeWriter) SetWriteDeadline(deadline time.Time) error {
+	return w.connection.SetWriteDeadline(deadline)
+}
+
+func (w *budgetPipeWriter) Write(data []byte) (int, error) {
+	return w.connection.Write(data)
+}
+
+func TestRelayBudgetStopsBlockedDownstreamWrite(t *testing.T) {
+	previousHTTP, previousStream := common.RelayTotalTimeout, common.RelayStreamTotalTimeout
+	common.RelayTotalTimeout, common.RelayStreamTotalTimeout = 2, 2
+	t.Cleanup(func() {
+		common.RelayTotalTimeout, common.RelayStreamTotalTimeout = previousHTTP, previousStream
+	})
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				writer, reader := net.Pipe()
+				defer writer.Close()
+				defer reader.Close()
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Writer = &budgetPipeWriter{ResponseWriter: c.Writer, connection: writer}
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				service.ObserveSchedulingResponse(c)
+				common.SetContextKey(c, constant.ContextKeyIsStream, stream)
+				cancel := service.BeginRelayRequestBudget(c)
+				defer cancel()
+				if stream {
+					ExtendWriteDeadline(c)
+				}
+				start := time.Now()
+				_, err := c.Writer.Write([]byte("blocked by an unread client"))
+				require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+				assert.Equal(t, 2*time.Second, time.Since(start))
+				cancel()
+				// Handler cleanup clears the deadline for a reused connection.
+				go func() { _, _ = io.Copy(io.Discard, reader) }()
+				_, err = c.Writer.Write([]byte("next request"))
+				require.NoError(t, err)
+			})
+		})
+	}
 }

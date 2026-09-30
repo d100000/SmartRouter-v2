@@ -77,7 +77,13 @@ func ExtendWriteDeadline(c *gin.Context) {
 	if c == nil || c.Writer == nil {
 		return
 	}
-	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+	deadline := time.Now().Add(streamWriteTimeout)
+	if c.Request != nil {
+		if requestDeadline, ok := c.Request.Context().Deadline(); ok && requestDeadline.Before(deadline) {
+			deadline = requestDeadline
+		}
+	}
+	_ = http.NewResponseController(c.Writer).SetWriteDeadline(deadline)
 }
 
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
@@ -287,7 +293,13 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}
 
 		if err := scanner.Err(); err != nil {
-			if err != io.EOF {
+			if requestErr := c.Request.Context().Err(); requestErr != nil {
+				// Binding the upstream request to client cancellation can unblock
+				// Scan before the main select observes Done. Keep the same end
+				// reason whichever goroutine wins, including a close immediately
+				// after a fully delivered terminal event.
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, requestErr)
+			} else if err != io.EOF {
 				logger.LogError(c, "scanner error: "+err.Error())
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
 			}

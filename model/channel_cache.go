@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -23,6 +24,15 @@ var channelsIDM map[int]*Channel                     // all channels include dis
 // path-aware selection avoids re-parsing JSON per request. Refreshed on full sync.
 var channel2advancedCustomConfig map[int]*kitdto.AdvancedCustomConfig
 var channelSyncLock sync.RWMutex
+
+// RoutingMetadataVersion changes after channel CRUD and cache publication.
+// Scheduling reconciles complete membership once per version, never from a
+// request-filtered candidate list or a full database scan on every request.
+var routingMetadataVersion atomic.Uint64
+
+func RoutingMetadataVersion() uint64 { return routingMetadataVersion.Load() }
+
+func invalidateRoutingMetadata() { routingMetadataVersion.Add(1) }
 
 // GetSatisfiedChannelCandidates returns every enabled matching channel across
 // priorities. Copies keep scheduling snapshots independent of cache updates.
@@ -76,6 +86,7 @@ func GetSatisfiedChannelCandidates(group, modelName string, filters []dto.Channe
 }
 
 func InitChannelCache() {
+	defer invalidateRoutingMetadata()
 	if !common.MemoryCacheEnabled {
 		InvalidatePricingCache()
 		rebuildTaskAliasView()
@@ -219,12 +230,10 @@ func GetRandomSatisfiedChannel(
 	targetPriority := int64(sortedUniquePriorities[retry])
 
 	// get the priority for the given retry number
-	var sumWeight = 0
 	var targetChannels []*Channel
 	for _, channelId := range channels {
 		if channel, ok := channelsIDM[channelId]; ok {
 			if channel.GetPriority() == targetPriority {
-				sumWeight += channel.GetWeight()
 				targetChannels = append(targetChannels, channel)
 			}
 		} else {
@@ -236,35 +245,11 @@ func GetRandomSatisfiedChannel(
 		return nil, errors.New(fmt.Sprintf("no channel found, group: %s, model: %s, priority: %d", group, model, targetPriority))
 	}
 
-	// smoothing factor and adjustment
-	smoothingFactor := 1
-	smoothingAdjustment := 0
-
-	if sumWeight == 0 {
-		// when all channels have weight 0, set sumWeight to the number of channels and set smoothing adjustment to 100
-		// each channel's effective weight = 100
-		sumWeight = len(targetChannels) * 100
-		smoothingAdjustment = 100
-	} else if sumWeight/len(targetChannels) < 10 {
-		// when the average weight is less than 10, set smoothing factor to 100
-		smoothingFactor = 100
+	weights := make([]uint, len(targetChannels))
+	for i, channel := range targetChannels {
+		weights[i] = uint(channel.GetWeight())
 	}
-
-	// Calculate the total weight of all channels up to endIdx
-	totalWeight := sumWeight * smoothingFactor
-
-	// Generate a random value in the range [0, totalWeight)
-	randomWeight := rand.Intn(totalWeight)
-
-	// Find a channel based on its weight
-	for _, channel := range targetChannels {
-		randomWeight -= channel.GetWeight()*smoothingFactor + smoothingAdjustment
-		if randomWeight < 0 {
-			return channel, nil
-		}
-	}
-	// return null if no channel is not found
-	return nil, errors.New("channel not found")
+	return targetChannels[configuredWeightIndex(weights, rand.Float64())], nil
 }
 
 func CacheGetChannel(id int) (*Channel, error) {
@@ -316,6 +301,7 @@ func CacheGetChannelInfo(id int) (*ChannelInfo, error) {
 }
 
 func CacheUpdateChannelStatus(id int, status int) {
+	defer invalidateRoutingMetadata()
 	if !common.MemoryCacheEnabled {
 		return
 	}
@@ -341,6 +327,7 @@ func CacheUpdateChannelStatus(id int, status int) {
 }
 
 func CacheUpdateChannel(channel *Channel) {
+	defer invalidateRoutingMetadata()
 	if !common.MemoryCacheEnabled {
 		return
 	}

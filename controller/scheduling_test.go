@@ -1,22 +1,112 @@
 package controller
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"testing/synctest"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
+	"github.com/QuantumNous/new-api/relay/channel/baidu"
+	"github.com/QuantumNous/new-api/relay/channel/vertex"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type schedulingTokenTransport func(*http.Request) (*http.Response, error)
+
+func (transport schedulingTokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return transport(req)
+}
+
+func TestRelayBudgetCancelsProviderTokenAcquisition(t *testing.T) {
+	service.InitHttpClient()
+	client := service.GetHttpClient()
+	previousTransport, previousTimeout := client.Transport, client.Timeout
+	previousBudget := common.RelayTotalTimeout
+	common.RelayTotalTimeout = 1
+	client.Timeout = 0
+	t.Cleanup(func() {
+		client.Transport, client.Timeout = previousTransport, previousTimeout
+		common.RelayTotalTimeout = previousBudget
+	})
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	encodedKey, err := x509.MarshalPKCS8PrivateKey(key)
+	require.NoError(t, err)
+	creds := vertex.Credentials{
+		ClientEmail: "budget-test@example.invalid",
+		PrivateKey:  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encodedKey})),
+	}
+	for _, tc := range []struct {
+		name, host string
+		acquire    func(*gin.Context) error
+	}{
+		{"Baidu cold cache", "aip.baidubce.com", func(c *gin.Context) error {
+			adaptor := &baidu.Adaptor{}
+			_, err := adaptor.DoRequest(c, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+				ApiKey: "budget-test-client|budget-test-secret", ChannelBaseUrl: "https://provider.invalid", UpstreamModelName: "ERNIE-Bot",
+			}}, strings.NewReader("{}"))
+			return err
+		}},
+		{"Vertex cold cache", "www.googleapis.com", func(c *gin.Context) error {
+			adaptor := &vertex.Adaptor{AccountCredentials: creds}
+			headers := make(http.Header)
+			return adaptor.SetupRequestHeader(c, &headers, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelId: -9917}})
+		}},
+		{"Vertex plugin credentials", "www.googleapis.com", func(c *gin.Context) error {
+			_, err := vertex.AcquireAccessTokenWithContext(c.Request.Context(), creds, "")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				defer service.BeginRelayRequestBudget(c)()
+				deadline, ok := c.Request.Context().Deadline()
+				require.True(t, ok)
+				calls := 0
+				client.Transport = schedulingTokenTransport(func(req *http.Request) (*http.Response, error) {
+					calls++
+					assert.Equal(t, tc.host, req.URL.Host)
+					assert.Equal(t, "https", req.URL.Scheme)
+					requestDeadline, bounded := req.Context().Deadline()
+					require.True(t, bounded, "provider credential acquisition must inherit the relay budget")
+					assert.Equal(t, deadline, requestDeadline)
+					if req.Body != nil {
+						_, err := io.Copy(io.Discard, req.Body)
+						require.NoError(t, err)
+						require.NoError(t, req.Body.Close())
+					}
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				})
+				err := tc.acquire(c)
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				assert.NotContains(t, err.Error(), "budget-test-secret")
+				assert.Equal(t, 1, calls)
+				assert.False(t, c.Writer.Written())
+				assert.False(t, service.SchedulingRetryAllowed(c))
+			})
+		})
+	}
+}
 
 func TestSchedulingConfigRejectsUnsafeCapacityAndWeights(t *testing.T) {
 	valid := service.SchedulingConfig{Group: "default", Model: "model-a", Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100}
@@ -265,6 +355,8 @@ func TestSchedulingDatabaseMatrix(t *testing.T) {
 			}
 			// Reach the real 50-original activation threshold and leave a failure
 			// on each channel, so false recovery eligibility would be observable.
+			model.InitChannelCache()
+			require.NoError(t, service.SyncSchedulingConfig())
 			for index := range 50 {
 				request := scheduler.Default.BeginRequest(keyA, fmt.Sprintf("activation-%d", index), false)
 				attempt, err := scheduler.Default.ReserveCandidate(request, candidate, true)
@@ -284,6 +376,7 @@ func TestSchedulingDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Model(&model.Ability{}).Where(&model.Ability{Group: keyA.Group, Model: keyA.Model, ChannelId: channels[1].Id}).Update("enabled", false).Error)
 			require.NoError(t, db.Where(&model.Ability{Group: keyA.Group, Model: keyA.Model, ChannelId: channels[2].Id}).Delete(&model.Ability{}).Error)
 			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channels[3].Id).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			model.InitChannelCache()
 
 			var dashboard struct {
 				Success bool                `json:"success"`

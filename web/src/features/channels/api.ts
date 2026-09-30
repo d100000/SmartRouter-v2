@@ -28,6 +28,7 @@ import type {
   Channel,
   ChannelBalanceResponse,
   ChannelOpsResponse,
+  ChannelRecentStats,
   ChannelTestResponse,
   CopyChannelParams,
   CopyChannelResponse,
@@ -121,6 +122,16 @@ export async function getChannels(
 ): Promise<GetChannelsResponse> {
   const res = await api.get('/api/channel', { params })
   return res.data
+}
+
+export async function getChannelRecentStats(
+  signal?: AbortSignal
+): Promise<ChannelRecentStats> {
+  const response = await api.get<{
+    success: boolean
+    data: ChannelRecentStats
+  }>('/api/channel/recent_stats', { signal, timeout: 10_000 })
+  return requireServerSuccess(response.data).data
 }
 
 /**

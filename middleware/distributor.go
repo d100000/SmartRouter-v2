@@ -36,7 +36,7 @@ func Distribute() func(c *gin.Context) {
 		var channel *model.Channel
 		defer service.EndSchedulingRequest(c)
 		service.ObserveSchedulingResponse(c)
-		if strings.Contains(c.Request.URL.Path, "streamGenerateContent") || strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
+		if strings.Contains(c.Request.URL.Path, "streamGenerateContent") || service.IsRelayWebSocketRequest(c) {
 			common.SetContextKey(c, constant.ContextKeyIsStream, true)
 		}
 		defer func() {
@@ -55,6 +55,8 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		cancelBudget := service.BeginRelayRequestBudget(c)
+		defer cancelBudget()
 		_, pinned, _ := constraints.ResolvedPin()
 		if !pinned {
 			// Select a channel for the user
@@ -285,7 +287,7 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 	}
 
 	values := gjson.GetManyBytes(requestBody, "model", "group", "stream")
-	common.SetContextKey(c, constant.ContextKeyIsStream, values[2].Bool() || strings.Contains(c.Request.URL.Path, "streamGenerateContent") || strings.EqualFold(c.GetHeader("Upgrade"), "websocket"))
+	common.SetContextKey(c, constant.ContextKeyIsStream, values[2].Bool() || strings.Contains(c.Request.URL.Path, "streamGenerateContent") || service.IsRelayWebSocketRequest(c))
 	model, err := getJSONStringValue(values[0], "model")
 	if err != nil {
 		return nil, err

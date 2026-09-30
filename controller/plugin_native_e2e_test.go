@@ -75,7 +75,7 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 	previousRedisEnabled := common.RedisEnabled
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}, &model.Log{}))
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Log{}))
 	model.DB = database
 	model.LOG_DB = database
 	common.MemoryCacheEnabled = false
@@ -133,6 +133,8 @@ func TestKlingNativeRouteSubmitPollSettleAndQuery(t *testing.T) {
 		Group:   "default",
 	}
 	require.NoError(t, database.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(database))
+	model.InitChannelCache()
 
 	generation := pluginruntime.DefaultRegistry.Generation()
 	require.NotNil(t, generation)

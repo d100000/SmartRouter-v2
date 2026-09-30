@@ -12,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,6 +21,8 @@ import (
 func TestClassifyRelayOutcome(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
+	expired, cancelDeadline := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer cancelDeadline()
 	for _, tc := range []struct {
 		name string
 		ctx  context.Context
@@ -40,6 +44,7 @@ func TestClassifyRelayOutcome(t *testing.T) {
 		{"empty upstream response", context.Background(), types.NewError(errors.New("empty"), types.ErrorCodeEmptyResponse), OutcomeFailure},
 		{"network failure", context.Background(), types.NewOpenAIError(errors.New("connection refused"), types.ErrorCodeDoRequestFailed, 500), OutcomeFailure},
 		{"client cancellation", canceled, types.NewOpenAIError(errors.New("context canceled"), types.ErrorCodeDoRequestFailed, 500), OutcomeIgnored},
+		{"whole request deadline", expired, types.NewOpenAIError(context.DeadlineExceeded, types.ErrorCodeDoRequestFailed, 504), OutcomeIgnored},
 		{"upstream deadline", context.Background(), types.NewOpenAIError(context.DeadlineExceeded, types.ErrorCodeDoRequestFailed, 504), OutcomeFailure},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,6 +117,7 @@ func TestHourlySuccessSeriesWeightsSmallerBuckets(t *testing.T) {
 // Terminal task sampling: success/failure counts, end-to-end latency, and
 // token throughput only for successful tasks that report tokens.
 func TestRecordTaskResultSamplesTerminalTasks(t *testing.T) {
+	t.Cleanup(WaitForPendingWrites)
 	hotBuckets.Clear()
 	t.Cleanup(func() { hotBuckets.Clear() })
 	now := time.Now().Unix()
@@ -153,6 +159,7 @@ func TestRecordTaskResultSamplesTerminalTasks(t *testing.T) {
 // TEST_PERF_MYSQL_DSN / TEST_PERF_POSTGRES_DSN optionally run the aggregation
 // against isolated real MySQL/PostgreSQL databases.
 func TestPerformanceAggregationAndFlush(t *testing.T) {
+	WaitForPendingWrites()
 	for _, dialect := range []struct{ name, env string }{
 		{"sqlite", ""}, {"mysql", "TEST_PERF_MYSQL_DSN"}, {"postgres", "TEST_PERF_POSTGRES_DSN"},
 	} {
@@ -170,6 +177,7 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			common.SQLitePath, common.IsMasterNode, common.RedisEnabled = filepath.Join(t.TempDir(), "perf.db"), false, false
 			hotBuckets.Clear()
 			t.Cleanup(func() {
+				WaitForPendingWrites()
 				model.DB, common.SQLitePath, common.IsMasterNode, common.RedisEnabled = oldDB, oldPath, oldMaster, oldRedis
 				common.SetDatabaseTypes(oldType, oldLogType)
 				hotBuckets.Clear()
@@ -251,4 +259,25 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			assert.Equal(t, 99.01, combined.Models[0].SuccessRate)
 		})
 	}
+}
+
+func TestRedisRecordsDrainBeforeConfigurationChanges(t *testing.T) {
+	WaitForPendingWrites()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	previousEnabled, previousClient := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, client
+	t.Cleanup(func() {
+		WaitForPendingWrites()
+		common.RedisEnabled, common.RDB = previousEnabled, previousClient
+		require.NoError(t, client.Close())
+		hotBuckets.Clear()
+	})
+	Record(Sample{Model: "redis-drain", Group: "default", Success: true})
+	WaitForPendingWrites()
+	common.RedisEnabled, common.RDB = false, nil
+	keys := server.Keys()
+	require.Len(t, keys, 1)
+	assert.Equal(t, "1", server.HGet(keys[0], "req"))
+	assert.Equal(t, "1", server.HGet(keys[0], "ok"))
 }

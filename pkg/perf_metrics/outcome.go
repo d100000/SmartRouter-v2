@@ -24,7 +24,9 @@ func ClassifyRelayOutcome(ctx context.Context, info *relaycommon.RelayInfo, apiE
 	if info == nil || info.PerformanceBusinessRejection {
 		return OutcomeIgnored
 	}
-	if ctx != nil && ctx.Err() == context.Canceled {
+	// A caller or whole-request deadline is not evidence of channel failure.
+	// An upstream-only timeout still has a live caller context and is counted.
+	if ctx != nil && ctx.Err() != nil {
 		return OutcomeIgnored
 	}
 	if apiErr != nil && errors.Is(apiErr, context.Canceled) {

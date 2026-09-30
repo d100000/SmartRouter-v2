@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,41 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestRequestCancellationCannotAutoDisableChannel(t *testing.T) {
+	previous := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = previous })
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelDeadline := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer cancelDeadline()
+	channelErr := types.NewError(errors.New("channel failed"), types.ErrorCodeChannelNoAvailableKey)
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want bool
+	}{
+		{"live channel failure keeps native disable", context.Background(), true},
+		{"caller cancellation", cancelled, false},
+		{"whole request deadline", expired, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/", nil).WithContext(tc.ctx)
+			assert.Equal(t, tc.want, shouldDisableFailedAttempt(c, channelErr))
+			c.Set("auto_ban", true)
+			RecordPolicyFailure(c, 1, channelErr, PolicyDecision{Action: "stop"})
+			events := RequestPolicy(c).Events()
+			require.Len(t, events, 2)
+			if tc.want {
+				assert.Equal(t, "channel_disable_requested", events[1].Health)
+			} else {
+				assert.Equal(t, "unchanged", events[1].Health)
+			}
+		})
+	}
+}
 
 func TestShouldRetryRelayErrorHonorsChannelPinOnChannelError(t *testing.T) {
 	err := types.NewError(errors.New("channel failed"), types.ErrorCodeChannelNoAvailableKey)

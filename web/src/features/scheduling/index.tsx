@@ -86,6 +86,11 @@ export function Scheduling() {
     enabled: canRead,
   })
   const data = query.data
+  const phases = {
+    cold: t('Cold start'),
+    transition: t('Routing transition'),
+    dynamic: t('Mature dynamic routing'),
+  }
   useEffect(() => {
     // Resolve defaults once, after a fresh response with a configured route.
     // Polls and cached defaults must not replace an explicit selection.
@@ -259,6 +264,9 @@ export function Scheduling() {
                         ? t('Intelligent routing active')
                         : t('Native routing')}
                     </Badge>
+                    {data.config.enabled && (
+                      <Badge variant='outline'>{phases[data.phase]}</Badge>
+                    )}
                     {!data.active && data.config.enabled && (
                       <span>
                         {t(
@@ -348,6 +356,16 @@ export function Scheduling() {
                             'Streaming and non-streaming latency are measured separately. Heartbeats, empty chunks and role declarations do not count as first output.'
                           )}
                         </p>
+                        <p>
+                          {t(
+                            'Initial configured weights apply during cold start and transition. Mature routing uses observed performance.'
+                          )}
+                        </p>
+                        <p>
+                          {t(
+                            'Gradual rollout follows successful attempts and ends after 20 successes. Traffic is limited only while a healthy, learned alternative is available.'
+                          )}
+                        </p>
                       </div>
                     </TabsContent>
                   </Tabs>
@@ -388,7 +406,7 @@ export function Scheduling() {
                 }}
                 title={t('Remove downweighting')}
                 desc={t(
-                  'Recalculate {{channel}} from its current baseline. Disabled status, cooldowns and capacity limits remain in effect.',
+                  'Remove the recovery limit for {{channel}} and recalculate from current performance. Failure history, disabled status, cooldowns and capacity limits remain in effect. Poor recent performance can still keep the weight low.',
                   { channel: recover?.name ?? '' }
                 )}
                 confirmText={t('Recalculate weight')}

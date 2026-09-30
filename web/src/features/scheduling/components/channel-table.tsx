@@ -28,8 +28,14 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { toIntlLocale } from '@/i18n/languages'
-import { formatNumber } from '@/lib/format'
+import { formatNumber, formatTimestamp } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 import type { SchedulingChannel } from '../types'
@@ -83,7 +89,7 @@ export function ChannelTable(props: {
             t('Channel Status'),
             t('Traffic share (30m)'),
             t('Dynamic weight'),
-            t('Configured weight'),
+            t('Initial configured weight'),
             t('Dispatches (30m)'),
             t('Success rate (30m)'),
             t('Success rate (5m)'),
@@ -117,6 +123,22 @@ export function ChannelTable(props: {
               >
                 {states[channel.route_state]}
               </Badge>
+              {channel.ramp_limited && (
+                <Badge variant='secondary' className='mt-1 block'>
+                  {t('Gradual rollout: {{progress}}', {
+                    progress: percent(channel.ramp_progress),
+                  })}
+                </Badge>
+              )}
+              {channel.cooldown_until && (
+                <span className='text-muted-foreground mt-1 block whitespace-nowrap'>
+                  {t('Cooldown ends: {{time}}', {
+                    time: formatTimestamp(
+                      Date.parse(channel.cooldown_until) / 1000
+                    ),
+                  })}
+                </span>
+              )}
             </TableCell>
             <TableCell className='bg-background sticky left-0 z-10 max-w-64 min-w-40'>
               <div className='truncate font-medium' title={channel.name}>
@@ -157,12 +179,44 @@ export function ChannelTable(props: {
               {percent(channel.health_attainment)}
             </TableCell>
             <TableCell className='tabular-nums'>
-              {number(channel.health_score)}
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        variant='ghost'
+                        size='sm'
+                        className='h-auto p-0 font-normal tabular-nums'
+                      />
+                    }
+                    aria-label={t('Health details for {{channel}}', {
+                      channel: channel.name,
+                    })}
+                    aria-describedby={`scheduling-health-${channel.channel_id}`}
+                  >
+                    {number(channel.health_score)}
+                  </TooltipTrigger>
+                  <TooltipContent
+                    id={`scheduling-health-${channel.channel_id}`}
+                    role='tooltip'
+                  >
+                    {t(
+                      'Window baseline: {{baseline}}%. Recovery limit: {{limit}}%.',
+                      {
+                        baseline: number(channel.health_baseline),
+                        limit: number(channel.recovery_limit),
+                      }
+                    )}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </TableCell>
             <TableCell className='tabular-nums'>
               {channel.avg_ttft_ms_5m == null
                 ? '—'
-                : t('{{value}} ms', { value: number(channel.avg_ttft_ms_5m) })}
+                : t('{{value}} ms', {
+                    value: number(channel.avg_ttft_ms_5m),
+                  })}
             </TableCell>
             <TableCell className='tabular-nums'>
               {number(channel.quality_score)}

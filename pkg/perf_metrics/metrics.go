@@ -16,9 +16,17 @@ import (
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/go-redis/redis/v8"
 )
 
 var hotBuckets sync.Map
+var pendingRedisWrites sync.WaitGroup
+
+// WaitForPendingWrites drains best-effort Redis updates after relay producers
+// have stopped, before closing the client or replacing test-global state.
+func WaitForPendingWrites() {
+	pendingRedisWrites.Wait()
+}
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
 // hiding fields or making response-only privacy hardening changes.
@@ -118,8 +126,16 @@ func Record(sample Sample) {
 	}
 	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
 	actual.(*atomicBucket).add(sample)
+	// Resolve process configuration before dispatch. A queued task must never
+	// read a later test's (or shutdown's) RedisEnabled/RDB values.
+	client := common.RDB
+	if !common.RedisEnabled || client == nil {
+		return
+	}
+	pendingRedisWrites.Add(1)
 	gopool.Go(func() {
-		recordRedis(key, sample)
+		defer pendingRedisWrites.Done()
+		recordRedis(client, key, sample)
 	})
 }
 
@@ -485,15 +501,12 @@ func avgTps(value counters) float64 {
 	return float64(value.outputTokens) / (float64(value.generationMs) / 1000)
 }
 
-func recordRedis(key bucketKey, sample Sample) {
-	if !common.RedisEnabled || common.RDB == nil {
-		return
-	}
+func recordRedis(client *redis.Client, key bucketKey, sample Sample) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	redisKey := redisBucketKey(key)
-	pipe := common.RDB.TxPipeline()
+	pipe := client.TxPipeline()
 	pipe.HIncrBy(ctx, redisKey, "req", 1)
 	if sample.Success {
 		pipe.HIncrBy(ctx, redisKey, "ok", 1)

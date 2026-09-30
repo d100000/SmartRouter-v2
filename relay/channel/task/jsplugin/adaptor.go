@@ -925,7 +925,7 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 	ctx["artifactKey"] = artifactKey
 	ctx["baseUrl"] = a.info.ChannelBaseUrl
 	ctx["clientRequest"] = jsonValue(clientRequest)
-	if err = a.applyUpstreamCredentials(ctx, a.info.ChannelType, a.info.ApiKey, a.info.ChannelSetting.Proxy); err != nil {
+	if err = a.applyUpstreamCredentials(context.Background(), ctx, a.info.ChannelType, a.info.ApiKey, a.info.ChannelSetting.Proxy); err != nil {
 		return nil, err
 	}
 	value, err := a.plugin.Engine.Call(context.Background(), "buildContentRequest", ctx)
@@ -1050,7 +1050,7 @@ func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string)
 			key = task.PrivateData.Key
 		}
 	}
-	if err := a.applyUpstreamCredentials(ctx, a.channelType(), key, proxy); err != nil {
+	if err := a.applyUpstreamCredentials(context.Background(), ctx, a.channelType(), key, proxy); err != nil {
 		return nil, err
 	}
 	return ctx, nil
@@ -1058,7 +1058,7 @@ func (a *TaskAdaptor) queryContext(task *model.Task, key, baseURL, proxy string)
 
 func (a *TaskAdaptor) batchQueryContext(key, baseURL, proxy string, tasks []map[string]any) (map[string]any, error) {
 	ctx := map[string]any{"baseUrl": baseURL, "tasks": tasks}
-	if err := a.applyUpstreamCredentials(ctx, a.channelType(), key, proxy); err != nil {
+	if err := a.applyUpstreamCredentials(context.Background(), ctx, a.channelType(), key, proxy); err != nil {
 		return nil, err
 	}
 	return ctx, nil
@@ -1085,7 +1085,7 @@ func (a *TaskAdaptor) channelType() int {
 // the plugin must address its own prefixed native routes there, and the
 // channel key is that gateway's token, so it is sent as a Bearer header for
 // every auth type instead of running the plugin's vendor auth scheme.
-func (a *TaskAdaptor) applyUpstreamCredentials(ctx map[string]any, channelType int, key, proxy string) error {
+func (a *TaskAdaptor) applyUpstreamCredentials(requestCtx context.Context, ctx map[string]any, channelType int, key, proxy string) error {
 	if channelType == constant.ChannelTypeNewAPI {
 		ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindNewAPI}
 		ctx["auth"] = map[string]any{"authHeader": "Bearer " + key}
@@ -1094,7 +1094,7 @@ func (a *TaskAdaptor) applyUpstreamCredentials(ctx map[string]any, channelType i
 		return nil
 	}
 	ctx["upstream"] = map[string]any{"kind": pluginruntime.UpstreamKindVendor}
-	auth, err := resolveAuth(a.plugin.Meta.Auth, key, proxy)
+	auth, err := resolveAuth(requestCtx, a.plugin.Meta.Auth, key, proxy)
 	if err != nil {
 		return err
 	}
@@ -1369,7 +1369,11 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["upstreamModel"] = info.UpstreamModelName
 	ctx["baseUrl"] = info.ChannelBaseUrl
 	ctx["userSetting"] = info.UserSetting
-	if err := a.applyUpstreamCredentials(ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	if err := a.applyUpstreamCredentials(requestCtx, ctx, info.ChannelType, info.ApiKey, info.ChannelSetting.Proxy); err != nil {
 		ctx["authError"] = err.Error()
 	}
 	return ctx

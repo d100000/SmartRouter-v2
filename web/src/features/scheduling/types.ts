@@ -54,6 +54,12 @@ export interface SchedulingChannel {
   capacity: number
   health_attainment: number | null
   health_score: number
+  health_baseline: number
+  recovery_limit: number
+  ramp_successes: number
+  ramp_progress: number
+  ramp_limited: boolean
+  cooldown_until?: string
   avg_ttft_ms_5m: number | null
   quality_score: number
   selection_probability: number
@@ -78,6 +84,7 @@ export interface SchedulingSnapshot {
   started_at: number
   refreshed_at: number
   active: boolean
+  phase: 'cold' | 'transition' | 'dynamic'
   activation_requests: number
   activation_threshold: number
   config: SchedulingConfig

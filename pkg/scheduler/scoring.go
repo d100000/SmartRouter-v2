@@ -13,6 +13,8 @@ type evaluatedCandidate struct {
 	health      float64
 	latency     float64
 	healthy     bool
+	mature      bool
+	rampLimited bool
 }
 
 func channelWindows(ch *channelState, now time.Time, learning, stream bool, targetMS float64) (Window, Window) {
@@ -102,25 +104,62 @@ func latencyQuality(long, short Window, targetMS float64) float64 {
 	return (1-alpha)*longScore + alpha*shortScore
 }
 
+// advanceHealth applies expiry boundaries in their original order, even when
+// nobody selected or viewed this channel between boundaries. Expiry can lower
+// the recovery ceiling, but only a new success or ClearPenalty can raise it.
+// Each bucket is visited twice total, with no historical rescans per outcome.
+func (ch *channelState) advanceHealth(now time.Time) {
+	for {
+		shortExpiry, longExpiry := int64(math.MaxInt64), int64(math.MaxInt64)
+		if ch.shortHealthCursor < len(ch.healthBuckets) {
+			shortExpiry = ch.healthBuckets[ch.shortHealthCursor].second + int64(shortWindow/time.Second) + 1
+		}
+		if ch.longHealthCursor < len(ch.healthBuckets) {
+			longExpiry = ch.healthBuckets[ch.longHealthCursor].second + int64(longWindow/time.Second) + 1
+		}
+		expiry := min(shortExpiry, longExpiry)
+		if expiry > now.Unix() {
+			break
+		}
+		// Short and long expirations at the same second are simultaneous;
+		// do not create an artificial baseline between those two removals.
+		if shortExpiry == expiry {
+			bucket := ch.healthBuckets[ch.shortHealthCursor]
+			ch.healthShort.Attempts -= bucket.attempts
+			ch.healthShort.Successes -= bucket.successes
+			ch.healthShort.Failures -= bucket.attempts - bucket.successes
+			ch.shortHealthCursor++
+		}
+		if longExpiry == expiry {
+			bucket := ch.healthBuckets[ch.longHealthCursor]
+			ch.healthLong.Attempts -= bucket.attempts
+			ch.healthLong.Successes -= bucket.successes
+			ch.healthLong.Failures -= bucket.attempts - bucket.successes
+			ch.longHealthCursor++
+		}
+		_, health := successHealth(ch.healthLong, ch.healthShort)
+		ch.recoveryLimit = min(ch.recoveryLimit, health)
+	}
+	if ch.longHealthCursor > 0 && (ch.longHealthCursor >= 256 || ch.longHealthCursor == len(ch.healthBuckets)) {
+		retained := copy(ch.healthBuckets, ch.healthBuckets[ch.longHealthCursor:])
+		ch.healthBuckets = ch.healthBuckets[:retained]
+		ch.shortHealthCursor -= ch.longHealthCursor
+		ch.longHealthCursor = 0
+	}
+}
+
 func (e *Engine) refreshScore(ch *channelState, config Config, now time.Time) {
-	if !ch.lastScore.IsZero() && now.Sub(ch.lastScore) < time.Minute {
+	if !ch.lastScore.IsZero() && ch.lastScore.Unix() == now.Unix() && ch.scoreVersion == ch.outcomeVersion {
 		return
 	}
+	ch.advanceHealth(now)
 	long, short := channelWindows(ch, now, true, false, config.LatencyTargetMS)
-	ch.baseSuccess, ch.baseHealth = successHealth(long, short)
+	ch.baseSuccess, ch.baseHealth = successHealth(ch.healthLong, ch.healthShort)
 	ch.latencyScore[0] = latencyQuality(long, short, config.LatencyTargetMS)
 	streamLong, streamShort := channelWindows(ch, now, true, true, config.LatencyTargetMS)
 	ch.latencyScore[1] = latencyQuality(streamLong, streamShort, config.LatencyTargetMS)
-	if ch.baseHealth < ch.recoveryLimit {
-		ch.recoveryLimit = ch.baseHealth
-	} else if ch.successSerial > ch.recoverySerial {
-		// Recovery needs new successful attempts. Its absolute ceiling rises
-		// toward this period's baseline; past weight is never multiplied again.
-		successes := float64(ch.successSerial - ch.recoverySerial)
-		ch.recoveryLimit = min(ch.baseHealth, ch.recoveryLimit+0.02*successes)
-	}
-	ch.recoverySerial = ch.successSerial
 	ch.lastScore = now
+	ch.scoreVersion = ch.outcomeVersion
 }
 
 func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time.Time, stream bool, exclude map[int]bool) []evaluatedCandidate {
@@ -133,7 +172,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 			continue
 		}
 		seen[candidate.ID] = true
-		_, candidate = e.registerCandidate(key, s, candidate)
+		_, candidate = e.resolveCandidate(key, s, candidate)
 		registered = append(registered, candidate)
 	}
 	result := make([]evaluatedCandidate, 0, len(registered))
@@ -166,6 +205,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 			candidate: candidate, weight: weight,
 			health: health, latency: latency,
 			healthy: short.Successes > 0 && ch.baseSuccess >= s.config.SuccessTarget && shortSuccess >= s.config.SuccessTarget,
+			mature:  ch.learningSuccesses >= channelRampSuccesses,
 		})
 	}
 	if len(result) == 0 {
@@ -213,6 +253,47 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 	top := 0
 	for i := range result {
 		result[i].probability = result[i].weight / total
+	}
+	if active {
+		matureHealthyWeight := 0.0
+		newChannels := 0
+		for _, item := range result {
+			if item.mature && item.healthy {
+				matureHealthyWeight += item.weight
+			} else if !item.mature {
+				newChannels++
+			}
+		}
+		if newChannels > 0 && matureHealthyWeight > 0 {
+			excess := 0.0
+			for i := range result {
+				item := &result[i]
+				if item.mature {
+					continue
+				}
+				// All zero-sample members share a 5% starting budget. Each
+				// successful business attempt adds 4.75 percentage points of
+				// headroom, with the guard removed after 20 successes. This is
+				// an upper bound, never a floor for a failing new channel.
+				progress := float64(s.channels[item.candidate.ID].learningSuccesses) / channelRampSuccesses
+				limit := channelRampInitialShare/float64(newChannels) + (1-channelRampInitialShare)*progress
+				item.rampLimited = true
+				if item.probability > limit {
+					excess += item.probability - limit
+					item.probability = limit
+				}
+			}
+			for i := range result {
+				item := &result[i]
+				if item.mature && item.healthy {
+					item.probability += excess * item.weight / matureHealthyWeight
+				}
+				// Retries rank the same effective weights with ramp protection.
+				item.weight = item.probability * total
+			}
+		}
+	}
+	for i := range result {
 		if result[i].probability > result[top].probability {
 			top = i
 		}
@@ -220,7 +301,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 	if active && result[top].probability > 0.9 {
 		healthyAlternativeWeight := 0.0
 		for i, item := range result {
-			if i != top && item.healthy {
+			if i != top && item.healthy && !item.rampLimited {
 				healthyAlternativeWeight += item.weight
 			}
 		}
@@ -228,7 +309,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 			excess := result[top].probability - 0.9
 			result[top].probability = 0.9
 			for i := range result {
-				if i != top && result[i].healthy {
+				if i != top && result[i].healthy && !result[i].rampLimited {
 					result[i].probability += excess * result[i].weight / healthyAlternativeWeight
 				}
 			}

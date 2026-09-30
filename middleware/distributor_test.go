@@ -16,8 +16,10 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestChannelMatchesExpectedTaskPluginUsesGenericChannelSetting(t *testing.T) {
@@ -27,6 +29,18 @@ func TestChannelMatchesExpectedTaskPluginUsesGenericChannelSetting(t *testing.T)
 	assert.True(t, channelMatchesExpectedTaskPlugin(nil, channel, "generic-alpha"))
 	assert.False(t, channelMatchesExpectedTaskPlugin(nil, channel, "generic-beta"))
 	assert.False(t, channelMatchesExpectedTaskPlugin(nil, channel, ""))
+}
+
+func TestHTTPUpgradeHeaderCannotSwitchRoutingTransport(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":"budget-model","stream":%t}`, stream)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Header.Set("Upgrade", "websocket")
+		_, _, err := getModelRequest(c)
+		require.NoError(t, err)
+		assert.Equal(t, stream, common.GetContextKeyBool(c, constant.ContextKeyIsStream))
+	}
 }
 
 func TestChannelMatchesExpectedTaskPluginUsesPinnedLegacyIndex(t *testing.T) {
@@ -182,10 +196,22 @@ func TestTokenModelLimitAllowsExemptAtNameByFullName(t *testing.T) {
 }
 
 func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+	})
 	require.NoError(t, i18n.Init())
 	previousCacheEnabled := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousCacheEnabled })
+	model.InitChannelCache()
 
 	const group = "private-plugin-error-test-group"
 	for _, locale := range []struct{ language, message string }{

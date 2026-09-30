@@ -509,3 +509,501 @@ func TestRecentBusinessKeysUseRealStartsAndExpireAtThirtyMinutes(t *testing.T) {
 	assert.Empty(t, f.engine.RecentBusinessKeys(), "an unfinished request does not turn its old start into fresh traffic")
 	f.engine.EndRequest(newerRequest)
 }
+
+func TestRecentChannelStatsUseCompletedAttemptsAndPublishedSnapshots(t *testing.T) {
+	f := newSchedulerFixture()
+	initial := f.engine.RecentChannelStats()
+	assert.False(t, initial.Ready)
+	assert.Zero(t, initial.RefreshedAt)
+	assert.EqualValues(t, 600, initial.WindowSeconds)
+	assert.Equal(t, "instance", initial.Scope)
+	require.NotNil(t, initial.Items)
+	assert.Empty(t, initial.Items)
+
+	f.engine.RefreshRecentChannelStats()
+	assert.True(t, f.engine.RecentChannelStats().Ready)
+	assert.Empty(t, f.engine.RecentChannelStats().Items, "a ready empty window is not pending")
+
+	fallback := Candidate{ID: 2, Name: "Fallback", Status: 1, Weight: 10, Capacity: 100}
+	r := f.engine.BeginRequest(f.key, "retried-request", false)
+	failed, err := f.engine.ReserveCandidate(r, f.candidate, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(failed)
+	f.engine.FinishAttempt(failed, Outcome{ChannelFailure: true})
+	retried, err := f.engine.ReserveCandidate(r, fallback, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(retried)
+	f.engine.FinishAttempt(retried, Outcome{Success: true})
+	f.engine.FinishAttempt(retried, Outcome{Success: true}) // duplicate completion
+	f.engine.EndRequest(r)
+
+	f.key = Key{Group: "other", Model: "other-model"}
+	f.dispatch(t, f.candidate, false, Outcome{Success: true})
+	f.dispatch(t, f.candidate, true, Outcome{}) // cancellation / client error
+	pending := f.engine.BeginRequest(f.key, "pending", false)
+	unfinished, err := f.engine.ReserveCandidate(pending, fallback, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(unfinished)
+	assert.Empty(t, f.engine.RecentChannelStats().Items, "request completion never forces synchronous cache refresh")
+
+	f.engine.RefreshRecentChannelStats()
+	stats := f.engine.RecentChannelStats()
+	assert.Equal(t, f.now.Unix(), stats.RefreshedAt)
+	require.Len(t, stats.Items, 2)
+	assert.Equal(t, 1, stats.Items[0].ChannelID)
+	assert.EqualValues(t, 2, stats.Items[0].Requests, "groups, models and stream modes are combined")
+	assert.EqualValues(t, 1, stats.Items[0].Successes)
+	require.NotNil(t, stats.Items[0].SuccessRate)
+	assert.Equal(t, 0.5, *stats.Items[0].SuccessRate)
+	assert.Equal(t, 2, stats.Items[1].ChannelID)
+	assert.EqualValues(t, 1, stats.Items[1].Requests, "successful retry is a separate attempt; pending attempts are excluded")
+	assert.EqualValues(t, 1, stats.Items[1].Successes)
+	require.NotNil(t, stats.Items[1].SuccessRate)
+	assert.Equal(t, 1.0, *stats.Items[1].SuccessRate)
+	f.engine.EndRequest(pending)
+
+	stats.Items[0].Requests = 999
+	*stats.Items[0].SuccessRate = 0
+	assert.EqualValues(t, 2, f.engine.RecentChannelStats().Items[0].Requests, "callers cannot alter the cache")
+	assert.Equal(t, 0.5, *f.engine.RecentChannelStats().Items[0].SuccessRate)
+
+	f.now = f.now.Add(9*time.Minute + 59*time.Second)
+	f.engine.ClearPenalty(f.key, f.candidate.ID)
+	f.engine.RefreshRecentChannelStats()
+	assert.Len(t, f.engine.RecentChannelStats().Items, 2, "recalculating weights preserves observed history")
+	f.now = f.now.Add(time.Second)
+	assert.Len(t, f.engine.RecentChannelStats().Items, 2, "reading does not aggregate even when samples have expired")
+	f.engine.RefreshRecentChannelStats()
+	assert.Empty(t, f.engine.RecentChannelStats().Items, "an attempt exactly ten minutes old has expired")
+
+	r = f.engine.BeginRequest(f.key, "long-stream", false)
+	longStream, err := f.engine.ReserveCandidate(r, f.candidate, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(longStream)
+	f.now = f.now.Add(31 * time.Minute)
+	f.engine.FinishAttempt(longStream, Outcome{Success: true})
+	f.engine.EndRequest(r) // triggers idle learning reset after the long stream
+	f.engine.RefreshRecentChannelStats()
+	reset := f.engine.RecentChannelStats()
+	require.Len(t, reset.Items, 1)
+	assert.EqualValues(t, 1, reset.Items[0].Requests, "idle reset retains attempts in their completion window")
+	require.NotNil(t, reset.Items[0].SuccessRate)
+	assert.Equal(t, 1.0, *reset.Items[0].SuccessRate)
+}
+
+func TestRecoverySurvivesOccasionalFailuresRegardlessOfReadTiming(t *testing.T) {
+	var finalHealth []float64
+	for _, failureFirst := range []bool{false, true} {
+		for _, readEveryCompletion := range []bool{false, true} {
+			t.Run(fmt.Sprintf("failure-first-%v-frequent-reads-%v", failureFirst, readEveryCompletion), func(t *testing.T) {
+				f := newSchedulerFixture()
+				for range 100 {
+					f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true})
+				}
+				assert.Equal(t, 1.0, f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0].HealthScore)
+				// This reproduces the reported 32-minute pattern, including a
+				// failure completing after 99 successes in every minute.
+				for range 32 {
+					f.now = f.now.Add(time.Minute)
+					for attempt := range 100 {
+						failed := (!failureFirst && attempt == 99) || (failureFirst && attempt == 0)
+						f.dispatch(t, f.candidate, true, Outcome{Success: !failed, ChannelFailure: failed})
+						if readEveryCompletion {
+							f.engine.Snapshot(f.key, []Candidate{f.candidate}, true)
+						}
+					}
+				}
+				row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+				require.NotNil(t, row.SuccessRate30m)
+				assert.InDelta(t, .99, *row.SuccessRate30m, 1e-9)
+				assert.Greater(t, row.HealthScore, 95.0)
+				finalHealth = append(finalHealth, row.HealthScore)
+			})
+		}
+	}
+	for _, health := range finalHealth[1:] {
+		assert.InDelta(t, finalHealth[0], health, 1e-9, "dashboard frequency and incidental completion order cannot erase earned recovery")
+	}
+}
+
+func TestRecoveryNeedsNewSuccessAfterErrorExpiry(t *testing.T) {
+	f := newSchedulerFixture()
+	for range 100 {
+		f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true})
+	}
+	for range 4 {
+		f.now = f.now.Add(8 * time.Minute)
+		request := f.engine.BeginRequest(f.key, "", false)
+		f.engine.EndRequest(request)
+		row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+		assert.InDelta(t, 1, row.HealthScore, 1e-9, "time and reads alone cannot restore health")
+	}
+	row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.Zero(t, row.Window30m.Failures)
+	assert.Greater(t, row.HealthBaseline, row.HealthScore)
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	row = f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.InDelta(t, 3, row.HealthScore, 1e-9, "one success consumes its two-point contribution immediately")
+	assert.Equal(t, row.HealthScore, f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0].HealthScore)
+	f.engine.ClearPenalty(f.key, f.candidate.ID)
+	cleared := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.Equal(t, cleared.HealthBaseline, cleared.HealthScore)
+	assert.Equal(t, row.Window30m, cleared.Window30m)
+}
+
+func TestNewChannelRampInMatureDimension(t *testing.T) {
+	f := newSchedulerFixture()
+	for range 100 {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(20 * time.Second)})
+	}
+	newcomer := Candidate{ID: 2, Name: "New", Status: 1, Priority: -10, Weight: 0, Capacity: 100}
+	candidates := []Candidate{f.candidate, newcomer}
+	snapshot := f.engine.Snapshot(f.key, candidates, true)
+	assert.Equal(t, "dynamic", snapshot.Phase)
+	assert.InDelta(t, .05, snapshot.Channels[1].SelectionProbability, 1e-9)
+	assert.True(t, snapshot.Channels[1].RampLimited)
+	assert.Zero(t, snapshot.Channels[1].RampSuccesses)
+	assert.Nil(t, snapshot.Channels[1].AvgTTFTMS5m)
+	previous := snapshot.Channels[1].SelectionProbability
+	for successes := range 20 {
+		f.dispatch(t, newcomer, true, Outcome{Success: true, TTFT: latency(time.Millisecond)})
+		snapshot = f.engine.Snapshot(f.key, candidates, true)
+		row := snapshot.Channels[1]
+		assert.GreaterOrEqual(t, row.SelectionProbability, previous)
+		assert.InDelta(t, 1, snapshot.Channels[0].SelectionProbability+row.SelectionProbability, 1e-9)
+		assert.EqualValues(t, successes+1, row.RampSuccesses)
+		assert.Equal(t, successes < 19, row.RampLimited)
+		previous = row.SelectionProbability
+	}
+	assert.Greater(t, previous, .8, "mature dynamic routing fades out initial zero weight and low priority")
+
+	// Removing and returning a channel starts its own ramp while retaining
+	// past dashboard outcomes, and does not reset the mature group.
+	f.engine.RegisterCandidates(f.key, []Candidate{f.candidate})
+	f.engine.RegisterCandidates(f.key, candidates)
+	snapshot = f.engine.Snapshot(f.key, candidates, true)
+	assert.True(t, snapshot.Active)
+	assert.EqualValues(t, 20, snapshot.Channels[1].Window30m.Successes)
+	assert.Zero(t, snapshot.Channels[1].RampSuccesses)
+	assert.InDelta(t, .05, snapshot.Channels[1].SelectionProbability, 1e-9)
+}
+
+func TestNewChannelRampSharesInitialBudgetAndKeepsFallbackAvailable(t *testing.T) {
+	f := newSchedulerFixture()
+	for range 100 {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Millisecond)})
+	}
+	newcomer := Candidate{ID: 2, Name: "New", Status: 1, Weight: 0, Capacity: 1}
+	other := Candidate{ID: 3, Name: "Other", Status: 1, Weight: 0, Capacity: 100}
+	candidates := []Candidate{f.candidate, newcomer, other}
+	snapshot := f.engine.Snapshot(f.key, candidates, true)
+	assert.InDelta(t, .05, snapshot.Channels[1].SelectionProbability+snapshot.Channels[2].SelectionProbability, 1e-9)
+	assert.InDelta(t, .025, snapshot.Channels[1].SelectionProbability, 1e-9)
+	for range 40 {
+		f.dispatch(t, newcomer, true, Outcome{ChannelFailure: true})
+	}
+	snapshot = f.engine.Snapshot(f.key, candidates, true)
+	assert.Less(t, snapshot.Channels[1].SelectionProbability, .025, "ramp cap cannot turn into a failing channel's traffic floor")
+	assert.Zero(t, snapshot.Channels[1].RampSuccesses)
+
+	unavailable := f.candidate
+	unavailable.Status = 2
+	other.CooldownUntil = f.now.Add(time.Minute)
+	snapshot = f.engine.Snapshot(f.key, []Candidate{unavailable, newcomer, other}, true)
+	assert.Equal(t, 1.0, snapshot.Channels[1].SelectionProbability, "no healthy mature alternative means the ramp cannot deny service")
+	assert.False(t, snapshot.Channels[1].RampLimited)
+	request := f.engine.BeginRequest(f.key, "fallback", false)
+	attempt, err := f.engine.SelectAndReserve(request, []Candidate{unavailable, newcomer, other}, true, false)
+	require.NoError(t, err)
+	assert.Equal(t, newcomer.ID, attempt.Candidate.ID)
+	full := f.engine.Snapshot(f.key, []Candidate{unavailable, newcomer, other}, true)
+	assert.Equal(t, "saturated", full.Channels[1].RouteState)
+	assert.Zero(t, full.Channels[1].SelectionProbability)
+	f.engine.EndRequest(request)
+}
+
+func TestFailureCooldownUsesQualifiedFailuresAndSurvivesAdministrativeActions(t *testing.T) {
+	f := newSchedulerFixture()
+	for _, outcome := range []Outcome{
+		{ChannelFailure: true, CooldownFailure: true},
+		{Success: true},
+		{ChannelFailure: true, CooldownFailure: true},
+		{ChannelFailure: true}, // an ordinary failure breaks the availability streak
+		{ChannelFailure: true, CooldownFailure: true},
+		{}, // ignored client mistakes/cancellations cannot be the third failure
+		{ChannelFailure: true, CooldownFailure: true},
+	} {
+		f.dispatch(t, f.candidate, true, outcome)
+		assert.NotEqual(t, "cooling", f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0].RouteState)
+	}
+	f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
+	row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.Equal(t, "cooling", row.RouteState)
+	require.NotNil(t, row.CooldownUntil)
+	assert.Equal(t, f.now.Add(15*time.Second), *row.CooldownUntil)
+	f.engine.ClearPenalty(f.key, f.candidate.ID)
+	f.engine.RegisterCandidates(f.key, nil)
+	f.engine.RegisterCandidates(f.key, []Candidate{f.candidate})
+	request := f.engine.BeginRequest(f.key, "cooling", false)
+	_, err := f.engine.SelectAndReserve(request, []Candidate{f.candidate}, true, true)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel)
+	_, err = f.engine.ReserveCandidate(request, f.candidate, true)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel)
+	assert.Equal(t, "cooling", f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0].RouteState)
+	f.now = f.now.Add(15 * time.Second)
+	attempt, err := f.engine.ReserveCandidate(request, f.candidate, true)
+	require.NoError(t, err, "expiry permits fresh business evidence without a background probe")
+	f.engine.StartAttempt(attempt)
+	f.engine.FinishAttempt(attempt, Outcome{Success: true})
+	f.engine.EndRequest(request)
+	f.candidate.Status = 2
+	f.now = f.now.Add(31 * time.Minute)
+	row = f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.Equal(t, "disabled", row.RouteState, "idle reset and cooldown expiry cannot enable a channel")
+	assert.Zero(t, row.SelectionProbability)
+}
+
+func TestFailureCooldownStreakExpiresAndIdleResetPreservesExternalCooldown(t *testing.T) {
+	f := newSchedulerFixture()
+	for range 2 {
+		f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
+	}
+	f.now = f.now.Add(time.Minute + time.Second)
+	f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
+	assert.NotEqual(t, "cooling", f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0].RouteState)
+	f.candidate.CooldownUntil = f.now.Add(time.Hour)
+	f.now = f.now.Add(31 * time.Minute)
+	row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.Equal(t, "cooling", row.RouteState)
+	assert.Zero(t, row.SelectionProbability)
+}
+
+func TestAuthoritativeMembershipRemovalPoolChangeAndOldLeases(t *testing.T) {
+	f := newSchedulerFixture()
+	vip := Key{Group: "vip", Model: f.key.Model}
+	otherModel := Key{Group: "default", Model: "removed-model"}
+	high := f.candidate
+	high.Capacity = 10
+	low := high
+	low.Capacity = 1
+	for _, removedKey := range []Key{vip, otherModel} {
+		t.Run(removedKey.Group+"-"+removedKey.Model, func(t *testing.T) {
+			f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {high}, removedKey: {low}})
+			request := f.engine.BeginRequest(removedKey, "old", false)
+			old, err := f.engine.ReserveCandidate(request, low, true)
+			require.NoError(t, err)
+			f.engine.StartAttempt(old)
+			f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {high}})
+			newRequest := f.engine.BeginRequest(f.key, "current", false)
+			current, err := f.engine.ReserveCandidate(newRequest, high, true)
+			require.NoError(t, err, "removed group/model must no longer impose its capacity of one")
+			assert.Equal(t, 10, current.Candidate.Capacity)
+			_, err = f.engine.SelectAndReserve(request, []Candidate{low}, true, false)
+			assert.ErrorIs(t, err, ErrNoEligibleChannel, "stale candidate lists cannot resurrect removed metadata")
+			f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {high}, removedKey: {low}})
+			f.engine.FinishAttempt(old, Outcome{Success: true})
+			row := f.engine.Snapshot(removedKey, []Candidate{low}, true).Channels[0]
+			assert.Zero(t, row.RampSuccesses, "old-epoch completions retain history but cannot mature a returned channel")
+			assert.GreaterOrEqual(t, row.Window30m.Successes, int64(1))
+			f.engine.EndRequest(request)
+			f.engine.EndRequest(newRequest)
+		})
+	}
+
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {high}})
+	request := f.engine.BeginRequest(f.key, "pool-change", false)
+	old, err := f.engine.ReserveCandidate(request, high, true)
+	require.NoError(t, err)
+	moved := high
+	moved.CapacityKey = "replacement-pool"
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {moved}})
+	staleRequest := f.engine.BeginRequest(f.key, "stale", false)
+	current, err := f.engine.ReserveCandidate(staleRequest, high, true)
+	require.NoError(t, err)
+	assert.Equal(t, "replacement-pool", current.Candidate.CapacityKey, "stale metadata cannot change the canonical shared pool")
+	f.engine.ReplaceCandidateMembership(nil) // deleted channel
+	_, err = f.engine.ReserveCandidate(staleRequest, high, true)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel)
+	f.engine.FinishAttempt(old, Outcome{})
+	f.engine.FinishAttempt(old, Outcome{})
+	f.engine.EndRequest(request)
+	f.engine.EndRequest(staleRequest)
+	assert.Zero(t, f.engine.pools[old.pool].inFlight)
+	assert.Zero(t, f.engine.pools[current.pool].inFlight)
+	assert.Empty(t, f.engine.pools[old.pool].members)
+	assert.Empty(t, f.engine.pools[current.pool].members)
+}
+
+func TestPinnedReservationOutsideAbilityDoesNotCreateMembership(t *testing.T) {
+	f := newSchedulerFixture()
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {f.candidate}})
+	outside := Key{Group: "original-task-group", Model: "original-task-model"}
+	request := f.engine.BeginRequest(outside, "origin-task", false)
+	attempt, err := f.engine.ReserveCandidate(request, f.candidate, true)
+	require.NoError(t, err, "native origin-task/fixed channel bindings can bypass current ability membership")
+	assert.Len(t, f.engine.pools[attempt.pool].members, 1, "a fixed reservation cannot become a global capacity member")
+	_, err = f.engine.SelectAndReserve(request, []Candidate{f.candidate}, true, false)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel, "the fixed reservation does not authorize ordinary routing in its group/model")
+	f.engine.EndRequest(request)
+	f.candidate.Status = 2
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {f.candidate}})
+	request = f.engine.BeginRequest(outside, "disabled-origin-task", false)
+	stale := f.candidate
+	stale.Status = 1
+	_, err = f.engine.ReserveCandidate(request, stale, true)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel, "fixed routing must still honor current channel disablement")
+	f.engine.EndRequest(request)
+}
+
+func TestProbesDoNotSupplyBusinessLearningOrCooldownEvidence(t *testing.T) {
+	f := newSchedulerFixture()
+	for range 2 {
+		f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
+	}
+	for _, outcome := range []Outcome{{Success: true}, {ChannelFailure: true, CooldownFailure: true}} {
+		probe := f.engine.BeginRequest(f.key, "probe", true)
+		attempt, err := f.engine.ReserveCandidate(probe, f.candidate, true)
+		require.NoError(t, err)
+		f.engine.StartAttempt(attempt)
+		f.engine.FinishAttempt(attempt, outcome)
+		f.engine.EndRequest(probe)
+	}
+	snapshot := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true)
+	assert.EqualValues(t, 2, snapshot.Summary.Requests30m)
+	assert.EqualValues(t, 2, snapshot.Summary.Attempts30m)
+	assert.EqualValues(t, 2, snapshot.Channels[0].Dispatches30m)
+	assert.Zero(t, snapshot.Channels[0].RampSuccesses)
+	assert.NotEqual(t, "cooling", snapshot.Channels[0].RouteState)
+	f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
+	assert.Equal(t, "cooling", f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0].RouteState,
+		"manual probe success cannot erase a real business failure streak")
+}
+
+func TestIdleLearningResetPreservesFreshFailureCooldown(t *testing.T) {
+	f := newSchedulerFixture()
+	var requests []*Request
+	var attempts []*Attempt
+	for range 3 {
+		request := f.engine.BeginRequest(f.key, "", false)
+		attempt, err := f.engine.ReserveCandidate(request, f.candidate, true)
+		require.NoError(t, err)
+		f.engine.StartAttempt(attempt)
+		requests = append(requests, request)
+		attempts = append(attempts, attempt)
+	}
+	f.now = f.now.Add(31 * time.Minute)
+	for i, attempt := range attempts {
+		f.engine.FinishAttempt(attempt, Outcome{ChannelFailure: true, CooldownFailure: true})
+		f.engine.EndRequest(requests[i])
+	}
+	snapshot := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true)
+	assert.False(t, snapshot.Active)
+	assert.Zero(t, snapshot.ActivationRequests)
+	assert.Equal(t, "cooling", snapshot.Channels[0].RouteState)
+	assert.Zero(t, snapshot.Channels[0].SelectionProbability)
+	assert.EqualValues(t, 3, snapshot.Summary.Attempts30m, "idle reset preserves failure history")
+}
+
+func TestAuthoritativeDashboardKeepsUnavailableHistoryWithoutMembership(t *testing.T) {
+	f := newSchedulerFixture()
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	f.engine.ReplaceCandidateMembership(nil)
+	disabled := f.candidate
+	disabled.Status = 2
+	unknown := Candidate{ID: 2, Name: "Disabled ability", Status: 1, Excluded: true}
+	snapshot := f.engine.Snapshot(f.key, []Candidate{disabled, unknown}, true)
+	require.Len(t, snapshot.Channels, 2)
+	assert.Equal(t, "disabled", snapshot.Channels[0].RouteState)
+	assert.Equal(t, "ineligible", snapshot.Channels[1].RouteState)
+	assert.EqualValues(t, 1, snapshot.Channels[0].Window30m.Successes)
+	assert.EqualValues(t, 1, snapshot.Summary.Successes30m)
+	assert.Zero(t, snapshot.Summary.EligibleChannels)
+	assert.Empty(t, f.engine.pools["channel:1"].members, "dashboard inspection cannot restore removed capacity limits")
+
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {f.candidate, unknown}})
+	filtered := f.candidate
+	filtered.Excluded = true
+	f.engine.Snapshot(f.key, []Candidate{filtered}, true)
+	row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+	assert.Equal(t, 1.0, row.SelectionProbability, "request filters cannot mutate authoritative ability membership")
+}
+
+func TestDimensionTransitionFadesConfiguredWeightAndReenabledChannelRamps(t *testing.T) {
+	f := newSchedulerFixture()
+	second := Candidate{ID: 2, Name: "Initially low weight", Status: 1, Weight: 1, Capacity: 100}
+	for range 25 {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Second)})
+		f.dispatch(t, second, true, Outcome{Success: true, TTFT: latency(time.Second)})
+	}
+	candidates := []Candidate{f.candidate, second}
+	transition := f.engine.Snapshot(f.key, candidates, true)
+	assert.Equal(t, "transition", transition.Phase)
+	assert.Greater(t, transition.Channels[0].SelectionProbability, .5)
+	assert.Less(t, transition.Channels[0].SelectionProbability, 10.0/11)
+	for range 25 {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Second)})
+		f.dispatch(t, second, true, Outcome{Success: true, TTFT: latency(time.Second)})
+	}
+	mature := f.engine.Snapshot(f.key, candidates, true)
+	assert.Equal(t, "dynamic", mature.Phase)
+	assert.InDelta(t, .5, mature.Channels[0].SelectionProbability, 1e-9, "configured weight is not a permanent dynamic multiplier")
+	second.Status = 2
+	f.engine.RegisterCandidates(f.key, []Candidate{f.candidate, second})
+	second.Status = 1
+	f.engine.RegisterCandidates(f.key, []Candidate{f.candidate, second})
+	row := f.engine.Snapshot(f.key, []Candidate{f.candidate, second}, true).Channels[1]
+	assert.Zero(t, row.RampSuccesses)
+	assert.True(t, row.RampLimited)
+	assert.InDelta(t, .05, row.SelectionProbability, 1e-9)
+	assert.EqualValues(t, 50, row.Window30m.Successes, "reenabling retains historical outcomes")
+}
+
+func TestExpiryCannotReboundHealthAfterOlderSuccessesExpire(t *testing.T) {
+	var results []float64
+	for _, observeDip := range []bool{false, true} {
+		t.Run(fmt.Sprintf("observe-dip-%v", observeDip), func(t *testing.T) {
+			f := newSchedulerFixture()
+			for range 100 {
+				f.dispatch(t, f.candidate, true, Outcome{Success: true})
+			}
+			f.now = f.now.Add(4 * time.Minute)
+			for range 10 {
+				f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true})
+			}
+			before := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+			// The old successes leave the short window before the newer errors.
+			f.now = f.now.Add(2 * time.Minute)
+			if observeDip {
+				dip := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+				assert.Less(t, dip.HealthScore, before.HealthScore)
+			}
+			f.now = f.now.Add(4 * time.Minute)
+			row := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
+			assert.Zero(t, row.Window5m.Failures)
+			assert.Less(t, row.HealthScore, before.HealthScore, "error expiry cannot undo the intervening loss of success evidence")
+			results = append(results, row.HealthScore)
+		})
+	}
+	assert.InDelta(t, results[0], results[1], 1e-9, "expiry penalties must not depend on observing the intermediate dip")
+}
+
+func TestFixedChannelWithoutCurrentAbilitiesRemainsPinnable(t *testing.T) {
+	f := newSchedulerFixture()
+	f.engine.ReplaceCandidateMembership(nil, f.candidate)
+	request := f.engine.BeginRequest(f.key, "original-task", false)
+	attempt, err := f.engine.ReserveCandidate(request, f.candidate, false)
+	require.NoError(t, err)
+	assert.Empty(t, f.engine.pools[attempt.pool].members)
+	f.engine.EndRequest(request)
+
+	excluded := f.candidate
+	excluded.Excluded = true
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {excluded}}, f.candidate)
+	request = f.engine.BeginRequest(f.key, "excluded-ability", false)
+	attempt, err = f.engine.ReserveCandidate(request, f.candidate, false)
+	require.NoError(t, err, "a host-authorized fixed channel can bypass an excluded ability")
+	assert.Empty(t, f.engine.pools[attempt.pool].members)
+	_, err = f.engine.SelectAndReserve(request, []Candidate{f.candidate}, false, false)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel, "native pins must not restore ordinary ability eligibility")
+	f.engine.EndRequest(request)
+}

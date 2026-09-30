@@ -203,7 +203,7 @@ export function ConfigDialog(props: {
               <div className='grid gap-3 sm:grid-cols-3'>
                 <div className='space-y-2'>
                   <Label htmlFor={`weight-${channel.channel_id}`}>
-                    {t('Configured weight')}
+                    {t('Initial configured weight')}
                   </Label>
                   <Input
                     id={`weight-${channel.channel_id}`}

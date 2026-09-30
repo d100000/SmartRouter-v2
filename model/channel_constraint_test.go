@@ -1,14 +1,20 @@
 package model
 
 import (
+	"os"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 func TestFilterCandidateIDs(t *testing.T) {
@@ -215,4 +221,123 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	}})
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
+}
+
+func TestConfiguredWeightLotteryBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		weights []uint
+		draw    float64
+		want    int
+	}{
+		{name: "ratio beginning", weights: []uint{1, 9}, draw: 0, want: 0},
+		{name: "ratio first interval", weights: []uint{1, 9}, draw: .099, want: 0},
+		{name: "ratio boundary", weights: []uint{1, 9}, draw: .1, want: 1},
+		{name: "ratio last interval", weights: []uint{1, 9}, draw: .999, want: 1},
+		{name: "zero cannot absorb boundary", weights: []uint{0, 9, 0}, draw: 0, want: 1},
+		{name: "zero cannot absorb tail", weights: []uint{0, 9, 0}, draw: .999, want: 1},
+		{name: "all zero first", weights: []uint{0, 0}, draw: 0, want: 0},
+		{name: "all zero boundary", weights: []uint{0, 0}, draw: .5, want: 1},
+		{name: "sum does not overflow", weights: []uint{^uint(0), ^uint(0)}, draw: .75, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, configuredWeightIndex(tc.weights, tc.draw))
+		})
+	}
+}
+
+func TestChannelRoutingDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(":memory:")
+			case "mysql":
+				dsn := os.Getenv("TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("TEST_MYSQL_DSN is not configured")
+				}
+				driver = mysql.Open(dsn)
+			case "postgres":
+				dsn := os.Getenv("TEST_POSTGRES_DSN")
+				if dsn == "" {
+					t.Skip("TEST_POSTGRES_DSN is not configured")
+				}
+				driver = postgres.Open(dsn)
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "scheduling_routing_test_"}})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			previousDB, previousType, previousMemory := DB, common.MainDatabaseType(), common.MemoryCacheEnabled
+			DB = db
+			common.SetMainDatabaseType(common.DatabaseType(dialect))
+			initCol()
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(&Ability{}, &Channel{}))
+				DB = previousDB
+				common.SetMainDatabaseType(previousType)
+				common.MemoryCacheEnabled = previousMemory
+				initCol()
+				InitChannelCache()
+				require.NoError(t, sqlDB.Close())
+			})
+			require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+			var version string
+			versionQuery := "SELECT version()"
+			if dialect == "sqlite" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("%s version: %s", dialect, version)
+			first := &Channel{Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Name: "zero", Group: "default", Models: "routing-matrix", Priority: common.GetPointer(int64(100)), Weight: common.GetPointer(uint(0))}
+			second := &Channel{Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Name: "positive", Group: "default", Models: "routing-matrix", Priority: common.GetPointer(int64(100)), Weight: common.GetPointer(uint(9))}
+			last := &Channel{Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Name: "last", Group: "default", Models: "routing-matrix", Priority: common.GetPointer(int64(0)), Weight: common.GetPointer(uint(0))}
+			for _, channel := range []*Channel{first, second, last} {
+				before := RoutingMetadataVersion()
+				require.NoError(t, channel.Insert())
+				assert.Greater(t, RoutingMetadataVersion(), before)
+			}
+			for _, cached := range []bool{false, true} {
+				common.MemoryCacheEnabled = cached
+				InitChannelCache()
+				selected, selectErr := GetRandomSatisfiedChannel("default", "routing-matrix", 0, nil)
+				require.NoError(t, selectErr)
+				require.NotNil(t, selected)
+				assert.Equal(t, second.Id, selected.Id, "a zero-weight peer must not gain an additive weight")
+				selected, selectErr = GetRandomSatisfiedChannel("default", "routing-matrix", 1, nil)
+				require.NoError(t, selectErr)
+				require.NotNil(t, selected)
+				assert.Equal(t, last.Id, selected.Id, "all-zero tiers stay routable")
+				candidates, candidateErr := GetSatisfiedChannelCandidates("default", "routing-matrix", nil)
+				require.NoError(t, candidateErr)
+				assert.Len(t, candidates, 3)
+			}
+			before := RoutingMetadataVersion()
+			first.Group, first.Models = "vip", "other-model"
+			require.NoError(t, first.Update())
+			assert.Greater(t, RoutingMetadataVersion(), before)
+			before = RoutingMetadataVersion()
+			require.NoError(t, second.Delete())
+			assert.Greater(t, RoutingMetadataVersion(), before)
+			common.MemoryCacheEnabled = false
+			candidates, err := GetSatisfiedChannelCandidates("default", "routing-matrix", nil)
+			require.NoError(t, err)
+			require.Len(t, candidates, 1)
+			assert.Equal(t, last.Id, candidates[0].Id)
+			candidates, err = GetSatisfiedChannelCandidates("vip", "other-model", nil)
+			require.NoError(t, err)
+			require.Len(t, candidates, 1)
+			assert.Equal(t, first.Id, candidates[0].Id)
+			InitChannelCache()
+			loaded, err := GetAllChannels(0, -1, false, true)
+			require.NoError(t, err)
+			assert.Len(t, loaded, 2)
+			abilities, err := LoadEnabledAbilities()
+			require.NoError(t, err)
+			assert.Len(t, abilities, 2, "authoritative metadata matches the remaining channel memberships")
+		})
+	}
 }

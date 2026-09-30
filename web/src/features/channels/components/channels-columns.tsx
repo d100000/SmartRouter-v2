@@ -85,6 +85,7 @@ import {
 } from '../lib'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
+import { ChannelRecentStatsCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { TaskPluginChannelBadge } from './channel-type-badge'
 import { useChannels } from './channels-provider'
@@ -1063,6 +1064,16 @@ export function useChannelsColumns(
           return false
         },
         size: 120,
+        enableSorting: false,
+      },
+
+      {
+        id: 'recent_stats',
+        // The channel ID is the lookup key; statistics arrive independently.
+        accessorFn: (channel) => channel.id,
+        header: t('Success / Requests (10m)'),
+        cell: ({ row }) => <ChannelRecentStatsCell channel={row.original} />,
+        size: 200,
         enableSorting: false,
       },
 

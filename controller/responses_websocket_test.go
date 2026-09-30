@@ -24,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/xunfei"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -40,6 +41,38 @@ import (
 )
 
 var responsesWSTestUserSequence atomic.Int64
+
+func TestXunfeiHTTPRelayHonorsCancelledRequestBudget(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, expired := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream-%v-expired-%v", stream, expired), func(t *testing.T) {
+				deadline := time.Now().Add(time.Hour)
+				want := context.Canceled
+				if expired {
+					deadline = time.Now().Add(-time.Second)
+					want = context.DeadlineExceeded
+				}
+				ctx, cancel := context.WithDeadline(context.Background(), deadline)
+				defer cancel()
+				if !expired {
+					cancel()
+				}
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions?api-version=v1.1", nil).WithContext(ctx)
+				adaptor := &xunfei.Adaptor{}
+				info := &relaycommon.RelayInfo{IsStream: stream, ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "test-app|test-secret|test-key"}}
+				_, err := adaptor.ConvertOpenAIRequest(c, info, &dto.GeneralOpenAIRequest{Model: "SparkDesk-v1.1"})
+				require.NoError(t, err)
+				usage, apiErr := adaptor.DoResponse(c, &http.Response{StatusCode: http.StatusOK}, info)
+				require.ErrorIs(t, apiErr, want)
+				assert.Nil(t, usage)
+				assert.False(t, c.Writer.Written(), "cancelled internal WebSocket setup must not commit the HTTP response")
+				assert.Empty(t, recorder.Body.String())
+			})
+		}
+	}
+}
 
 func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Helper()
@@ -1506,6 +1539,8 @@ func TestResponsesSchedulingTerminalFraming(t *testing.T) {
 	db := modelManagementDB(t, "sqlite", "")
 	channel := &model.Channel{Name: "terminal framing", Type: constant.ChannelTypeOpenAI, Key: "fixture-key", Status: common.ChannelStatusEnabled, Group: "default", Models: "framing-model"}
 	require.NoError(t, db.Create(channel).Error)
+	require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: channel.Group, Model: channel.Models, Enabled: true}).Error)
+	model.InitChannelCache()
 	previousEngine := scheduler.Default
 	t.Cleanup(func() { scheduler.Default = previousEngine })
 	largeTerminal := `{"type":"response.completed","response":{"status":"completed","output":"` + strings.Repeat("a", 300*1024) + `"}}`

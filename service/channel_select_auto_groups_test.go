@@ -11,11 +11,13 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -179,6 +181,7 @@ func TestSchedulingAttemptsPreserveFailuresAndMeasureUsefulOutput(t *testing.T) 
 	_, writeErr := c.Writer.WriteString(": heartbeat\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n")
 	require.NoError(t, writeErr)
 	assert.Nil(t, schedulingState(c).ttft)
+	assert.False(t, SchedulingRetryAllowed(c), "a heartbeat commits the response even without useful first output")
 	_, writeErr = c.Writer.WriteString("data: {\"choices\":[{\"delta\":{\"content\":")
 	require.NoError(t, writeErr)
 	assert.Nil(t, schedulingState(c).ttft)
@@ -313,4 +316,371 @@ func TestSchedulingColdOverrideRetainsNativeRetryPriority(t *testing.T) {
 	require.Nil(t, selectErr)
 	require.NotNil(t, second)
 	assert.Equal(t, 3403, second.Id, "cold retry moves to the next configured priority even when the previous tier has remaining candidates")
+}
+
+func setSchedulingTestConfig(t *testing.T, entries []SchedulingConfig) {
+	t.Helper()
+	encoded, err := common.Marshal(entries)
+	require.NoError(t, err)
+	previousEngine := scheduler.Default
+	scheduler.Default = scheduler.New()
+	common.OptionMapRWMutex.Lock()
+	previousRaw := common.OptionMap[schedulingOptionKey]
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMap[schedulingOptionKey] = string(encoded)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		scheduler.Default = previousEngine
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap[schedulingOptionKey] = previousRaw
+		common.OptionMapRWMutex.Unlock()
+	})
+}
+
+func TestSchedulingColdFallbackSkipsUnavailableTiers(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		busy     []int
+		disabled []int
+		used     []string
+		want     int64
+	}{
+		{name: "top full", busy: []int{4101, 4102}, want: 50},
+		{name: "consecutive empty tiers", busy: []int{4101, 4102, 4103, 4104}, want: 0},
+		{name: "disabled and attempted", disabled: []int{4101}, used: []string{"4102"}, want: 50},
+		{name: "all unavailable", busy: []int{4101, 4102, 4103, 4104, 4105}, want: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupChannelSelectAutoGroupsTest(t)
+			const modelName = "cold-fallback"
+			setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1}})
+			for i, priority := range []int64{100, 100, 50, 50, 0} {
+				id := 4101 + i
+				createChannelSelectAutoGroupsChannel(t, db, id, "default", modelName)
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", id).Update("priority", priority).Error)
+			}
+			for _, id := range tc.disabled {
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", id).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			}
+			model.InitChannelCache()
+			require.NoError(t, SyncSchedulingConfig())
+			key := scheduler.Key{Group: "default", Model: modelName}
+			for _, id := range tc.busy {
+				channel, err := model.CacheGetChannelForRouting(id)
+				require.NoError(t, err)
+				request := scheduler.Default.BeginRequest(key, fmt.Sprint(id), true)
+				_, err = scheduler.Default.ReserveCandidate(request, SchedulerCandidate(channel), false)
+				require.NoError(t, err)
+				defer scheduler.Default.EndRequest(request)
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			c.Set("use_channel", tc.used)
+			defer EndSchedulingRequest(c)
+			channel, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+			require.NoError(t, err)
+			if tc.want == -1 {
+				assert.Nil(t, channel)
+				return
+			}
+			require.NotNil(t, channel)
+			assert.Equal(t, tc.want, channel.GetPriority())
+			assert.Equal(t, tc.used, c.GetStringSlice("use_channel"), "skipping a tier does not create an upstream attempt")
+			assert.Zero(t, scheduler.Default.Snapshot(key, []scheduler.Candidate{SchedulerCandidate(channel)}, false).Summary.Attempts30m)
+		})
+	}
+}
+
+func TestSchedulingColdRetryAdvancesAfterFallbackAndPinsStayFixed(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	common.RetryTimes = 2
+	const modelName = "fallback-retry"
+	setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1}})
+	for i, priority := range []int64{100, 50, 50, 0} {
+		id := 4201 + i
+		createChannelSelectAutoGroupsChannel(t, db, id, "default", modelName)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", id).Update("priority", priority).Error)
+	}
+	model.InitChannelCache()
+	busy, _ := gin.CreateTestContext(httptest.NewRecorder())
+	busy.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(busy)
+	top, err := model.CacheGetChannelForRouting(4201)
+	require.NoError(t, err)
+	require.NoError(t, ReserveSchedulingChannel(busy, top, "default", modelName))
+	pinned, _ := gin.CreateTestContext(httptest.NewRecorder())
+	pinned.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(pinned)
+	GetChannelConstraints(pinned).AddPin(dto.ChannelPin{ChannelId: top.Id, Source: dto.PinSourceToken})
+	selected, _, selectErr := SelectChannelForRequest(pinned, modelName, &RetryParam{Ctx: pinned, TokenGroup: "default", ModelName: modelName})
+	assert.Nil(t, selected)
+	require.NotNil(t, selectErr)
+	assert.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+
+	affinity := operation_setting.GetChannelAffinitySetting()
+	previousAffinity := *affinity
+	t.Cleanup(func() { *affinity = previousAffinity })
+	policy, err := model.BuildRequestPolicy(map[string]string{
+		"channel_affinity_setting.enabled":      "true",
+		"channel_affinity_setting.session_mode": "strict",
+		"channel_affinity_setting.rules":        `[{"name":"full-channel","model_regex":[".*"],"key_sources":[{"type":"request_header","key":"X-Session"}]}]`,
+	})
+	require.NoError(t, err)
+	*affinity = policy.Affinity
+	strict, _ := gin.CreateTestContext(httptest.NewRecorder())
+	strict.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	strict.Request.Header.Set("X-Session", t.Name())
+	defer EndSchedulingRequest(strict)
+	_, found := GetPreferredChannelByAffinity(strict, modelName, "default")
+	require.False(t, found)
+	RecordChannelAffinity(strict, top.Id)
+	t.Cleanup(func() { ClearCurrentChannelAffinityCache(strict) })
+	selected, _, selectErr = SelectChannelForRequest(strict, modelName, &RetryParam{Ctx: strict, TokenGroup: "default", ModelName: modelName})
+	assert.Nil(t, selected, "strict sessions cannot escape a full bound channel")
+	require.NotNil(t, selectErr)
+	assert.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(c)
+	first, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, int64(50), first.GetPriority())
+	info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: modelName}
+	StartSchedulingAttempt(c, info)
+	AppendUsedChannel(c, first.Id)
+	FinishSchedulingAttempt(c, info, types.NewOpenAIError(errors.New("upstream unavailable"), types.ErrorCodeBadResponseStatusCode, 502))
+	second, err := schedulerSelectChannel(c, "default", modelName, 1, nil)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	assert.Equal(t, 4204, second.Id, "retry advances to the next tier, not an untried peer of the fallback")
+}
+
+func TestSchedulingMembershipRefreshPreservesOutstandingLeases(t *testing.T) {
+	for _, mutation := range []string{"remove group", "remove model", "delete channel", "switch pool", "change capacity"} {
+		t.Run(mutation, func(t *testing.T) {
+			db := setupChannelSelectAutoGroupsTest(t)
+			const modelName = "membership-model"
+			entries := []SchedulingConfig{
+				{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 10, ChannelOverrides: []SchedulingChannelOverride{{ChannelID: 4301, CapacityKey: "shared"}}},
+				{Group: "vip", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1, ChannelOverrides: []SchedulingChannelOverride{{ChannelID: 4302, CapacityKey: "shared"}}},
+			}
+			setSchedulingTestConfig(t, entries)
+			createChannelSelectAutoGroupsChannel(t, db, 4301, "default", modelName)
+			createChannelSelectAutoGroupsChannel(t, db, 4302, "vip", modelName)
+			model.InitChannelCache()
+			require.NoError(t, SyncSchedulingConfig())
+			primary, err := model.CacheGetChannelForRouting(4301)
+			require.NoError(t, err)
+			old, err := model.CacheGetChannelForRouting(4302)
+			require.NoError(t, err)
+			oldRequest := scheduler.Default.BeginRequest(scheduler.Key{Group: "vip", Model: modelName}, "old", true)
+			oldAttempt, err := scheduler.Default.ReserveCandidate(oldRequest, SchedulerCandidate(old), false)
+			require.NoError(t, err)
+			scheduler.Default.StartAttempt(oldAttempt)
+			defer scheduler.Default.EndRequest(oldRequest)
+			key := scheduler.Key{Group: "default", Model: modelName}
+			request := scheduler.Default.BeginRequest(key, "new", true)
+			defer scheduler.Default.EndRequest(request)
+			_, err = scheduler.Default.ReserveCandidate(request, SchedulerCandidate(primary), false)
+			assert.ErrorIs(t, err, scheduler.ErrNoEligibleChannel)
+			switch mutation {
+			case "remove group":
+				old.Group = "other"
+				require.NoError(t, old.Update())
+			case "remove model":
+				old.Models = "other-model"
+				require.NoError(t, old.Update())
+			case "delete channel":
+				require.NoError(t, old.Delete())
+			case "switch pool", "change capacity":
+				if mutation == "switch pool" {
+					entries[1].ChannelOverrides[0].CapacityKey = "new-pool"
+				} else {
+					entries[1].DefaultCapacity = 10
+				}
+				encoded, encodeErr := common.Marshal(entries)
+				require.NoError(t, encodeErr)
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap[schedulingOptionKey] = string(encoded)
+				common.OptionMapRWMutex.Unlock()
+			}
+			// CRUD versions trigger reconciliation even before a controller's
+			// next cache publication, without re-saving scheduling settings.
+			require.NoError(t, SyncSchedulingConfig())
+			current, err := scheduler.Default.ReserveCandidate(request, SchedulerCandidate(primary), false)
+			require.NoError(t, err)
+			assert.Equal(t, 10, current.Candidate.Capacity)
+			snapshot := scheduler.Default.Snapshot(key, []scheduler.Candidate{SchedulerCandidate(primary)}, false)
+			assert.Equal(t, 2, snapshot.Channels[0].InFlight, "the moved/deleted request retains its original pool lease")
+			scheduler.Default.FinishAttempt(oldAttempt, scheduler.Outcome{Success: true})
+			snapshot = scheduler.Default.Snapshot(key, []scheduler.Candidate{SchedulerCandidate(primary)}, false)
+			assert.Equal(t, 1, snapshot.Channels[0].InFlight)
+			scheduler.Default.FinishAttempt(current, scheduler.Outcome{})
+			snapshot = scheduler.Default.Snapshot(key, []scheduler.Candidate{SchedulerCandidate(primary)}, false)
+			assert.Zero(t, snapshot.Channels[0].InFlight)
+		})
+	}
+}
+
+func TestSchedulingMembershipSameChannelGroupRemovalAndCachedAliases(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "gpt-4-gizmo-*"
+	setSchedulingTestConfig(t, []SchedulingConfig{
+		{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 10},
+		{Group: "vip", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1},
+	})
+	createChannelSelectAutoGroupsChannel(t, db, 4401, "default", modelName)
+	channel, err := model.GetChannelById(4401, true)
+	require.NoError(t, err)
+	channel.Group = "default,vip"
+	require.NoError(t, channel.Update())
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	key := scheduler.Key{Group: "default", Model: modelName}
+	old := scheduler.Default.BeginRequest(key, "old", true)
+	defer scheduler.Default.EndRequest(old)
+	_, err = scheduler.Default.ReserveCandidate(old, SchedulerCandidate(channel), false)
+	require.NoError(t, err)
+	channel.Group = "default"
+	require.NoError(t, channel.Update())
+	model.InitChannelCache()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(c)
+	selected, err := schedulerSelectChannel(c, "default", "gpt-4-gizmo-example", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected, "removing vip releases its old limit; unconfigured normalized aliases still route")
+	assert.Equal(t, 4401, selected.Id)
+	assert.Equal(t, 10, schedulingState(c).attempt.Candidate.Capacity)
+
+	queries := 0
+	callback := "scheduling_membership_query_count"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) { queries++ }))
+	t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callback)) })
+	require.NoError(t, SyncSchedulingConfig())
+	require.NoError(t, SyncSchedulingConfig(scheduler.Key{Group: "default", Model: "gpt-4-gizmo-another"}))
+	assert.Zero(t, queries, "stable metadata and new aliases use the complete cached snapshot, not database scans")
+}
+
+func TestSchedulingStaticWeightUnaffectedByCapacityOverride(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "static-weight"
+	entries := []SchedulingConfig{{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 10}}
+	setSchedulingTestConfig(t, entries)
+	var candidates []scheduler.Candidate
+	for index, weight := range []uint{1, 9, 0} {
+		id := 4501 + index
+		createChannelSelectAutoGroupsChannel(t, db, id, "default", modelName)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", id).Update("weight", weight).Error)
+		require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", id).Update("weight", weight).Error)
+		channel, err := model.GetChannelById(id, true)
+		require.NoError(t, err)
+		candidates = append(candidates, SchedulerCandidate(channel))
+	}
+	for _, cached := range []bool{false, true} {
+		common.MemoryCacheEnabled = cached
+		model.InitChannelCache()
+		for _, override := range []bool{false, true} {
+			entries[0].ChannelOverrides = nil
+			if override {
+				entries[0].ChannelOverrides = []SchedulingChannelOverride{{ChannelID: 4501, Capacity: common.GetPointer(3)}}
+			}
+			encoded, err := common.Marshal(entries)
+			require.NoError(t, err)
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap[schedulingOptionKey] = string(encoded)
+			common.OptionMapRWMutex.Unlock()
+			require.NoError(t, SyncSchedulingConfig())
+			snapshot := scheduler.Default.Snapshot(scheduler.Key{Group: "default", Model: modelName}, candidates, false)
+			require.Len(t, snapshot.Channels, 3)
+			assert.InDelta(t, .1, snapshot.Channels[0].SelectionProbability, 1e-9)
+			assert.InDelta(t, .9, snapshot.Channels[1].SelectionProbability, 1e-9)
+			assert.Zero(t, snapshot.Channels[2].SelectionProbability)
+		}
+	}
+}
+
+func TestSchedulingTransientCooldownIsEnforcedByHostRouting(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		lastStatus int
+		cancelled  bool
+		wantID     int
+	}{
+		{name: "three transient failures", lastStatus: 503, wantID: 4602},
+		{name: "parameter error excluded", lastStatus: 400, wantID: 4601},
+		{name: "client cancellation excluded", lastStatus: 502, cancelled: true, wantID: 4601},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupChannelSelectAutoGroupsTest(t)
+			const modelName = "host-cooldown"
+			setSchedulingTestConfig(t, nil)
+			createChannelSelectAutoGroupsChannel(t, db, 4601, "default", modelName)
+			createChannelSelectAutoGroupsChannel(t, db, 4602, "default", modelName)
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 4601).Update("priority", 100).Error)
+			model.InitChannelCache()
+			channel, err := model.CacheGetChannelForRouting(4601)
+			require.NoError(t, err)
+			for index := range 3 {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx, cancel := context.WithCancel(context.Background())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+				require.NoError(t, ReserveSchedulingChannel(c, channel, "default", modelName))
+				info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: modelName}
+				StartSchedulingAttempt(c, info)
+				status := 502
+				if index == 2 {
+					status = tc.lastStatus
+					if tc.cancelled {
+						cancel()
+					}
+				}
+				FinishSchedulingAttempt(c, info, types.NewOpenAIError(errors.New("upstream failure"), types.ErrorCodeBadResponseStatusCode, status))
+				EndSchedulingRequest(c)
+				cancel()
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			defer EndSchedulingRequest(c)
+			selected, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+			require.NoError(t, err)
+			require.NotNil(t, selected)
+			assert.Equal(t, tc.wantID, selected.Id)
+			if tc.wantID == 4602 {
+				assert.ErrorIs(t, ReserveSchedulingChannel(c, channel, "default", modelName), scheduler.ErrNoEligibleChannel, "fixed reservations cannot bypass cooldown")
+			}
+		})
+	}
+}
+
+func TestSchedulingColdRetryDoesNotSkipTierAfterPreviousIsDisabled(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "retry-disabled-tier"
+	setSchedulingTestConfig(t, nil)
+	for index, priority := range []int64{100, 50, 0} {
+		createChannelSelectAutoGroupsChannel(t, db, 4701+index, "default", modelName)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 4701+index).Update("priority", priority).Error)
+	}
+	model.InitChannelCache()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(c)
+	first, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, 4701, first.Id)
+	info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: modelName}
+	StartSchedulingAttempt(c, info)
+	AppendUsedChannel(c, first.Id)
+	FinishSchedulingAttempt(c, info, types.NewOpenAIError(errors.New("upstream down"), types.ErrorCodeBadResponseStatusCode, 502))
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", first.Id).Update("status", common.ChannelStatusAutoDisabled).Error)
+	model.InitChannelCache()
+	next, err := schedulerSelectChannel(c, "default", modelName, 1, nil)
+	require.NoError(t, err)
+	require.NotNil(t, next)
+	assert.Equal(t, 4702, next.Id, "removing the previous tier does not consume the following tier too")
 }

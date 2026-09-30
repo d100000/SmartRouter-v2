@@ -33,6 +33,13 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 		ActivationRequests: len(s.activation), Channels: make([]ChannelSnapshot, 0, len(candidates)),
 		Trend: make([]TrendPoint, 0, 30),
 	}
+	result.Phase = "cold"
+	if result.Active {
+		result.Phase = "transition"
+		if s.learningSamples >= 100 {
+			result.Phase = "dynamic"
+		}
+	}
 	evaluated := e.evaluate(key, s, candidates, now, stream, nil)
 	byID := make(map[int]evaluatedCandidate, len(evaluated))
 	for _, item := range evaluated {
@@ -46,10 +53,23 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 			continue
 		}
 		seen[candidate.ID] = true
-		ch, resolved := e.registerCandidate(key, s, candidate)
+		ch, resolved := e.resolveCandidate(key, s, candidate)
+		if ch == nil {
+			ch = &channelState{recoveryLimit: 1}
+		}
+		if !ch.registered {
+			// Historical/disabled rows remain visible without creating capacity
+			// members from a dashboard or a stale request candidate list.
+			resolved = configuredCandidate(s, ch, resolved)
+		}
 		e.refreshScore(ch, s.config, now)
 		pool := e.pools[resolved.CapacityKey]
-		resolved.Capacity = poolCapacity(pool)
+		if pool == nil {
+			pool = &capacityPool{}
+		}
+		if capacity := poolCapacity(pool); capacity > 0 {
+			resolved.Capacity = capacity
+		}
 		long, short := channelWindows(ch, now, false, stream, s.config.LatencyTargetMS)
 		row := ChannelSnapshot{
 			ChannelID: resolved.ID, Name: resolved.Name, Status: resolved.Status,
@@ -59,6 +79,12 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 			AvgTTFTMS5m:      meanLatency(short.LatencySumMS, short.LatencySamples),
 			HealthAttainment: ratio(short.HealthySamples, short.HealthSamples),
 			Window30m:        long, Window5m: short,
+			HealthBaseline: ch.baseHealth * 100, RecoveryLimit: ch.recoveryLimit * 100,
+			RampSuccesses: ch.learningSuccesses, RampProgress: min(1, float64(ch.learningSuccesses)/channelRampSuccesses),
+		}
+		if resolved.CooldownUntil.After(now) {
+			until := resolved.CooldownUntil
+			row.CooldownUntil = &until
 		}
 		for second, count := range ch.dispatches {
 			if second >= cutoff {
@@ -94,6 +120,7 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 			row.RouteState = "eligible"
 		}
 		if item, ok := byID[resolved.ID]; ok {
+			row.RampLimited = item.rampLimited
 			row.EffectiveWeight = item.weight
 			row.SelectionProbability = item.probability
 			row.HealthScore = item.health * 100
@@ -142,7 +169,11 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 		for second := start; second < start+60; second++ {
 			point.Requests += s.requests[second]
 			for channelID := range seen {
-				if bucket := s.channels[channelID].buckets[second]; bucket != nil {
+				ch := s.channels[channelID]
+				if ch == nil {
+					continue
+				}
+				if bucket := ch.buckets[second]; bucket != nil {
 					point.Attempts += bucket.attempts
 					successes += bucket.successes
 					latencySamples += bucket.latency[streamIndex].count

@@ -5,6 +5,7 @@ package scheduler
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,19 +66,23 @@ type Request struct {
 // StartAttempt must be called immediately before sending to the upstream.
 // In particular, a streaming reservation must live until its stream ends.
 type Attempt struct {
-	Candidate Candidate
-	StartedAt time.Time
-	request   *Request
-	pool      string
-	stream    bool
-	started   bool
-	finished  bool
+	Candidate     Candidate
+	StartedAt     time.Time
+	request       *Request
+	pool          string
+	stream        bool
+	started       bool
+	finished      bool
+	learningEpoch uint64
 }
 
 type Outcome struct {
 	Success        bool
 	ChannelFailure bool
-	TTFT           *time.Duration
+	// CooldownFailure identifies a transient availability failure classified
+	// by the host. It has no effect unless ChannelFailure is also true.
+	CooldownFailure bool
+	TTFT            *time.Duration
 }
 
 type Window struct {
@@ -91,28 +96,34 @@ type Window struct {
 }
 
 type ChannelSnapshot struct {
-	ChannelID            int      `json:"channel_id"`
-	Name                 string   `json:"name"`
-	Status               int      `json:"status"`
-	RouteState           string   `json:"route_state"`
-	TrafficShare         float64  `json:"traffic_share"`
-	EffectiveWeight      float64  `json:"effective_weight"`
-	ConfiguredWeight     float64  `json:"configured_weight"`
-	Priority             int64    `json:"priority"`
-	Dispatches30m        int64    `json:"dispatches_30m"`
-	SuccessRate30m       *float64 `json:"success_rate_30m"`
-	SuccessRate5m        *float64 `json:"success_rate_5m"`
-	InFlight             int      `json:"in_flight"`
-	Capacity             int      `json:"capacity"`
-	CapacityKey          string   `json:"capacity_key"`
-	HealthAttainment     *float64 `json:"health_attainment"`
-	HealthScore          float64  `json:"health_score"`
-	AvgTTFTMS5m          *float64 `json:"avg_ttft_ms_5m"`
-	QualityScore         float64  `json:"quality_score"`
-	SelectionProbability float64  `json:"selection_probability"`
-	CanRecover           bool     `json:"can_recover"`
-	Window30m            Window   `json:"window_30m"`
-	Window5m             Window   `json:"window_5m"`
+	ChannelID            int        `json:"channel_id"`
+	Name                 string     `json:"name"`
+	Status               int        `json:"status"`
+	RouteState           string     `json:"route_state"`
+	TrafficShare         float64    `json:"traffic_share"`
+	EffectiveWeight      float64    `json:"effective_weight"`
+	ConfiguredWeight     float64    `json:"configured_weight"`
+	Priority             int64      `json:"priority"`
+	Dispatches30m        int64      `json:"dispatches_30m"`
+	SuccessRate30m       *float64   `json:"success_rate_30m"`
+	SuccessRate5m        *float64   `json:"success_rate_5m"`
+	InFlight             int        `json:"in_flight"`
+	Capacity             int        `json:"capacity"`
+	CapacityKey          string     `json:"capacity_key"`
+	HealthAttainment     *float64   `json:"health_attainment"`
+	HealthScore          float64    `json:"health_score"`
+	HealthBaseline       float64    `json:"health_baseline"`
+	RecoveryLimit        float64    `json:"recovery_limit"`
+	RampSuccesses        int64      `json:"ramp_successes"`
+	RampProgress         float64    `json:"ramp_progress"`
+	RampLimited          bool       `json:"ramp_limited"`
+	CooldownUntil        *time.Time `json:"cooldown_until,omitempty"`
+	AvgTTFTMS5m          *float64   `json:"avg_ttft_ms_5m"`
+	QualityScore         float64    `json:"quality_score"`
+	SelectionProbability float64    `json:"selection_probability"`
+	CanRecover           bool       `json:"can_recover"`
+	Window30m            Window     `json:"window_30m"`
+	Window5m             Window     `json:"window_5m"`
 }
 
 type Summary struct {
@@ -147,6 +158,7 @@ type Snapshot struct {
 	Scope              string            `json:"scope"`
 	Config             Config            `json:"config"`
 	Active             bool              `json:"active"`
+	Phase              string            `json:"phase"`
 	ActivationRequests int               `json:"activation_requests"`
 	Summary            Summary           `json:"summary"`
 	Trend              []TrendPoint      `json:"trend"`
@@ -154,12 +166,15 @@ type Snapshot struct {
 }
 
 type Engine struct {
-	mu       sync.Mutex
-	now      func() time.Time
-	random   func() float64
-	states   map[Key]*keyState
-	pools    map[string]*capacityPool
-	sequence uint64
+	mu                 sync.Mutex
+	now                func() time.Time
+	random             func() float64
+	states             map[Key]*keyState
+	pools              map[string]*capacityPool
+	sequence           uint64
+	membershipManaged  bool
+	channelMetadata    map[int]Candidate
+	recentChannelStats atomic.Pointer[RecentChannelStats]
 }
 
 var Default = New()

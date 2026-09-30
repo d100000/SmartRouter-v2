@@ -165,6 +165,12 @@ var BatchUpdateInterval int
 
 var RelayTimeout int // unit is second
 
+// RelayTotalTimeout and RelayStreamTotalTimeout bound one HTTP relay request,
+// including all attempts. Zero disables the corresponding total budget.
+// Streaming has its own opt-in budget; WebSocket sessions are excluded.
+var RelayTotalTimeout int       // seconds
+var RelayStreamTotalTimeout int // seconds
+
 var RelayIdleConnTimeout int // unit is second
 
 // RelayResponseHeaderTimeout limits how long the relay transport waits for the

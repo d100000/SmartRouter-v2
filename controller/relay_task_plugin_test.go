@@ -251,7 +251,7 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := make([]string, 0, 3)
-			database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.User{}, &model.Channel{})
+			database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.User{}, &model.Channel{}, &model.Ability{})
 			previousDB := model.DB
 			model.DB = database
 			t.Cleanup(func() { model.DB = previousDB })
@@ -434,7 +434,7 @@ func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testi
 func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *gorm.DB {
 	t.Helper()
 	previousDB := model.DB
-	models := []any{&model.Channel{}}
+	models := []any{&model.Channel{}, &model.Ability{}}
 	if migrate {
 		models = append(models, &model.Task{})
 	}
@@ -453,7 +453,9 @@ func seedTaskSubmissionChannel(t *testing.T, database *gorm.DB) {
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
-	require.NoError(t, database.Create(&model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "plugin", Status: common.ChannelStatusEnabled, Group: "default", Models: "plugin-model"}).Error)
+	channel := &model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: "plugin", Status: common.ChannelStatusEnabled, Group: "default", Models: "plugin-model"}
+	require.NoError(t, database.Create(channel).Error)
+	require.NoError(t, channel.AddAbilities(database))
 }
 
 func taskSubmissionTestContext() *gin.Context {
@@ -522,7 +524,7 @@ func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.Data
 }
 
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
-	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{})
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Log{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
 	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
@@ -575,6 +577,7 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 			require.NoError(t, db.Create(&user).Error)
 			ch := model.Channel{Name: "test provider", Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled}
 			require.NoError(t, db.Create(&ch).Error)
+			model.InitChannelCache()
 			c := taskSubmissionTestContext()
 			c.Set("group", "default")
 			c.Set("username", user.Username)

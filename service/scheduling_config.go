@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"gorm.io/gorm"
 )
 
 const schedulingOptionKey = "SchedulingConfig"
@@ -37,8 +38,12 @@ type SchedulingChannelOverride struct {
 
 var schedulingConfigState = struct {
 	sync.Mutex
-	raw     string
-	entries []SchedulingConfig
+	raw             string
+	entries         []SchedulingConfig
+	metadataVersion uint64
+	engine          *scheduler.Engine
+	database        *gorm.DB
+	candidates      map[scheduler.Key][]scheduler.Candidate
 }{}
 
 func ValidateSchedulingConfig(config SchedulingConfig) error {
@@ -76,19 +81,34 @@ func ValidateSchedulingConfig(config SchedulingConfig) error {
 	return nil
 }
 
-// SyncSchedulingConfig applies only changed option snapshots, so the routing
-// hot path never reads the database or resets the scheduler's learning state.
-func SyncSchedulingConfig() error {
+// SyncSchedulingConfig applies option and channel metadata generations. The
+// unchanged routing hot path only reads the version; complete membership is
+// rebuilt after configuration/CRUD/cache publication, never from request filters.
+func SyncSchedulingConfig(requestedKeys ...scheduler.Key) error {
 	schedulingConfigState.Lock()
 	defer schedulingConfigState.Unlock()
-	return syncSchedulingConfigLocked()
+	if err := syncSchedulingConfigLocked(); err != nil {
+		return err
+	}
+	for _, key := range requestedKeys {
+		if _, known := schedulingConfigState.candidates[key]; known {
+			continue
+		}
+		normalized := scheduler.Key{Group: key.Group, Model: ratio_setting.RoutingMatchModelName(key.Model)}
+		candidates := slices.Clone(schedulingConfigState.candidates[normalized])
+		schedulingConfigState.candidates[key] = candidates
+		// This comes from complete metadata, never request-filtered candidates.
+		scheduler.Default.RegisterCandidates(key, candidates)
+	}
+	return nil
 }
 
 func syncSchedulingConfigLocked() error {
 	common.OptionMapRWMutex.RLock()
 	raw := common.OptionMap[schedulingOptionKey]
 	common.OptionMapRWMutex.RUnlock()
-	if raw == schedulingConfigState.raw {
+	metadataVersion := model.RoutingMetadataVersion()
+	if raw == schedulingConfigState.raw && metadataVersion == schedulingConfigState.metadataVersion && schedulingConfigState.engine == scheduler.Default && schedulingConfigState.database == model.DB {
 		return nil
 	}
 	entries := []SchedulingConfig{}
@@ -118,17 +138,58 @@ func syncSchedulingConfigLocked() error {
 	if err != nil {
 		return fmt.Errorf("unable to load scheduling capacity members: %w", err)
 	}
+	abilities, err := model.LoadEnabledAbilities()
+	if err != nil {
+		return fmt.Errorf("unable to load scheduling ability members: %w", err)
+	}
+	enabledAbilities := make(map[scheduler.Key]map[int]bool)
+	for _, ability := range abilities {
+		key := scheduler.Key{Group: ability.Group, Model: ability.Model}
+		if enabledAbilities[key] == nil {
+			enabledAbilities[key] = make(map[int]bool)
+		}
+		enabledAbilities[key][ability.ChannelId] = true
+	}
 	candidateSets := make(map[scheduler.Key][]scheduler.Candidate)
-	allEntries := append(append([]SchedulingConfig(nil), entries...), schedulingConfigState.entries...)
-	for _, entry := range allEntries {
-		key := scheduler.Key{Group: entry.Group, Model: entry.Model}
-		if _, exists := candidateSets[key]; exists {
+	channelMetadata := make([]scheduler.Candidate, 0, len(channels))
+	for _, channel := range channels {
+		channelMetadata = append(channelMetadata, SchedulerCandidate(channel))
+		for _, group := range channel.GetGroups() {
+			for _, modelName := range channel.GetModels() {
+				key := scheduler.Key{Group: group, Model: modelName}
+				candidate := SchedulerCandidate(channel)
+				candidate.Excluded = !enabledAbilities[key][channel.Id]
+				candidateSets[key] = append(candidateSets[key], candidate)
+			}
+		}
+	}
+	// Keep known aliases synchronized even if they have no explicit settings.
+	// The complete raw model sets above remain authoritative for fallback.
+	aliasKeys := make(map[scheduler.Key]bool, len(candidateSets)+len(schedulingConfigState.candidates)+len(entries))
+	for key := range candidateSets {
+		aliasKeys[key] = true
+	}
+	for key := range schedulingConfigState.candidates {
+		aliasKeys[key] = true
+	}
+	for _, entry := range entries {
+		aliasKeys[scheduler.Key{Group: entry.Group, Model: entry.Model}] = true
+	}
+	for key := range aliasKeys {
+		normalized := scheduler.Key{Group: key.Group, Model: ratio_setting.RoutingMatchModelName(key.Model)}
+		if normalized == key {
 			continue
 		}
-		candidates := make([]scheduler.Candidate, 0)
-		for _, channel := range channels {
-			if slices.Contains(channel.GetGroups(), key.Group) && (slices.Contains(channel.GetModels(), key.Model) || slices.Contains(channel.GetModels(), ratio_setting.RoutingMatchModelName(key.Model))) {
-				candidates = append(candidates, SchedulerCandidate(channel))
+		// Routing can fall back to normalized metadata when request filters
+		// empty an exact-model set. Register both complete sets so the filter
+		// can choose either source without changing global pool membership.
+		candidates := slices.Clone(candidateSets[key])
+		for _, candidate := range candidateSets[normalized] {
+			index := slices.IndexFunc(candidates, func(existing scheduler.Candidate) bool { return existing.ID == candidate.ID })
+			if index < 0 {
+				candidates = append(candidates, candidate)
+			} else {
+				candidates[index].Excluded = candidates[index].Excluded && candidate.Excluded
 			}
 		}
 		candidateSets[key] = candidates
@@ -142,7 +203,6 @@ func syncSchedulingConfigLocked() error {
 			if err := scheduler.Default.ReplaceOverrides(key, nil); err != nil {
 				return err
 			}
-			scheduler.Default.RegisterCandidates(key, candidateSets[key])
 		}
 	}
 	for _, entry := range entries {
@@ -157,8 +217,12 @@ func syncSchedulingConfigLocked() error {
 		if err := scheduler.Default.ReplaceOverrides(key, overrides); err != nil {
 			return err
 		}
-		scheduler.Default.RegisterCandidates(key, candidateSets[key])
 	}
+	scheduler.Default.ReplaceCandidateMembership(candidateSets, channelMetadata...)
+	schedulingConfigState.candidates = candidateSets
+	schedulingConfigState.metadataVersion = metadataVersion
+	schedulingConfigState.engine = scheduler.Default
+	schedulingConfigState.database = model.DB
 	schedulingConfigState.entries = entries
 	schedulingConfigState.raw = raw
 	return nil

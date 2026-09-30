@@ -1,12 +1,11 @@
 package xunfei
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -129,47 +128,70 @@ func buildXunfeiAuthUrl(hostUrl string, apiKey, apiSecret string) string {
 }
 
 func xunfeiStreamHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	dataChan, stopChan, err := xunfeiMakeRequest(textRequest, domain, authUrl, appId)
+	dataChan, stopChan, err := xunfeiMakeRequest(ctx, textRequest, domain, authUrl, appId)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
+	defer func() {
+		cancel()
+		<-stopChan
+	}()
 	helper.SetEventStreamHeaders(c)
 	var usage dto.Usage
-	c.Stream(func(w io.Writer) bool {
+	clientGone := c.Writer.CloseNotify()
+	for {
 		select {
+		case <-ctx.Done():
+			return &usage, types.NewError(ctx.Err(), types.ErrorCodeDoRequestFailed)
+		case <-clientGone:
+			cancel()
+			return &usage, types.NewError(context.Canceled, types.ErrorCodeDoRequestFailed)
 		case xunfeiResponse := <-dataChan:
 			usage.PromptTokens += xunfeiResponse.Payload.Usage.Text.PromptTokens
 			usage.CompletionTokens += xunfeiResponse.Payload.Usage.Text.CompletionTokens
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
 			response := streamResponseXunfei2OpenAI(&xunfeiResponse)
-			jsonResponse, err := json.Marshal(response)
+			jsonResponse, err := common.Marshal(response)
 			if err != nil {
 				common.SysLog("error marshalling stream response: " + err.Error())
-				return true
+				continue
 			}
 			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
-			return true
+			c.Writer.Flush()
 		case <-stopChan:
+			if err := ctx.Err(); err != nil {
+				return &usage, types.NewError(err, types.ErrorCodeDoRequestFailed)
+			}
 			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
-			return false
+			c.Writer.Flush()
+			return &usage, nil
 		}
-	})
-	return &usage, nil
+	}
 }
 
 func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	dataChan, stopChan, err := xunfeiMakeRequest(textRequest, domain, authUrl, appId)
+	dataChan, stopChan, err := xunfeiMakeRequest(ctx, textRequest, domain, authUrl, appId)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
+	defer func() {
+		cancel()
+		<-stopChan
+	}()
 	var usage dto.Usage
 	var content string
 	var xunfeiResponse XunfeiChatResponse
 	stop := false
 	for !stop {
 		select {
+		case <-ctx.Done():
+			return &usage, types.NewError(ctx.Err(), types.ErrorCodeDoRequestFailed)
 		case xunfeiResponse = <-dataChan:
 			if len(xunfeiResponse.Payload.Choices.Text) == 0 {
 				continue
@@ -178,8 +200,12 @@ func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId s
 			usage.PromptTokens += xunfeiResponse.Payload.Usage.Text.PromptTokens
 			usage.CompletionTokens += xunfeiResponse.Payload.Usage.Text.CompletionTokens
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
-		case stop = <-stopChan:
+		case <-stopChan:
+			stop = true
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return &usage, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	if len(xunfeiResponse.Payload.Choices.Text) == 0 {
 		xunfeiResponse.Payload.Choices.Text = []XunfeiChatResponseTextItem{
@@ -191,7 +217,7 @@ func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId s
 	xunfeiResponse.Payload.Choices.Text[0].Content = content
 
 	response := responseXunfei2OpenAI(&xunfeiResponse)
-	jsonResponse, err := json.Marshal(response)
+	jsonResponse, err := common.Marshal(response)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
@@ -200,48 +226,68 @@ func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId s
 	return &usage, nil
 }
 
-func xunfeiMakeRequest(textRequest dto.GeneralOpenAIRequest, domain, authUrl, appId string) (chan XunfeiChatResponse, chan bool, error) {
+func xunfeiMakeRequest(ctx context.Context, textRequest dto.GeneralOpenAIRequest, domain, authUrl, appId string) (<-chan XunfeiChatResponse, <-chan struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	d := websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
 	}
-	conn, resp, err := d.Dial(authUrl, nil)
-	if err != nil || resp.StatusCode != 101 {
+	conn, resp, err := d.DialContext(ctx, authUrl, nil)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return nil, nil, err
 	}
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 
 	data := requestOpenAI2Xunfei(textRequest, appId, domain)
-	err = conn.WriteJSON(data)
+	body, err := common.Marshal(data)
+	if err == nil {
+		err = conn.WriteMessage(websocket.TextMessage, body)
+	}
 	if err != nil {
+		stopClose()
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return nil, nil, err
 	}
 
 	dataChan := make(chan XunfeiChatResponse)
-	stopChan := make(chan bool)
+	stopChan := make(chan struct{})
 	go func() {
-		defer func() {
-			conn.Close()
-		}()
+		defer close(stopChan)
+		defer stopClose()
+		defer conn.Close()
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				common.SysLog("error reading stream response: " + err.Error())
-				break
+				if ctx.Err() == nil {
+					common.SysLog("error reading stream response: " + err.Error())
+				}
+				return
 			}
 			var response XunfeiChatResponse
-			err = json.Unmarshal(msg, &response)
+			err = common.Unmarshal(msg, &response)
 			if err != nil {
 				common.SysLog("error unmarshalling stream response: " + err.Error())
 				break
 			}
-			dataChan <- response
+			select {
+			case dataChan <- response:
+			case <-ctx.Done():
+				return
+			}
 			if response.Payload.Choices.Status == 2 {
-				if err != nil {
-					common.SysLog("error closing websocket connection: " + err.Error())
-				}
 				break
 			}
 		}
-		stopChan <- true
 	}()
 
 	return dataChan, stopChan, nil

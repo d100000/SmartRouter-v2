@@ -13,15 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestChannelDefaultBaseURLsRequireReadPermission(t *testing.T) {
+func TestChannelReadEndpointsRequireReadPermission(t *testing.T) {
 	assertChannelRoutePermission(t, http.MethodGet, "/default_base_urls", authz.ChannelRead, controller.GetChannelDefaultBaseURLs)
+	assertChannelRoutePermission(t, http.MethodGet, "/recent_stats", authz.ChannelRead, controller.GetChannelRecentStats)
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	registerChannelRoutes(engine.Group("/api"))
-	recorder := httptest.NewRecorder()
-	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/channel/default_base_urls", nil))
-	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	for _, path := range []string{"/api/channel/default_base_urls", "/api/channel/recent_stats"} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	}
 }
 
 func TestChannelStatusRoutesUseExpectedPermissions(t *testing.T) {
