@@ -181,6 +181,7 @@ export function useSidebarData(): SidebarData {
             url: '/system-settings/site',
             activeUrls: ['/system-settings'],
             icon: Settings,
+            requiredRole: ROLE.SUPER_ADMIN,
           },
         ],
       },

@@ -1,6 +1,8 @@
 package router
 
 import (
+	"net/http"
+
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -10,7 +12,7 @@ import (
 func registerSchedulingRoutes(apiRouter *gin.RouterGroup) {
 	routes := apiRouter.Group("/scheduling")
 	routes.Use(middleware.AdminAuth(), middleware.DisableCache())
-	routes.GET("", middleware.RequirePermission(authz.ChannelRead), controller.GetScheduling)
-	routes.POST("/config", middleware.RequirePermission(authz.ChannelWrite), controller.UpdateSchedulingConfig)
-	routes.POST("/recover", middleware.RequirePermission(authz.ChannelOperate), controller.RecoverSchedulingChannel)
+	handlePermissionRoute(routes, http.MethodGet, "", authz.ChannelRead, controller.GetScheduling)
+	handlePermissionRoute(routes, http.MethodPost, "/config", authz.ChannelWrite, controller.UpdateSchedulingConfig)
+	handlePermissionRoute(routes, http.MethodPost, "/recover", authz.ChannelOperate, controller.RecoverSchedulingChannel)
 }

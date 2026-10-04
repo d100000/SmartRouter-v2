@@ -74,6 +74,7 @@ func TestNormalizeResponsesWSMaxOutputTokens(t *testing.T) {
 func TestSelectResponsesWSChannelHonorsPinsAndFilters(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Ability{}))
 	enabled := &model.Channel{Name: "enabled", Key: "sk-test", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeOpenAI}
 	enabled.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
 	wsDisabled := &model.Channel{Name: "ws-disabled", Key: "sk-test", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeOpenAI}
@@ -149,6 +150,7 @@ func TestCheckResponsesWSModelAccessMatchesHTTPTokenLimits(t *testing.T) {
 func TestSelectResponsesWSChannelAcceptsNativeResponsesChannelTypes(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Ability{}))
 	nativeRoute := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/responses", UpstreamPath: "/v1/responses"}}}
 	noneRoute := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/responses", UpstreamPath: "/v1/responses", Converter: "none"}}}
 	convertedRoute := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/responses", UpstreamPath: "/v1/chat/completions", Converter: "openai_responses_to_openai_chat_completions"}}}
@@ -172,6 +174,7 @@ func TestSelectResponsesWSChannelAcceptsNativeResponsesChannelTypes(t *testing.T
 			channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
 			channel.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: tc.advanced})
 			require.NoError(t, database.Create(channel).Error)
+			model.InitChannelCache()
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 			constraints := service.GetChannelConstraints(c)
@@ -194,6 +197,7 @@ func TestSelectResponsesWSChannelAcceptsNativeResponsesChannelTypes(t *testing.T
 
 func TestRestoreConnectionContextRejectsChangedAdvancedCustomRoute(t *testing.T) {
 	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Ability{}))
 	baseURL := "http://upstream.example"
 	channel := &model.Channel{Name: "advanced", Key: "sk-test", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeAdvancedCustom, BaseURL: &baseURL}
 	channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
