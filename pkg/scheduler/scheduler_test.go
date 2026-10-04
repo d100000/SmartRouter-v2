@@ -149,10 +149,10 @@ func TestAttemptAccountingMissingLatencyAndTransportSeparation(t *testing.T) {
 func TestStaticInitializationAndConfigReplacement(t *testing.T) {
 	f := newSchedulerFixture()
 	primary := f.candidate
-	primary.Priority = 1000
+	primary.Priority = math.MaxInt64
 	primary.Weight = 30
-	secondary := Candidate{ID: 2, Name: "Secondary", Status: 1, Priority: 1000, Weight: 10}
-	fallback := Candidate{ID: 3, Name: "Fallback", Status: 1, Priority: 1, Weight: 9999}
+	secondary := Candidate{ID: 2, Name: "Secondary", Status: 1, Priority: math.MaxInt64, Weight: 10}
+	fallback := Candidate{ID: 3, Name: "Fallback", Status: 1, Priority: math.MinInt64, Weight: 9999}
 	candidates := []Candidate{primary, secondary, fallback}
 	snapshot := f.engine.Snapshot(f.key, candidates, false)
 	assert.Equal(t, 0.75, snapshot.Channels[0].SelectionProbability)
@@ -310,6 +310,172 @@ func TestRetryRankingExclusionAndMonotonicDynamicTransition(t *testing.T) {
 	assert.Greater(t, snapshot.Channels[1].EffectiveWeight, 0.0, "sample expiry cannot restore static priority gating")
 }
 
+func TestMaturePriorityPreference(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		highPriority    int64
+		lowPriority     int64
+		failures        int
+		lowFailures     int
+		highLatency     time.Duration
+		heldReservation bool
+		reverse         bool
+		expectedLeader  int
+		noBonus         bool
+		belowTarget     bool
+	}{
+		{name: "equal-quality", highPriority: 100, lowPriority: 1, expectedLeader: 1},
+		{name: "negative-priorities", highPriority: -1, lowPriority: -100, expectedLeader: 1},
+		{name: "signed-extremes", highPriority: math.MaxInt64, lowPriority: math.MinInt64, expectedLeader: 1},
+		{name: "reversed-candidate-order", highPriority: math.MaxInt64, lowPriority: math.MinInt64, reverse: true, expectedLeader: 1},
+		{name: "same-priority", highPriority: 100, lowPriority: 100, noBonus: true},
+		{name: "success-within-three-points", highPriority: 100, lowPriority: 1, failures: 2, expectedLeader: 1},
+		{name: "success-near-three-point-boundary", highPriority: 100, lowPriority: 1, failures: 3, expectedLeader: 1},
+		{name: "success-outside-three-points", highPriority: 100, lowPriority: 1, failures: 4, expectedLeader: 2, noBonus: true},
+		{name: "same-success-below-target", highPriority: 100, lowPriority: 1, failures: 25, lowFailures: 25, expectedLeader: 1, belowTarget: true},
+		{name: "latency-overrides-priority", highPriority: 100, lowPriority: 1, highLatency: 20 * time.Second, expectedLeader: 2},
+		{name: "load-and-latency-override-priority", highPriority: 100, lowPriority: 1, highLatency: 3 * time.Second, heldReservation: true, expectedLeader: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSchedulerFixture()
+			high := f.candidate
+			high.Priority, high.Capacity = tc.highPriority, 2
+			low := Candidate{ID: 2, Name: "Lower priority", Status: 1, Priority: tc.lowPriority, Weight: 1, Capacity: 100}
+			highLatency := tc.highLatency
+			if highLatency == 0 {
+				highLatency = time.Second
+			}
+			for range 100 {
+				f.dispatch(t, high, true, Outcome{Success: true, TTFT: latency(highLatency)})
+				f.dispatch(t, low, true, Outcome{Success: true, TTFT: latency(time.Second)})
+			}
+			for range tc.failures {
+				f.dispatch(t, high, true, Outcome{ChannelFailure: true})
+			}
+			for range tc.lowFailures {
+				f.dispatch(t, low, true, Outcome{ChannelFailure: true})
+			}
+			if tc.heldReservation {
+				request := f.engine.BeginRequest(f.key, "in-flight", false)
+				_, err := f.engine.ReserveCandidate(request, high, true)
+				require.NoError(t, err)
+				defer f.engine.EndRequest(request)
+			}
+			controlLow := low
+			controlLow.Priority = high.Priority
+			control := f.engine.Snapshot(f.key, []Candidate{high, controlLow}, true)
+			candidates := []Candidate{high, low}
+			if tc.reverse {
+				candidates = []Candidate{low, high}
+			}
+			snapshot := f.engine.Snapshot(f.key, candidates, true)
+			require.Equal(t, "dynamic", snapshot.Phase)
+			require.Len(t, snapshot.Channels, 2)
+			rows := make(map[int]ChannelSnapshot, 2)
+			probability := 0.0
+			for _, row := range snapshot.Channels {
+				rows[row.ChannelID] = row
+				assert.False(t, math.IsNaN(row.EffectiveWeight) || math.IsInf(row.EffectiveWeight, 0))
+				assert.False(t, math.IsNaN(row.SelectionProbability) || math.IsInf(row.SelectionProbability, 0))
+				assert.Positive(t, row.SelectionProbability)
+				probability += row.SelectionProbability
+			}
+			assert.InDelta(t, 1, probability, 1e-9)
+			assert.InDelta(t, control.Channels[1].EffectiveWeight, rows[low.ID].EffectiveWeight, 1e-9)
+			assert.GreaterOrEqual(t, rows[high.ID].EffectiveWeight, control.Channels[0].EffectiveWeight)
+			assert.LessOrEqual(t, rows[high.ID].EffectiveWeight, 2*control.Channels[0].EffectiveWeight+1e-9)
+			if tc.noBonus {
+				assert.InDelta(t, control.Channels[0].EffectiveWeight, rows[high.ID].EffectiveWeight, 1e-9)
+				assert.InDelta(t, control.Channels[0].SelectionProbability, rows[high.ID].SelectionProbability, 1e-9)
+			} else if tc.failures == tc.lowFailures {
+				assert.InDelta(t, 2*control.Channels[0].EffectiveWeight, rows[high.ID].EffectiveWeight, 1e-9)
+			}
+			if tc.expectedLeader == 0 {
+				assert.InDelta(t, .5, rows[high.ID].SelectionProbability, 1e-9)
+			} else {
+				assert.Greater(t, rows[tc.expectedLeader].SelectionProbability, .5)
+			}
+			if tc.failures == tc.lowFailures && highLatency == time.Second && !tc.noBonus {
+				assert.InDelta(t, 2.0/3, rows[high.ID].SelectionProbability, 1e-9, "comparable mature channels retain a bounded two-to-one preference")
+			}
+			if tc.belowTarget {
+				assert.Zero(t, snapshot.Summary.HealthyChannels)
+				assert.InDelta(t, rows[high.ID].HealthBaseline, rows[low.ID].HealthBaseline, 1e-9)
+				assert.InDelta(t, .5, control.Channels[0].SelectionProbability, 1e-9)
+				for _, row := range snapshot.Channels {
+					require.NotNil(t, row.SuccessRate5m)
+					assert.InDelta(t, .8, *row.SuccessRate5m, 1e-9)
+					assert.Less(t, *row.SuccessRate5m, snapshot.Config.SuccessTarget)
+					assert.InDelta(t, row.HealthBaseline, row.HealthScore, 1e-9, "stable failures leave no extra recovery ceiling")
+				}
+			}
+
+			cumulative := 0.0
+			for _, row := range snapshot.Channels {
+				sample := cumulative + row.SelectionProbability/2
+				f.engine.random = func() float64 { return sample }
+				request := f.engine.BeginRequest(f.key, "", false)
+				attempt, err := f.engine.SelectAndReserve(request, candidates, true, false)
+				require.NoError(t, err)
+				assert.Equal(t, row.ChannelID, attempt.Candidate.ID, "selection must use the displayed probability intervals")
+				if tc.heldReservation && row.ChannelID == high.ID {
+					full := f.engine.Snapshot(f.key, []Candidate{high, low}, true)
+					assert.Equal(t, "saturated", full.Channels[0].RouteState)
+					assert.Zero(t, full.Channels[0].SelectionProbability, "priority cannot bypass a full capacity pool")
+				}
+				f.engine.EndRequest(request)
+				cumulative += row.SelectionProbability
+			}
+			expectedRetry := high.ID
+			if rows[low.ID].EffectiveWeight > rows[high.ID].EffectiveWeight {
+				expectedRetry = low.ID
+			}
+			request := f.engine.BeginRequest(f.key, "retry", false)
+			attempt, err := f.engine.SelectAndReserve(request, candidates, true, true)
+			require.NoError(t, err)
+			assert.Equal(t, expectedRetry, attempt.Candidate.ID, "retry ranks the same effective weights shown in the snapshot")
+			f.engine.EndRequest(request)
+			if tc.name == "signed-extremes" {
+				high.CooldownUntil = f.now.Add(time.Minute)
+				cooling := f.engine.Snapshot(f.key, []Candidate{high, low}, true)
+				assert.Equal(t, "cooling", cooling.Channels[0].RouteState)
+				assert.Zero(t, cooling.Channels[0].SelectionProbability, "priority cannot bypass a cooling channel")
+			}
+		})
+	}
+}
+
+func TestPriorityCannotBypassResidualRecoveryPenalty(t *testing.T) {
+	f := newSchedulerFixture()
+	high := f.candidate
+	high.Priority = math.MaxInt64
+	low := Candidate{ID: 2, Name: "Recovered", Status: 1, Priority: math.MinInt64, Weight: 1, Capacity: 100}
+	for range 100 {
+		f.dispatch(t, high, true, Outcome{Success: true, TTFT: latency(time.Second)})
+		f.dispatch(t, low, true, Outcome{Success: true, TTFT: latency(time.Second)})
+	}
+	for range 40 {
+		f.dispatch(t, high, true, Outcome{ChannelFailure: true})
+	}
+	f.now = f.now.Add(20 * time.Minute)
+	keepAlive := f.engine.BeginRequest(f.key, "keep-alive", false)
+	f.engine.EndRequest(keepAlive)
+	f.now = f.now.Add(11 * time.Minute)
+	for _, candidate := range []Candidate{high, low} {
+		f.dispatch(t, candidate, true, Outcome{Success: true, TTFT: latency(time.Second)})
+	}
+	controlLow := low
+	controlLow.Priority = high.Priority
+	control := f.engine.Snapshot(f.key, []Candidate{high, controlLow}, true)
+	snapshot := f.engine.Snapshot(f.key, []Candidate{high, low}, true)
+	require.Equal(t, "dynamic", snapshot.Phase)
+	assert.Equal(t, snapshot.Channels[0].Window30m, snapshot.Channels[1].Window30m, "both channels now have the same observed success and latency")
+	assert.Less(t, snapshot.Channels[0].HealthScore, snapshot.Channels[0].HealthBaseline)
+	assert.InDelta(t, control.Channels[0].EffectiveWeight, snapshot.Channels[0].EffectiveWeight, 1e-9)
+	assert.InDelta(t, control.Channels[0].SelectionProbability, snapshot.Channels[0].SelectionProbability, 1e-9,
+		"expired failures cannot grant priority while the recovery ceiling still applies")
+}
+
 func TestSharedCapacityAtomicReservationAndPoolChanges(t *testing.T) {
 	f := newSchedulerFixture()
 	candidate := f.candidate
@@ -370,7 +536,8 @@ func TestExplorationRequiresHealthyRecentEvidence(t *testing.T) {
 	for _, healthy := range []bool{true, false} {
 		t.Run(fmt.Sprintf("healthy-alternative-%v", healthy), func(t *testing.T) {
 			f := newSchedulerFixture()
-			alternative := Candidate{ID: 2, Name: "Alternative", Status: 1, Weight: 10, Capacity: 100}
+			f.candidate.Priority = math.MaxInt64
+			alternative := Candidate{ID: 2, Name: "Alternative", Status: 1, Priority: math.MinInt64, Weight: 10, Capacity: 100}
 			for range 100 {
 				f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Millisecond)})
 				if healthy {
@@ -675,7 +842,7 @@ func TestNewChannelRampInMatureDimension(t *testing.T) {
 		assert.Equal(t, successes < 19, row.RampLimited)
 		previous = row.SelectionProbability
 	}
-	assert.Greater(t, previous, .8, "mature dynamic routing fades out initial zero weight and low priority")
+	assert.Greater(t, previous, .75, "bounded priority preference still gives a substantially faster mature channel most traffic")
 
 	// Removing and returning a channel starts its own ramp while retaining
 	// past dashboard outcomes, and does not reset the mature group.
@@ -686,6 +853,31 @@ func TestNewChannelRampInMatureDimension(t *testing.T) {
 	assert.EqualValues(t, 20, snapshot.Channels[1].Window30m.Successes)
 	assert.Zero(t, snapshot.Channels[1].RampSuccesses)
 	assert.InDelta(t, .05, snapshot.Channels[1].SelectionProbability, 1e-9)
+}
+
+func TestPriorityCannotBenefitUnprovenNewChannel(t *testing.T) {
+	f := newSchedulerFixture()
+	for range 100 {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(20 * time.Second)})
+	}
+	newcomer := Candidate{ID: 2, Name: "New", Status: 1, Priority: math.MaxInt64, Weight: 0, Capacity: 100}
+	for _, successes := range []int{0, 19} {
+		for range successes {
+			f.dispatch(t, newcomer, true, Outcome{Success: true, TTFT: latency(time.Millisecond)})
+		}
+		controlNewcomer := newcomer
+		controlNewcomer.Priority = f.candidate.Priority
+		control := f.engine.Snapshot(f.key, []Candidate{f.candidate, controlNewcomer}, true)
+		snapshot := f.engine.Snapshot(f.key, []Candidate{f.candidate, newcomer}, true)
+		assert.EqualValues(t, successes, snapshot.Channels[1].RampSuccesses)
+		assert.True(t, snapshot.Channels[1].RampLimited)
+		assert.InDelta(t, control.Channels[1].EffectiveWeight, snapshot.Channels[1].EffectiveWeight, 1e-9,
+			"priority cannot reward a new channel before it proves successful business routing")
+		assert.InDelta(t, control.Channels[1].SelectionProbability, snapshot.Channels[1].SelectionProbability, 1e-9)
+		if successes == 0 {
+			assert.InDelta(t, .05, snapshot.Channels[1].SelectionProbability, 1e-9)
+		}
+	}
 }
 
 func TestNewChannelRampSharesInitialBudgetAndKeepsFallbackAvailable(t *testing.T) {

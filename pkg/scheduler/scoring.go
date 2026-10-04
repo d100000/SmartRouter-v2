@@ -6,15 +6,19 @@ import (
 	"time"
 )
 
+const prioritySuccessTolerance = 0.03
+
 type evaluatedCandidate struct {
-	candidate   Candidate
-	weight      float64
-	probability float64
-	health      float64
-	latency     float64
-	healthy     bool
-	mature      bool
-	rampLimited bool
+	candidate        Candidate
+	weight           float64
+	probability      float64
+	health           float64
+	latency          float64
+	success          float64
+	healthy          bool
+	mature           bool
+	priorityEligible bool
+	rampLimited      bool
 }
 
 func channelWindows(ch *channelState, now time.Time, learning, stream bool, targetMS float64) (Window, Window) {
@@ -201,11 +205,16 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		latency := ch.latencyScore[streamIndex]
 		weight := latency * health / (1 + float64(pool.inFlight)/float64(loadCapacity))
 		shortSuccess := float64(short.Successes+19) / float64(short.Attempts+20)
+		mature := ch.learningSuccesses >= channelRampSuccesses
 		result = append(result, evaluatedCandidate{
 			candidate: candidate, weight: weight,
 			health: health, latency: latency,
+			success: min(ch.baseSuccess, shortSuccess),
 			healthy: short.Successes > 0 && ch.baseSuccess >= s.config.SuccessTarget && shortSuccess >= s.config.SuccessTarget,
-			mature:  ch.learningSuccesses >= channelRampSuccesses,
+			mature:  mature,
+			// A prior or an expired failure cannot establish preference. Keep
+			// residual recovery and short-window error penalties intact.
+			priorityEligible: mature && short.Successes > 0 && health >= ch.baseHealth,
 		})
 	}
 	if len(result) == 0 {
@@ -225,6 +234,28 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 	}
 	active := s.config.Enabled && s.active
 	transition := min(1, max(0.01, float64(s.learningSamples)/100))
+	priorityRanks := make(map[int64]float64)
+	bestSuccess := 0.0
+	if active {
+		priorities := make([]int64, 0, len(result))
+		for _, item := range result {
+			// Keep tier ranks stable when a new peer finishes its ramp. Only
+			// observed, recovered peers can establish the success reference.
+			priorities = append(priorities, item.candidate.Priority)
+			if item.priorityEligible {
+				bestSuccess = max(bestSuccess, item.success)
+			}
+		}
+		slices.Sort(priorities)
+		priorities = slices.Compact(priorities)
+		if len(priorities) > 1 {
+			for rank, priority := range priorities {
+				// Rank tiers rather than subtracting configured priorities:
+				// even the full int64 range gives at most a twofold preference.
+				priorityRanks[priority] = float64(rank) / float64(len(priorities)-1)
+			}
+		}
+	}
 	for i := range result {
 		item := &result[i]
 		staticShare := 0.0
@@ -238,9 +269,13 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		if !active {
 			item.weight = staticShare
 		} else {
-			// Priority defines a tier, never an additive score. The normalized
-			// configured ratio fades as 100 real attempt samples accumulate.
+			// The configured ratio fades as 100 real attempt samples
+			// accumulate; comparable observed success retains a soft tier bias.
 			item.weight *= transition + (1-transition)*staticShare*float64(len(result))
+			if item.priorityEligible {
+				closeness := max(0, 1-(bestSuccess-item.success)/prioritySuccessTolerance)
+				item.weight *= 1 + transition*priorityRanks[item.candidate.Priority]*closeness
+			}
 		}
 	}
 	total := 0.0
