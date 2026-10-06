@@ -151,6 +151,18 @@ describe('API key group table cell', () => {
     ).toBeVisible()
   })
 
+  test('truncates group names without a rounded clipping edge while preserving the multiplier badge', () => {
+    const groupName = 'production-with-a-very-long-custom-group-name'
+    render(<CellHarness group={groupName} ratio={1} />)
+    const label = screen.getByText(groupName)
+    const group = label.closest('[data-slot="status-badge"]')
+    expect(label).toHaveClass('truncate')
+    expect(group).toHaveClass('overflow-hidden', 'px-0')
+    expect(group).not.toHaveClass('rounded-4xl')
+    expect(group).toHaveAttribute('title', groupName)
+    expect(screen.getByText('1x').parentElement).toHaveClass('rounded-full')
+  })
+
   test('never turns a string-valued normal group ratio into an automatic multiplier', () => {
     render(<CellHarness group='vip' ratio='自动' />)
     expect(screen.getByText('vip')).toBeInTheDocument()
