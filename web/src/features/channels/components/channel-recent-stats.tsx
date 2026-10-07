@@ -215,14 +215,17 @@ export function ChannelRecentStatsCell(props: {
     <span
       role='group'
       aria-label={description}
-      data-table-text='secondary'
+      data-table-text={props.placement === 'footer' ? 'secondary' : undefined}
       aria-description={
         stats.status === 'ready' && stats.delayed
           ? t('Statistics are delayed; showing the last snapshot.')
           : undefined
       }
       className={cn(
-        'inline-grid h-5 shrink-0 grid-cols-[46px_56px_minmax(0,1fr)] items-center gap-1 text-xs whitespace-nowrap tabular-nums',
+        'inline-grid shrink-0 items-center gap-x-1 whitespace-nowrap tabular-nums',
+        props.placement === 'footer'
+          ? 'h-5 grid-cols-[46px_56px_minmax(0,1fr)] text-xs'
+          : 'h-10 grid-cols-[46px_minmax(0,1fr)] grid-rows-[20px_16px] gap-y-1 text-sm font-medium',
         props.placement === 'column' ? 'w-full min-w-50' : 'w-50'
       )}
     >
@@ -301,7 +304,10 @@ export function ChannelRecentStatsCell(props: {
         <TooltipTrigger
           render={<span tabIndex={0} />}
           aria-label={rateDescription}
-          className='min-w-0 truncate text-right'
+          className={cn(
+            'min-w-0 truncate',
+            props.placement === 'footer' ? 'text-right' : 'justify-self-start'
+          )}
         >
           {unavailable ? placeholder : rate}
         </TooltipTrigger>
@@ -348,7 +354,11 @@ export function ChannelRecentStatsCell(props: {
         <TooltipTrigger
           render={<span tabIndex={0} />}
           aria-label={latencyDescription}
-          className='inline-flex min-w-0 items-center gap-1'
+          data-table-text='secondary'
+          className={cn(
+            'text-muted-foreground inline-flex min-w-0 items-center gap-1 text-xs leading-4 font-normal',
+            props.placement !== 'footer' && 'col-span-2 row-start-2'
+          )}
         >
           {warning ? (
             <AlertTriangle

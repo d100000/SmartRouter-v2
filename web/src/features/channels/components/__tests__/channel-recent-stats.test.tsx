@@ -116,7 +116,7 @@ afterEach(async () => {
 })
 
 describe('channel recent statistics', () => {
-  test('keeps six chronological health intervals and the first-token measurement on one compact line', async () => {
+  test('keeps health above a muted first-token line within the existing table row height', async () => {
     const refreshedAt = Math.floor(Date.now() / 1000)
     const health = {
       ...snapshot,
@@ -150,13 +150,23 @@ describe('channel recent statistics', () => {
     mount([{ id: 1 }] as Channel[], health)
     const summary = screen.getByRole('group', { name: 'Channel health (1h)' })
     expect(summary).toHaveClass(
-      'h-5',
+      'h-10',
       'w-50',
       'shrink-0',
       'whitespace-nowrap',
-      'grid-cols-[46px_56px_minmax(0,1fr)]'
+      'grid-cols-[46px_minmax(0,1fr)]',
+      'grid-rows-[20px_16px]',
+      'gap-y-1'
     )
-    expect(summary).toHaveAttribute('data-table-text', 'secondary')
+    const latency = within(summary).getByLabelText(
+      'Average streaming first-token time (5m): 250ms'
+    )
+    expect(latency).toHaveClass(
+      'col-span-2',
+      'row-start-2',
+      'text-muted-foreground'
+    )
+    expect(latency).toHaveAttribute('data-table-text', 'secondary')
     expect(within(summary).getByText('90%')).toBeVisible()
     expect(within(summary).getByText('250ms')).toBeVisible()
     const intervals = within(summary).getAllByRole('img')
@@ -353,6 +363,9 @@ describe('channel recent statistics', () => {
     expect(
       screen.getAllByRole('group', { name: 'Channel health (1h)' })
     ).toHaveLength(1)
+    expect(
+      screen.getByRole('group', { name: 'Channel health (1h)' })
+    ).toHaveClass('h-5')
     expect(screen.getByText('90%')).toBeVisible()
   })
 
