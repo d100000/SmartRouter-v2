@@ -155,7 +155,7 @@ describe('channel recent statistics', () => {
       'shrink-0',
       'whitespace-nowrap',
       'grid-cols-[46px_minmax(0,1fr)]',
-      'grid-rows-[20px_16px]',
+      'grid-rows-[calc(var(--spacing)*5)_calc(var(--spacing)*4)]',
       'gap-y-1'
     )
     const latency = within(summary).getByLabelText(

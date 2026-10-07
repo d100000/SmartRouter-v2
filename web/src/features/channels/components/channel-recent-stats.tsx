@@ -225,7 +225,7 @@ export function ChannelRecentStatsCell(props: {
         'inline-grid shrink-0 items-center gap-x-1 whitespace-nowrap tabular-nums',
         props.placement === 'footer'
           ? 'h-5 grid-cols-[46px_56px_minmax(0,1fr)] text-xs'
-          : 'h-10 grid-cols-[46px_minmax(0,1fr)] grid-rows-[20px_16px] gap-y-1 text-sm font-medium',
+          : 'h-10 grid-cols-[46px_minmax(0,1fr)] grid-rows-[calc(var(--spacing)*5)_calc(var(--spacing)*4)] gap-y-1 text-sm font-medium',
         props.placement === 'column' ? 'w-full min-w-50' : 'w-50'
       )}
     >
