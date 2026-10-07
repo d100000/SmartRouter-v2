@@ -9,8 +9,8 @@ import (
 
 var channelRecentStatsOnce sync.Once
 
-// StartChannelRecentStatsTask publishes instance-local statistics asynchronously.
-// Neither channel listing nor the statistics endpoint performs aggregation.
+// StartChannelRecentStatsTask prewarms observations and prunes idle history.
+// Explicit statistics reads also refresh without visiting database or routing state.
 func StartChannelRecentStatsTask() {
 	channelRecentStatsOnce.Do(func() {
 		go func() {

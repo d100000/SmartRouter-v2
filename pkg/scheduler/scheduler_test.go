@@ -741,7 +741,11 @@ func TestRecentChannelStatsUseCompletedAttemptsAndPublishedSnapshots(t *testing.
 	f.now = f.now.Add(time.Second)
 	assert.Len(t, f.engine.RecentChannelStats().Items, 2, "reading does not aggregate even when samples have expired")
 	f.engine.RefreshRecentChannelStats()
-	assert.Empty(t, f.engine.RecentChannelStats().Items, "an attempt exactly ten minutes old has expired")
+	expiredTenMinute := f.engine.RecentChannelStats()
+	require.Len(t, expiredTenMinute.Items, 2)
+	assert.Zero(t, expiredTenMinute.Items[0].Requests, "an attempt exactly ten minutes old has expired from the legacy window")
+	assert.Nil(t, expiredTenMinute.Items[0].SuccessRate)
+	assert.EqualValues(t, 2, expiredTenMinute.Items[0].Requests1h, "the independent hour history is retained")
 
 	r = f.engine.BeginRequest(f.key, "long-stream", false)
 	longStream, err := f.engine.ReserveCandidate(r, f.candidate, true)
@@ -752,10 +756,261 @@ func TestRecentChannelStatsUseCompletedAttemptsAndPublishedSnapshots(t *testing.
 	f.engine.EndRequest(r) // triggers idle learning reset after the long stream
 	f.engine.RefreshRecentChannelStats()
 	reset := f.engine.RecentChannelStats()
-	require.Len(t, reset.Items, 1)
+	require.Len(t, reset.Items, 2)
 	assert.EqualValues(t, 1, reset.Items[0].Requests, "idle reset retains attempts in their completion window")
+	assert.EqualValues(t, 3, reset.Items[0].Requests1h)
 	require.NotNil(t, reset.Items[0].SuccessRate)
 	assert.Equal(t, 1.0, *reset.Items[0].SuccessRate)
+}
+
+func TestRecentChannelHistoryRollingBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		age       time.Duration
+		segment   int
+		inTenMin  bool
+		inFiveMin bool
+	}{
+		{time.Hour, -1, false, false},
+		{time.Hour - time.Second, 0, false, false},
+		{50 * time.Minute, 0, false, false},
+		{50*time.Minute - time.Second, 1, false, false},
+		{40 * time.Minute, 1, false, false},
+		{40*time.Minute - time.Second, 2, false, false},
+		{30 * time.Minute, 2, false, false},
+		{30*time.Minute - time.Second, 3, false, false},
+		{20 * time.Minute, 3, false, false},
+		{20*time.Minute - time.Second, 4, false, false},
+		{10 * time.Minute, 4, false, false},
+		{10*time.Minute - time.Second, 5, true, false},
+		{5 * time.Minute, 5, true, false},
+		{5*time.Minute - time.Second, 5, true, true},
+		{0, 5, true, true},
+	} {
+		t.Run(tc.age.String(), func(t *testing.T) {
+			f := newSchedulerFixture()
+			start := f.now
+			initial := f.engine.FreshRecentChannelStats()
+			assert.True(t, initial.Ready)
+			assert.Equal(t, start.Unix(), initial.CollectedSince)
+			assert.EqualValues(t, 3600, initial.HistoryWindowSeconds)
+			assert.EqualValues(t, 600, initial.BucketSeconds)
+			assert.EqualValues(t, 300, initial.LatencyWindowSeconds)
+			f.now = start.Add(time.Hour - tc.age)
+			f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(2 * time.Second)})
+			f.now = start.Add(time.Hour)
+			stats := f.engine.FreshRecentChannelStats()
+			assert.Equal(t, f.now.Unix(), stats.RefreshedAt)
+			assert.Equal(t, start.Unix(), stats.CollectedSince)
+			if tc.segment < 0 {
+				assert.Empty(t, stats.Items, "an attempt exactly one hour old expires even without new traffic")
+				return
+			}
+			require.Len(t, stats.Items, 1)
+			row := stats.Items[0]
+			assert.EqualValues(t, 1, row.Requests1h)
+			require.NotNil(t, row.SuccessRate1h)
+			assert.Equal(t, 1.0, *row.SuccessRate1h)
+			require.Len(t, row.History, 6)
+			for i, segment := range row.History {
+				assert.Equal(t, start.Unix()+int64(i)*600, segment.StartTime)
+				assert.Equal(t, start.Unix()+int64(i+1)*600, segment.EndTime)
+				if i == tc.segment {
+					assert.EqualValues(t, 1, segment.Requests)
+					require.NotNil(t, segment.SuccessRate)
+					assert.Equal(t, 1.0, *segment.SuccessRate)
+				} else {
+					assert.Zero(t, segment.Requests)
+					assert.Nil(t, segment.SuccessRate, "no observations differs from zero percent success")
+				}
+			}
+			if tc.inTenMin {
+				assert.EqualValues(t, 1, row.Requests)
+			} else {
+				assert.Zero(t, row.Requests)
+				assert.Nil(t, row.SuccessRate)
+			}
+			if tc.inFiveMin {
+				assert.EqualValues(t, 1, row.TTFTSamples5m)
+				assert.Equal(t, 2000.0, row.TTFTSumMS5m)
+				require.NotNil(t, row.AvgTTFTMS5m)
+				assert.Equal(t, 2000.0, *row.AvgTTFTMS5m)
+			} else {
+				assert.Zero(t, row.TTFTSamples5m)
+				assert.Nil(t, row.AvgTTFTMS5m)
+			}
+		})
+	}
+}
+
+func TestRecentChannelLatencyAggregationFilteringAndSnapshotIsolation(t *testing.T) {
+	f := newSchedulerFixture()
+	f.engine.FreshRecentChannelStats()
+	f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Second)})
+	first := f.engine.FreshRecentChannelStats()
+	require.Len(t, first.Items, 1)
+	assert.EqualValues(t, 1, first.Items[0].Requests)
+	f.key = Key{Group: "vip", Model: "other-model"}
+	for _, duration := range []time.Duration{3 * time.Second, 5 * time.Second} {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(duration)})
+	}
+	for _, duration := range []time.Duration{2 * time.Second, 10 * time.Second} {
+		f.dispatch(t, f.candidate, false, Outcome{Success: true, TTFT: latency(duration)})
+	}
+	f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, TTFT: latency(20 * time.Second)})
+	for _, duration := range []*time.Duration{nil, latency(0), latency(-time.Second)} {
+		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: duration})
+	}
+	failed := Candidate{ID: 2, Status: 1, Weight: 10, Capacity: 100}
+	f.dispatch(t, failed, false, Outcome{ChannelFailure: true})
+	stats := f.engine.FreshRecentChannelStats(1, 1, 999)
+	require.Len(t, stats.Items, 1)
+	row := stats.Items[0]
+	assert.EqualValues(t, 9, row.Requests, "a completion invalidates a snapshot even in the same second")
+	assert.EqualValues(t, 8, row.Successes)
+	assert.EqualValues(t, 3, row.TTFTSamples5m)
+	assert.Equal(t, 9000.0, row.TTFTSumMS5m)
+	require.NotNil(t, row.AvgTTFTMS5m)
+	assert.Equal(t, 3000.0, *row.AvgTTFTMS5m, "model averages are weighted by their sample counts")
+	assert.EqualValues(t, 2, row.ResponseSamples5m)
+	assert.Equal(t, 12000.0, row.ResponseSumMS5m)
+	require.NotNil(t, row.AvgResponseMS5m)
+	assert.Equal(t, 6000.0, *row.AvgResponseMS5m, "non-stream response latency remains separate from stream TTFT")
+	assert.Empty(t, f.engine.FreshRecentChannelStats(999).Items)
+	all := f.engine.FreshRecentChannelStats()
+	require.Len(t, all.Items, 2)
+	require.NotNil(t, all.Items[1].SuccessRate1h)
+	assert.Zero(t, *all.Items[1].SuccessRate1h)
+	assert.Nil(t, all.Items[1].AvgTTFTMS5m)
+	assert.Nil(t, all.Items[1].AvgResponseMS5m)
+	stats.Items[0].Requests = 999
+	stats.Items[0].History[5].Requests = 999
+	for _, rate := range []*float64{stats.Items[0].SuccessRate, stats.Items[0].SuccessRate1h, stats.Items[0].AvgTTFTMS5m, stats.Items[0].AvgResponseMS5m, stats.Items[0].History[5].SuccessRate} {
+		require.NotNil(t, rate)
+		*rate = 999
+	}
+	assert.Equal(t, all, f.engine.FreshRecentChannelStats(), "callers cannot alter cached history, rates, or latency values")
+}
+
+func TestRecentChannelHistorySurvivesMembershipChangesAndIdleLearningReset(t *testing.T) {
+	f := newSchedulerFixture()
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {f.candidate}})
+	r := f.engine.BeginRequest(f.key, "removed-before-completion", false)
+	a, err := f.engine.ReserveCandidate(r, f.candidate, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(a)
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{})
+	f.engine.FinishAttempt(a, Outcome{Success: true, TTFT: latency(time.Second)})
+	f.engine.FinishAttempt(a, Outcome{Success: true, TTFT: latency(time.Second)})
+	f.engine.EndRequest(r)
+	stats := f.engine.FreshRecentChannelStats()
+	require.Len(t, stats.Items, 1)
+	assert.EqualValues(t, 1, stats.Items[0].Requests1h, "removed membership and an old learning epoch retain one completed observation")
+	f.now = f.now.Add(31 * time.Minute)
+	assert.False(t, f.engine.IsActive(f.key))
+	stats = f.engine.FreshRecentChannelStats()
+	require.Len(t, stats.Items, 1)
+	assert.EqualValues(t, 1, stats.Items[0].Requests1h, "learning/history pruning at thirty minutes does not erase hour observations")
+	assert.Zero(t, stats.Items[0].Requests)
+	assert.Nil(t, stats.Items[0].AvgTTFTMS5m)
+	f.now = f.now.Add(29 * time.Minute)
+	f.engine.RefreshRecentChannelStats() // background cleanup works without any new request
+	assert.Empty(t, f.engine.RecentChannelStats().Items)
+	assert.Empty(t, f.engine.FreshRecentChannelStats().Items)
+}
+
+func TestChannelObservationLockDoesNotHoldRoutingCapacity(t *testing.T) {
+	f := newSchedulerFixture()
+	r := f.engine.BeginRequest(f.key, "finishing", false)
+	candidate := f.candidate
+	candidate.Capacity = 1
+	a, err := f.engine.ReserveCandidate(r, candidate, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(a)
+	finishing := make(chan struct{})
+	allowFinish := make(chan struct{})
+	var clockOnce sync.Once
+	f.engine.now = func() time.Time {
+		clockOnce.Do(func() {
+			close(finishing) // FinishAttempt is inside the routing critical section.
+			<-allowFinish
+		})
+		return f.now
+	}
+	f.engine.channelObservations.mu.Lock()
+	var releaseObservations sync.Once
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		releaseObservations.Do(f.engine.channelObservations.mu.Unlock)
+		workers.Wait()
+	})
+	workers.Go(func() { f.engine.FinishAttempt(a, Outcome{Success: true}) })
+	<-finishing
+	close(allowFinish)
+	reserved := make(chan error, 1)
+	workers.Go(func() {
+		next := f.engine.BeginRequest(f.key, "next", false)
+		_, reserveErr := f.engine.ReserveCandidate(next, candidate, true)
+		f.engine.EndRequest(next)
+		reserved <- reserveErr
+	})
+	select {
+	case reserveErr := <-reserved:
+		require.NoError(t, reserveErr, "a blocked observation writer must already release routing capacity")
+	case <-time.After(5 * time.Second):
+		t.Fatal("observation reading blocked routing")
+	}
+	releaseObservations.Do(f.engine.channelObservations.mu.Unlock)
+	workers.Wait()
+	f.engine.EndRequest(r)
+	stats := f.engine.FreshRecentChannelStats()
+	require.Len(t, stats.Items, 1)
+	assert.EqualValues(t, 1, stats.Items[0].Requests)
+	assert.Zero(t, f.engine.Snapshot(f.key, []Candidate{candidate}, true).Summary.InFlight)
+}
+
+func TestConcurrentChannelObservationsAndUIReadsPreserveAccountingAndSelection(t *testing.T) {
+	f := newSchedulerFixture()
+	other := f.candidate
+	other.ID = 2
+	other.Priority = 10
+	var attempts []*Attempt
+	var requests []*Request
+	for _, candidate := range []Candidate{f.candidate, other} {
+		r := f.engine.BeginRequest(f.key, "", false)
+		a, err := f.engine.ReserveCandidate(r, candidate, true)
+		require.NoError(t, err)
+		f.engine.StartAttempt(a)
+		requests = append(requests, r)
+		attempts = append(attempts, a)
+	}
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Go(func() { f.engine.FinishAttempt(attempts[0], Outcome{Success: true, TTFT: latency(time.Second)}) })
+	}
+	workers.Go(func() { f.engine.FinishAttempt(attempts[1], Outcome{ChannelFailure: true}) })
+	for range 2 {
+		workers.Go(func() {
+			stats := f.engine.FreshRecentChannelStats()
+			for i := range stats.Items {
+				stats.Items[i].History[5].Requests = 999 // Readers own independent snapshots.
+			}
+		})
+	}
+	workers.Wait()
+	for _, r := range requests {
+		f.engine.EndRequest(r)
+	}
+	stats := f.engine.FreshRecentChannelStats()
+	require.Len(t, stats.Items, 2)
+	assert.EqualValues(t, 1, stats.Items[0].Requests)
+	assert.EqualValues(t, 1, stats.Items[0].TTFTSamples5m)
+	assert.EqualValues(t, 1, stats.Items[1].Requests)
+	assert.Zero(t, stats.Items[1].Successes)
+	candidates := []Candidate{f.candidate, other}
+	before := f.engine.Snapshot(f.key, candidates, true)
+	f.engine.FreshRecentChannelStats()
+	f.engine.RefreshRecentChannelStats()
+	assert.Equal(t, before, f.engine.Snapshot(f.key, candidates, true), "UI reads must not alter probabilities, recovery, maturity, or routing samples")
 }
 
 func TestRecoverySurvivesOccasionalFailuresRegardlessOfReadTiming(t *testing.T) {

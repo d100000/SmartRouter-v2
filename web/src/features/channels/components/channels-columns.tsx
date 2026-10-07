@@ -697,7 +697,7 @@ export function useChannelsColumns(
             const childrenCount = (row.original as TagRow).children?.length || 0
 
             return (
-              <div className='flex items-center gap-2'>
+              <div className='flex w-full min-w-0 items-center gap-2'>
                 <Button
                   variant='ghost'
                   size='sm'
@@ -710,8 +710,12 @@ export function useChannelsColumns(
                     <ChevronRight className='h-4 w-4' />
                   )}
                 </Button>
-                <div className='flex items-center gap-1.5'>
-                  <span className='font-semibold'>Tag：{tag}</span>
+                <div className='flex min-w-0 flex-1 items-center gap-1.5'>
+                  <TruncatedText
+                    text={`Tag：${tag}`}
+                    className='font-semibold'
+                    maxWidth='max-w-full'
+                  />
                   <StatusBadge
                     label={`${childrenCount} channels`}
                     variant='blue'
@@ -719,6 +723,7 @@ export function useChannelsColumns(
                     copyable={false}
                   />
                 </div>
+                <ChannelRecentStatsCell channel={channel} placement='name' />
               </div>
             )
           }
@@ -729,9 +734,9 @@ export function useChannelsColumns(
           const hasParamOverride = Boolean(channel.param_override?.trim())
 
           return (
-            <div className='flex max-w-full min-w-0 items-center gap-2'>
-              <div className='flex max-w-full min-w-0 flex-col gap-1'>
-                <div className='flex max-w-full min-w-0 items-center gap-1.5'>
+            <div className='flex w-full max-w-full min-w-0 flex-col gap-1'>
+              <div className='flex w-full max-w-full min-w-0 items-center gap-2'>
+                <div className='flex min-w-0 flex-1 items-center gap-1.5'>
                   <TruncatedText
                     text={sensitiveVisible ? name : SENSITIVE_MASK}
                     className='font-medium'
@@ -769,28 +774,29 @@ export function useChannelsColumns(
                   )}
                   <UpstreamUpdateTags channel={channel} />
                 </div>
-                {channel.remark && (
-                  <TooltipProvider delay={200}>
-                    <Tooltip>
-                      <TooltipTrigger
-                        render={
-                          <span className='text-muted-foreground text-xs' />
-                        }
-                      >
-                        {truncateText(channel.remark, 40)}
-                      </TooltipTrigger>
-                      <TooltipContent side='bottom' className='max-w-xs'>
-                        {channel.remark}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )}
+                <ChannelRecentStatsCell channel={channel} placement='name' />
               </div>
+              {channel.remark && (
+                <TooltipProvider delay={200}>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <span className='text-muted-foreground block max-w-full min-w-0 truncate text-xs' />
+                      }
+                    >
+                      {truncateText(channel.remark, 40)}
+                    </TooltipTrigger>
+                    <TooltipContent side='bottom' className='max-w-xs'>
+                      {channel.remark}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
             </div>
           )
         },
-        size: 260,
-        minSize: 200,
+        size: 380,
+        minSize: 320,
       },
 
       // Type column
@@ -1064,16 +1070,6 @@ export function useChannelsColumns(
           return false
         },
         size: 120,
-        enableSorting: false,
-      },
-
-      {
-        id: 'recent_stats',
-        // The channel ID is the lookup key; statistics arrive independently.
-        accessorFn: (channel) => channel.id,
-        header: t('Success / Requests (10m)'),
-        cell: ({ row }) => <ChannelRecentStatsCell channel={row.original} />,
-        size: 200,
         enableSorting: false,
       },
 

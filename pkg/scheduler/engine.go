@@ -670,16 +670,20 @@ func (e *Engine) StartAttempt(a *Attempt, stream ...bool) {
 
 func (e *Engine) FinishAttempt(a *Attempt, outcome Outcome) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if a == nil || a.request == nil || a.request.engine != e {
+		e.mu.Unlock()
 		return
 	}
-	e.finishAttempt(a, outcome, e.now())
+	observation, accepted := e.finishAttempt(a, outcome, e.now())
+	e.mu.Unlock()
+	if accepted {
+		e.recordChannelObservation(observation)
+	}
 }
 
-func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) {
+func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) (channelObservation, bool) {
 	if a.finished {
-		return
+		return channelObservation{}, false
 	}
 	a.finished = true
 	r := a.request
@@ -692,9 +696,13 @@ func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) {
 	ch.inFlight--
 	e.pools[a.pool].inFlight--
 	if !a.started || r.businessAt.IsZero() || (!outcome.Success && !outcome.ChannelFailure) {
-		return
+		return channelObservation{}, false
 	}
 	second := now.Unix()
+	observation := channelObservation{channelID: a.Candidate.ID, second: second, success: outcome.Success, stream: a.stream}
+	if outcome.Success && outcome.TTFT != nil && *outcome.TTFT > 0 {
+		observation.latencyMS = float64(*outcome.TTFT) / float64(time.Millisecond)
+	}
 	bucket := ch.buckets[second]
 	if bucket == nil {
 		bucket = &secondBucket{}
@@ -721,7 +729,7 @@ func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) {
 	// Old leases still release normally and retain history, but cannot establish
 	// confidence for a new membership/learning epoch after metadata changed.
 	if a.learningEpoch != ch.learningEpoch {
-		return
+		return observation, true
 	}
 	learning := ch.learningBuckets[second]
 	if learning == nil {
@@ -764,6 +772,7 @@ func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) {
 		// multiplicative discount on an already discounted previous weight.
 		ch.recoveryLimit = min(ch.recoveryLimit, health)
 	}
+	return observation, true
 }
 
 func (window *Window) recordOutcome(outcome Outcome, matchingTransport bool, targetMS float64) {

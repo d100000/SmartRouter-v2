@@ -85,9 +85,14 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-async function renderChannelsPage(searchGate: () => Promise<void>) {
+async function renderChannelsPage(
+  searchGate: () => Promise<void>,
+  statsGate: () => Promise<void> = async () => {},
+  currentChannels: () => Channel[] = () => [channel('prod')]
+) {
   const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
     if (url === '/api/channel/recent_stats') {
+      await statsGate()
       return {
         data: {
           success: true,
@@ -106,7 +111,7 @@ async function renderChannelsPage(searchGate: () => Promise<void>) {
       return {
         data: {
           success: true,
-          data: { items: [channel('prod')], total: 1, type_counts: {} },
+          data: { items: currentChannels(), total: 1, type_counts: {} },
         },
       }
     }
@@ -145,24 +150,72 @@ async function renderChannelsPage(searchGate: () => Promise<void>) {
   return get
 }
 
-it('refetches the channel list with the current filters and marks Refresh busy while it runs', async () => {
+it('refetches the filtered channel list and current-page statistics together and stays busy until both finish', async () => {
   let gate = Promise.resolve()
-  const get = await renderChannelsPage(() => gate)
+  let statsGate = Promise.resolve()
+  const get = await renderChannelsPage(
+    () => gate,
+    () => statsGate
+  )
   const searchCalls = () =>
     get.mock.calls.filter(([url]) => url === '/api/channel/search')
+  const statsCalls = () =>
+    get.mock.calls.filter(([url]) => url === '/api/channel/recent_stats')
   const refresh = screen.getByRole('button', { name: 'Refresh' })
   expect(searchCalls()).toHaveLength(1)
+  await waitFor(() => expect(statsCalls()).toHaveLength(1))
   expect(refresh).toHaveAttribute('aria-busy', 'false')
 
   let release!: () => void
   gate = new Promise((resolve) => {
     release = resolve
   })
+  let releaseStats!: () => void
+  statsGate = new Promise((resolve) => {
+    releaseStats = resolve
+  })
   await userEvent.click(refresh)
 
   await waitFor(() => expect(searchCalls()).toHaveLength(2))
+  await waitFor(() => expect(statsCalls()).toHaveLength(2))
+  expect(statsCalls()[1][1]?.params).toEqual({ channel_ids: '3' })
   expect(searchCalls()[1][1]?.params).toEqual(searchCalls()[0][1]?.params)
   expect(refresh).toHaveAttribute('aria-busy', 'true')
   release()
+  await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'true'))
+  releaseStats()
   await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'false'))
+})
+
+it('fetches fresh statistics when refresh changes the page back to a recently cached channel scope', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_900_000_000_000)
+  let rows = [channel('prod')]
+  const get = await renderChannelsPage(
+    async () => {},
+    async () => {},
+    () => rows
+  )
+  const refresh = screen.getByRole('button', { name: 'Refresh' })
+  const originalScopeRequests = () =>
+    get.mock.calls.filter(
+      ([url, config]) =>
+        url === '/api/channel/recent_stats' &&
+        config?.params?.channel_ids === '3'
+    )
+  await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'false'))
+  expect(originalScopeRequests()).toHaveLength(1)
+
+  rows = [{ ...channel('prod-next'), id: 4 }]
+  await userEvent.click(refresh)
+  expect(await screen.findByText('prod-next')).toBeVisible()
+  await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'false'))
+  expect(originalScopeRequests()).toHaveLength(2)
+
+  rows = [channel('prod')]
+  await userEvent.click(refresh)
+  expect(await screen.findByText('prod')).toBeVisible()
+  await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'false'))
+  // The clock has not advanced: the original scope is still inside staleTime.
+  // Refresh must invalidate that inactive cache before it becomes visible.
+  expect(originalScopeRequests()).toHaveLength(3)
 })

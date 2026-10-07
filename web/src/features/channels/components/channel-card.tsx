@@ -169,8 +169,7 @@ function ChannelCardComponent({
             )}
           </div>
           <div className='flex shrink-0 items-center gap-1.5'>
-            <span className={labelClass}>{t('Last 10 minutes')}</span>
-            <ChannelRecentStatsCell channel={row.original} />
+            <ChannelRecentStatsCell channel={row.original} placement='footer' />
           </div>
         </div>
       </div>

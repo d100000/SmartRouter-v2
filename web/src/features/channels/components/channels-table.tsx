@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import { useIsFetching, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
 import type {
   ColumnFiltersState,
@@ -50,6 +50,7 @@ import { cn } from '@/lib/utils'
 import { getChannels, searchChannels, getGroups } from '../api'
 import {
   DEFAULT_PAGE_SIZE,
+  CHANNEL_RECENT_STATS_QUERY_KEY,
   CHANNEL_STATUS,
   CHANNEL_STATUS_OPTIONS,
 } from '../constants'
@@ -91,6 +92,9 @@ function isDisabledChannelRow(channel: Channel) {
 
 export function ChannelsTable() {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const statsFetching =
+    useIsFetching({ queryKey: CHANNEL_RECENT_STATS_QUERY_KEY }) > 0
   const {
     enableTagMode,
     idSort,
@@ -413,7 +417,7 @@ export function ChannelsTable() {
   ]
 
   return (
-    <ChannelRecentStatsProvider>
+    <ChannelRecentStatsProvider channels={channels}>
       <DataTablePage
         table={table}
         columns={columns}
@@ -494,14 +498,27 @@ export function ChannelsTable() {
                     <Button
                       variant='ghost'
                       size='icon'
-                      onClick={() => void refetch()}
+                      onClick={() => {
+                        void Promise.allSettled([
+                          refetch(),
+                          queryClient.invalidateQueries({
+                            queryKey: CHANNEL_RECENT_STATS_QUERY_KEY,
+                            refetchType: 'active',
+                          }),
+                        ])
+                      }}
                       aria-label={t('Refresh')}
-                      aria-busy={isFetching}
+                      aria-busy={isFetching || statsFetching}
+                      disabled={isFetching || statsFetching}
                       className='text-muted-foreground hover:text-foreground size-8'
                     />
                   }
                 >
-                  <RefreshCw className={cn(isFetching && 'animate-spin')} />
+                  <RefreshCw
+                    className={cn(
+                      (isFetching || statsFetching) && 'animate-spin'
+                    )}
+                  />
                 </TooltipTrigger>
                 <TooltipContent>{t('Refresh')}</TooltipContent>
               </Tooltip>

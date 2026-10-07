@@ -80,6 +80,24 @@ export interface ChannelRecentStat {
   requests: number
   successes: number
   success_rate: number | null
+  requests_1h: number
+  successes_1h: number
+  success_rate_1h: number | null
+  history: ChannelRecentHistoryBucket[]
+  ttft_samples_5m: number
+  ttft_sum_ms_5m: number
+  avg_ttft_ms_5m: number | null
+  response_samples_5m: number
+  response_sum_ms_5m: number
+  avg_response_ms_5m: number | null
+}
+
+export interface ChannelRecentHistoryBucket {
+  start_time: number
+  end_time: number
+  requests: number
+  successes: number
+  success_rate: number | null
 }
 
 export interface ChannelRecentStats {
@@ -88,6 +106,10 @@ export interface ChannelRecentStats {
   window_seconds: number
   scope: 'instance'
   items: ChannelRecentStat[]
+  collected_since: number
+  history_window_seconds: number
+  bucket_seconds: number
+  latency_window_seconds: number
 }
 
 // ============================================================================

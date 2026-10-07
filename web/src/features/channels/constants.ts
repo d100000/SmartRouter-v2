@@ -388,6 +388,8 @@ export const SUCCESS_MESSAGES = {
 
 export const DEFAULT_PAGE_SIZE = 20
 
+export const CHANNEL_RECENT_STATS_QUERY_KEY = ['channel-recent-stats'] as const
+
 export const DEFAULT_CHANNEL_VALUES = {
   name: '',
   type: 0,

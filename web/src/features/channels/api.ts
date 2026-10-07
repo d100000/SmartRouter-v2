@@ -125,12 +125,17 @@ export async function getChannels(
 }
 
 export async function getChannelRecentStats(
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  channelIds?: readonly number[]
 ): Promise<ChannelRecentStats> {
   const response = await api.get<{
     success: boolean
     data: ChannelRecentStats
-  }>('/api/channel/recent_stats', { signal, timeout: 10_000 })
+  }>('/api/channel/recent_stats', {
+    signal,
+    timeout: 10_000,
+    params: channelIds ? { channel_ids: channelIds.join(',') } : undefined,
+  })
   return requireServerSuccess(response.data).data
 }
 

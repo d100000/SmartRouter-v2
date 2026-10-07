@@ -166,15 +166,16 @@ type Snapshot struct {
 }
 
 type Engine struct {
-	mu                 sync.Mutex
-	now                func() time.Time
-	random             func() float64
-	states             map[Key]*keyState
-	pools              map[string]*capacityPool
-	sequence           uint64
-	membershipManaged  bool
-	channelMetadata    map[int]Candidate
-	recentChannelStats atomic.Pointer[RecentChannelStats]
+	mu                  sync.Mutex
+	now                 func() time.Time
+	random              func() float64
+	states              map[Key]*keyState
+	pools               map[string]*capacityPool
+	sequence            uint64
+	membershipManaged   bool
+	channelMetadata     map[int]Candidate
+	channelObservations channelObservations
+	recentChannelStats  atomic.Pointer[RecentChannelStats]
 }
 
 var Default = New()
