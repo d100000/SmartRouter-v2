@@ -131,13 +131,13 @@ export function ChannelRecentStatsProvider(props: {
 
 export function ChannelRecentStatsCell(props: {
   channel: Channel
-  placement?: 'name' | 'footer'
+  placement?: 'column' | 'footer'
 }) {
   const { t, i18n } = useTranslation()
   const stats = useContext(RecentStatsContext)
   const layout = useContext(ChannelRowActionsLayoutContext)
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  if (props.placement === 'name' && layout === 'card') return null
+  if (props.placement === 'column' && layout === 'card') return null
 
   const channels = isTagAggregateRow(props.channel)
     ? props.channel.children
@@ -221,7 +221,10 @@ export function ChannelRecentStatsCell(props: {
           ? t('Statistics are delayed; showing the last snapshot.')
           : undefined
       }
-      className='inline-grid h-5 w-50 shrink-0 grid-cols-[46px_56px_minmax(0,1fr)] items-center gap-1 text-xs whitespace-nowrap tabular-nums'
+      className={cn(
+        'inline-grid h-5 shrink-0 grid-cols-[46px_56px_minmax(0,1fr)] items-center gap-1 text-xs whitespace-nowrap tabular-nums',
+        props.placement === 'column' ? 'w-full min-w-50' : 'w-50'
+      )}
     >
       <span className='flex items-center gap-0.5'>
         {history.map((bucket) => {

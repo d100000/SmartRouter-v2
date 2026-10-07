@@ -24,7 +24,13 @@ import {
   createRouter,
   RouterProvider,
 } from '@tanstack/react-router'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createInstance } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
@@ -218,4 +224,57 @@ it('fetches fresh statistics when refresh changes the page back to a recently ca
   // The clock has not advanced: the original scope is still inside staleTime.
   // Refresh must invalidate that inactive cache before it becomes visible.
   expect(originalScopeRequests()).toHaveLength(3)
+})
+
+it('shows health in a separate column after the name and allows hiding it', async () => {
+  localStorage.setItem('channels:view-mode', 'table')
+  await renderChannelsPage(async () => {})
+
+  const headers = screen.getAllByRole('columnheader')
+  const nameHeader = screen.getByRole('columnheader', { name: /^Name\b/ })
+  const healthHeader = screen.getByRole('columnheader', {
+    name: /^Channel health \(1h\)/,
+  })
+  expect(headers.indexOf(healthHeader)).toBe(headers.indexOf(nameHeader) + 1)
+  const nameCell = screen.getByRole('cell', { name: 'prod' })
+  expect(within(nameCell).queryByRole('group')).not.toBeInTheDocument()
+  const health = screen.getByRole('group', { name: 'Channel health (1h)' })
+  expect(within(health).getAllByRole('img')).toHaveLength(6)
+
+  await userEvent.click(screen.getByRole('button', { name: 'View' }))
+  await userEvent.click(
+    screen.getByRole('menuitemcheckbox', { name: 'Channel health (1h)' })
+  )
+  expect(
+    screen.queryByRole('columnheader', { name: /^Channel health \(1h\)/ })
+  ).not.toBeInTheDocument()
+  expect(screen.getByRole('cell', { name: 'prod' })).toBeVisible()
+})
+
+it('restores the health column width and saves keyboard width changes independently of the name', async () => {
+  localStorage.setItem('channels:view-mode', 'table')
+  localStorage.setItem(
+    'channels:column-sizing',
+    JSON.stringify({ channel_health: 300, name: 280 })
+  )
+  await renderChannelsPage(async () => {})
+
+  const healthHeader = screen.getByRole('columnheader', {
+    name: /^Channel health \(1h\)/,
+  })
+  expect(healthHeader).toHaveStyle({ width: '300px' })
+  const resizer = within(healthHeader).getByRole('separator', {
+    name: 'Resize column',
+  })
+  resizer.focus()
+  await userEvent.keyboard('{ArrowLeft}')
+  expect(healthHeader).toHaveStyle({ width: '290px' })
+  expect(screen.getByRole('columnheader', { name: /^Name\b/ })).toHaveStyle({
+    width: '280px',
+  })
+  await waitFor(() => {
+    expect(
+      JSON.parse(localStorage.getItem('channels:column-sizing') ?? 'null')
+    ).toEqual(expect.objectContaining({ channel_health: 290, name: 280 }))
+  })
 })

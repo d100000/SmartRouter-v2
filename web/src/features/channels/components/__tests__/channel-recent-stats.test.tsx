@@ -333,7 +333,7 @@ describe('channel recent statistics', () => {
     )
   })
 
-  test('renders card statistics once in the footer and keeps them out of the name', () => {
+  test('renders card statistics once in the footer and omits the table column', () => {
     const client = createAppQueryClient(onInternalServerError)
     clients.push(client)
     client.setQueryData(['channel-recent-stats'], snapshot)
@@ -343,7 +343,7 @@ describe('channel recent statistics', () => {
         <TooltipProvider>
           <ChannelRecentStatsProvider>
             <ChannelRowActionsLayoutContext.Provider value='card'>
-              <ChannelRecentStatsCell channel={row} placement='name' />
+              <ChannelRecentStatsCell channel={row} placement='column' />
               <ChannelRecentStatsCell channel={row} placement='footer' />
             </ChannelRowActionsLayoutContext.Provider>
           </ChannelRecentStatsProvider>

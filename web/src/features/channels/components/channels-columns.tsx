@@ -723,7 +723,6 @@ export function useChannelsColumns(
                     copyable={false}
                   />
                 </div>
-                <ChannelRecentStatsCell channel={channel} placement='name' />
               </div>
             )
           }
@@ -774,7 +773,6 @@ export function useChannelsColumns(
                   )}
                   <UpstreamUpdateTags channel={channel} />
                 </div>
-                <ChannelRecentStatsCell channel={channel} placement='name' />
               </div>
               {channel.remark && (
                 <TooltipProvider delay={200}>
@@ -795,8 +793,19 @@ export function useChannelsColumns(
             </div>
           )
         },
-        size: 380,
-        minSize: 320,
+        size: 260,
+        minSize: 200,
+      },
+      {
+        id: 'channel_health',
+        accessorFn: (channel) => channel.id,
+        header: t('Channel health (1h)'),
+        cell: ({ row }) => (
+          <ChannelRecentStatsCell channel={row.original} placement='column' />
+        ),
+        enableSorting: false,
+        size: 240,
+        minSize: 220,
       },
 
       // Type column
