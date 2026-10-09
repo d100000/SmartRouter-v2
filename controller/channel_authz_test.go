@@ -158,6 +158,26 @@ func TestChannelStatusValidation(t *testing.T) {
 	assert.False(t, isManageableChannelStatus(0))
 }
 
+func TestProcurementMetadataRejectsOrdinaryUsers(t *testing.T) {
+	for name, handler := range map[string]gin.HandlerFunc{"channel credentials": GetChannelUpstreamCredentials, "update credential": UpdateUpstreamCredential, "list suppliers": GetUpstreamSuppliers, "create supplier": AddUpstreamSupplier} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Set("id", 42)
+			ctx.Set("role", common.RoleCommonUser)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/api/upstream-credential/public-id", strings.NewReader(`{"alias":"forbidden","cost_ratio":0}`))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			handler(ctx)
+			var response struct {
+				Success bool `json:"success"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.False(t, response.Success)
+			assert.NotContains(t, recorder.Body.String(), "fingerprint")
+		})
+	}
+}
+
 // TestChannelFieldsAreClassified guards the fail-closed sensitivity check: every
 // JSON field of PatchChannel (including the embedded model.Channel) must be listed
 // in channelSensitiveFields, channelNonSensitiveFields, or

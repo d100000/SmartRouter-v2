@@ -276,7 +276,7 @@ func TestChannelRoutingDatabaseMatrix(t *testing.T) {
 			common.SetMainDatabaseType(common.DatabaseType(dialect))
 			initCol()
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&Ability{}, &Channel{}))
+				require.NoError(t, db.Migrator().DropTable(&Ability{}, &Channel{}, &ChannelCredentialBinding{}, &UpstreamCredentialVersion{}, &UpstreamCredential{}, &UpstreamSupplier{}, &UpstreamCredentialFingerprintSecret{}))
 				DB = previousDB
 				common.SetMainDatabaseType(previousType)
 				common.MemoryCacheEnabled = previousMemory
@@ -285,6 +285,7 @@ func TestChannelRoutingDatabaseMatrix(t *testing.T) {
 				require.NoError(t, sqlDB.Close())
 			})
 			require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+			require.NoError(t, AutoMigrateUpstreamCredentialSchema(db))
 			var version string
 			versionQuery := "SELECT version()"
 			if dialect == "sqlite" {

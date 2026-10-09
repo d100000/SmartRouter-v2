@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ type QuotaInfo struct {
 	ModelPrice    float64
 	ModelRatio    float64
 	GroupRatio    float64
+	QuotaPerUnit  float64
 }
 
 func hasCustomModelRatio(modelName string, currentRatio float64) bool {
@@ -46,13 +48,21 @@ func hasCustomModelRatio(modelName string, currentRatio float64) bool {
 }
 
 func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
+	return common.QuotaFromDecimalChecked(calculateAudioQuotaDecimal(info))
+}
+
+func calculateAudioQuotaDecimal(info QuotaInfo) decimal.Decimal {
 	if info.UsePrice {
 		modelPrice := decimal.NewFromFloat(info.ModelPrice)
-		quotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
+		unit := info.QuotaPerUnit
+		if unit <= 0 {
+			unit = common.QuotaPerUnit
+		}
+		quotaPerUnit := decimal.NewFromFloat(unit)
 		groupRatio := decimal.NewFromFloat(info.GroupRatio)
 
 		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio)
-		return common.QuotaFromDecimalChecked(quota)
+		return quota
 	}
 
 	completionRatio := decimal.NewFromFloat(ratio_setting.GetCompletionRatio(info.ModelName))
@@ -81,7 +91,41 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 		quota = decimal.NewFromInt(1)
 	}
 
-	return common.QuotaFromDecimalChecked(quota)
+	return quota
+}
+
+func captureAudioBillingSnapshot(info *relaycommon.RelayInfo, quotaInfo QuotaInfo, snapshot *relaycommon.OverviewBillingSnapshot, tieredApplied bool, result *billingexpr.TieredResult) {
+	// Preserve confirmed direct debits if final settlement subsequently fails.
+	snapshot.RevenueQuota = info.AnalyticsRealtimeRevenueQuota
+	snapshot.QuotaPerUnit = quotaInfo.QuotaPerUnit
+	if tieredApplied && info.TieredBillingSnapshot != nil {
+		snapshot.QuotaPerUnit = info.TieredBillingSnapshot.QuotaPerUnit
+	}
+	if info.AnalyticsRealtimeRevenueQuota > 0 && info.AnalyticsBilling != nil && info.AnalyticsBilling.QuotaPerUnit != snapshot.QuotaPerUnit {
+		info.AnalyticsRevenueUnitAmbiguous = true
+	}
+	info.AnalyticsBilling = snapshot
+	if snapshot.UsageSource == "local_estimate" || info.QuotaClamp != nil || snapshot.InputTokens < 0 || snapshot.OutputTokens < 0 {
+		return
+	}
+	var base float64
+	if tieredApplied {
+		if result == nil {
+			return
+		}
+		base = info.PriceData.ApplyOtherRatiosToDecimal(decimal.NewFromFloat(result.ActualQuotaBeforeGroup)).InexactFloat64()
+	} else {
+		// Legacy audio callers do not pass their per-call price into the
+		// calculator. Preserve the existing charge without inventing a base.
+		if quotaInfo.UsePrice || snapshot.InputTokens+snapshot.OutputTokens == 0 {
+			return
+		}
+		quotaInfo.GroupRatio = 1
+		base = calculateAudioQuotaDecimal(quotaInfo).InexactFloat64()
+	}
+	if base >= 0 && !math.IsNaN(base) && !math.IsInf(base, 0) {
+		snapshot.BaseQuota = &base
+	}
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
@@ -128,10 +172,11 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 			TextTokens:  textOutTokens,
 			AudioTokens: audioOutTokens,
 		},
-		ModelName:  modelName,
-		UsePrice:   relayInfo.UsePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: actualGroupRatio,
+		ModelName:    modelName,
+		UsePrice:     relayInfo.UsePrice,
+		ModelRatio:   modelRatio,
+		GroupRatio:   actualGroupRatio,
+		QuotaPerUnit: common.QuotaPerUnit,
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -145,7 +190,18 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
 	}
 
-	err = PostConsumeQuota(relayInfo, quota, 0, false)
+	result, err := postConsumeQuotaWithResult(relayInfo, quota, 0, false)
+	if result.FundingApplied {
+		relayInfo.AnalyticsRealtimeRevenueQuota += int64(quota)
+		if relayInfo.AnalyticsBilling == nil {
+			relayInfo.AnalyticsBilling = &relaycommon.OverviewBillingSnapshot{UsageSource: "upstream_realtime", QuotaPerUnit: quotaInfo.QuotaPerUnit}
+		} else if relayInfo.AnalyticsBilling.QuotaPerUnit != quotaInfo.QuotaPerUnit {
+			relayInfo.AnalyticsRevenueUnitAmbiguous = true
+		}
+		relayInfo.AnalyticsBilling.RevenueQuota = relayInfo.AnalyticsRealtimeRevenueQuota
+		// The session is still in progress; this is only its committed portion.
+		relayInfo.AnalyticsBilling.RevenueConfirmed = false
+	}
 	if err != nil {
 		return err
 	}
@@ -192,10 +248,11 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 			TextTokens:  textOutTokens,
 			AudioTokens: audioOutTokens,
 		},
-		ModelName:  modelName,
-		UsePrice:   usePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
+		ModelName:    modelName,
+		UsePrice:     usePrice,
+		ModelRatio:   modelRatio,
+		GroupRatio:   groupRatio,
+		QuotaPerUnit: common.QuotaPerUnit,
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -226,6 +283,13 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
+	snapshot := &relaycommon.OverviewBillingSnapshot{
+		InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens), UsageSource: "upstream_realtime",
+	}
+	if common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens) {
+		snapshot.UsageSource = "local_estimate"
+	}
+	captureAudioBillingSnapshot(relayInfo, quotaInfo, snapshot, tieredOk, tieredResult)
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	}
@@ -256,11 +320,15 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	})
 }
 
-func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData) int {
+func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData, quotaUnits ...float64) int {
 	if priceData.CacheCreationRatio == 1 {
 		return 0
 	}
-	quotaPrice := priceData.ModelRatio / common.QuotaPerUnit
+	quotaPerUnit := common.QuotaPerUnit
+	if len(quotaUnits) > 0 {
+		quotaPerUnit = quotaUnits[0]
+	}
+	quotaPrice := priceData.ModelRatio / quotaPerUnit
 	promptCacheCreatePrice := quotaPrice * priceData.CacheCreationRatio
 	promptCacheReadPrice := quotaPrice * priceData.CacheRatio
 	completionPrice := quotaPrice * priceData.CompletionRatio
@@ -283,6 +351,7 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
+	actualUsage := usage != nil && !common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens)
 	if usage == nil {
 		usage = &dto.Usage{PromptTokens: relayInfo.GetEstimatePromptTokens(), TotalTokens: relayInfo.GetEstimatePromptTokens()}
 	}
@@ -325,10 +394,11 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 			TextTokens:  textOutTokens,
 			AudioTokens: audioOutTokens,
 		},
-		ModelName:  billingModelName,
-		UsePrice:   usePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
+		ModelName:    billingModelName,
+		UsePrice:     usePrice,
+		ModelRatio:   modelRatio,
+		GroupRatio:   groupRatio,
+		QuotaPerUnit: common.QuotaPerUnit,
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -359,6 +429,15 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
+	snapshot := &relaycommon.OverviewBillingSnapshot{
+		InputTokens: int64(usage.PromptTokens), OutputTokens: int64(usage.CompletionTokens), UsageSource: "upstream",
+	}
+	if !actualUsage {
+		snapshot.UsageSource = "local_estimate"
+	} else if usage.UsageSource != "" {
+		snapshot.UsageSource = usage.UsageSource
+	}
+	captureAudioBillingSnapshot(relayInfo, quotaInfo, snapshot, tieredOk, tieredResult)
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	}

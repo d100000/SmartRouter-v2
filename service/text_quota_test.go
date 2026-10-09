@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +30,255 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
+
+func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
+	operation_setting.SetToolPriceForTest("overview_test_tool", 4)
+	t.Cleanup(func() { operation_setting.DeleteToolPriceForTest("overview_test_tool") })
+	for _, tc := range []struct {
+		name                     string
+		group                    float64
+		mode                     string
+		expression               string
+		local, missing, overflow bool
+		changedUnit              bool
+		base                     *float64
+		revenue                  int64
+	}{
+		{name: "free group preserves cache image tool and request multipliers", group: 0, base: common.GetPointer(2399.75)},
+		{name: "paid group preserves unrounded base", group: .8, base: common.GetPointer(2399.75), revenue: 1920},
+		{name: "locally estimated usage has unknown cost", group: .8, local: true, revenue: 1920},
+		{name: "missing usage has unknown cost", group: .8, missing: true, revenue: 1840},
+		{name: "free tiered group preserves actual base", group: 0, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0)},
+		{name: "historical tiered unit preserves monetary tool cost", group: 0, changedUnit: true, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0)},
+		{name: "mixed tiered and tool units preserve fee and mark income unknown", group: .8, changedUnit: true, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0), revenue: 3312},
+		{name: "tiered evaluation failure has unknown cost", group: .8, expression: `tier("base", param("missing") * p)`, revenue: 1723},
+		{name: "saturated charge has unknown cost", group: .8, overflow: true, revenue: int64(common.MaxQuota)},
+		{name: "audio free group preserves pre group cost", group: 0, mode: "audio", base: common.GetPointer(120.0)},
+		{name: "audio paid group preserves pre group cost", group: .8, mode: "audio", base: common.GetPointer(120.0), revenue: 96},
+		{name: "audio estimate has unknown cost", group: .8, mode: "audio", local: true, revenue: 96},
+		{name: "realtime total usage preserves pre group cost", group: .8, mode: "realtime", base: common.GetPointer(120.0), revenue: 96},
+		{name: "requested image count has unknown procurement cost", group: .8, mode: "image_estimate", revenue: 49600},
+		{name: "measured image count preserves procurement cost", group: .8, mode: "image_actual", base: common.GetPointer(62000.0), revenue: 49600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 831, 1_000_000)
+			channel := model.Channel{Name: "overview-billing-test", Key: "unused"}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			if tc.local {
+				common.SetContextKey(ctx, constant.ContextKeyLocalCountTokens, true)
+			}
+			info := &relaycommon.RelayInfo{UserId: 831, IsPlayground: true, UserQuota: 1_000_000_000_000, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, OriginModelName: "overview-test", StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAI,
+				PriceData: hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 2, CacheRatio: .1, CacheCreationRatio: 1.25, ImageRatio: 2, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: tc.group}}}
+			info.SetEstimatePromptTokens(100)
+			info.PriceData.AddOtherRatio("request", 3)
+			if tc.mode == "image_estimate" || tc.mode == "image_actual" {
+				info.Request = &dto.ImageRequest{N: common.GetPointer(uint(2))}
+				info.ImageRequestCount = 2
+				info.PriceData.UsePrice = true
+				info.PriceData.ModelPrice = .02
+				info.PriceData.AddOtherRatio("n", 2)
+				if tc.mode == "image_actual" {
+					info.BillingImageCount = common.GetPointer(2)
+				}
+			}
+			info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{"overview_test_tool": {CallCount: 1}}}
+			info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 831}}
+			usage := &dto.Usage{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 20, CachedCreationTokens: 5, ImageTokens: 10, TextTokens: 100}, CompletionTokenDetails: dto.OutputTokenDetails{TextTokens: 20}}
+			if tc.overflow {
+				usage.PromptTokens = 1_000_000_000
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
+			if tc.missing {
+				usage = nil
+			}
+			if tc.expression != "" {
+				info.FinalPreConsumedQuota = 123
+				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), QuotaPerUnit: common.QuotaPerUnit, GroupRatio: tc.group}
+			}
+			if tc.changedUnit {
+				unit := common.QuotaPerUnit
+				common.QuotaPerUnit = unit * 2
+				t.Cleanup(func() { common.QuotaPerUnit = unit })
+			}
+			switch tc.mode {
+			case "audio":
+				PostAudioConsumeQuota(ctx, info, usage, "")
+			case "realtime":
+				PostWssConsumeQuota(ctx, info, info.OriginModelName, &dto.RealtimeUsage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120, InputTokenDetails: dto.InputTokenDetails{TextTokens: 100}, OutputTokenDetails: dto.OutputTokenDetails{TextTokens: 20}}, "")
+			default:
+				PostTextConsumeQuota(ctx, info, usage, nil)
+			}
+			require.NotNil(t, info.AnalyticsBilling)
+			assert.Equal(t, !tc.changedUnit || tc.group == 0, info.AnalyticsBilling.RevenueConfirmed)
+			assert.Equal(t, tc.revenue, info.AnalyticsBilling.RevenueQuota)
+			unit := common.QuotaPerUnit
+			if info.TieredBillingSnapshot != nil {
+				unit = info.TieredBillingSnapshot.QuotaPerUnit
+			}
+			assert.Equal(t, unit, info.AnalyticsBilling.QuotaPerUnit)
+			if tc.base == nil {
+				assert.Nil(t, info.AnalyticsBilling.BaseQuota)
+			} else {
+				require.NotNil(t, info.AnalyticsBilling.BaseQuota)
+				assert.InDelta(t, *tc.base, *info.AnalyticsBilling.BaseQuota, 0.000001)
+			}
+			if tc.local || tc.missing {
+				assert.Equal(t, "local_estimate", info.AnalyticsBilling.UsageSource)
+			}
+		})
+	}
+}
+
+func TestOverviewRevenueConfirmationFollowsFundingCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		session   bool
+		failTable string
+		quota     int
+		confirmed bool
+	}{
+		{name: "session zero delta confirms revenue", session: true, quota: 50, confirmed: true},
+		{name: "session funding failure remains unconfirmed", session: true, failTable: "users", quota: 80},
+		{name: "session token failure retains confirmed revenue", session: true, failTable: "tokens", quota: 80, confirmed: true},
+		{name: "legacy funding failure remains unconfirmed", failTable: "users", quota: 80},
+		{name: "legacy token failure retains confirmed revenue", failTable: "tokens", quota: 80, confirmed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 832, 1000)
+			seedToken(t, 833, 832, "overview-revenue-test", 1000)
+			info := &relaycommon.RelayInfo{UserId: 832, TokenId: 833, TokenKey: "overview-revenue-test", FinalPreConsumedQuota: 50, UserQuota: 1_000_000, AnalyticsBilling: &relaycommon.OverviewBillingSnapshot{BaseQuota: common.GetPointer(100.0), QuotaPerUnit: 250_000}}
+			if tc.session {
+				info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 832}, preConsumedQuota: 50}
+			}
+			if tc.failTable != "" {
+				const callback = "overview_revenue_failure"
+				require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+					if tx.Statement.Table == tc.failTable {
+						tx.AddError(errors.New("overview test funding or token failure"))
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callback)) })
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			err := SettleBilling(ctx, info, tc.quota)
+			if tc.failTable != "" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.confirmed, info.AnalyticsBilling.RevenueConfirmed)
+			assert.Equal(t, 250_000.0, info.AnalyticsBilling.QuotaPerUnit)
+			if tc.confirmed {
+				assert.Equal(t, int64(tc.quota), info.AnalyticsBilling.RevenueQuota)
+			}
+			if tc.session && tc.confirmed {
+				*info.AnalyticsBilling.BaseQuota = 999
+				info.AnalyticsBilling = &relaycommon.OverviewBillingSnapshot{BaseQuota: common.GetPointer(999.0), QuotaPerUnit: 1}
+				require.NoError(t, SettleBilling(ctx, info, tc.quota+25))
+				assert.True(t, info.AnalyticsBilling.RevenueConfirmed)
+				assert.Equal(t, int64(tc.quota), info.AnalyticsBilling.RevenueQuota)
+				assert.Equal(t, 250_000.0, info.AnalyticsBilling.QuotaPerUnit)
+				require.NotNil(t, info.AnalyticsBilling.BaseQuota)
+				assert.Equal(t, 100.0, *info.AnalyticsBilling.BaseQuota)
+			}
+			var user model.User
+			require.NoError(t, model.DB.First(&user, 832).Error)
+			want := 1000
+			if tc.failTable == "tokens" {
+				want -= tc.quota - 50
+			}
+			assert.Equal(t, want, user.Quota)
+		})
+	}
+}
+
+func TestOverviewRealtimeRevenueMatchesCommittedContributions(t *testing.T) {
+	// Initialize production dialect quoting used by the token-key lookup.
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	modelRatios, err := common.Marshal(ratio_setting.GetModelRatioCopy())
+	require.NoError(t, err)
+	groupRatios, err := common.Marshal(ratio_setting.GetGroupRatioCopy())
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"overview-realtime":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(modelRatios)))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(groupRatios)))
+	})
+	for _, tc := range []struct {
+		name, directFailure, finalFailure string
+		directRevenue, revenue            int64
+		wallet, token                     int
+		confirmed                         bool
+		changeUnit                        bool
+	}{
+		{name: "two direct chunks and final settlement are each counted once", directRevenue: 30, revenue: 60, wallet: 940, token: 940, confirmed: true},
+		{name: "direct token failure retains funding contribution", directFailure: "tokens", directRevenue: 30, revenue: 60, wallet: 940, token: 950, confirmed: true},
+		{name: "direct funding failure contributes no revenue", directFailure: "users", directRevenue: 20, revenue: 50, wallet: 950, token: 950, confirmed: true},
+		{name: "final funding failure preserves partial committed income", finalFailure: "users", directRevenue: 30, revenue: 30, wallet: 970, token: 970},
+		{name: "final token failure retains complete funding income", finalFailure: "tokens", directRevenue: 30, revenue: 60, wallet: 940, token: 970, confirmed: true},
+		{name: "changing unit preserves actual debits without claiming complete revenue", directRevenue: 30, revenue: 60, wallet: 940, token: 940, changeUnit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 834, 1000)
+			seedToken(t, 835, 834, "overview-realtime-test", 1000)
+			channel := model.Channel{Name: "overview-realtime-test", Key: "unused"}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("GET", "/v1/realtime", nil)
+			info := &relaycommon.RelayInfo{UserId: 834, TokenId: 835, TokenKey: "overview-realtime-test", UserQuota: 1_000_000, UsingGroup: "default", UserGroup: "default", OriginModelName: "overview-realtime", StartTime: time.Now(), ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id},
+				PriceData: hosttypes.PriceData{ModelRatio: 1, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}}
+			info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 834}}
+			failTable := tc.directFailure
+			const callback = "overview_realtime_failure"
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+				if failTable != "" && tx.Statement.Table == failTable {
+					tx.AddError(errors.New("overview realtime funding or token failure"))
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callback)) })
+			err := PreWssConsumeQuota(ctx, info, &dto.RealtimeUsage{InputTokens: 10, TotalTokens: 10, InputTokenDetails: dto.InputTokenDetails{TextTokens: 10}})
+			if tc.directFailure != "" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			failTable = ""
+			if tc.changeUnit {
+				unit := common.QuotaPerUnit
+				common.QuotaPerUnit = unit * 2
+				t.Cleanup(func() { common.QuotaPerUnit = unit })
+			}
+			require.NoError(t, PreWssConsumeQuota(ctx, info, &dto.RealtimeUsage{InputTokens: 20, TotalTokens: 20, InputTokenDetails: dto.InputTokenDetails{TextTokens: 20}}))
+			assert.Equal(t, tc.directRevenue, info.AnalyticsRealtimeRevenueQuota)
+			require.NotNil(t, info.AnalyticsBilling)
+			assert.False(t, info.AnalyticsBilling.RevenueConfirmed)
+			assert.Nil(t, info.AnalyticsBilling.BaseQuota)
+			failTable = tc.finalFailure
+			PostWssConsumeQuota(ctx, info, info.OriginModelName, &dto.RealtimeUsage{InputTokens: 30, TotalTokens: 30, InputTokenDetails: dto.InputTokenDetails{TextTokens: 30}}, "")
+			assert.Equal(t, tc.revenue, info.AnalyticsBilling.RevenueQuota)
+			assert.Equal(t, tc.confirmed, info.AnalyticsBilling.RevenueConfirmed)
+			require.NotNil(t, info.AnalyticsBilling.BaseQuota)
+			assert.Equal(t, 30.0, *info.AnalyticsBilling.BaseQuota)
+			if tc.finalFailure == "" {
+				require.NoError(t, SettleBilling(ctx, info, 30))
+				assert.Equal(t, tc.revenue, info.AnalyticsBilling.RevenueQuota)
+			}
+			var user model.User
+			var token model.Token
+			require.NoError(t, model.DB.First(&user, 834).Error)
+			require.NoError(t, model.DB.First(&token, 835).Error)
+			assert.Equal(t, tc.wallet, user.Quota)
+			assert.Equal(t, tc.token, token.RemainQuota)
+		})
+	}
+}
 
 // The configured DSNs must point at isolated test databases. Each dialect runs
 // the real reservation, settlement and log paths with the same billing cases.

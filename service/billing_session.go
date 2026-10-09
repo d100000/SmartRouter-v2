@@ -36,6 +36,8 @@ type BillingSession struct {
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
 	refunded         bool // Refund 已调用
+	confirmedQuota   int
+	settledBilling   *relaycommon.OverviewBillingSnapshot
 	mu               sync.Mutex
 }
 
@@ -46,10 +48,21 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
+		if actualQuota != s.confirmedQuota {
+			common.SysError(fmt.Sprintf("ignored settled billing replay with different quota: actual=%d confirmed=%d", actualQuota, s.confirmedQuota))
+		}
+		if s.relayInfo != nil && s.settledBilling != nil {
+			snapshot := *s.settledBilling
+			if snapshot.BaseQuota != nil {
+				snapshot.BaseQuota = common.GetPointer(*snapshot.BaseQuota)
+			}
+			s.relayInfo.AnalyticsBilling = &snapshot
+		}
 		return nil
 	}
 	delta := actualQuota - s.preConsumedQuota
 	if delta == 0 {
+		s.confirmOverviewSettlement(actualQuota)
 		s.settled = true
 		return nil
 	}
@@ -60,6 +73,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		}
 		s.fundingSettled = true
 	}
+	s.confirmOverviewSettlement(actualQuota)
 	// 2) 调整令牌额度
 	var tokenErr error
 	if !s.relayInfo.IsPlayground {
@@ -80,6 +94,19 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	}
 	s.settled = true
 	return tokenErr
+}
+
+func (s *BillingSession) confirmOverviewSettlement(actualQuota int) {
+	s.confirmedQuota = actualQuota
+	confirmOverviewRevenue(s.relayInfo, actualQuota)
+	if s.relayInfo == nil || s.relayInfo.AnalyticsBilling == nil {
+		return
+	}
+	snapshot := *s.relayInfo.AnalyticsBilling
+	if snapshot.BaseQuota != nil {
+		snapshot.BaseQuota = common.GetPointer(*snapshot.BaseQuota)
+	}
+	s.settledBilling = &snapshot
 }
 
 // Refund 退还所有预扣费，幂等安全，异步执行。

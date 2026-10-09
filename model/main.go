@@ -341,6 +341,14 @@ func migrateDB() error {
 
 	err := DB.AutoMigrate(
 		&Channel{},
+		&UpstreamSupplier{},
+		&UpstreamCredential{},
+		&UpstreamCredentialVersion{},
+		&ChannelCredentialBinding{},
+		&UpstreamCredentialFingerprintSecret{},
+		&OverviewAttemptEvent{},
+		&OverviewDaily{},
+		&OverviewCollectionState{},
 		&Token{},
 		&User{},
 		&UserSession{},
@@ -378,6 +386,12 @@ func migrateDB() error {
 		&UserAccessToken{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := InitializeOverviewCollection(DB); err != nil {
+		return err
+	}
+	if err := BackfillUpstreamCredentials(); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

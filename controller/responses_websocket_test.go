@@ -390,6 +390,7 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		"perf_metrics_setting.enabled":    "true",
 	}))
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(model.DB))
 	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 100000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
 	require.NoError(t, model.DB.Model(token).Update("remain_quota", 3000).Error)

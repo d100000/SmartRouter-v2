@@ -400,6 +400,7 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		}
 		dialer.Proxy = http.ProxyURL(proxyURL)
 	}
+	service.MarkOverviewUpstreamSent(info)
 	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
 	if err != nil {
 		statusCode := http.StatusInternalServerError
@@ -467,6 +468,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// client cancellation/deadline, which remains active while reading the body.
 	req = req.WithContext(c.Request.Context())
 
+	service.MarkOverviewUpstreamSent(info)
 	resp, err := relayClient.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())

@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Skeleton } from '@/components/ui/skeleton'
@@ -31,6 +31,7 @@ interface PanelWrapperProps {
   height?: string
   className?: string
   contentClassName?: string
+  headerClassName?: string
   headerActions?: ReactNode
   children?: ReactNode
 }
@@ -39,6 +40,7 @@ function PanelHeader(props: {
   title: ReactNode
   description?: ReactNode
   actions?: ReactNode
+  className?: string
 }) {
   const heading = (
     <div className='flex flex-col gap-1'>
@@ -50,7 +52,7 @@ function PanelHeader(props: {
   )
 
   return (
-    <div className='border-b px-4 py-3 sm:px-5'>
+    <div className={cn('border-b px-4 py-3 sm:px-5', props.className)}>
       {props.actions != null ? (
         <div className='flex items-start justify-between gap-2'>
           {heading}
@@ -75,7 +77,11 @@ export function PanelWrapper(props: PanelWrapperProps) {
   if (props.loading) {
     return (
       <div className={frameClassName}>
-        <PanelHeader title={props.title} description={props.description} />
+        <PanelHeader
+          title={props.title}
+          description={props.description}
+          className={props.headerClassName}
+        />
         <div className={cn('p-4 sm:p-5', props.contentClassName)}>
           <Skeleton className={`w-full ${height}`} />
         </div>
@@ -86,7 +92,11 @@ export function PanelWrapper(props: PanelWrapperProps) {
   if (props.empty) {
     return (
       <div className={frameClassName}>
-        <PanelHeader title={props.title} description={props.description} />
+        <PanelHeader
+          title={props.title}
+          description={props.description}
+          className={props.headerClassName}
+        />
         <div
           className={cn(
             'text-muted-foreground flex items-center justify-center px-4 text-sm',
@@ -106,6 +116,7 @@ export function PanelWrapper(props: PanelWrapperProps) {
         title={props.title}
         description={props.description}
         actions={props.headerActions}
+        className={props.headerClassName}
       />
       <div className={cn('p-4 sm:p-5', props.contentClassName)}>
         {props.children}

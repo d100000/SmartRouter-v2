@@ -229,7 +229,7 @@ func GetAllChannels(c *gin.Context) {
 			}
 			var tagChannels []*model.Channel
 			err := sortOptions.Apply(buildChannelListQuery(groupFilter, statusFilter, typeFilter).Where("tag = ?", *tag)).
-				Omit("key").
+				Omit("key", "upstream_credential_snapshot_data").
 				Find(&tagChannels).Error
 			if err != nil {
 				common.SysError("failed to get channels by tag: " + err.Error())
@@ -248,7 +248,7 @@ func GetAllChannels(c *gin.Context) {
 		err := sortOptions.Apply(buildChannelListQuery(groupFilter, statusFilter, typeFilter)).
 			Limit(pageInfo.GetPageSize()).
 			Offset(pageInfo.GetStartIdx()).
-			Omit("key").
+			Omit("key", "upstream_credential_snapshot_data").
 			Find(&channelData).Error
 		if err != nil {
 			common.SysError("failed to get channels: " + err.Error())
@@ -387,7 +387,7 @@ func SearchChannels(c *gin.Context) {
 			if tag != nil && *tag != "" {
 				var tagChannels []*model.Channel
 				err := sortOptions.Apply(buildChannelListQuery(group, -1, -1).Where("tag = ?", *tag)).
-					Omit("key").
+					Omit("key", "upstream_credential_snapshot_data").
 					Find(&tagChannels).Error
 				if err != nil {
 					c.JSON(http.StatusOK, gin.H{
@@ -546,6 +546,9 @@ const maxTaskExtendPluginKeys = 32
 func validateChannel(channel *model.Channel, isAdd bool) error {
 	if channel == nil {
 		return fmt.Errorf("channel cannot be empty")
+	}
+	if err := model.ValidateUpstreamCostRatio(channel.CostRatio); err != nil {
+		return err
 	}
 
 	// 校验 channel settings
@@ -1136,6 +1139,7 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	clearChannelReadOnlyFields(&channel, requestData)
+	_, channel.CostRatioSet = requestData["cost_ratio"]
 
 	if channel.Type == constant.ChannelTypeTaskPlugin &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
@@ -1188,6 +1192,7 @@ func UpdateChannel(c *gin.Context) {
 
 	// Always copy the original ChannelInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ChannelInfo = originChannel.ChannelInfo
+	channel.ExpectKeyState(originChannel)
 
 	if channelHasSensitiveChanges(&channel, originChannel, requestData) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
@@ -1306,10 +1311,19 @@ func UpdateChannel(c *gin.Context) {
 	if channel.Key != "" && channel.Key != originChannel.Key {
 		changedFields = append(changedFields, "key")
 	}
+	if channel.CostRuleChange != nil {
+		changedFields = append(changedFields, "cost_ratio")
+	}
 	updateAudit := map[string]any{
 		"id":             channel.Id,
 		"name":           channel.Name,
 		"changed_fields": changedFields,
+	}
+	if change := channel.CostRuleChange; change != nil {
+		updateAudit["cost_ratio_from"] = change.BeforeRatio
+		updateAudit["cost_ratio"] = change.AfterRatio
+		updateAudit["previous_cost_version_id"] = change.BeforeVersionID
+		updateAudit["cost_version_id"] = change.AfterVersionID
 	}
 	if baseURLFromPluginDefault {
 		updateAudit["base_url_source"] = "plugin_default"
@@ -1747,9 +1761,9 @@ func ManageMultiKeys(c *gin.Context) {
 		})
 	}
 
-	lock := model.GetChannelPollingLock(channel.Id)
-	lock.Lock()
-	defer lock.Unlock()
+	// The model owns the polling lock and checks this expected availability
+	// snapshot inside its database transaction before applying an edit.
+	channel.ExpectKeyState(channel)
 
 	switch request.Action {
 	case "get_key_status":

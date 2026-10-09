@@ -81,17 +81,68 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+// OverviewBillingSnapshot is reporting data, independent of the user charge.
+// A nil base means procurement cost cannot be established from actual usage.
+type OverviewBillingSnapshot struct {
+	BaseQuota            *float64
+	QuotaPerUnit         float64
+	RevenueQuota         int64
+	RevenueConfirmed     bool
+	RevenueUnitAmbiguous bool
+	InputTokens          int64
+	OutputTokens         int64
+	UsageSource          string
+}
+
+// OverviewAttempt contains only non-secret frozen procurement metadata.
+type OverviewAttempt struct {
+	EventID                 string
+	RequestID               string
+	BillingSource           string
+	StartedAt               time.Time
+	DispatchedAt            time.Time
+	ChannelID               int
+	ChannelName             string
+	GroupName               string
+	ModelName               string
+	CredentialID            string
+	CredentialName          string
+	CredentialVersionID     string
+	BindingID               string
+	SupplierID              string
+	SupplierName            string
+	OwnershipVersionID      string
+	CostVersionID           string
+	CredentialCostVersionID string
+	ChannelCostVersionID    string
+	Tags                    []string
+	CostSource              string
+	CostRatio               *float64
+	QuotaPerUnit            float64
+	Sent                    bool
+	Finished                bool
+	Success                 bool
+	Failure                 bool
+	LatencyMS               int64
+	Billing                 *OverviewBillingSnapshot
+}
+
 type RelayInfo struct {
-	TokenId           int
-	TokenKey          string
-	TokenGroup        string
-	UserId            int
-	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
-	UserGroup         string // 用户所在分组
-	TokenUnlimited    bool
-	StartTime         time.Time
-	FirstResponseTime time.Time
-	isFirstResponse   bool
+	AnalyticsBilling              *OverviewBillingSnapshot
+	AnalyticsRealtimeRevenueQuota int64
+	AnalyticsRevenueUnitAmbiguous bool
+	OverviewAttempts              []*OverviewAttempt
+	OverviewAttempt               *OverviewAttempt
+	TokenId                       int
+	TokenKey                      string
+	TokenGroup                    string
+	UserId                        int
+	UsingGroup                    string // 使用的分组，当auto跨分组重试时，会变动
+	UserGroup                     string // 用户所在分组
+	TokenUnlimited                bool
+	StartTime                     time.Time
+	FirstResponseTime             time.Time
+	isFirstResponse               bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool

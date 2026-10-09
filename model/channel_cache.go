@@ -284,8 +284,8 @@ func CacheGetChannelForRouting(id int) (*Channel, error) {
 
 func CacheGetChannelInfo(id int) (*ChannelInfo, error) {
 	if !common.MemoryCacheEnabled {
-		channel, err := GetChannelById(id, true)
-		if err != nil {
+		var channel Channel
+		if err := DB.Select("id", "channel_info").First(&channel, "id = ?", id).Error; err != nil {
 			return nil, err
 		}
 		return &channel.ChannelInfo, nil

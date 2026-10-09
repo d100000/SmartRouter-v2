@@ -19,6 +19,18 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  // Channel procurement forms and server analytics warnings.
+  'Enter a cost ratio between 0 and 100, or leave empty.',
+  'Name must be 100 characters or fewer.',
+  'Use up to 20 tags, with no more than 40 characters each.',
+  'Unfinished attempts are excluded; collection may be incomplete',
+  'Distribution is limited to the top 900 daily cohorts',
+  'Object options are limited to 100; use a specific object ID for additional objects',
+  'Some costs are unknown; margin includes only requests with every attempt cost known',
+  'A collection write failed on this node; totals may be incomplete',
+  'UTC daily buckets; asynchronous tasks and unsupported transports are not included',
+  'Amounts are billed quota equivalents; subscription usage is not cash revenue',
+  'Some requests have unconfirmed funding or refunds and are excluded from margin',
   'Task usage metadata is unavailable. Pricing details cannot be displayed.',
   'This expression cannot be expanded into a price table. View the original expression below.',
   'This operation is only supported for vLLM or SGLang channels',
@@ -896,4 +908,5 @@ export const STATIC_I18N_KEYS = [
   'Verification method',
   'Admin permissions updated',
   'Provider ID',
+  'Usage revenue excludes violation fees and cash receipts',
 ] as const

@@ -40,6 +40,12 @@ func joinPaths(absolutePath, relativePath string) string {
 func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 	channelRoute := apiRouter.Group("/channel")
 	channelRoute.Use(middleware.AdminAuth())
+	overviewRoute := apiRouter.Group("")
+	overviewRoute.Use(middleware.AdminAuth(), middleware.DisableCache())
+	handlePermissionRoute(overviewRoute, http.MethodGet, "/channel-overview", authz.ChannelRead, controller.GetChannelOverview)
+	handlePermissionRoute(overviewRoute, http.MethodGet, "/upstream-supplier", authz.ChannelRead, controller.GetUpstreamSuppliers)
+	handlePermissionRoute(overviewRoute, http.MethodPost, "/upstream-supplier", authz.ChannelWrite, controller.AddUpstreamSupplier)
+	handlePermissionRoute(overviewRoute, http.MethodPut, "/upstream-credential/:id", authz.ChannelWrite, controller.UpdateUpstreamCredential)
 
 	channelRoute.POST("/:id/key",
 		middleware.RootAuth(),
@@ -55,6 +61,7 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 }
 
 var channelPermissionRoutes = []permissionRoute{
+	{method: http.MethodGet, path: "/:id/upstream-credentials", permission: authz.ChannelRead, handler: controller.GetChannelUpstreamCredentials},
 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
 	{method: http.MethodGet, path: "/recent_stats", permission: authz.ChannelRead, handler: controller.GetChannelRecentStats},

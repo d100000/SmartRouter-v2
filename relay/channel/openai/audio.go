@@ -29,6 +29,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	usage := &dto.Usage{}
 	usage.PromptTokens = info.GetEstimatePromptTokens()
 	usage.TotalTokens = info.GetEstimatePromptTokens()
+	actualUsage := false
 	for k, v := range resp.Header {
 		if !service.ShouldCopyUpstreamHeader(c, k, v) {
 			continue
@@ -48,6 +49,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 					usage.PromptTokens = simpleResponse.Usage.InputTokens
 					usage.CompletionTokens = simpleResponse.OutputTokens
 					usage.TotalTokens = simpleResponse.TotalTokens
+					actualUsage = usage.PromptTokens+usage.CompletionTokens == usage.TotalTokens
 				}
 			}
 			if err := helper.StringData(c, data); err != nil {
@@ -111,6 +113,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
+	if !actualUsage {
+		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+	}
 
 	return usage
 }
@@ -142,6 +147,7 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	}
 
 	usage := &dto.Usage{}
+	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	usage.PromptTokens = info.GetEstimatePromptTokens()
 	usage.CompletionTokens = 0
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens

@@ -31,6 +31,7 @@ func setupTaskPluginControllerTest(t *testing.T) {
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, database.AutoMigrate(&model.TaskPlugin{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.Option{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(database))
 	model.DB = database
 	t.Cleanup(func() { model.DB = originalDB })
 }

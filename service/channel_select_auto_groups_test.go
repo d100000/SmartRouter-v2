@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -41,6 +42,7 @@ func setupChannelSelectAutoGroupsTest(t *testing.T) *gorm.DB {
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(db))
 	model.DB = db
 	common.MemoryCacheEnabled = true
 	common.RetryTimes = 0
@@ -262,12 +264,15 @@ func TestSchedulingCompleteResponseSurvivesClientClosingAfterRead(t *testing.T) 
 	channel, err := model.CacheGetChannelForRouting(3301)
 	require.NoError(t, err)
 	require.NoError(t, ReserveSchedulingChannel(c, channel, "default", modelName))
-	info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: modelName}
+	info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: modelName, OverviewAttempt: &relaycommon.OverviewAttempt{Sent: true, DispatchedAt: time.Now()}}
 	StartSchedulingAttempt(c, info)
 	_, err = c.Writer.WriteString(`{"choices":[{"message":{"content":"complete"}}]}`)
 	require.NoError(t, err)
 	cancel()
 	FinishSchedulingAttempt(c, info, nil)
+	FinishOverviewAttempt(c, info, nil)
+	assert.True(t, info.OverviewAttempt.Success, "daily health must preserve a complete response after the caller closes")
+	assert.False(t, info.OverviewAttempt.Failure)
 	snapshot := scheduler.Default.Snapshot(scheduler.Key{Group: "default", Model: modelName}, []scheduler.Candidate{SchedulerCandidate(channel)}, false)
 	assert.Equal(t, int64(1), snapshot.Summary.Successes30m)
 	assert.Equal(t, int64(1), snapshot.Summary.Requests30m)

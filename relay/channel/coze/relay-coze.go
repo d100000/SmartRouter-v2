@@ -283,6 +283,7 @@ func doRequest(req *http.Request, info *relaycommon.RelayInfo) (*http.Response, 
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
 	}
+	service.MarkOverviewUpstreamSent(info)
 	resp, err := client.Do(req)
 	if err != nil { // 增加对 client.Do(req) 返回错误的检查
 		return nil, fmt.Errorf("client.Do failed: %w", err)

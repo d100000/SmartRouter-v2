@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -14,6 +15,27 @@ const (
 	BillingSourceWallet       = "wallet"
 	BillingSourceSubscription = "subscription"
 )
+
+func confirmOverviewRevenue(info *relaycommon.RelayInfo, actualQuota int) {
+	if info == nil || actualQuota < 0 {
+		return
+	}
+	if info.AnalyticsBilling == nil {
+		info.AnalyticsBilling = &relaycommon.OverviewBillingSnapshot{}
+	}
+	if info.AnalyticsBilling.QuotaPerUnit <= 0 {
+		info.AnalyticsBilling.QuotaPerUnit = common.QuotaPerUnit
+		if snap := info.TieredBillingSnapshot; snap != nil && snap.BillingMode == "tiered_expr" {
+			info.AnalyticsBilling.QuotaPerUnit = snap.QuotaPerUnit
+		}
+	}
+	// Realtime chunks are already debited independently of final settlement.
+	// Assign the full contribution instead of adding, because both the session
+	// and its caller can confirm the same settlement.
+	info.AnalyticsBilling.RevenueQuota = int64(actualQuota) + info.AnalyticsRealtimeRevenueQuota
+	info.AnalyticsBilling.RevenueConfirmed = !info.AnalyticsRevenueUnitAmbiguous
+	info.AnalyticsBilling.RevenueUnitAmbiguous = info.AnalyticsRevenueUnitAmbiguous
+}
 
 // PreConsumeBilling 根据用户计费偏好创建 BillingSession 并执行预扣费。
 // 会话存储在 relayInfo.Billing 上，供后续 Settle / Refund 使用。
@@ -74,6 +96,9 @@ func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuo
 		if err := relayInfo.Billing.Settle(actualQuota); err != nil {
 			return err
 		}
+		if _, concreteSession := relayInfo.Billing.(*BillingSession); !concreteSession {
+			confirmOverviewRevenue(relayInfo, actualQuota)
+		}
 
 		// 发送额度通知（订阅计费使用订阅剩余额度）
 		if actualQuota != 0 {
@@ -89,7 +114,12 @@ func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuo
 	// 回退：无 BillingSession 时使用旧路径
 	quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
 	if quotaDelta != 0 {
-		return PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+		result, err := postConsumeQuotaWithResult(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+		if result.FundingApplied {
+			confirmOverviewRevenue(relayInfo, actualQuota)
+		}
+		return err
 	}
+	confirmOverviewRevenue(relayInfo, actualQuota)
 	return nil
 }

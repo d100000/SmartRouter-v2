@@ -26,6 +26,7 @@ import {
   parseSidebarModulesAdmin,
   serializeSidebarModulesAdmin,
 } from '@/features/system-settings/maintenance/config'
+import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { useSidebarConfig } from '../use-sidebar-config'
@@ -118,6 +119,35 @@ describe('security sidebar visibility', () => {
         .some((item) => item.title === 'Security & Access')
     ).toBe(true)
   })
+})
+
+describe('channel overview sidebar entry', () => {
+  it('follows Channels and shares its module visibility settings', () => {
+    const { result } = sidebarFor()
+    const items =
+      result.current.find((group) => group.id === 'admin')?.items ?? []
+    const channelIndex = items.findIndex((item) => item.title === 'Channels')
+    expect(items[channelIndex + 1]).toMatchObject({
+      title: 'Channel Overview',
+      url: '/channel-overview',
+      requiredRole: ROLE.ADMIN,
+    })
+  })
+
+  it.each([
+    [{ admin: { enabled: true, channel: false } }, undefined],
+    [undefined, { admin: { enabled: true, channel: false } }],
+  ])(
+    'hides both channel entries under the shared module setting (%j, %j)',
+    (admin, user) => {
+      const { result } = sidebarFor(admin, user)
+      const titles = result.current
+        .flatMap((group) => group.items)
+        .map((item) => item.title)
+      expect(titles).not.toContain('Channels')
+      expect(titles).not.toContain('Channel Overview')
+    }
+  )
 })
 
 describe('audit log sidebar entry', () => {

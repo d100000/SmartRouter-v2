@@ -131,7 +131,11 @@ func fetchCodexChannelWhamData(
 
 			encoded, encErr := common.Marshal(oauthKey)
 			if encErr == nil {
-				_ = model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
+				if err := model.RotateChannelUpstreamCredential(ch.Id, ch.Key, string(encoded)); err != nil {
+					common.SysError(logPrefix + ": credential update failed")
+					c.JSON(http.StatusOK, gin.H{"success": false, "message": userMessage})
+					return
+				}
 				model.InitChannelCache()
 			}
 

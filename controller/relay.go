@@ -136,6 +136,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			resultErr = types.NewError(fmt.Errorf("relay panic: %v", recovered), types.ErrorCodeBadResponse)
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, resultErr)
+		service.FinishOverviewAttempt(c, relayInfo, resultErr)
+		service.CompleteOverviewRelay(relayInfo)
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
 		}
@@ -190,6 +192,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 		service.StartSchedulingAttempt(c, relayInfo)
+		service.PrepareOverviewAttempt(c, relayInfo, channel)
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -202,6 +205,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = relayHandler(c, relayInfo)
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, newAPIError)
+		service.FinishOverviewAttempt(c, relayInfo, newAPIError)
 
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)

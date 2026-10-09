@@ -32,6 +32,7 @@ func setupTaskPluginBindChannelTest(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.CasbinRule{}, &model.AuthzRole{}, &model.Log{}, &model.AuditLog{}, &model.User{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(database))
 	model.DB = database
 	model.LOG_DB = database
 	require.NoError(t, authz.Init(database))

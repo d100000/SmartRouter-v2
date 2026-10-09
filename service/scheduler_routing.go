@@ -42,6 +42,7 @@ type schedulingRequest struct {
 	writtenOutcome            relaycommon.ResponseOutcome
 	output                    bool
 	writeFailedBeforeTerminal bool
+	lastOutcome               perfmetrics.Outcome
 }
 
 func schedulingState(c *gin.Context) *schedulingRequest {
@@ -220,6 +221,7 @@ func StartSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo) {
 	state.coldPriorities[state.currentRequest.Key] = state.attempt.Candidate.Priority
 	scheduler.Default.TouchRequest(state.currentRequest)
 	state.stream = info.IsStream
+	state.lastOutcome = ""
 	scheduler.Default.StartAttempt(state.attempt, info.IsStream)
 	state.started = true
 }
@@ -259,6 +261,7 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 				}
 			}
 		}
+		state.lastOutcome = classification
 		outcome.Success = classification == perfmetrics.OutcomeSuccess
 		outcome.ChannelFailure = classification == perfmetrics.OutcomeFailure
 		if outcome.ChannelFailure && c.Request.Context().Err() == nil && apiErr != nil {

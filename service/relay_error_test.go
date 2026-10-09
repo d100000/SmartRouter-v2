@@ -117,6 +117,7 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(database))
 	model.DB = database
 	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 	common.MemoryCacheEnabled, common.RedisEnabled = false, false

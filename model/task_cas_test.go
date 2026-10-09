@@ -48,6 +48,11 @@ func TestMain(m *testing.M) {
 		&TwoFABackupCode{},
 		&Log{},
 		&Channel{},
+		&UpstreamSupplier{},
+		&UpstreamCredential{},
+		&UpstreamCredentialVersion{},
+		&ChannelCredentialBinding{},
+		&UpstreamCredentialFingerprintSecret{},
 		&QuotaData{},
 		&Ability{},
 		&TopUp{},
@@ -83,6 +88,10 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM users")
 		DB.Exec("DELETE FROM logs")
 		DB.Exec("DELETE FROM channels")
+		DB.Exec("DELETE FROM channel_credential_bindings")
+		DB.Exec("DELETE FROM upstream_credential_versions")
+		DB.Exec("DELETE FROM upstream_credentials")
+		DB.Exec("DELETE FROM upstream_suppliers")
 		DB.Exec("DELETE FROM quota_data")
 		DB.Exec("DELETE FROM abilities")
 		DB.Exec("DELETE FROM top_ups")

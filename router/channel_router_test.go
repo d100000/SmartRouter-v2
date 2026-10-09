@@ -20,11 +20,17 @@ func TestChannelReadEndpointsRequireReadPermission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	registerChannelRoutes(engine.Group("/api"))
-	for _, path := range []string{"/api/channel/default_base_urls", "/api/channel/recent_stats"} {
+	for _, path := range []string{"/api/channel/default_base_urls", "/api/channel/recent_stats", "/api/channel-overview", "/api/upstream-supplier", "/api/channel/1/upstream-credentials"} {
 		recorder := httptest.NewRecorder()
 		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
 	}
+	for _, request := range []struct{ method, path string }{{http.MethodPost, "/api/upstream-supplier"}, {http.MethodPut, "/api/upstream-credential/credential-id"}} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(request.method, request.path, nil))
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	}
+	assertChannelRoutePermission(t, http.MethodGet, "/:id/upstream-credentials", authz.ChannelRead, controller.GetChannelUpstreamCredentials)
 }
 
 func TestChannelStatusRoutesUseExpectedPermissions(t *testing.T) {

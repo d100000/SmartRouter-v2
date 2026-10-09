@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -15,31 +18,35 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 
+	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Channel struct {
-	Id                 int     `json:"id"`
-	Type               int     `json:"type" gorm:"default:0"`
-	Key                string  `json:"key" gorm:"not null"`
-	OpenAIOrganization *string `json:"openai_organization"`
-	TestModel          *string `json:"test_model"`
-	Status             int     `json:"status" gorm:"default:1"`
-	Name               string  `json:"name" gorm:"index"`
-	Weight             *uint   `json:"weight" gorm:"default:0"`
-	CreatedTime        int64   `json:"created_time" gorm:"bigint"`
-	TestTime           int64   `json:"test_time" gorm:"bigint"`
-	ResponseTime       int     `json:"response_time"` // in milliseconds
-	BaseURL            *string `json:"base_url" gorm:"column:base_url;default:''"`
-	Other              string  `json:"other"`
-	Balance            float64 `json:"balance"` // in USD
-	BalanceUpdatedTime int64   `json:"balance_updated_time" gorm:"bigint"`
-	Models             string  `json:"models"`
-	Group              string  `json:"group" gorm:"type:varchar(64);default:'default'"`
-	UsedQuota          int64   `json:"used_quota" gorm:"bigint;default:0"`
-	ModelMapping       *string `json:"model_mapping" gorm:"type:text"`
+	Id                 int      `json:"id"`
+	Type               int      `json:"type" gorm:"default:0"`
+	Key                string   `json:"key" gorm:"not null"`
+	OpenAIOrganization *string  `json:"openai_organization"`
+	TestModel          *string  `json:"test_model"`
+	Status             int      `json:"status" gorm:"default:1"`
+	Name               string   `json:"name" gorm:"index"`
+	Weight             *uint    `json:"weight" gorm:"default:0"`
+	CreatedTime        int64    `json:"created_time" gorm:"bigint"`
+	TestTime           int64    `json:"test_time" gorm:"bigint"`
+	ResponseTime       int      `json:"response_time"` // in milliseconds
+	BaseURL            *string  `json:"base_url" gorm:"column:base_url;default:''"`
+	Other              string   `json:"other"`
+	Balance            float64  `json:"balance"` // in USD
+	BalanceUpdatedTime int64    `json:"balance_updated_time" gorm:"bigint"`
+	Models             string   `json:"models"`
+	Group              string   `json:"group" gorm:"type:varchar(64);default:'default'"`
+	UsedQuota          int64    `json:"used_quota" gorm:"bigint;default:0"`
+	CostRatio          *float64 `json:"cost_ratio"`
+	CostVersionID      string   `json:"cost_version_id" gorm:"type:varchar(36)"`
+	ModelMapping       *string  `json:"model_mapping" gorm:"type:text"`
 	//MaxInputTokens     *int    `json:"max_input_tokens" gorm:"default:0"`
 	StatusCodeMapping *string `json:"status_code_mapping" gorm:"type:varchar(1024);default:''"`
 	Priority          *int64  `json:"priority" gorm:"bigint;default:0"`
@@ -56,7 +63,39 @@ type Channel struct {
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
 	// cache info
-	Keys []string `json:"-" gorm:"-"`
+	Keys                           []string               `json:"-" gorm:"-"`
+	CostRatioSet                   bool                   `json:"-" gorm:"-"`
+	CostRuleChange                 *ChannelCostRuleChange `json:"-" gorm:"-"`
+	UpstreamCredentialSnapshotData string                 `json:"-" gorm:"type:text"`
+	keyStateExpected               *channelKeyState
+	upstreamCredentialSnapshots    map[int]UpstreamCredentialSnapshot `json:"-" gorm:"-"`
+	upstreamCredentialMirror       string                             `json:"-" gorm:"-"`
+}
+
+// CostRuleChange freezes the committed rule transition for safe administrative
+// auditing. It is request-local metadata and never enters the channel schema.
+type ChannelCostRuleChange struct {
+	BeforeRatio     *float64
+	AfterRatio      *float64
+	BeforeVersionID string
+	AfterVersionID  string
+}
+
+type channelKeyState struct {
+	key         string
+	status      int
+	otherInfo   string
+	channelInfo ChannelInfo
+}
+
+// ExpectKeyState protects an administrator's edit from overwriting a newer
+// credential list or availability decision. Polling cursor changes are allowed.
+func (channel *Channel) ExpectKeyState(current *Channel) {
+	info := current.ChannelInfo
+	info.MultiKeyStatusList = maps.Clone(info.MultiKeyStatusList)
+	info.MultiKeyDisabledReason = maps.Clone(info.MultiKeyDisabledReason)
+	info.MultiKeyDisabledTime = maps.Clone(info.MultiKeyDisabledTime)
+	channel.keyStateExpected = &channelKeyState{key: current.Key, status: current.Status, otherInfo: current.OtherInfo, channelInfo: info}
 }
 
 const ChannelStatusReasonAllKeysDisabled = "All keys are disabled"
@@ -290,7 +329,19 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 }
 
 func (channel *Channel) SaveChannelInfo() error {
-	return DB.Model(channel).Update("channel_info", channel.ChannelInfo).Error
+	// Polling owns only the cursor. A request can hold an older channel snapshot
+	// after another instance has edited keys or disabled one of them.
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := lockForUpdate(tx).Select("id", "key", "channel_info").First(&current, channel.Id).Error; err != nil {
+			return err
+		}
+		if current.Key != channel.Key || !current.ChannelInfo.IsMultiKey || current.ChannelInfo.MultiKeyMode != channel.ChannelInfo.MultiKeyMode {
+			return nil
+		}
+		current.ChannelInfo.MultiKeyPollingIndex = channel.ChannelInfo.MultiKeyPollingIndex
+		return tx.Model(&Channel{}).Where("id = ?", channel.Id).Update("channel_info", current.ChannelInfo).Error
+	})
 }
 
 func (channel *Channel) GetModels() []string {
@@ -323,7 +374,7 @@ func (channel *Channel) GetOtherInfo() map[string]any {
 }
 
 func (channel *Channel) SetOtherInfo(otherInfo map[string]any) {
-	otherInfoBytes, err := json.Marshal(otherInfo)
+	otherInfoBytes, err := common.Marshal(otherInfo)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("failed to marshal other info: channel_id=%d, tag=%s, name=%s, error=%v", channel.Id, channel.GetTag(), channel.Name, err))
 		return
@@ -356,7 +407,7 @@ func (channel *Channel) Save() error {
 // saveStatusState persists only the fields owned by the channel status flow.
 // Keeping this allowlist here prevents a stale channel snapshot from
 // overwriting credentials, accounting counters, or channel configuration.
-func (channel *Channel) saveStatusState() error {
+func (channel *Channel) saveStatusState(transactions ...*gorm.DB) error {
 	if channel.Id == 0 {
 		return errors.New("channel ID is 0")
 	}
@@ -367,7 +418,11 @@ func (channel *Channel) saveStatusState() error {
 	if channel.ChannelInfo.IsMultiKey {
 		updates["channel_info"] = channel.ChannelInfo
 	}
-	return DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	db := DB
+	if len(transactions) > 0 && transactions[0] != nil {
+		db = transactions[0]
+	}
+	return db.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
 }
 
 func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
@@ -377,7 +432,7 @@ func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOpti
 	if selectAll {
 		err = order.Apply(DB).Find(&channels).Error
 	} else {
-		err = order.Apply(DB).Limit(num).Offset(startIdx).Omit("key").Find(&channels).Error
+		err = order.Apply(DB).Limit(num).Offset(startIdx).Omit("key", "upstream_credential_snapshot_data").Find(&channels).Error
 	}
 	return channels, err
 }
@@ -387,7 +442,7 @@ func GetChannelsByTag(tag string, idSort bool, selectAll bool, sortOptions ...Ch
 	order := resolveChannelSortOptions(idSort, sortOptions)
 	query := order.Apply(DB.Where("tag = ?", tag))
 	if !selectAll {
-		query = query.Omit("key")
+		query = query.Omit("key", "upstream_credential_snapshot_data")
 	}
 	err := query.Find(&channels).Error
 	return channels, err
@@ -411,7 +466,7 @@ func SearchChannels(keyword string, group string, model string, idSort bool, sor
 	order := resolveChannelSortOptions(idSort, sortOptions)
 
 	// 构造基础查询
-	baseQuery := DB.Model(&Channel{}).Omit("key")
+	baseQuery := DB.Model(&Channel{}).Omit("key", "upstream_credential_snapshot_data")
 
 	// 构造WHERE子句
 	whereClause := "(id = ? OR name LIKE ? OR " + commonKeyCol + " = ? OR " + baseURLCol + " LIKE ?) AND " + modelsCol + " LIKE ?"
@@ -441,7 +496,7 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 	if selectAll {
 		err = DB.First(channel, "id = ?", id).Error
 	} else {
-		err = DB.Omit("key").First(channel, "id = ?", id).Error
+		err = DB.Omit("key", "upstream_credential_snapshot_data").First(channel, "id = ?", id).Error
 	}
 	if err != nil {
 		return nil, err
@@ -454,6 +509,15 @@ func BatchInsertChannels(channels []Channel) error {
 	if len(channels) == 0 {
 		return nil
 	}
+	for i := range channels {
+		if err := ValidateUpstreamCostRatio(channels[i].CostRatio); err != nil {
+			return err
+		}
+		channels[i].CostVersionID = uuid.NewString()
+		channels[i].UpstreamCredentialSnapshotData = ""
+	}
+	upstreamCredentialWriteMutex.Lock()
+	defer upstreamCredentialWriteMutex.Unlock()
 	tx := DB.Begin()
 	if tx.Error != nil {
 		return tx.Error
@@ -465,11 +529,15 @@ func BatchInsertChannels(channels []Channel) error {
 	}()
 
 	for _, chunk := range lo.Chunk(channels, 50) {
-		if err := tx.Create(&chunk).Error; err != nil {
+		if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Create(&chunk).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
 		for _, channel_ := range chunk {
+			if err := syncChannelUpstreamCredentials(tx, &channel_); err != nil {
+				tx.Rollback()
+				return err
+			}
 			if err := channel_.AddAbilities(tx); err != nil {
 				tx.Rollback()
 				return err
@@ -484,13 +552,23 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	upstreamCredentialWriteMutex.Lock()
+	defer upstreamCredentialWriteMutex.Unlock()
 	// 使用事务 分批删除channel表和abilities表
 	tx := DB.Begin()
 	if tx.Error != nil {
 		return 0, tx.Error
 	}
+	if _, err := upstreamFingerprintSecret(tx); err != nil {
+		tx.Rollback()
+		return 0, err
+	}
 	var deletedCount int64
 	for _, chunk := range lo.Chunk(ids, 200) {
+		if err := tx.Model(&ChannelCredentialBinding{}).Where("channel_id IN ?", chunk).Updates(map[string]any{"active": false, "active_slot": nil}).Error; err != nil {
+			tx.Rollback()
+			return 0, err
+		}
 		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
 		if result.Error != nil {
 			tx.Rollback()
@@ -549,62 +627,150 @@ func (channel *Channel) GetStatusCodeMapping() string {
 
 func (channel *Channel) Insert() error {
 	defer invalidateRoutingMetadata()
-	var err error
-	err = DB.Create(channel).Error
-	if err != nil {
+	if err := ValidateUpstreamCostRatio(channel.CostRatio); err != nil {
 		return err
 	}
-	err = channel.AddAbilities(nil)
-	return err
+	upstreamCredentialWriteMutex.Lock()
+	defer upstreamCredentialWriteMutex.Unlock()
+	channel.CostVersionID = uuid.NewString()
+	channel.UpstreamCredentialSnapshotData = ""
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Create(channel).Error; err != nil {
+			return err
+		}
+		if err := syncChannelUpstreamCredentials(tx, channel); err != nil {
+			return err
+		}
+		return channel.AddAbilities(tx)
+	})
 }
 
 func (channel *Channel) Update() error {
 	defer invalidateRoutingMetadata()
-	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
-	if channel.ChannelInfo.IsMultiKey {
-		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
-		} else {
-			// If key is not provided, read the existing key from the database
-			if existing, err := GetChannelById(channel.Id, true); err == nil {
-				keyStr = existing.Key
-			}
-		}
-		// Parse the key list (supports newline separation or JSON array)
-		keys := []string{}
-		if keyStr != "" {
-			trimmed := strings.TrimSpace(keyStr)
-			if strings.HasPrefix(trimmed, "[") {
-				var arr []json.RawMessage
-				if err := common.Unmarshal([]byte(trimmed), &arr); err == nil {
-					keys = make([]string, len(arr))
-					for i, v := range arr {
-						keys[i] = string(v)
-					}
-				}
-			}
-			if len(keys) == 0 { // fallback to newline split
-				keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
-			}
-		}
-		channel.ChannelInfo.MultiKeySize = len(keys)
-		// Clean up status data that exceeds the new key count to prevent index out of range
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
-					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
-				}
-			}
-		}
-	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
+	channel.CostRuleChange = nil
+	if err := ValidateUpstreamCostRatio(channel.CostRatio); err != nil {
 		return err
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
+	pollingLock := GetChannelPollingLock(channel.Id)
+	pollingLock.Lock()
+	defer pollingLock.Unlock()
+	upstreamCredentialWriteMutex.Lock()
+	defer upstreamCredentialWriteMutex.Unlock()
+	var costRuleChange *ChannelCostRuleChange
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := upstreamFingerprintSecret(tx); err != nil {
+			return err
+		}
+		var existing Channel
+		if err := lockForUpdate(tx).First(&existing, "id = ?", channel.Id).Error; err != nil {
+			return err
+		}
+		if expected := channel.keyStateExpected; expected != nil {
+			if existing.Key != expected.key || existing.ChannelInfo.IsMultiKey != expected.channelInfo.IsMultiKey {
+				return errors.New("channel key state changed; reload and retry")
+			}
+			if existing.Status != expected.status || existing.OtherInfo != expected.otherInfo ||
+				existing.ChannelInfo.MultiKeyMode != expected.channelInfo.MultiKeyMode ||
+				!reflect.DeepEqual(existing.ChannelInfo.MultiKeyStatusList, expected.channelInfo.MultiKeyStatusList) ||
+				!reflect.DeepEqual(existing.ChannelInfo.MultiKeyDisabledReason, expected.channelInfo.MultiKeyDisabledReason) ||
+				!reflect.DeepEqual(existing.ChannelInfo.MultiKeyDisabledTime, expected.channelInfo.MultiKeyDisabledTime) {
+				return errors.New("channel key state changed; reload and retry")
+			}
+			if channel.Status == 0 || channel.Status == expected.status {
+				channel.Status = existing.Status
+			}
+			if channel.OtherInfo == "" || channel.OtherInfo == expected.otherInfo {
+				channel.OtherInfo = existing.OtherInfo
+			}
+		}
+		if channel.ChannelInfo.IsMultiKey {
+			keyList := Channel{Key: channel.Key}
+			if keyList.Key == "" {
+				keyList.Key = existing.Key
+			}
+			newKeys := keyList.GetKeys()
+			oldKeys := existing.GetKeys()
+			channel.ChannelInfo.MultiKeySize = len(newKeys)
+			if existing.ChannelInfo.IsMultiKey && !slices.Equal(oldKeys, newKeys) {
+				// Status belongs to the actual credential material, never its old
+				// slot. Read the latest state under the same row lock as the edit.
+				statuses := make(map[int]int)
+				reasons := make(map[int]string)
+				times := make(map[int]int64)
+				oldSlots := make(map[string][]int, len(oldKeys))
+				for oldIndex, oldKey := range oldKeys {
+					oldSlots[oldKey] = append(oldSlots[oldKey], oldIndex)
+				}
+				for newIndex, newKey := range newKeys {
+					indices := oldSlots[newKey]
+					if len(indices) == 0 {
+						continue
+					}
+					oldIndex := indices[0]
+					oldSlots[newKey] = indices[1:]
+					if status, ok := existing.ChannelInfo.MultiKeyStatusList[oldIndex]; ok {
+						statuses[newIndex] = status
+					}
+					if reason, ok := existing.ChannelInfo.MultiKeyDisabledReason[oldIndex]; ok {
+						reasons[newIndex] = reason
+					}
+					if disabledTime, ok := existing.ChannelInfo.MultiKeyDisabledTime[oldIndex]; ok {
+						times[newIndex] = disabledTime
+					}
+				}
+				channel.ChannelInfo.MultiKeyStatusList = statuses
+				channel.ChannelInfo.MultiKeyDisabledReason = reasons
+				channel.ChannelInfo.MultiKeyDisabledTime = times
+			}
+			for index := range channel.ChannelInfo.MultiKeyStatusList {
+				if index < 0 || index >= len(newKeys) {
+					delete(channel.ChannelInfo.MultiKeyStatusList, index)
+					delete(channel.ChannelInfo.MultiKeyDisabledReason, index)
+					delete(channel.ChannelInfo.MultiKeyDisabledTime, index)
+				}
+			}
+			if channel.ChannelInfo.MultiKeyPollingIndex < 0 || channel.ChannelInfo.MultiKeyPollingIndex >= len(newKeys) {
+				channel.ChannelInfo.MultiKeyPollingIndex = 0
+			}
+		}
+		costProvided := channel.CostRatioSet || channel.CostRatio != nil
+		channel.CostVersionID = existing.CostVersionID
+		if channel.CostVersionID == "" || costProvided && !equalUpstreamCostRatio(channel.CostRatio, existing.CostRatio) {
+			channel.CostVersionID = uuid.NewString()
+		}
+		if costProvided && !equalUpstreamCostRatio(channel.CostRatio, existing.CostRatio) {
+			costRuleChange = &ChannelCostRuleChange{BeforeVersionID: existing.CostVersionID, AfterVersionID: channel.CostVersionID}
+			if existing.CostRatio != nil {
+				costRuleChange.BeforeRatio = common.GetPointer(*existing.CostRatio)
+			}
+			if channel.CostRatio != nil {
+				costRuleChange.AfterRatio = common.GetPointer(*channel.CostRatio)
+			}
+		}
+		// Never let a stale or client-provided mirror overwrite current identity.
+		channel.UpstreamCredentialSnapshotData = ""
+		if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Model(channel).Omit("upstream_credential_snapshot_data").Updates(channel).Error; err != nil {
+			return err
+		}
+		if costProvided {
+			if err := tx.Model(&Channel{}).Where("id = ?", channel.Id).Update("cost_ratio", channel.CostRatio).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.First(channel, "id = ?", channel.Id).Error; err != nil {
+			return err
+		}
+		channel.Keys = nil
+		channel.keyStateExpected = nil
+		if err := syncChannelUpstreamCredentials(tx, channel); err != nil {
+			return err
+		}
+		return channel.UpdateAbilities(tx)
+	})
+	if err == nil {
+		channel.CostRuleChange = costRuleChange
+		CacheUpdateChannel(channel)
+	}
 	return err
 }
 
@@ -630,13 +796,20 @@ func (channel *Channel) UpdateBalance(balance float64) {
 
 func (channel *Channel) Delete() error {
 	defer invalidateRoutingMetadata()
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
-	}
-	err = channel.DeleteAbilities()
-	return err
+	upstreamCredentialWriteMutex.Lock()
+	defer upstreamCredentialWriteMutex.Unlock()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := upstreamFingerprintSecret(tx); err != nil {
+			return err
+		}
+		if err := tx.Model(&ChannelCredentialBinding{}).Where("channel_id = ?", channel.Id).Updates(map[string]any{"active": false, "active_slot": nil}).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(channel).Error; err != nil {
+			return err
+		}
+		return tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
+	})
 }
 
 var channelStatusLock sync.Mutex
@@ -754,72 +927,51 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	pollingLock.Lock()
 	defer pollingLock.Unlock()
 
-	if common.MemoryCacheEnabled {
-		channelCache, _ := CacheGetChannel(channelId)
-		if channelCache == nil {
-			return false
+	channel := &Channel{}
+	changed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).First(channel, channelId).Error; err != nil {
+			return err
 		}
-		if channelCache.ChannelInfo.IsMultiKey {
-			beforeStatus := channelCache.Status
-			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
-			if beforeStatus != channelCache.Status {
-				CacheUpdateChannelStatus(channelId, channelCache.Status)
-			}
-			//CacheUpdateChannel(channelCache)
-			//return true
-		} else {
-			// 如果缓存渠道存在，且状态已是目标状态，直接返回
-			if channelCache.Status == status {
-				return false
-			}
-			CacheUpdateChannelStatus(channelId, status)
-		}
-	}
-
-	shouldUpdateAbilities := false
-	defer func() {
-		if shouldUpdateAbilities {
-			err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled)
-			if err != nil {
-				common.SysLog(fmt.Sprintf("failed to update ability status: channel_id=%d, error=%v", channelId, err))
-			}
-		}
-	}()
-	channel, err := GetChannelById(channelId, true)
-	if err != nil {
-		return false
-	} else {
 		// A manual channel operation must replace the exhaustion reason even
 		// when the status value is already manually disabled.
 		overridesKeyExhaustion := channel.ChannelInfo.IsMultiKey && usingKey == "" &&
 			status == common.ChannelStatusManuallyDisabled && reason != ChannelStatusReasonAllKeysDisabled &&
 			channel.GetOtherInfo()["status_reason"] == ChannelStatusReasonAllKeysDisabled
-		if channel.Status == status && !overridesKeyExhaustion {
-			return false
+		if channel.Status == status && !overridesKeyExhaustion && (!channel.ChannelInfo.IsMultiKey || usingKey == "") {
+			return nil
 		}
-
+		beforeStatus := channel.Status
 		if channel.ChannelInfo.IsMultiKey {
-			beforeStatus := channel.Status
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
-			if beforeStatus != channel.Status {
-				shouldUpdateAbilities = true
+			if usingKey != "" && !slices.Contains(channel.GetKeys(), usingKey) {
+				return nil
 			}
+			handlerMultiKeyUpdate(channel, usingKey, status, reason)
 		} else {
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
 			channel.Status = status
-			shouldUpdateAbilities = true
 		}
-		err = channel.saveStatusState()
-		if err != nil {
-			common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channel.Id, status, err))
-			return false
+		if err := channel.saveStatusState(tx); err != nil {
+			return err
 		}
+		if beforeStatus != channel.Status {
+			if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
+				return err
+			}
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
+		return false
 	}
-	return true
+	CacheUpdateChannel(channel)
+	CacheUpdateChannelStatus(channelId, channel.Status)
+	return changed
 }
 
 func EnableChannelByTag(tag string) error {
@@ -973,7 +1125,7 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 	}
 
 	// 构造基础查询
-	baseQuery := DB.Model(&Channel{}).Omit("key")
+	baseQuery := DB.Model(&Channel{}).Omit("key", "upstream_credential_snapshot_data")
 
 	// 构造WHERE子句
 	whereClause := "(id = ? OR name LIKE ? OR " + commonKeyCol + " = ? OR " + baseURLCol + " LIKE ?) AND " + modelsCol + " LIKE ?"
@@ -1174,7 +1326,7 @@ func GetChannelsByType(startIdx int, num int, idSort bool, channelType int) ([]*
 	if idSort {
 		order = "id desc"
 	}
-	err := DB.Where("type = ?", channelType).Order(order).Limit(num).Offset(startIdx).Omit("key").Find(&channels).Error
+	err := DB.Where("type = ?", channelType).Order(order).Limit(num).Offset(startIdx).Omit("key", "upstream_credential_snapshot_data").Find(&channels).Error
 	return channels, err
 }
 

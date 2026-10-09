@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -40,6 +41,7 @@ func (a *Adaptor) doSGLangRerankResponse(c *gin.Context, resp *http.Response, in
 	// top_n can omit scored documents, and decoder rerankers can omit meta_info.
 	// Per-result counts therefore cannot account for the full request; use the
 	// existing prompt estimate, as with other rerank providers without usage.
+	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	response.Usage = dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), TotalTokens: info.GetEstimatePromptTokens()}
 	c.JSON(http.StatusOK, response)
 	return &response.Usage, nil

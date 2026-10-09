@@ -41,7 +41,8 @@ export interface StatCardDetail {
 interface StatCardProps {
   title: string
   value: string | number
-  description: string
+  description?: string
+  density?: 'default' | 'compact'
   icon: LucideIcon
   sparkline?: number[]
   sparklineVariant?: StatCardSparklineVariant
@@ -232,6 +233,7 @@ function StatCardDetails(props: { details: StatCardDetail[] }) {
 }
 
 export function StatCard(props: StatCardProps) {
+  const compact = props.density === 'compact'
   const Icon = props.icon
   const tone = props.tone ?? 'accent-3'
   const iconTone = props.iconTone ?? ICON_TONE_BY_STAT_TONE[tone]
@@ -260,14 +262,16 @@ export function StatCard(props: StatCardProps) {
         <div className='text-muted-foreground mt-0.5 font-mono text-base font-bold tracking-tight break-all tabular-nums sm:text-2xl'>
           --
         </div>
-        <p
-          className={cn(
-            'text-muted-foreground/60 line-clamp-1 text-[11px] sm:text-xs',
-            props.compactMobile && 'hidden sm:block'
-          )}
-        >
-          {props.description}
-        </p>
+        {props.description != null && (
+          <p
+            className={cn(
+              'text-muted-foreground/60 line-clamp-1 text-[11px] sm:text-xs',
+              props.compactMobile && 'hidden sm:block'
+            )}
+          >
+            {props.description}
+          </p>
+        )}
       </div>
     )
   } else {
@@ -276,14 +280,16 @@ export function StatCard(props: StatCardProps) {
         <div className='text-foreground font-mono text-base font-semibold tracking-tight break-all tabular-nums sm:text-2xl'>
           {props.value}
         </div>
-        <p
-          className={cn(
-            'text-muted-foreground/60 line-clamp-1 text-[11px] leading-relaxed sm:text-xs',
-            props.compactMobile && 'hidden sm:block'
-          )}
-        >
-          {props.description}
-        </p>
+        {props.description != null && (
+          <p
+            className={cn(
+              'text-muted-foreground/60 line-clamp-1 text-[11px] leading-relaxed sm:text-xs',
+              props.compactMobile && 'hidden sm:block'
+            )}
+          >
+            {props.description}
+          </p>
+        )}
       </div>
     )
   }
@@ -300,11 +306,17 @@ export function StatCard(props: StatCardProps) {
   return (
     <div
       className={cn(
-        'group flex flex-col justify-between sm:min-h-32 sm:gap-3',
-        props.compactMobile ? 'gap-1' : 'gap-1.5'
+        'group flex flex-col',
+        compact ? 'gap-2' : 'justify-between sm:min-h-32 sm:gap-3',
+        !compact && (props.compactMobile ? 'gap-1' : 'gap-1.5')
       )}
     >
-      <div className='flex items-start justify-between gap-1'>
+      <div
+        className={cn(
+          'flex justify-between gap-1',
+          compact ? 'min-h-8 items-center' : 'items-start'
+        )}
+      >
         <div className='text-muted-foreground flex items-center gap-1 text-[11px] font-medium sm:gap-2 sm:text-xs'>
           <IconBadge
             tone={iconTone}
@@ -325,7 +337,9 @@ export function StatCard(props: StatCardProps) {
 
       {valueContent}
 
-      <div className='hidden sm:block'>{visualization}</div>
+      {(!compact || props.details?.length || props.sparkline?.length) && (
+        <div className='hidden sm:block'>{visualization}</div>
+      )}
     </div>
   )
 }

@@ -13,6 +13,9 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
+	"github.com/QuantumNous/new-api/relay/channel/cohere"
+	"github.com/QuantumNous/new-api/relay/channel/minimax"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -116,6 +119,70 @@ func TestSGLangRerankRequestAndResponse(t *testing.T) {
 	assert.Equal(t, []dto.RerankResponseResult{{Index: 1, RelevanceScore: 0.9, Document: map[string]any{"text": "second"}}}, decoded.Results)
 	assert.Equal(t, 12, decoded.Usage.PromptTokens)
 	assert.Zero(t, decoded.Usage.CompletionTokens)
+	assert.True(t, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
+}
+
+func TestProviderUsageSourcesPreserveMeasuredAndEstimatedAmounts(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 5
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	for _, tc := range []struct {
+		name       string
+		provider   string
+		stream     bool
+		body       string
+		prompt     int
+		completion int
+		total      int
+		estimated  bool
+	}{
+		{"chat measured", "chat", false, `{"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`, 7, 2, 9, false},
+		{"chat mixed prompt estimate", "chat", false, `{"usage":{"completion_tokens":2,"total_tokens":2}}`, 15, 2, 17, true},
+		{"transcription measured", "stt", false, `{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}`, 7, 2, 9, false},
+		{"transcription fallback", "stt", false, `{"text":"hello"}`, 15, 0, 15, true},
+		{"speech stream measured", "tts", true, "data: {\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"total_tokens\":9}}\n\ndata: [DONE]\n", 7, 2, 9, false},
+		{"speech stream incomplete measured fields", "tts", true, "data: {\"usage\":{\"input_tokens\":7,\"total_tokens\":9}}\n\ndata: [DONE]\n", 7, 0, 9, true},
+		{"speech stream fallback", "tts", true, "data: {\"audio\":\"x\"}\n\ndata: [DONE]\n", 15, 0, 15, true},
+		{"rerank measured", "cohere", false, `{"results":[],"meta":{"billed_units":{"input_tokens":7,"output_tokens":2}}}`, 7, 2, 9, false},
+		{"rerank fallback", "cohere", false, `{"results":[],"meta":{"billed_units":{}}}`, 15, 0, 15, true},
+		{"speech characters with estimated prompt", "minimax", false, `{"data":{"audio":"0102"},"extra_info":{"usage_characters":7},"base_resp":{"status_code":0}}`, 15, 0, 7, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/test", nil)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "test-model"}, RelayFormat: types.RelayFormatOpenAI, IsStream: tc.stream, StreamStatus: relaycommon.NewStreamStatus()}
+			info.SetEstimatePromptTokens(15)
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.body))}
+			var usage *dto.Usage
+			var apiErr *types.NewAPIError
+			switch tc.provider {
+			case "chat":
+				usage, apiErr = openai.OpenaiHandler(c, info, resp)
+			case "stt":
+				apiErr, usage = openai.OpenaiSTTHandler(c, resp, info, "json")
+			case "tts":
+				usage = openai.OpenaiTTSHandler(c, resp, info)
+			case "cohere":
+				info.RelayMode = relayconstant.RelayModeRerank
+				result, err := (&cohere.Adaptor{}).DoResponse(c, resp, info)
+				apiErr = err
+				require.IsType(t, &dto.Usage{}, result)
+				usage = result.(*dto.Usage)
+			case "minimax":
+				info.RelayMode = relayconstant.RelayModeAudioSpeech
+				result, err := (&minimax.Adaptor{}).DoResponse(c, resp, info)
+				apiErr = err
+				require.IsType(t, &dto.Usage{}, result)
+				usage = result.(*dto.Usage)
+			}
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.Equal(t, tc.prompt, usage.PromptTokens)
+			assert.Equal(t, tc.completion, usage.CompletionTokens)
+			assert.Equal(t, tc.total, usage.TotalTokens)
+			assert.Equal(t, tc.estimated, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
+		})
+	}
 }
 
 func TestSGLangRerankRejectsMalformedResults(t *testing.T) {

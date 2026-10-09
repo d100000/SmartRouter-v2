@@ -69,6 +69,7 @@ function ChannelCardComponent({
   const actionsCell = renderCell('actions')
   const priorityCell = renderCell('priority')
   const weightCell = renderCell('weight')
+  const costRatioCell = renderCell('cost_ratio')
   const balanceCell = renderCell('balance')
   const responseCell = renderCell('response_time')
   const testCell = renderCell('test_time')
@@ -149,6 +150,11 @@ function ChannelCardComponent({
             </dl>
           </div>
         </StatusBadgeTypeContext.Provider>
+
+        <div className='flex items-center justify-between gap-2'>
+          <span className={labelClass}>{t('Cost Ratio')}</span>
+          {costRatioCell}
+        </div>
 
         {/* Groups retain their compact, full-width footer. */}
         <div className='flex min-w-0 items-center justify-between gap-2'>

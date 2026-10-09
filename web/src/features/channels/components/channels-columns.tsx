@@ -85,6 +85,7 @@ import {
 } from '../lib'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
+import { ChannelCostCell } from './channel-cost-cell'
 import { ChannelRecentStatsCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { TaskPluginChannelBadge } from './channel-type-badge'
@@ -1182,6 +1183,13 @@ export function useChannelsColumns(
         cell: ({ row }) => <WeightCell channel={row.original} />,
         size: 90,
         enableSorting: false,
+      },
+      {
+        accessorKey: 'cost_ratio',
+        header: t('Cost Ratio'),
+        cell: ({ row }) => <ChannelCostCell channel={row.original} />,
+        enableSorting: false,
+        size: 150,
       },
 
       // Balance column (Used/Remaining)

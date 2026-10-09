@@ -3,16 +3,18 @@ package volcengine
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -56,7 +58,7 @@ type VolcengineTTSReqInfo struct {
 	Model           string                   `json:"model,omitempty"`
 	TextType        string                   `json:"text_type,omitempty"`
 	SilenceDuration float64                  `json:"silence_duration,omitempty"`
-	WithTimestamp   interface{}              `json:"with_timestamp,omitempty"`
+	WithTimestamp   any                      `json:"with_timestamp,omitempty"`
 	ExtraParam      *VolcengineTTSExtraParam `json:"extra_param,omitempty"`
 }
 
@@ -154,7 +156,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 	defer resp.Body.Close()
 
 	var volcResp VolcengineTTSResponse
-	if unmarshalErr := json.Unmarshal(body, &volcResp); unmarshalErr != nil {
+	if unmarshalErr := common.Unmarshal(body, &volcResp); unmarshalErr != nil {
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("failed to parse volcengine response"),
 			types.ErrorCodeBadResponseBody,
@@ -183,6 +185,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 	c.Header("Content-Type", contentType)
 	c.Data(http.StatusOK, contentType, audioData)
 
+	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	usage = &dto.Usage{
 		PromptTokens:     info.GetEstimatePromptTokens(),
 		CompletionTokens: 0,
@@ -209,6 +212,22 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	header := http.Header{}
 	header.Set("Authorization", fmt.Sprintf("Bearer;%s", token))
 
+	payload, marshalErr := common.Marshal(volcRequest)
+	if marshalErr != nil {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("failed to marshal request: %w", marshalErr),
+			types.ErrorCodeBadRequestBody,
+			http.StatusInternalServerError,
+		)
+	}
+	if contextErr := c.Request.Context().Err(); contextErr != nil {
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("failed to connect to websocket: %w", contextErr),
+			types.ErrorCodeBadResponseStatusCode,
+			http.StatusBadGateway,
+		)
+	}
+	service.MarkOverviewUpstreamSent(info)
 	conn, resp, dialErr := websocket.DefaultDialer.DialContext(c.Request.Context(), requestURL, header)
 	if dialErr != nil {
 		if resp != nil {
@@ -227,15 +246,6 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	defer conn.Close()
 	stopCancellation := context.AfterFunc(c.Request.Context(), func() { _ = conn.Close() })
 	defer stopCancellation()
-
-	payload, marshalErr := json.Marshal(volcRequest)
-	if marshalErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("failed to marshal request: %w", marshalErr),
-			types.ErrorCodeBadRequestBody,
-			http.StatusInternalServerError,
-		)
-	}
 
 	if sendErr := FullClientRequest(conn, payload); sendErr != nil {
 		return nil, types.NewErrorWithStatusCode(
@@ -285,6 +295,7 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 
 			if msg.Sequence < 0 {
 				c.Status(http.StatusOK)
+				common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 				usage = &dto.Usage{
 					PromptTokens:     info.GetEstimatePromptTokens(),
 					CompletionTokens: 0,
@@ -298,6 +309,7 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	}
 
 	c.Status(http.StatusOK)
+	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	usage = &dto.Usage{
 		PromptTokens:     info.GetEstimatePromptTokens(),
 		CompletionTokens: 0,

@@ -320,6 +320,18 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
           <DropdownMenuSeparator />
 
+          <DropdownMenuItem
+            onClick={() => {
+              setCurrentRow(channel)
+              setOpen('upstream-metadata')
+            }}
+          >
+            {t('Upstream Key Metadata')}
+            <DropdownMenuShortcut>
+              <Key size={16} />
+            </DropdownMenuShortcut>
+          </DropdownMenuItem>
+
           {/* Copy Channel */}
           <DropdownMenuItem
             disabled={!canEditSensitive}

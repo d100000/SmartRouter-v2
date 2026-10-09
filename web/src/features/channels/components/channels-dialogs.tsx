@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { CHANNEL_TYPE_VLLM, CHANNEL_TYPE_SGLANG } from '../constants'
 import { useChannels } from './channels-provider'
 import { BalanceQueryDialog } from './dialogs/balance-query-dialog'
+import { ChannelCostDialog } from './dialogs/channel-cost-dialog'
 import { ChannelTestDialog } from './dialogs/channel-test-dialog'
 import { CopyChannelDialog } from './dialogs/copy-channel-dialog'
 import { EditTagDialog } from './dialogs/edit-tag-dialog'
@@ -27,6 +28,7 @@ import { InferenceStatusDialog } from './dialogs/inference-status-dialog'
 import { MultiKeyManageDialog } from './dialogs/multi-key-manage-dialog'
 import { OllamaModelsDialog } from './dialogs/ollama-models-dialog'
 import { TagBatchEditDialog } from './dialogs/tag-batch-edit-dialog'
+import { UpstreamMetadataDialog } from './dialogs/upstream-metadata-dialog'
 import { UpstreamUpdateDialog } from './dialogs/upstream-update-dialog'
 import { ChannelMutateDrawer } from './drawers/channel-mutate-drawer'
 
@@ -35,6 +37,20 @@ export function ChannelsDialogs() {
 
   return (
     <>
+      {open === 'cost-settings' && currentRow && (
+        <ChannelCostDialog
+          key={currentRow.id}
+          channel={currentRow}
+          onClose={() => setOpen(null)}
+        />
+      )}
+      {open === 'upstream-metadata' && currentRow && (
+        <UpstreamMetadataDialog
+          key={currentRow.id}
+          channel={currentRow}
+          onClose={() => setOpen(null)}
+        />
+      )}
       {open === 'inference-status' &&
         currentRow &&
         [CHANNEL_TYPE_VLLM, CHANNEL_TYPE_SGLANG].includes(currentRow.type) && (
