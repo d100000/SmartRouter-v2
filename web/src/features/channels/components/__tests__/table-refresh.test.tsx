@@ -180,7 +180,8 @@ it('refetches the filtered channel list and current-page statistics together and
   statsGate = new Promise((resolve) => {
     releaseStats = resolve
   })
-  await userEvent.click(refresh)
+  refresh.focus()
+  await userEvent.setup().keyboard('{Enter}')
 
   await waitFor(() => expect(searchCalls()).toHaveLength(2))
   await waitFor(() => expect(statsCalls()).toHaveLength(2))

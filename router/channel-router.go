@@ -62,6 +62,8 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 
 var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/:id/upstream-credentials", permission: authz.ChannelRead, handler: controller.GetChannelUpstreamCredentials},
+	{method: http.MethodGet, path: "/priority/order", permission: authz.ChannelRead, handler: controller.GetChannelPriorityOrder},
+	{method: http.MethodPost, path: "/priority/reorder", permission: authz.ChannelWrite, handler: controller.ReorderChannelPriority},
 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
 	{method: http.MethodGet, path: "/recent_stats", permission: authz.ChannelRead, handler: controller.GetChannelRecentStats},

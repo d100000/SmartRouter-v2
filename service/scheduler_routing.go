@@ -79,6 +79,15 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 		return nil, err
 	}
 	state, request := schedulerRequestForGroup(c, group, modelName)
+	state.mu.Lock()
+	if state.attempt != nil && !state.started {
+		// Plugin preparation can reject a provisional candidate. Release its
+		// lease before choosing again, including when candidates share capacity.
+		// Undispatched reservations never count as attempts or health failures.
+		scheduler.Default.FinishAttempt(state.attempt, scheduler.Outcome{})
+		state.attempt, state.currentRequest = nil, nil
+	}
+	state.mu.Unlock()
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
 	active := scheduler.Default.IsActive(request.Key)
 	priorities := make([]int64, 0, len(channels))
@@ -243,9 +252,9 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 			classificationContext = context.WithoutCancel(classificationContext)
 		}
 		classification := perfmetrics.ClassifyRelayOutcome(classificationContext, info, apiErr)
-		if state.writeFailedBeforeTerminal {
+		if state.writeFailedBeforeTerminal || info != nil && info.IsStream && classificationContext.Err() != nil && state.writtenOutcome == relaycommon.ResponseOutcomeUnknown {
 			classification = perfmetrics.OutcomeIgnored
-		} else if info != nil && info.IsStream && state.writtenOutcome != relaycommon.ResponseOutcomeUnknown && apiErr == nil && !info.PerformanceBusinessRejection {
+		} else if info != nil && info.IsStream && state.writtenOutcome != relaycommon.ResponseOutcomeUnknown && apiErr == nil && !info.PerformanceBusinessRejection && (classificationContext.Err() == nil || errors.Is(classificationContext.Err(), context.Canceled)) {
 			stream := info.StreamStatus.OutcomeSnapshot()
 			// The caller may close after receiving the complete terminal SSE
 			// event, before upstream EOF or quota settlement. Only terminal

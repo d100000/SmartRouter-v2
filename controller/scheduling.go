@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
@@ -171,7 +170,7 @@ func UpdateSchedulingConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "Unable to save scheduling configuration"})
 		return
 	}
-	model.RecordLog(c.GetInt("id"), model.LogTypeManage, fmt.Sprintf("Updated scheduling configuration: group=%q model=%q enabled=%t channel_overrides=%d", config.Group, config.Model, config.Enabled, len(config.ChannelOverrides)))
+	model.RecordLog(c.GetInt("id"), model.LogTypeManage, common.NewMessage("Updated scheduling configuration: group={{group}} model={{model}} enabled={{enabled}} channel_overrides={{overrides}}", map[string]any{"group": config.Group, "model": config.Model, "enabled": config.Enabled, "overrides": len(config.ChannelOverrides)}))
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": config})
 }
 
@@ -210,7 +209,7 @@ func RecoverSchedulingChannel(c *gin.Context) {
 		return
 	}
 	scheduler.Default.ClearPenalty(key, request.ChannelID)
-	model.RecordLog(c.GetInt("id"), model.LogTypeManage, fmt.Sprintf("Recalculated scheduling penalty: group=%q model=%q channel=%d", request.Group, request.Model, request.ChannelID))
+	model.RecordLog(c.GetInt("id"), model.LogTypeManage, common.NewMessage("Recalculated scheduling penalty: group={{group}} model={{model}} channel={{channel}}", map[string]any{"group": request.Group, "model": request.Model, "channel": request.ChannelID}))
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 

@@ -33,7 +33,7 @@ var Cache = asynccache.NewAsyncCache(asynccache.Options{
 	RefreshDuration: time.Minute * 35,
 	EnableExpire:    true,
 	ExpireDuration:  time.Minute * 30,
-	Fetcher: func(key string) (interface{}, error) {
+	Fetcher: func(key string) (any, error) {
 		return nil, errors.New("not found")
 	},
 })
@@ -54,7 +54,7 @@ func getAccessToken(ctx context.Context, a *Adaptor, info *relaycommon.RelayInfo
 	if err != nil {
 		return "", fmt.Errorf("failed to create signed JWT: %w", err)
 	}
-	newToken, err := exchangeJwtForAccessToken(ctx, signedJWT, info)
+	newToken, err := exchangeJwtForAccessTokenWithProxy(ctx, signedJWT, info.ChannelSetting.Proxy)
 	if err != nil {
 		return "", fmt.Errorf("failed to exchange JWT for access token: %w", err)
 	}
@@ -105,41 +105,6 @@ func createSignedJWT(email, privateKeyPEM string) (string, error) {
 	return signedToken, nil
 }
 
-func exchangeJwtForAccessToken(ctx context.Context, signedJWT string, info *relaycommon.RelayInfo) (string, error) {
-
-	authURL := "https://www.googleapis.com/oauth2/v4/token"
-	data := url.Values{}
-	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
-	data.Set("assertion", signedJWT)
-
-	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
-	if err != nil {
-		return "", fmt.Errorf("new proxy http client failed: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result map[string]any
-	if err := common.DecodeJson(resp.Body, &result); err != nil {
-		return "", err
-	}
-
-	if accessToken, ok := result["access_token"].(string); ok {
-		return accessToken, nil
-	}
-
-	return "", fmt.Errorf("failed to get access token: %v", result)
-}
-
 func AcquireAccessToken(creds Credentials, proxy string) (string, error) {
 	return AcquireAccessTokenWithContext(context.Background(), creds, proxy)
 }
@@ -158,15 +123,11 @@ func exchangeJwtForAccessTokenWithProxy(ctx context.Context, signedJWT string, p
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
 	data.Set("assertion", signedJWT)
 
-	var client *http.Client
-	var err error
-	if proxy != "" {
-		client, err = service.GetHttpClientWithProxy(proxy)
-		if err != nil {
-			return "", fmt.Errorf("new proxy http client failed: %w", err)
-		}
-	} else {
-		client = service.GetHttpClient()
+	// Service-account credentials are exchanged only over verified TLS; the
+	// channel's upstream certificate bypass must not affect Google's OAuth host.
+	client, err := service.GetHttpClientWithProxy(proxy)
+	if err != nil {
+		return "", fmt.Errorf("new proxy http client failed: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(data.Encode()))

@@ -4,7 +4,6 @@ import (
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
@@ -12,12 +11,12 @@ import (
 
 func GetChannelUpstreamCredentials(c *gin.Context) {
 	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelRead) {
-		common.ApiErrorI18n(c, i18n.MsgAuthInsufficientPrivilege)
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
-		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 	snapshots, err := model.GetChannelUpstreamCredentials(id)
@@ -30,7 +29,7 @@ func GetChannelUpstreamCredentials(c *gin.Context) {
 
 func UpdateUpstreamCredential(c *gin.Context) {
 	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelWrite) {
-		common.ApiErrorI18n(c, i18n.MsgAuthInsufficientPrivilege)
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 	var metadata model.UpstreamCredentialMetadata
@@ -50,7 +49,7 @@ func UpdateUpstreamCredential(c *gin.Context) {
 
 func GetUpstreamSuppliers(c *gin.Context) {
 	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelRead) {
-		common.ApiErrorI18n(c, i18n.MsgAuthInsufficientPrivilege)
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 	suppliers, err := model.ListUpstreamSuppliers()
@@ -63,7 +62,7 @@ func GetUpstreamSuppliers(c *gin.Context) {
 
 func AddUpstreamSupplier(c *gin.Context) {
 	if !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelWrite) {
-		common.ApiErrorI18n(c, i18n.MsgAuthInsufficientPrivilege)
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 	var request struct {

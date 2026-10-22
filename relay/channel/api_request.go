@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 
 	common2 "github.com/QuantumNous/new-api/common"
+	appconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -195,10 +197,12 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 	}
 
 	headerOverrideSource := common.GetEffectiveHeaderOverride(info)
+	// Background polling has no client request from which to copy headers.
+	hasClientRequest := !info.IsChannelTest && c != nil && c.Request != nil
 
 	passAll := false
 	var passthroughRegex []*regexp.Regexp
-	if !info.IsChannelTest {
+	if hasClientRequest {
 		for k := range headerOverrideSource {
 			key := strings.TrimSpace(strings.ToLower(k))
 			if key == "" {
@@ -231,9 +235,6 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 	}
 
 	if passAll || len(passthroughRegex) > 0 {
-		if c == nil || c.Request == nil {
-			return nil, types.NewError(fmt.Errorf("missing request context for header passthrough"), types.ErrorCodeChannelHeaderOverrideInvalid)
-		}
 		for name := range c.Request.Header {
 			if shouldSkipPassthroughHeader(name) {
 				continue
@@ -271,7 +272,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		if !ok {
 			return nil, types.NewError(nil, types.ErrorCodeChannelHeaderOverrideInvalid)
 		}
-		if info.IsChannelTest && strings.HasPrefix(strings.TrimSpace(str), clientHeaderPlaceholderPrefix) {
+		if !hasClientRequest && strings.HasPrefix(strings.TrimSpace(str), clientHeaderPlaceholderPrefix) {
 			continue
 		}
 
@@ -290,6 +291,17 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 
 func ResolveHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]string, error) {
 	return processHeaderOverride(info, c)
+}
+
+// ApplyHeaderOverride applies channel overrides after the adaptor's headers.
+// Without a client request, only static values and {api_key} are resolved.
+func ApplyHeaderOverride(info *common.RelayInfo, c *gin.Context, req *http.Request) error {
+	headers, err := processHeaderOverride(info, c)
+	if err != nil {
+		return err
+	}
+	applyHeaderOverrideToRequest(req, headers)
+	return nil
 }
 
 func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]string) {
@@ -323,11 +335,9 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	}
 	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
 	// 这样可以覆盖默认的 Authorization header 设置
-	headerOverride, err := processHeaderOverride(info, c)
-	if err != nil {
+	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
-	applyHeaderOverrideToRequest(req, headerOverride)
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
@@ -355,11 +365,9 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	}
 	// 在 SetupRequestHeader 之后应用 Header Override，确保用户设置优先级最高
 	// 这样可以覆盖默认的 Authorization header 设置
-	headerOverride, err := processHeaderOverride(info, c)
-	if err != nil {
+	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
-	applyHeaderOverrideToRequest(req, headerOverride)
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
@@ -377,6 +385,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	fullRequestURL = toWebSocketURL(fullRequestURL)
+	if targetURL, parseErr := url.Parse(fullRequestURL); parseErr == nil {
+		common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, targetURL.Scheme+"://"+targetURL.Host)
+	}
 	targetHeader := http.Header{}
 	err = a.SetupRequestHeader(c, &targetHeader, info)
 	if err != nil {
@@ -399,6 +410,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 			return nil, proxyErr
 		}
 		dialer.Proxy = http.ProxyURL(proxyURL)
+	}
+	if info.ChannelSetting.TLSInsecureSkipVerify {
+		dialer.TLSClientConfig = common2.InsecureTLSConfig
 	}
 	service.MarkOverviewUpstreamSent(info)
 	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
@@ -451,13 +465,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	relayClient.CheckRedirect = keepUpstreamRedirectResponse
 	if common2.DebugEnabled && req != nil && req.URL != nil {
 		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
-		logger.LogDebug(c, fmt.Sprintf(
-			"http transport select: host=%s protocol=%s shards=%d policy=%s",
+		logger.LogDebug(c, "http transport select: host=%s protocol=%s shards=%d policy=%s",
 			req.URL.Host,
 			policy.Protocol,
 			policy.Shards,
-			policy.String(),
-		))
+			policy.String())
 	}
 
 	// Waiting for response headers must not commit a downstream response. A
@@ -467,11 +479,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// Bind externally built requests as well as adaptor requests to the same
 	// client cancellation/deadline, which remains active while reading the body.
 	req = req.WithContext(c.Request.Context())
-
+	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	service.MarkOverviewUpstreamSent(info)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		logger.LogError(c, "do request failed: "+err.Error())
+		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
@@ -479,14 +491,12 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 	if common2.DebugEnabled {
 		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
-		logger.LogDebug(c, fmt.Sprintf(
-			"http transport negotiated: host=%s protocol=%s shards=%d policy=%s negotiated=%s",
+		logger.LogDebug(c, "http transport negotiated: host=%s protocol=%s shards=%d policy=%s negotiated=%s",
 			req.URL.Host,
 			policy.Protocol,
 			policy.Shards,
 			policy.String(),
-			resp.Proto,
-		))
+			resp.Proto)
 	}
 
 	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
@@ -524,6 +534,9 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	err = a.BuildRequestHeader(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
+	}
+	if err = ApplyHeaderOverride(info, c, req); err != nil {
+		return nil, err
 	}
 	resp, err := doRequest(c, req, info)
 	if err != nil {

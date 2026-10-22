@@ -26,6 +26,81 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type headerCommitWriter struct {
+	*httptest.ResponseRecorder
+	headerStarted chan struct{}
+	once          sync.Once
+}
+
+func (w *headerCommitWriter) WriteHeader(code int) {
+	// Let the scanner start while the first keepalive snapshots the headers.
+	w.once.Do(func() { close(w.headerStarted) })
+	w.ResponseRecorder.WriteHeader(code)
+}
+
+func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
+	settings := operation_setting.GetGeneralSetting()
+	previousEnabled, previousInterval := settings.PingIntervalEnabled, settings.PingIntervalSeconds
+	settings.PingIntervalEnabled, settings.PingIntervalSeconds = true, 60
+	t.Cleanup(func() {
+		settings.PingIntervalEnabled, settings.PingIntervalSeconds = previousEnabled, previousInterval
+	})
+
+	for _, test := range []struct {
+		name        string
+		interval    time.Duration
+		waitForPing bool
+	}{
+		{name: "before first keepalive", interval: time.Hour},
+		{name: "during header commit", interval: time.Millisecond, waitForPing: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &headerCommitWriter{
+				ResponseRecorder: httptest.NewRecorder(),
+				headerStarted:    make(chan struct{}),
+			}
+			c, _ := gin.CreateTestContext(writer)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			stop := StartStreamKeepAlive(c, test.interval)
+			defer stop()
+			if test.waitForPing {
+				select {
+				case <-writer.headerStarted:
+				case <-time.After(time.Second):
+					t.Fatal("keepalive did not start")
+				}
+			}
+
+			resp := &http.Response{
+				Header: http.Header{
+					"X-Reasoning-Included": {"true"},
+					"X-Codex-Turn-State":   {"turn-state"},
+				},
+				Body: io.NopCloser(strings.NewReader("data: chunk\n\ndata: [DONE]\n\n")),
+			}
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+			var received []string
+			StreamScannerHandler(c, resp, info, func(data string, _ *StreamResult) {
+				received = append(received, data)
+				assert.NoError(t, StringData(c, data))
+			})
+			stop()
+
+			require.NotNil(t, info.StreamStatus)
+			assert.True(t, info.StreamStatus.IsNormalEnd())
+			assert.Equal(t, []string{"chunk"}, received)
+			assert.True(t, strings.HasSuffix(writer.Body.String(), "data: chunk\n\n"))
+			if test.waitForPing {
+				assert.True(t, strings.HasPrefix(writer.Body.String(), ": PING\n\n"))
+			} else {
+				assert.Equal(t, "data: chunk\n\n", writer.Body.String())
+				assert.Equal(t, "true", writer.Result().Header.Get("X-Reasoning-Included"))
+				assert.Equal(t, "turn-state", writer.Result().Header.Get("X-Codex-Turn-State"))
+			}
+		})
+	}
+}
+
 func init() {
 	gin.SetMode(gin.TestMode)
 	if constant.StreamingTimeout == 0 {
@@ -618,13 +693,14 @@ func TestRelayBudgetStopsBlockedDownstreamWrite(t *testing.T) {
 				defer reader.Close()
 				c, _ := gin.CreateTestContext(httptest.NewRecorder())
 				c.Writer = &budgetPipeWriter{ResponseWriter: c.Writer, connection: writer}
+				connectionWriter := c.Writer
 				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 				service.ObserveSchedulingResponse(c)
 				common.SetContextKey(c, constant.ContextKeyIsStream, stream)
 				cancel := service.BeginRelayRequestBudget(c)
 				defer cancel()
 				if stream {
-					ExtendWriteDeadline(c)
+					SetEventStreamHeaders(c)
 				}
 				start := time.Now()
 				_, err := c.Writer.Write([]byte("blocked by an unread client"))
@@ -633,9 +709,80 @@ func TestRelayBudgetStopsBlockedDownstreamWrite(t *testing.T) {
 				cancel()
 				// Handler cleanup clears the deadline for a reused connection.
 				go func() { _, _ = io.Copy(io.Discard, reader) }()
-				_, err = c.Writer.Write([]byte("next request"))
+				_, err = connectionWriter.Write([]byte("next request"))
 				require.NoError(t, err)
 			})
+		})
+	}
+}
+
+// ---------- Write deadlines ----------
+
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (r *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return nil
+}
+
+func TestStreamWriteBudget(t *testing.T) {
+	start := time.Unix(1_800_000_000, 0)
+	var budget StreamWriteBudget
+	steps := []struct {
+		name  string
+		at    time.Duration
+		bytes int
+		want  time.Duration
+	}{
+		{"small event", 0, 8 << 10, 31 * time.Second},
+		{"image event gets the time a slow client needs", 0, 3600 << 10, 481 * time.Second},
+		{"next write keeps the image budget", 60 * time.Second, 8 << 10, 482 * time.Second},
+		{"budget starts over once it ran out", 600 * time.Second, 8 << 10, 631 * time.Second},
+	}
+	for _, step := range steps {
+		assert.Equal(t, start.Add(step.want), budget.Deadline(start.Add(step.at), step.bytes), step.name)
+	}
+}
+
+func TestSetEventStreamHeadersBoundsStreamWritesByBudget(t *testing.T) {
+	recorder := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	SetEventStreamHeaders(c)
+
+	before := time.Now()
+	require.NoError(t, StringData(c, strings.Repeat("A", 3600<<10)))
+
+	require.NotEmpty(t, recorder.deadlines)
+	assert.False(t, recorder.deadlines[0].Before(before.Add(streamWriteTimeout+450*time.Second)))
+	assert.Contains(t, recorder.Body.String(), "data: AAAA")
+}
+
+func TestStreamWriteBudgetPreservesRequestDeadline(t *testing.T) {
+	for _, writeString := range []bool{false, true} {
+		t.Run(fmt.Sprintf("write_string_%t", writeString), func(t *testing.T) {
+			recorder := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			c, _ := gin.CreateTestContext(recorder)
+			deadline := time.Now().Add(2 * time.Second)
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			defer cancel()
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil).WithContext(ctx)
+			service.ObserveSchedulingResponse(c)
+			SetEventStreamHeaders(c)
+			payload := strings.Repeat("A", 3600<<10)
+			var err error
+			if writeString {
+				_, err = c.Writer.WriteString(payload)
+			} else {
+				_, err = c.Writer.Write([]byte(payload))
+			}
+			require.NoError(t, err)
+			require.Len(t, recorder.deadlines, 1)
+			assert.Equal(t, deadline, recorder.deadlines[0], "a large event must not extend the total relay budget")
+			assert.False(t, service.SchedulingRetryAllowed(c), "the stream wrapper must preserve output observation")
 		})
 	}
 }

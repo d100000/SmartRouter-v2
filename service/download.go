@@ -67,7 +67,7 @@ func DoDownloadRequest(originUrl string, reason ...string) (resp *http.Response,
 // cancellation/deadline as the inference request, including worker downloads.
 func DoDownloadRequestWithContext(ctx context.Context, originUrl string, reason ...string) (resp *http.Response, err error) {
 	if system_setting.EnableWorker() {
-		common.SysLog(fmt.Sprintf("downloading file from worker: %s, reason: %s", originUrl, strings.Join(reason, ", ")))
+		common.SysLog(common.LogText("downloading file from worker: %s, reason: %s", originUrl, strings.Join(reason, ", ")))
 		req := &WorkerRequest{
 			URL: originUrl,
 			Key: system_setting.WorkerValidKey,
@@ -79,7 +79,7 @@ func DoDownloadRequestWithContext(ctx context.Context, originUrl string, reason 
 			return nil, fmt.Errorf("request reject: %v", err)
 		}
 
-		common.SysLog(fmt.Sprintf("downloading from origin: %s, reason: %s", common.MaskSensitiveInfo(originUrl), strings.Join(reason, ", ")))
+		common.SysLog(common.LogText("downloading from origin: %s, reason: %s", common.MaskSensitiveInfo(originUrl), strings.Join(reason, ", ")))
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, originUrl, nil)
 		if err != nil {
 			return nil, err

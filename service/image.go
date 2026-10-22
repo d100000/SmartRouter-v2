@@ -31,7 +31,7 @@ func DecodeBase64ImageData(base64String string) (image.Config, string, string, e
 	// 将base64字符串解码为字节切片
 	decodedData, err := base64.StdEncoding.DecodeString(base64String)
 	if err != nil {
-		fmt.Println("Error: Failed to decode base64 string")
+		fmt.Println(common.LogText("Error: Failed to decode base64 string"))
 		return image.Config{}, "", "", fmt.Errorf("failed to decode base64 string: %s", err.Error())
 	}
 
@@ -124,7 +124,7 @@ func GetImageFromURLWithContext(ctx context.Context, url string) (mimeType strin
 func DecodeUrlImageData(imageUrl string) (image.Config, string, error) {
 	response, err := DoDownloadRequest(imageUrl)
 	if err != nil {
-		common.SysLog(fmt.Sprintf("fail to get image from url: %s", err.Error()))
+		common.SysLog(common.LogText("fail to get image from url: %s", err.Error()))
 		return image.Config{}, "", err
 	}
 	defer response.Body.Close()
@@ -142,7 +142,7 @@ func DecodeUrlImageData(imageUrl string) (image.Config, string, error) {
 
 	var readData []byte
 	for _, limit := range []int64{1024 * 8, 1024 * 24, 1024 * 64} {
-		common.SysLog(fmt.Sprintf("try to decode image config with limit: %d", limit))
+		common.SysLog(common.LogText("try to decode image config with limit: %d", limit))
 
 		// 从response.Body读取更多的数据直到达到当前的限制
 		additionalData := make([]byte, limit-int64(len(readData)))
@@ -175,13 +175,13 @@ func getImageConfig(reader io.Reader) (image.Config, string, error) {
 	if err == nil {
 		return config, format, nil
 	}
-	common.SysLog(fmt.Sprintf("fail to decode image config(gif, jpg, png): %s", err.Error()))
+	common.SysLog(common.LogText("fail to decode image config(gif, jpg, png): %s", err.Error()))
 
 	config, err = webp.DecodeConfig(bytes.NewReader(data))
 	if err == nil {
 		return config, "webp", nil
 	}
-	common.SysLog(fmt.Sprintf("fail to decode image config(webp): %s", err.Error()))
+	common.SysLog(common.LogText("fail to decode image config(webp): %s", err.Error()))
 
 	// Try HEIF/HEIC: parse ISOBMFF ispe box for dimensions
 	if heifMime := detectHEIF(data); heifMime != "" {

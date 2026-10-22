@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,154 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// TestStartupUpgradePreservesData runs against disposable databases only. Seed
+// them by running this test in the source revision with TEST_STARTUP_PHASE=seed,
+// then run the destination revision with phase=upgrade and the same snapshot.
+// A fresh run creates its fixtures after the first real startup migration.
+func TestStartupUpgradePreservesData(t *testing.T) {
+	mainDSN := os.Getenv("TEST_STARTUP_MAIN_DSN")
+	if mainDSN == "" {
+		t.Skip("disposable startup database is not configured")
+	}
+	logDSN := os.Getenv("TEST_STARTUP_LOG_DSN")
+	require.NotEmpty(t, logDSN, "exercise a separate log database")
+	phase := os.Getenv("TEST_STARTUP_PHASE")
+	require.Contains(t, []string{"seed", "upgrade", "fresh"}, phase)
+	snapshotPath := os.Getenv("TEST_STARTUP_SNAPSHOT")
+	require.NotEmpty(t, snapshotPath)
+	oldDB, oldLogDB, oldMaster, oldSQLite := DB, LOG_DB, common.IsMasterNode, common.SQLitePath
+	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	t.Cleanup(func() {
+		DB, LOG_DB, common.IsMasterNode, common.SQLitePath = oldDB, oldLogDB, oldMaster, oldSQLite
+		common.SetDatabaseTypes(oldMainType, oldLogType)
+		initCol()
+	})
+	common.IsMasterNode = true
+	t.Setenv("SQL_DSN", mainDSN)
+	t.Setenv("LOG_SQL_DSN", logDSN)
+	t.Setenv("SQL_MAX_IDLE_CONNS", "1")
+	t.Setenv("SQL_MAX_OPEN_CONNS", "2")
+	type tableSnapshot struct {
+		Rows    []map[string]string
+		Indexes []string
+	}
+	expected := map[string]tableSnapshot{}
+	if phase == "upgrade" {
+		data, err := os.ReadFile(snapshotPath)
+		require.NoError(t, err)
+		require.NoError(t, common.Unmarshal(data, &expected))
+	}
+	for restart := range 2 {
+		common.SQLitePath = os.Getenv("TEST_STARTUP_SQLITE_MAIN")
+		require.NoError(t, InitDB())
+		common.SQLitePath = os.Getenv("TEST_STARTUP_SQLITE_LOG")
+		require.NoError(t, InitLogDB())
+		mainSQL, err := DB.DB()
+		require.NoError(t, err)
+		logSQL, err := LOG_DB.DB()
+		require.NoError(t, err)
+		if restart == 0 && phase != "upgrade" {
+			for _, fixture := range []struct {
+				table string
+				row   map[string]any
+			}{
+				{"users", map[string]any{"id": 87001, "username": "startup-upgrade-user", "password": "unusable-upgrade-fixture", "quota": int64(123456789012), "used_quota": 7654321, "status": 1}},
+				{"tokens", map[string]any{"id": 87002, "user_id": 87001, "key": "startup-upgrade-fixture-token", "name": "upgrade token", "remain_quota": 9876543}},
+				{"channels", map[string]any{"id": 87003, "type": 1, "name": "startup-upgrade-channel", "key": "startup-upgrade-fixture-key", "status": 1, "models": "upgrade-model", "group": "default", "used_quota": 654321}},
+				{"options", map[string]any{"key": "billing_setting.billing_expr", "value": `{"upgrade-model":"tier(\"base\", p * 2 + cc * 2.5)"}`}},
+				{"tasks", map[string]any{"id": 87004, "task_id": "startup-upgrade-task", "user_id": 87001, "channel_id": 87003, "quota": 123000, "status": "SUCCESS", "data": `{"result":"preserved"}`}},
+				{"quota_data", map[string]any{"id": 87005, "user_id": 87001, "username": "startup-upgrade-user", "model_name": "upgrade-model", "created_at": 1790000000, "token_used": 500, "quota": 600, "count": 1}},
+				{"overview_attempt_events", map[string]any{"id": "startup-upgrade-attempt", "request_id": "startup-upgrade-request", "status": "completed", "day": "2026-10-20", "channel_id": 87003, "base_quota": 1000.25, "quota_per_unit": 500000, "revenue_quota": 600, "cost_quota": 250.0625, "cost_known": true, "revenue_confirmed": true}},
+				{"overview_dailies", map[string]any{"id": "startup-upgrade-daily", "day": "2026-10-20", "channel_id": 87003, "quota_per_unit": 500000, "revenue": 600, "cost": 250.0625, "complete_revenue": 600, "complete_cost": 250.0625, "requests": 1, "attempts": 1}},
+			} {
+				if DB.Migrator().HasTable(fixture.table) {
+					require.NoError(t, DB.Table(fixture.table).Create(fixture.row).Error, fixture.table)
+				}
+			}
+			require.NoError(t, LOG_DB.Table("logs").Create(map[string]any{"id": 87006, "user_id": 87001, "type": 2, "quota": 600, "content": "historical usage", "other": `{"cache_tokens":123,"cache_write_tokens":45}`}).Error)
+			require.NoError(t, LOG_DB.Table("audit_logs").Create(map[string]any{"id": 87007, "event_id": "startup-upgrade-audit", "user_id": 87001, "created_at": 1790000000, "action": "channel.update", "content": "historical audit"}).Error)
+			// Newly seeded channels and users need the same initialization that
+			// an ordinary creation path or the following startup performs.
+			require.NoError(t, migrateDB())
+		}
+		actual := map[string]tableSnapshot{}
+		for _, table := range []string{"users", "tokens", "channels", "options", "tasks", "quota_data", "overview_attempt_events", "overview_dailies", "overview_collection_states", "upstream_suppliers", "upstream_credentials", "upstream_credential_versions", "channel_credential_bindings", "upstream_credential_fingerprint_secrets", "logs", "audit_logs"} {
+			db := DB
+			if table == "logs" || table == "audit_logs" {
+				db = LOG_DB
+			}
+			if !db.Migrator().HasTable(table) {
+				continue
+			}
+			query := db.Table(table).Order("id")
+			if table == "options" {
+				query = db.Table(table).Where(map[string]any{"key": "billing_setting.billing_expr"})
+			}
+			var rows []map[string]any
+			require.NoError(t, query.Find(&rows).Error, table)
+			snapshot := tableSnapshot{}
+			for _, row := range rows {
+				values := map[string]string{}
+				for key, value := range row {
+					if bytes, ok := value.([]byte); ok {
+						value = string(bytes)
+					}
+					values[key] = fmt.Sprint(value)
+				}
+				snapshot.Rows = append(snapshot.Rows, values)
+			}
+			indexes, err := db.Migrator().GetIndexes(table)
+			require.NoError(t, err, table)
+			for _, index := range indexes {
+				snapshot.Indexes = append(snapshot.Indexes, index.Name())
+			}
+			actual[table] = snapshot
+		}
+		for table, before := range expected {
+			after, ok := actual[table]
+			require.True(t, ok, "table %s must survive", table)
+			require.Len(t, after.Rows, len(before.Rows), table)
+			for index, row := range before.Rows {
+				for column, value := range row {
+					assert.Equal(t, value, after.Rows[index][column], "%s.%s on restart %d", table, column, restart)
+				}
+			}
+			for _, index := range before.Indexes {
+				assert.Contains(t, after.Indexes, index, table)
+			}
+		}
+		if restart == 1 {
+			// Both uniqueness guarantees must still be enforced by the engine.
+			assert.Error(t, DB.Table("tokens").Create(map[string]any{"id": 87999, "key": "startup-upgrade-fixture-token"}).Error)
+			assert.Error(t, LOG_DB.Table("audit_logs").Create(map[string]any{"id": 87999, "event_id": "startup-upgrade-audit"}).Error)
+			if phase == "seed" {
+				data, err := common.Marshal(actual)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(snapshotPath, data, 0600))
+			} else {
+				assert.True(t, DB.Migrator().HasColumn("quota_data", "cache_read_tokens"))
+				assert.True(t, DB.Migrator().HasColumn("quota_data", "cache_creation_tokens"))
+				assert.True(t, LOG_DB.Migrator().HasIndex("audit_logs", "idx_audit_time_event"))
+				for _, field := range []string{"cache_read_tokens", "cache_creation_tokens"} {
+					var quantity int64
+					require.NoError(t, DB.Table("quota_data").Select(field).Where("id = ?", 87005).Scan(&quantity).Error)
+					assert.Zero(t, quantity, "historical cache usage is not backfilled")
+				}
+				recorder := &migrationSQLRecorder{}
+				DB, LOG_DB = DB.Session(&gorm.Session{Logger: recorder}), LOG_DB.Session(&gorm.Session{Logger: recorder})
+				require.NoError(t, migrateDB())
+				require.NoError(t, migrateLOGDB())
+				assert.Empty(t, recorder.schemaMutations(), "repeated startup must not issue schema changes")
+			}
+		}
+		if phase == "fresh" {
+			expected = actual
+		}
+		require.NoError(t, logSQL.Close())
+		require.NoError(t, mainSQL.Close())
+	}
+}
 
 type MigrationIdentityFields struct {
 	ID        int    `gorm:"primaryKey"`

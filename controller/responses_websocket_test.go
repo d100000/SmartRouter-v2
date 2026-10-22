@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -266,6 +265,7 @@ func TestResponsesWSRequestRunnerRejectsRevokedCredentials(t *testing.T) {
 }
 
 func TestResponsesWSRequestRunnerUsesExistingMemoryRateLimit(t *testing.T) {
+	require.NoError(t, i18n.Init())
 	_, token := setupResponsesWSRequestTest(t)
 	setting.ModelRequestRateLimitEnabled = true
 	setting.ModelRequestRateLimitDurationMinutes = 1
@@ -278,7 +278,8 @@ func TestResponsesWSRequestRunnerUsesExistingMemoryRateLimit(t *testing.T) {
 	apiError := runner(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), "limited", handle)
 	require.NotNil(t, apiError)
 	assert.Equal(t, http.StatusTooManyRequests, apiError.StatusCode)
-	assert.Equal(t, http.StatusText(http.StatusTooManyRequests), apiError.Error())
+	message := i18n.Translate("", i18n.MsgRateLimitTotalReached, map[string]any{"Minutes": 1, "Max": 1})
+	assert.Equal(t, common.MessageWithRequestId(message, "limited"), apiError.Error())
 	assert.Equal(t, 1, called)
 }
 
@@ -1153,11 +1154,117 @@ func TestResponsesWebSocketAmbiguousControlErrorClosesAndSettlesOnce(t *testing.
 	require.NoError(t, err)
 	assert.JSONEq(t, terminal, string(body))
 	_, _, err = fixture.client.ReadMessage()
-	require.Error(t, err, "an unattributed error must close the connection instead of remaining busy")
-	var timeout net.Error
-	assert.False(t, errors.As(err, &timeout) && timeout.Timeout(), "the server must close before the read deadline")
+	// A dropped socket would read as a synthetic 1006; 1011 is the gateway's frame.
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr, "an unattributed error must close the connection instead of remaining busy")
+	assert.Equal(t, websocket.CloseInternalServerErr, closeErr.Code)
 	fixture.closeAndWait(t)
 	assertResponsesWSAccounting(t, fixture, []int{1000})
+}
+
+// Every way a session ends sends the client a close frame whose code says
+// why. A dropped socket would read as a synthetic 1006 close error, so a
+// received 1000, 1001, 1008 or 1011 proves the gateway sent the frame.
+func TestResponsesWebSocketCloseCodes(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	const (
+		created   = `{"type":"response.created","response":{"id":"active","status":"in_progress"}}`
+		delta     = `{"type":"response.output_text.delta","delta":"hello"}`
+		completed = `{"type":"response.completed","response":{"id":"active","status":"completed","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`
+	)
+	for _, tc := range []struct {
+		name   string
+		events []string // upstream events after the create, all relayed
+		// After the events, and after the client read them with waitClient,
+		// upstream sends upstreamClose or drops the socket. Otherwise it reads
+		// until the gateway closes the connection.
+		upstreamClose    int
+		drop, waitClient bool
+		timeout          bool
+		end              func(*testing.T, *responsesWSBillingTest)
+		code             int
+		reason           string
+		upstreamCode     int // the close code upstream receives, when checked
+	}{
+		{name: "upstream closes after completion", events: []string{completed}, upstreamClose: websocket.CloseNormalClosure, code: websocket.CloseNormalClosure, reason: "upstream connection closed"},
+		{name: "idle upstream goes away", events: []string{completed}, waitClient: true, upstreamClose: websocket.CloseGoingAway, code: websocket.CloseGoingAway, reason: "upstream connection closed"},
+		{name: "idle upstream drops", events: []string{completed}, waitClient: true, drop: true, code: websocket.CloseInternalServerErr, reason: "upstream connection closed"},
+		// A normal upstream close still truncates the active response.
+		{name: "upstream closes mid-response", events: []string{created, delta}, upstreamClose: websocket.CloseNormalClosure, code: websocket.CloseInternalServerErr, reason: "upstream connection closed"},
+		{name: "upstream drops mid-response", events: []string{created, delta}, drop: true, code: websocket.CloseInternalServerErr, reason: "upstream connection closed"},
+		{name: "upstream response times out", events: []string{created}, timeout: true, code: websocket.CloseInternalServerErr, reason: "upstream response timed out", upstreamCode: websocket.CloseInternalServerErr},
+		{name: "client closes", events: []string{completed}, end: func(t *testing.T, fixture *responsesWSBillingTest) {
+			require.NoError(t, fixture.client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+		}, code: websocket.CloseNormalClosure, upstreamCode: websocket.CloseNormalClosure},
+		{name: "channel disabled", events: []string{completed}, end: func(t *testing.T, fixture *responsesWSBillingTest) {
+			require.Equal(t, 1, service.CloseActiveWebSocketsForChannel(fixture.channel.Id, service.ChannelDisabledCloseReason))
+		}, code: websocket.ClosePolicyViolation, reason: service.ChannelDisabledCloseReason, upstreamCode: websocket.ClosePolicyViolation},
+		{name: "token revoked", events: []string{completed}, end: func(t *testing.T, fixture *responsesWSBillingTest) {
+			fixture.token.Status = common.TokenStatusDisabled
+			require.NoError(t, fixture.token.SelectUpdate())
+			require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"again"}`)))
+			assert.Equal(t, float64(http.StatusUnauthorized), readResponsesWSTestEvent(t, fixture.client)["status"])
+		}, code: websocket.ClosePolicyViolation, upstreamCode: websocket.ClosePolicyViolation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientRead := make(chan struct{})
+			upstreamCodes := make(chan int, 2)
+			fixture := newResponsesWSBillingTest(t, `tier("request", fixed(0.002))`, func(ws *websocket.Conn, _ *http.Request) {
+				defaultClose := ws.CloseHandler()
+				ws.SetCloseHandler(func(code int, text string) error {
+					upstreamCodes <- code
+					return defaultClose(code, text)
+				})
+				if _, _, err := ws.ReadMessage(); !assert.NoError(t, err) {
+					return
+				}
+				for _, event := range tc.events {
+					if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(event))) {
+						return
+					}
+				}
+				if tc.waitClient {
+					<-clientRead
+				}
+				if tc.drop {
+					return
+				}
+				if tc.upstreamClose != 0 && !assert.NoError(t, ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(tc.upstreamClose, "upstream shutdown"), time.Now().Add(time.Second))) {
+					return
+				}
+				for {
+					if _, _, err := ws.ReadMessage(); err != nil {
+						return
+					}
+				}
+			})
+			if tc.timeout {
+				constant.StreamingTimeout = 1
+			}
+			require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"hi"}`)))
+			for _, event := range tc.events {
+				actual, err := common.Marshal(readResponsesWSTestEvent(t, fixture.client))
+				require.NoError(t, err)
+				assert.JSONEq(t, event, string(actual))
+			}
+			close(clientRead)
+			if tc.end != nil {
+				tc.end(t, fixture)
+			}
+			require.NoError(t, fixture.client.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, _, err := fixture.client.ReadMessage()
+			var closeErr *websocket.CloseError
+			require.ErrorAs(t, err, &closeErr)
+			assert.Equal(t, tc.code, closeErr.Code)
+			assert.Equal(t, tc.reason, closeErr.Text)
+			fixture.closeAndWait(t)
+			assertResponsesWSAccounting(t, fixture, []int{1000})
+			if tc.upstreamCode != 0 {
+				require.Len(t, upstreamCodes, 1)
+				assert.Equal(t, tc.upstreamCode, <-upstreamCodes)
+			}
+		})
+	}
 }
 
 // A control event queued while another is still outstanding is rejected
@@ -1548,17 +1655,19 @@ func TestResponsesSchedulingTerminalFraming(t *testing.T) {
 	completeEvent := "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
 	failedEvent := "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"code\":\"server_error\"}}}\n\n"
 	for _, tc := range []struct {
-		name       string
-		writes     []string
-		counts     int64
-		failed     bool
-		failBefore bool
-		failAfter  bool
-		shortAfter bool
+		name            string
+		writes          []string
+		counts          int64
+		failed          bool
+		failBefore      bool
+		failAfter       bool
+		shortAfter      bool
+		deadlineExpired bool
 	}{
 		{name: "large complete data line and CRLF", writes: []string{"data: " + largeTerminal, "\r\n\r\n"}, counts: 1},
 		{name: "split data prefix and JSON", writes: []string{"data: ", `{"type":"response.completed","response":{"status":"completed"}}`, "\n\n"}, counts: 1},
 		{name: "terminal without event delimiter", writes: []string{`data: {"type":"response.completed","response":{"status":"completed"}}`, "\n"}},
+		{name: "completed terminal after total deadline stays neutral", writes: []string{completeEvent}, deadlineExpired: true},
 		{name: "complete survives failed trailing write", writes: []string{completeEvent}, counts: 1, failAfter: true},
 		{name: "complete survives short trailing write", writes: []string{completeEvent}, counts: 1, shortAfter: true},
 		{name: "upstream failure survives failed trailing write", writes: []string{failedEvent}, counts: 1, failed: true, failAfter: true},
@@ -1568,6 +1677,10 @@ func TestResponsesSchedulingTerminalFraming(t *testing.T) {
 			scheduler.Default = scheduler.New()
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx, cancel := context.WithCancel(context.Background())
+			if tc.deadlineExpired {
+				cancel()
+				ctx, cancel = context.WithDeadline(context.Background(), time.Time{})
+			}
 			defer cancel()
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
 			writer := &responsesSchedulingTerminalWriter{ResponseWriter: c.Writer}

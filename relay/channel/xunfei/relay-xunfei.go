@@ -158,7 +158,7 @@ func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textReques
 			response := streamResponseXunfei2OpenAI(&xunfeiResponse)
 			jsonResponse, err := common.Marshal(response)
 			if err != nil {
-				common.SysLog("error marshalling stream response: " + err.Error())
+				common.SysLog(common.LogText("error marshalling stream response: %s", err.Error()))
 				continue
 			}
 			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
@@ -273,14 +273,14 @@ func xunfeiMakeRequest(ctx context.Context, info *relaycommon.RelayInfo, textReq
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
 				if ctx.Err() == nil {
-					common.SysLog("error reading stream response: " + err.Error())
+					common.SysLog(common.LogText("error reading stream response: %s", err.Error()))
 				}
 				return
 			}
 			var response XunfeiChatResponse
 			err = common.Unmarshal(msg, &response)
 			if err != nil {
-				common.SysLog("error unmarshalling stream response: " + err.Error())
+				common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 				break
 			}
 			select {
@@ -337,6 +337,6 @@ func getAPIVersion(c *gin.Context, modelName string) string {
 		return apiVersion
 	}
 	apiVersion = "v1.1"
-	common.SysLog("api_version not found, using default: " + apiVersion)
+	common.SysLog(common.LogText("api_version not found, using default: %s", apiVersion))
 	return apiVersion
 }
