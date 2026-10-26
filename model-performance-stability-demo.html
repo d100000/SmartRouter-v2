@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>模型性能与稳定性 · Preview</title>
+    <style>
+      :root {
+        --canvas: #f4f7fb;
+        --surface: #ffffff;
+        --surface-soft: #f8fafc;
+        --ink: #142033;
+        --muted: #6c7890;
+        --line: #e5eaf2;
+        --blue: #3568e8;
+        --blue-soft: #eaf0ff;
+        --green: #0e9f6e;
+        --green-soft: #e8f8f1;
+        --amber: #b7791f;
+        --amber-soft: #fff6df;
+        --red: #d04b55;
+        --red-soft: #fff0f1;
+        --shadow: 0 16px 44px rgba(38, 58, 94, 0.08);
+        --radius: 18px;
+        color-scheme: light;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 82% 0%, rgba(91, 132, 255, 0.13), transparent 32rem),
+          var(--canvas);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        line-height: 1.45;
+      }
+
+      button, select { font: inherit; }
+
+      button { cursor: pointer; }
+
+      .shell {
+        width: min(1440px, calc(100% - 40px));
+        margin: 0 auto;
+        padding: 34px 0 48px;
+      }
+
+      .topbar, .section-heading, .toolbar, .chart-heading,
+      .table-heading, .company-heading, .row-main, .legend {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .topbar { align-items: flex-end; margin-bottom: 24px; }
+
+      .eyebrow {
+        margin: 0 0 8px;
+        color: var(--blue);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+
+      h1, h2, h3, p { margin: 0; }
+
+      h1 { font-size: clamp(26px, 3vw, 40px); letter-spacing: -0.045em; }
+
+      h2 { font-size: 18px; letter-spacing: -0.02em; }
+
+      h3 { font-size: 14px; }
+
+      .subtitle { max-width: 720px; margin-top: 7px; color: var(--muted); font-size: 14px; }
+
+      .top-actions, .toolbar-actions, .legend, .badge-list { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+      .chip, .badge, .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 5px 10px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.72);
+        font-size: 11px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      .chip.preview { border-color: #bfd0ff; color: var(--blue); background: var(--blue-soft); }
+      .status.healthy { border-color: #b9ead7; color: var(--green); background: var(--green-soft); }
+      .status.watch { border-color: #f2dda5; color: var(--amber); background: var(--amber-soft); }
+      .status.degraded { border-color: #f0c2c6; color: var(--red); background: var(--red-soft); }
+
+      .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+      .button, .select {
+        min-height: 38px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        padding: 0 13px;
+        color: var(--ink);
+        background: var(--surface);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .button:hover, .select:hover { border-color: #afc0e7; }
+      .button.primary { border-color: var(--blue); color: white; background: var(--blue); box-shadow: 0 8px 18px rgba(53, 104, 232, 0.2); }
+      .button.ghost { color: var(--blue); background: var(--blue-soft); border-color: transparent; }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 22px;
+        align-items: center;
+        margin-bottom: 16px;
+        padding: 22px 24px;
+        border: 1px solid #dbe4f5;
+        border-radius: var(--radius);
+        background: linear-gradient(120deg, rgba(255,255,255,0.96), rgba(239,245,255,0.88));
+        box-shadow: var(--shadow);
+      }
+
+      .hero-copy strong { color: var(--blue); }
+
+      .filter-block { display: grid; gap: 6px; min-width: 170px; }
+      .filter-block label { color: var(--muted); font-size: 11px; font-weight: 700; }
+
+      .kpis {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .kpi, .panel {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: 0 8px 24px rgba(38, 58, 94, 0.04);
+      }
+
+      .kpi { min-width: 0; padding: 15px; }
+      .kpi-label { color: var(--muted); font-size: 11px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .kpi-value { margin-top: 9px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 22px; font-weight: 800; letter-spacing: -0.05em; }
+      .kpi-hint { margin-top: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .kpi.success .kpi-value { color: var(--green); }
+      .kpi.warning .kpi-value { color: var(--amber); }
+      .kpi.info .kpi-value { color: var(--blue); }
+
+      .grid-main { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, 0.75fr); gap: 16px; margin-bottom: 16px; }
+      .panel { min-width: 0; overflow: hidden; }
+      .panel-header { padding: 18px 20px 15px; border-bottom: 1px solid var(--line); }
+      .panel-body { padding: 18px 20px 20px; }
+      .muted { color: var(--muted); font-size: 12px; }
+
+      .chart-wrap { margin-top: 16px; padding: 12px 10px 8px; border: 1px solid var(--line); border-radius: 14px; background: linear-gradient(180deg, #fbfcff, #f8faff); }
+      #chart { display: block; width: 100%; height: 260px; }
+      .chart-grid { stroke: #dfe6f1; stroke-dasharray: 3 7; }
+      .chart-target { stroke: #8aa4e9; stroke-dasharray: 5 5; }
+      .chart-label { fill: #8793a8; font-size: 11px; }
+      .chart-area { fill: url(#areaFill); }
+      .chart-line { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .chart-point { fill: white; stroke: var(--blue); stroke-width: 2; }
+
+      .company-list { display: grid; gap: 10px; margin-top: 14px; }
+      .company-row { width: 100%; padding: 13px; border: 1px solid var(--line); border-radius: 14px; text-align: left; background: var(--surface); transition: 160ms ease; }
+      .company-row:hover, .company-row.active { border-color: #b8c9f4; background: #f5f8ff; transform: translateY(-1px); }
+      .company-name { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 800; }
+      .company-dot { width: 9px; height: 9px; border-radius: 50%; }
+      .company-meta { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+      .company-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+      .company-metric { padding-top: 9px; border-top: 1px solid var(--line); }
+      .company-metric b { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+      .company-metric span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+
+      .table-panel { margin-bottom: 16px; }
+      .table-scroll { overflow-x: auto; }
+      table { width: 100%; min-width: 840px; border-collapse: collapse; font-size: 12px; }
+      th { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-align: left; text-transform: uppercase; }
+      th, td { padding: 13px 20px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+      tbody tr:last-child td { border-bottom: 0; }
+      tbody tr:hover { background: #f9fbff; }
+      td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .rate { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 800; }
+      .rate.good { color: var(--green); }
+      .rate.warn { color: var(--amber); }
+      .rate.bad { color: var(--red); }
+
+      .notice { display: none; margin-top: 13px; padding: 11px 12px; border: 1px solid #cad8fa; border-radius: 11px; color: #35528d; background: var(--blue-soft); font-size: 11px; }
+      .notice.show { display: block; }
+
+      .footnote { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); font-size: 11px; }
+      .footnote strong { color: var(--ink); }
+
+      @media (max-width: 1100px) {
+        .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      }
+
+      @media (max-width: 820px) {
+        .shell { width: min(100% - 24px, 680px); padding-top: 22px; }
+        .topbar, .hero { grid-template-columns: 1fr; display: grid; align-items: start; }
+        .top-actions { justify-content: flex-start; }
+        .grid-main { grid-template-columns: 1fr; }
+        .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .panel-header, .panel-body { padding-left: 15px; padding-right: 15px; }
+        th, td { padding-left: 15px; padding-right: 15px; }
+        .footnote { flex-direction: column; }
+      }
+
+      @media (max-width: 460px) {
+        .kpis { gap: 8px; }
+        .kpi { padding: 12px; }
+        .kpi-value { font-size: 19px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Model observability / preview</p>
+          <h1>模型性能与稳定性</h1>
+          <p class="subtitle">用最终请求结果衡量用户体验，用尝试和重试指标解释路由行为。当前页面使用静态示例数据。</p>
+        </div>
+        <div class="top-actions">
+          <span class="chip preview"><span class="dot"></span>前端 Demo</span>
+          <span class="chip">数据更新于 2 分钟前</span>
+        </div>
+      </header>
+
+      <section class="hero" aria-label="看板筛选">
+        <div class="hero-copy">
+          <p class="eyebrow">24 小时滚动窗口</p>
+          <h2>所有公司的请求健康度</h2>
+          <p class="subtitle">失败后重试成功的请求只计为一次最终成功，同时保留重试压力用于诊断。</p>
+        </div>
+        <div class="toolbar-actions">
+          <div class="filter-block">
+            <label for="companyFilter">公司</label>
+            <select class="select" id="companyFilter">
+              <option value="all">全部公司</option>
+            </select>
+          </div>
+          <div class="filter-block">
+            <label for="modelFilter">模型</label>
+            <select class="select" id="modelFilter" aria-label="模型"></select>
+          </div>
+          <button class="button primary" id="configureButton" type="button">配置模型分组</button>
+        </div>
+      </section>
+
+      <section class="kpis" aria-label="核心指标">
+        <article class="kpi success"><div class="kpi-label">最终请求成功率</div><div class="kpi-value" id="successRate">—</div><div class="kpi-hint" id="successHint">—</div></article>
+        <article class="kpi info"><div class="kpi-label">请求量</div><div class="kpi-value" id="requestCount">—</div><div class="kpi-hint">过去 24 小时逻辑请求</div></article>
+        <article class="kpi success"><div class="kpi-label">首次尝试成功率</div><div class="kpi-value" id="firstAttemptRate">—</div><div class="kpi-hint">路由第一选择直接成功</div></article>
+        <article class="kpi warning"><div class="kpi-label">重试恢复率</div><div class="kpi-value" id="recoveryRate">—</div><div class="kpi-hint">首次失败后成功恢复</div></article>
+        <article class="kpi warning"><div class="kpi-label">P95 最终响应</div><div class="kpi-value" id="latency">—</div><div class="kpi-hint">包含重试等待</div></article>
+        <article class="kpi info"><div class="kpi-label">错误预算</div><div class="kpi-value" id="budget">—</div><div class="kpi-hint">SLO 99.90%</div></article>
+      </section>
+
+      <div class="notice" id="configureNotice" role="status">这是配置预览：实际版本将允许管理员创建公司、维护模型分组、设置 SLO，并记录配置审计。当前不会写入后端。</div>
+
+      <section class="grid-main">
+        <article class="panel">
+          <div class="panel-header">
+            <div class="chart-heading">
+              <div>
+                <h2>24 小时成功率曲线</h2>
+                <p class="muted" id="chartSubtitle">—</p>
+              </div>
+              <div class="legend"><span class="chip"><span class="dot" style="color: var(--blue)"></span>最终成功率</span><span class="chip">虚线：SLO 99.90%</span></div>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="chart-wrap">
+              <svg id="chart" viewBox="0 0 760 260" role="img" aria-label="24 小时成功率曲线"></svg>
+            </div>
+          </div>
+        </article>
+
+        <aside class="panel">
+          <div class="panel-header">
+            <div class="company-heading"><div><h2>公司健康排行</h2><p class="muted">按请求量加权</p></div><span class="status healthy"><span class="dot"></span>监控中</span></div>
+          </div>
+          <div class="panel-body"><div class="company-list" id="companyList"></div></div>
+        </aside>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-header">
+          <div class="table-heading"><div><h2>分模型成功率</h2><p class="muted">最终请求成功率与执行侧指标分开阅读</p></div><span class="chip">示例数据 · 6 个模型</span></div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>模型</th><th>公司 / 分组</th><th>请求量</th><th>最终成功率</th><th>首次成功</th><th>重试恢复</th><th>P95 延迟</th><th>状态</th></tr></thead>
+            <tbody id="modelTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer class="footnote"><span><strong>口径：</strong>失败后重试成功的逻辑请求计为一次最终成功，上游失败尝试仍保留在诊断指标中。</span><span>前端静态演示 · 不产生真实请求</span></footer>
+    </main>
+
+    <script>
+      const companies = [
+        { id: 'openai', name: 'OpenAI', group: '主力通用模型', color: '#0e9f6e' },
+        { id: 'anthropic', name: 'Anthropic', group: '长文本与推理', color: '#b7791f' },
+        { id: 'google', name: 'Google', group: '多模态与高速', color: '#3568e8' },
+      ]
+
+      const models = [
+        { id: 'gpt-4.1', company: 'openai', requests: 12840, success: 99.72, first: 97.84, recovery: 2.15, p95: 1.61, incidents: 2, trend: [99.2,99.3,99.5,99.4,99.7,99.8,99.7,99.8,99.9,99.8,99.7,99.8,99.8,99.7,99.8,99.9,99.8,99.8,99.7,99.8,99.9,99.8,99.7,99.8] },
+        { id: 'gpt-4o-mini', company: 'openai', requests: 8460, success: 99.48, first: 96.91, recovery: 3.04, p95: 1.18, incidents: 3, trend: [99.1,99.2,99.4,99.6,99.5,99.4,99.6,99.5,99.5,99.4,99.6,99.5,99.4,99.5,99.6,99.5,99.4,99.5,99.6,99.5,99.4,99.5,99.6,99.5] },
+        { id: 'claude-3-7-sonnet', company: 'anthropic', requests: 5044, success: 98.92, first: 95.82, recovery: 4.87, p95: 2.34, incidents: 7, trend: [99.3,99.2,99.0,98.7,98.8,98.9,99.0,98.8,98.9,99.1,98.9,98.9,98.8,98.9,99.0,98.8,98.7,98.9,98.8,98.9,98.7,98.8,98.9,98.9] },
+        { id: 'claude-3-5-haiku', company: 'anthropic', requests: 2180, success: 99.31, first: 97.88, recovery: 2.74, p95: 1.43, incidents: 2, trend: [99.0,99.2,99.2,99.3,99.4,99.3,99.2,99.4,99.3,99.4,99.3,99.3,99.2,99.3,99.4,99.3,99.2,99.3,99.4,99.3,99.3,99.4,99.3,99.3] },
+        { id: 'gemini-2.5-pro', company: 'google', requests: 3620, success: 98.64, first: 94.53, recovery: 5.09, p95: 2.71, incidents: 9, trend: [99.0,98.8,98.7,98.6,98.5,98.7,98.6,98.5,98.7,98.6,98.5,98.6,98.5,98.6,98.7,98.5,98.4,98.6,98.5,98.6,98.4,98.5,98.6,98.6] },
+        { id: 'gemini-2.0-flash', company: 'google', requests: 1940, success: 99.05, first: 96.38, recovery: 3.14, p95: 1.29, incidents: 4, trend: [98.8,98.9,99.0,99.1,99.0,99.1,99.2,99.0,99.1,99.1,99.0,99.1,99.0,99.1,99.2,99.0,99.1,99.1,99.0,99.1,99.2,99.1,99.0,99.1] },
+      ]
+
+      const state = { company: 'all', model: 'gpt-4.1' }
+      const companyFilter = document.querySelector('#companyFilter')
+      const modelFilter = document.querySelector('#modelFilter')
+      const companyList = document.querySelector('#companyList')
+      const modelTable = document.querySelector('#modelTable')
+
+      const number = value => new Intl.NumberFormat('zh-CN').format(value)
+      const percent = value => `${value.toFixed(2)}%`
+      const companyById = id => companies.find(company => company.id === id)
+      const visibleModels = () => state.company === 'all' ? models : models.filter(model => model.company === state.company)
+
+      function statusFor(rate) {
+        if (rate >= 99.5) return ['健康', 'healthy']
+        if (rate >= 99) return ['关注', 'watch']
+        return ['降级', 'degraded']
+      }
+
+      function weighted(items, field) {
+        const total = items.reduce((sum, item) => sum + item.requests, 0)
+        return total ? items.reduce((sum, item) => sum + item[field] * item.requests, 0) / total : 0
+      }
+
+      function renderFilters() {
+        companyFilter.innerHTML = '<option value="all">全部公司</option>' + companies.map(company => `<option value="${company.id}">${company.name}</option>`).join('')
+        companyFilter.value = state.company
+        const list = visibleModels()
+        if (!list.some(model => model.id === state.model)) state.model = list[0]?.id || ''
+        modelFilter.innerHTML = list.map(model => `<option value="${model.id}">${model.id}</option>`).join('')
+        modelFilter.value = state.model
+      }
+
+      function renderKpis() {
+        const selected = models.find(model => model.id === state.model)
+        const items = state.company === 'all' ? models : visibleModels()
+        const requests = items.reduce((sum, item) => sum + item.requests, 0)
+        const success = weighted(items, 'success')
+        const first = weighted(items, 'first')
+        const recovery = weighted(items, 'recovery')
+        const p95 = weighted(items, 'p95')
+        const budget = Math.max(0, ((success - 99.9) / 0.1) * 100)
+        document.querySelector('#successRate').textContent = percent(success)
+        document.querySelector('#requestCount').textContent = number(requests)
+        document.querySelector('#firstAttemptRate').textContent = percent(first)
+        document.querySelector('#recoveryRate').textContent = percent(recovery)
+        document.querySelector('#latency').textContent = `${p95.toFixed(2)}s`
+        document.querySelector('#budget').textContent = `${budget.toFixed(0)}%`
+        document.querySelector('#successHint').textContent = `${number(Math.round(requests * success / 100))} 次最终成功 · ${state.company === 'all' ? '整站' : companyById(state.company).name}`
+        document.querySelector('#chartSubtitle').textContent = `${selected?.id || '全部模型'} · ${selected ? companyById(selected.company).name : '整站'} · 当前窗口 24 个小时桶`
+      }
+
+      function renderChart() {
+        const selected = models.find(model => model.id === state.model) || models[0]
+        const values = selected.trend
+        const svg = document.querySelector('#chart')
+        const left = 42, top = 18, width = 690, height = 198, min = 98, max = 100
+        const x = index => left + (index / (values.length - 1)) * width
+        const y = value => top + height - ((value - min) / (max - min)) * height
+        const points = values.map((value, index) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(' ')
+        const area = `${left},${top + height} ${points} ${left + width},${top + height}`
+        const horizontal = [98, 98.5, 99, 99.5, 100].map(value => `<line class="chart-grid" x1="${left}" x2="${left + width}" y1="${y(value)}" y2="${y(value)}"/><text class="chart-label" x="8" y="${y(value) + 4}">${value.toFixed(1)}%</text>`).join('')
+        const ticks = [0, 4, 8, 12, 16, 20, 23].map(index => `<text class="chart-label" text-anchor="middle" x="${x(index)}" y="244">${String(index).padStart(2, '0')}:00</text>`).join('')
+        svg.innerHTML = `<defs><linearGradient id="areaFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#3568e8" stop-opacity=".22"/><stop offset="100%" stop-color="#3568e8" stop-opacity="0"/></linearGradient></defs>${horizontal}<line class="chart-target" x1="${left}" x2="${left + width}" y1="${y(99.9)}" y2="${y(99.9)}"/><polygon class="chart-area" points="${area}"/><polyline class="chart-line" points="${points}"/>${values.map((value, index) => `<circle class="chart-point" cx="${x(index)}" cy="${y(value)}" r="${index === values.length - 1 ? 4 : 2.5}"/>`).join('')}${ticks}`
+        svg.setAttribute('aria-label', `${selected.id} 24 小时成功率曲线`)
+      }
+
+      function renderCompanies() {
+        companyList.innerHTML = companies.map(company => {
+          const items = models.filter(model => model.company === company.id)
+          const requests = items.reduce((sum, item) => sum + item.requests, 0)
+          const success = weighted(items, 'success')
+          const [label, tone] = statusFor(success)
+          return `<button class="company-row ${state.company === company.id ? 'active' : ''}" type="button" data-company="${company.id}" aria-pressed="${state.company === company.id}"><div class="row-main"><span class="company-name"><span class="company-dot" style="background:${company.color}"></span>${company.name}</span><span class="status ${tone}"><span class="dot"></span>${label}</span></div><div class="company-meta">${company.group} · ${number(items.length)} 个模型</div><div class="company-metrics"><div class="company-metric"><b>${percent(success)}</b><span>最终成功率</span></div><div class="company-metric"><b>${number(requests)}</b><span>请求量</span></div><div class="company-metric"><b>${weighted(items, 'p95').toFixed(2)}s</b><span>P95 延迟</span></div></div></button>`
+        }).join('')
+        companyList.querySelectorAll('[data-company]').forEach(button => button.addEventListener('click', () => {
+          state.company = button.dataset.company
+          render()
+        }))
+      }
+
+      function renderTable() {
+        modelTable.innerHTML = visibleModels().map(model => {
+          const company = companyById(model.company)
+          const [label, tone] = statusFor(model.success)
+          const rateTone = model.success >= 99.5 ? 'good' : model.success >= 99 ? 'warn' : 'bad'
+          return `<tr><td class="mono"><strong>${model.id}</strong></td><td>${company.name}<br><span class="muted">${company.group}</span></td><td class="mono">${number(model.requests)}</td><td class="rate ${rateTone}">${percent(model.success)}</td><td class="mono">${percent(model.first)}</td><td class="mono">${percent(model.recovery)}</td><td class="mono">${model.p95.toFixed(2)}s</td><td><span class="status ${tone}"><span class="dot"></span>${label}</span></td></tr>`
+        }).join('')
+      }
+
+      function render() {
+        renderFilters()
+        renderKpis()
+        renderChart()
+        renderCompanies()
+        renderTable()
+      }
+
+      companyFilter.addEventListener('change', event => { state.company = event.target.value; render() })
+      modelFilter.addEventListener('change', event => { state.model = event.target.value; render() })
+      document.querySelector('#configureButton').addEventListener('click', () => document.querySelector('#configureNotice').classList.toggle('show'))
+      render()
+    </script>
+  </body>
+</html>

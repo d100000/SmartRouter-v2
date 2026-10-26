@@ -42,6 +42,21 @@ func SetApiRouter(router *gin.Engine) {
 			perfMetricsRoute.GET("/summary", controller.GetPerfMetricsSummary)
 			perfMetricsRoute.GET("", controller.GetPerfMetrics)
 		}
+		performanceHealthRoute := apiRouter.Group("/performance-health")
+		performanceHealthRoute.Use(middleware.AdminAuth())
+		{
+			performanceHealthRoute.GET("/summary", controller.GetPerformanceHealthSummary)
+			performanceHealthRoute.GET("/timeseries", controller.GetPerformanceHealthTimeseries)
+			performanceHealthRoute.GET("/companies", controller.GetPerformanceHealthCompanies)
+			performanceHealthRoute.POST("/companies", controller.CreatePerformanceHealthCompany)
+			performanceHealthRoute.PATCH("/companies/:company_id", controller.UpdatePerformanceHealthCompany)
+			performanceHealthRoute.DELETE("/companies/:company_id", controller.DeletePerformanceHealthCompany)
+			performanceHealthRoute.PUT("/config", controller.PutPerformanceHealthConfig)
+			performanceHealthRoute.GET("/companies/:company_id/groups", controller.GetPerformanceHealthGroups)
+			performanceHealthRoute.POST("/companies/:company_id/groups", controller.CreatePerformanceHealthGroup)
+			performanceHealthRoute.PATCH("/groups/:group_id", controller.UpdatePerformanceHealthGroup)
+			performanceHealthRoute.DELETE("/groups/:group_id", controller.DeletePerformanceHealthGroup)
+		}
 		apiRouter.GET("/rankings", middleware.HeaderNavModuleAuth("rankings"), controller.GetRankings)
 		apiRouter.GET("/verification", middleware.EmailVerificationRateLimit(), middleware.TurnstileCheck(), controller.SendEmailVerification)
 		apiRouter.GET("/reset_password", middleware.CriticalRateLimit(), middleware.TurnstileCheck(), controller.SendPasswordResetEmail)

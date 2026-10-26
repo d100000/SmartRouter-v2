@@ -23,6 +23,7 @@ import {
   CreditCard,
   FileText,
   FlaskConical,
+  HeartPulse,
   Key,
   LayoutDashboard,
   ListTodo,
@@ -148,6 +149,12 @@ export function useSidebarData(): SidebarData {
             title: t('Channel Overview'),
             url: '/channel-overview',
             icon: LayoutDashboard,
+            requiredRole: ROLE.ADMIN,
+          },
+          {
+            title: t('Model reliability'),
+            url: '/dashboard/reliability',
+            icon: HeartPulse,
             requiredRole: ROLE.ADMIN,
           },
           {

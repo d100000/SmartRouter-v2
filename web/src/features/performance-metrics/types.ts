@@ -75,3 +75,67 @@ export type PerfSummaryAllData = {
     recent_success_series?: Record<string, SuccessRatePoint[]>
   }
 }
+
+export type PerformanceHealthModel = PerfModelSummary & {
+  company_id?: string
+  company_name?: string
+  group_id?: string
+  group_name?: string
+  group?: string
+  p95_latency_ms?: number
+  p95_ttft_ms?: number
+  first_attempt_success_rate?: number
+  retry_request_rate?: number
+  retry_recovery_rate?: number
+  attempt_success_rate?: number
+  incidents?: number
+  recent_success_series?: SuccessRatePoint[]
+}
+
+export type PerformanceHealthCompany = {
+  id: string
+  name: string
+  status?: number | string
+  slo?: number
+  owner?: string
+  note?: string
+  groups?: Array<{
+    id: string
+    name: string
+    models: string[]
+    enabled?: boolean
+    slo?: number
+    p95_latency_ms?: number
+    min_samples?: number
+  }>
+}
+
+export type PerformanceHealthConfig = {
+  version?: number
+  updated_at?: number
+  companies: PerformanceHealthCompany[]
+}
+
+export type PerformanceHealthData = {
+  summary?: PerformanceSummary | null
+  models: PerformanceHealthModel[]
+  companies?: PerformanceHealthCompany[]
+  series?: PerformanceSeriesPoint[]
+  window_start?: number
+  window_end?: number
+  terminal_coverage?: number
+  data_freshness?: string | number
+  definition_version?: string
+}
+
+export type PerformanceHealthResponse = {
+  success: boolean
+  message?: string
+  data: PerformanceHealthData
+}
+
+export type PerformanceHealthCompanyResponse = {
+  success: boolean
+  message?: string
+  data: PerformanceHealthConfig
+}

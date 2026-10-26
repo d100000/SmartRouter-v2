@@ -18,7 +18,13 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
-import type { PerformanceMetricsData, PerfSummaryAllData } from './types'
+import type {
+  PerformanceHealthCompanyResponse,
+  PerformanceHealthConfig,
+  PerformanceHealthResponse,
+  PerformanceMetricsData,
+  PerfSummaryAllData,
+} from './types'
 
 export async function getPerfMetricsSummary(
   hours = 24,
@@ -42,4 +48,31 @@ export async function getPerfMetrics(
     },
   })
   return res.data
+}
+
+export async function getPerformanceHealthSummary(
+  hours = 24
+): Promise<PerformanceHealthResponse> {
+  const res = await api.get<PerformanceHealthResponse>(
+    '/api/performance-health/summary',
+    { params: { hours } }
+  )
+  return res.data
+}
+
+export async function getPerformanceHealthCompanies(): Promise<PerformanceHealthCompanyResponse> {
+  const res = await api.get<PerformanceHealthCompanyResponse>(
+    '/api/performance-health/companies'
+  )
+  return res.data
+}
+
+export async function savePerformanceHealthConfig(
+  config: PerformanceHealthConfig
+): Promise<PerformanceHealthConfig> {
+  const res = await api.put<{
+    success: boolean
+    data: PerformanceHealthConfig
+  }>('/api/performance-health/config', config)
+  return res.data.data
 }

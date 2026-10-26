@@ -18,10 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PerformanceOverview } from '@/features/dashboard/components/models/performance-overview'
 import { PerformanceHealthPanel } from '@/features/dashboard/components/overview/performance-health-panel'
+import { ModelReliabilityDemo } from '@/features/performance-metrics/components/model-reliability-demo'
 import { ModelDetailsPerformance } from '@/features/pricing/components/model-details-performance'
 import { UptimeSparkline } from '@/features/pricing/components/model-details-uptime-sparkline'
 
@@ -204,5 +206,62 @@ describe('server performance summaries', () => {
     )
     expect(screen.getAllByText('—')).toHaveLength(3)
     expect(screen.queryByText('0.00%')).not.toBeInTheDocument()
+  })
+
+  it('filters live model rows by company', async () => {
+    const user = userEvent.setup()
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        summary,
+        models: [
+          {
+            model_name: 'gpt-4.1',
+            company_id: 'openai',
+            company_name: 'OpenAI',
+            group_name: 'general',
+            request_count: 100,
+            success_rate: 99.8,
+            avg_latency_ms: 400,
+            avg_tps: 12,
+            recent_success_series: [
+              { ts: windowStart, success_rate: 99.8 },
+              { ts: windowStart + 3600, success_rate: 100 },
+            ],
+          },
+          {
+            model_name: 'claude-3-7-sonnet',
+            company_id: 'anthropic',
+            company_name: 'Anthropic',
+            group_name: 'reasoning',
+            request_count: 80,
+            success_rate: 98.8,
+            avg_latency_ms: 600,
+            avg_tps: 8,
+            recent_success_series: [
+              { ts: windowStart, success_rate: 98.8 },
+              { ts: windowStart + 3600, success_rate: 99 },
+            ],
+          },
+        ],
+        companies: [
+          { id: 'openai', name: 'OpenAI' },
+          { id: 'anthropic', name: 'Anthropic' },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    const companySelect = screen.getByRole('combobox', { name: 'Company' })
+
+    expect(screen.getAllByText('gpt-4.1').length).toBeGreaterThan(0)
+    await user.selectOptions(companySelect, 'anthropic')
+
+    expect(screen.getAllByText('claude-3-7-sonnet').length).toBeGreaterThan(0)
+    expect(screen.queryByText('gpt-4.1')).not.toBeInTheDocument()
   })
 })

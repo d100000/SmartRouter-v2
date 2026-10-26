@@ -34,6 +34,7 @@ import {
 import { ROLE } from '@/lib/roles'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
+import { ModelReliabilityDemo } from '@/features/performance-metrics/components/model-reliability-demo'
 
 import { ModelsChartPreferences } from './components/models/models-chart-preferences'
 import { ModelsFilter } from './components/models/models-filter-dialog'
@@ -194,6 +195,9 @@ const SECTION_META: Record<DashboardSectionId, { titleKey: string }> = {
   users: {
     titleKey: 'User Analytics',
   },
+  reliability: {
+    titleKey: 'Model reliability',
+  },
 }
 
 export function Dashboard() {
@@ -253,7 +257,9 @@ export function Dashboard() {
   const visibleSections = useMemo(
     () =>
       DASHBOARD_SECTION_IDS.filter(
-        (section) => section !== 'overview' && (section !== 'users' || isAdmin)
+        (section) =>
+          section !== 'overview' &&
+          (!['users', 'reliability'].includes(section) || isAdmin)
       ),
     [isAdmin]
   )
@@ -414,6 +420,11 @@ export function Dashboard() {
                   sensitiveVisible={flowSensitiveVisible}
                 />
               </Suspense>
+            </FadeIn>
+          )}
+          {activeSection === 'reliability' && (
+            <FadeIn>
+              <ModelReliabilityDemo />
             </FadeIn>
           )}
         </div>
