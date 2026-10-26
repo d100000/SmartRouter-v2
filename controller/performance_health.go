@@ -45,19 +45,104 @@ type performanceHealthCompany struct {
 }
 
 type performanceHealthSummary struct {
-	Summary             *perfmetrics.Summary                      `json:"summary"`
-	WindowStart         int64                                     `json:"window_start"`
-	WindowEnd           int64                                     `json:"window_end"`
-	Models              []performanceHealthModel                  `json:"models"`
-	Companies           []performanceHealthCompany                `json:"companies"`
-	RecentSuccessSeries map[string][]perfmetrics.SuccessRatePoint `json:"recent_success_series,omitempty"`
-	TerminalCoverage    float64                                   `json:"terminal_coverage"`
-	DataFreshness       int64                                     `json:"data_freshness"`
-	DefinitionVersion   string                                    `json:"definition_version"`
-	ConfigVersion       int64                                     `json:"config_version"`
+	Summary                   *perfmetrics.Summary                      `json:"summary"`
+	WindowStart               int64                                     `json:"window_start"`
+	WindowEnd                 int64                                     `json:"window_end"`
+	Models                    []performanceHealthModel                  `json:"models"`
+	Companies                 []performanceHealthCompany                `json:"companies"`
+	RecentSuccessSeries       map[string][]perfmetrics.SuccessRatePoint `json:"recent_success_series,omitempty"`
+	TerminalCoverage          float64                                   `json:"terminal_coverage"`
+	TerminalCoverageAvailable bool                                      `json:"terminal_coverage_available"`
+	DataFreshness             int64                                     `json:"data_freshness"`
+	DefinitionVersion         string                                    `json:"definition_version"`
+	ConfigVersion             int64                                     `json:"config_version"`
 }
 
 type performanceHealthOwnership struct{ CompanyID, CompanyName, GroupID, GroupName string }
+
+type performanceHealthCacheRow struct {
+	ChannelID           int     `json:"channel_id"`
+	ChannelName         string  `json:"channel_name"`
+	ModelName           string  `json:"model_name"`
+	RequestCount        int64   `json:"request_count"`
+	TokenUsed           int64   `json:"token_used"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheReadRatio      float64 `json:"cache_read_ratio"`
+	CacheWriteRatio     float64 `json:"cache_write_ratio"`
+}
+
+func GetPerformanceHealthCacheRatios(c *gin.Context) {
+	hours, ok := parsePerformanceHealthHours(c.Query("hours"))
+	if !ok {
+		common.ApiErrorStatus(c, http.StatusBadRequest, errors.New("hours must be between 1 and 720"))
+		return
+	}
+	endTs := time.Now().Unix()
+	startTs := endTs - int64(hours)*3600
+	summaries, err := model.GetCacheRatioSummary(startTs, endTs)
+	if err != nil {
+		performanceHealthError(c, err)
+		return
+	}
+	channelIDs := make([]int, 0, len(summaries))
+	seenChannels := make(map[int]struct{}, len(summaries))
+	for _, summary := range summaries {
+		if summary.ChannelID <= 0 {
+			continue
+		}
+		if _, seen := seenChannels[summary.ChannelID]; seen {
+			continue
+		}
+		seenChannels[summary.ChannelID] = struct{}{}
+		channelIDs = append(channelIDs, summary.ChannelID)
+	}
+	channelNames, err := model.GetChannelNamesByIds(channelIDs)
+	if err != nil {
+		performanceHealthError(c, err)
+		return
+	}
+	rows := make([]performanceHealthCacheRow, 0, len(summaries))
+	for _, summary := range summaries {
+		// TokenUsed already includes cache-read tokens for the normal OpenAI-like
+		// usage semantics recorded in quota_data. Adding CacheReadTokens again
+		// would double-count reads and understate the cache share.
+		readDenominator := summary.TokenUsed
+		writeDenominator := summary.TokenUsed + summary.CacheCreationTokens
+		channelName := channelNames[summary.ChannelID]
+		if channelName == "" {
+			if summary.ChannelID > 0 {
+				channelName = fmt.Sprintf("Channel #%d", summary.ChannelID)
+			} else {
+				channelName = "Unknown channel"
+			}
+		}
+		row := performanceHealthCacheRow{
+			ChannelID:           summary.ChannelID,
+			ChannelName:         channelName,
+			ModelName:           summary.ModelName,
+			RequestCount:        summary.RequestCount,
+			TokenUsed:           summary.TokenUsed,
+			CacheReadTokens:     summary.CacheReadTokens,
+			CacheCreationTokens: summary.CacheCreationTokens,
+		}
+		if readDenominator > 0 {
+			row.CacheReadRatio = float64(summary.CacheReadTokens) / float64(readDenominator) * 100
+		}
+		if writeDenominator > 0 {
+			row.CacheWriteRatio = float64(summary.CacheCreationTokens) / float64(writeDenominator) * 100
+		}
+		rows = append(rows, row)
+	}
+	common.ApiSuccess(c, gin.H{
+		"available":          len(rows) > 0,
+		"source":             "quota_data",
+		"definition_version": "cache-token-share-v1",
+		"window_start":       startTs,
+		"window_end":         endTs,
+		"rows":               rows,
+	})
+}
 
 func GetPerformanceHealthSummary(c *gin.Context) {
 	hours, ok := parsePerformanceHealthHours(c.Query("hours"))
@@ -142,27 +227,13 @@ func GetPerformanceHealthGroups(c *gin.Context) {
 
 func queryPerformanceHealthSummary(hours int, config model.PerformanceHealthConfig, companyID, groupID, modelFilter string) (*performanceHealthSummary, error) {
 	allowedGroups := append(lo.Keys(ratio_setting.GetGroupRatioCopy()), "auto")
-	first, err := perfmetrics.QuerySummaryAll(hours, allowedGroups)
+	result, err := perfmetrics.QuerySummaryAll(hours, allowedGroups)
 	if err != nil {
 		return nil, err
 	}
-	modelNames := make([]string, 0, len(first.Models))
-	for _, item := range first.Models {
-		modelNames = append(modelNames, item.ModelName)
-	}
-	slices.Sort(modelNames)
-	if len(modelNames) > perfmetrics.MaxRecentModels {
-		modelNames = modelNames[:perfmetrics.MaxRecentModels]
-	}
-	result := first
-	if len(modelNames) > 0 {
-		result, err = perfmetrics.QuerySummaryAll(hours, allowedGroups, modelNames...)
-		if err != nil {
-			return nil, err
-		}
-	}
 	ownership := buildPerformanceHealthOwnership(config)
 	models := make([]performanceHealthModel, 0, len(result.Models))
+	recentSeries := make(map[string][]perfmetrics.SuccessRatePoint, len(result.Models))
 	for _, item := range result.Models {
 		owner := ownership[item.ModelName]
 		if companyID != "" && owner.CompanyID != companyID {
@@ -174,9 +245,10 @@ func queryPerformanceHealthSummary(hours int, config model.PerformanceHealthConf
 		if modelFilter != "" && item.ModelName != modelFilter {
 			continue
 		}
+		recentSeries[item.ModelName] = item.RecentSuccessSeries
 		models = append(models, performanceHealthModel{ModelName: item.ModelName, CompanyID: owner.CompanyID, CompanyName: owner.CompanyName, GroupID: owner.GroupID, GroupName: owner.GroupName, RequestCount: item.RequestCount, SuccessRate: item.SuccessRate, AvgLatencyMs: item.AvgLatencyMs, AvgTps: item.AvgTps, RecentSuccessSeries: item.RecentSuccessSeries})
 	}
-	return &performanceHealthSummary{Summary: result.Summary, WindowStart: result.WindowStart, WindowEnd: result.WindowEnd, Models: models, Companies: aggregatePerformanceHealthCompanies(config, models), RecentSuccessSeries: result.RecentSuccessSeries, TerminalCoverage: 100, DataFreshness: time.Now().Unix(), DefinitionVersion: performanceHealthDefinitionVersion, ConfigVersion: config.Version}, nil
+	return &performanceHealthSummary{Summary: result.Summary, WindowStart: result.WindowStart, WindowEnd: result.WindowEnd, Models: models, Companies: aggregatePerformanceHealthCompanies(config, models), RecentSuccessSeries: recentSeries, TerminalCoverage: 0, TerminalCoverageAvailable: false, DataFreshness: time.Now().Unix(), DefinitionVersion: performanceHealthDefinitionVersion, ConfigVersion: config.Version}, nil
 }
 
 func buildPerformanceHealthOwnership(config model.PerformanceHealthConfig) map[string]performanceHealthOwnership {
@@ -227,7 +299,7 @@ func aggregatePerformanceHealthCompanies(config model.PerformanceHealthConfig, m
 			rate = entry.success / float64(entry.requests)
 			latency = int64(entry.latency / float64(entry.requests))
 		}
-		result = append(result, performanceHealthCompany{ID: entry.company.ID, Name: entry.company.Name, Status: entry.company.Status, RequestCount: entry.requests, SuccessRate: rate, AvgLatencyMs: latency, ModelCount: entry.models, TerminalCoverage: 100})
+		result = append(result, performanceHealthCompany{ID: entry.company.ID, Name: entry.company.Name, Status: entry.company.Status, RequestCount: entry.requests, SuccessRate: rate, AvgLatencyMs: latency, ModelCount: entry.models, TerminalCoverage: 0})
 	}
 	slices.SortFunc(result, func(a, b performanceHealthCompany) int {
 		if a.RequestCount == b.RequestCount {

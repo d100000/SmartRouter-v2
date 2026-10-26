@@ -49,6 +49,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/perf-metrics":                                     accessTokenAnyRule,
 	"GET /api/performance-health/summary":                       accessTokenScopeRule("model:read"),
 	"GET /api/performance-health/timeseries":                    accessTokenScopeRule("model:read"),
+	"GET /api/performance-health/cache-ratios":                  accessTokenScopeRule("model:read"),
 	"GET /api/performance-health/companies":                     accessTokenScopeRule("model:read"),
 	"POST /api/performance-health/companies":                    accessTokenScopeRule("model:write"),
 	"PATCH /api/performance-health/companies/:company_id":       accessTokenScopeRule("model:write"),

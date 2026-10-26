@@ -1273,6 +1273,31 @@ func GetChannelsByIds(ids []int) ([]*Channel, error) {
 	return channels, err
 }
 
+// GetChannelNamesByIds fetches only the display fields needed by aggregate
+// dashboards. It avoids loading channel credentials and routing configuration
+// when a report only needs channel labels.
+func GetChannelNamesByIds(ids []int) (map[int]string, error) {
+	if len(ids) == 0 {
+		return map[int]string{}, nil
+	}
+	type channelName struct {
+		Id   int
+		Name string
+	}
+	var rows []channelName
+	if err := DB.Model(&Channel{}).
+		Select("id, name").
+		Where("id IN ?", ids).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	names := make(map[int]string, len(rows))
+	for _, row := range rows {
+		names[row.Id] = row.Name
+	}
+	return names, nil
+}
+
 func BatchSetChannelTag(ids []int, tag *string) error {
 	// 开启事务
 	tx := DB.Begin()

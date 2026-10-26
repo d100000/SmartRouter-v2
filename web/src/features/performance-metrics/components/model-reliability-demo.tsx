@@ -8,15 +8,21 @@ the Free Software Foundation, either version 3 of the License, or
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Activity,
   ArrowDown,
   ArrowUp,
+  AlertTriangle,
   Columns3,
+  DatabaseZap,
   HeartPulse,
+  Gauge,
   RefreshCcw,
+  RotateCcw,
   Settings2,
   ShieldCheck,
+  TriangleAlert,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -81,6 +87,7 @@ type ModelRow = {
   companyId: string
   companyName: string
   groupName: string
+  isAssigned: boolean
   requests: number
   successRate: number
   firstAttemptRate: number
@@ -155,12 +162,16 @@ function persistColumnPreferences(order: ColumnId[], visible: ColumnId[]) {
 }
 
 function normalizeModel(raw: PerformanceHealthModel): ModelRow {
-  const companyName = raw.company_name || raw.company_id || 'Unassigned'
+  const companyId = raw.company_id?.trim() || 'unassigned'
+  const isAssigned = Boolean(raw.company_id?.trim())
+  const companyName =
+    raw.company_name || (isAssigned ? companyId : 'Unassigned')
   return {
     model: raw.model_name,
-    companyId: raw.company_id || companyName,
+    companyId,
     companyName,
     groupName: raw.group_name || raw.group || raw.group_id || 'Unassigned',
+    isAssigned,
     requests: raw.request_count ?? 0,
     successRate: raw.success_rate,
     firstAttemptRate: raw.first_attempt_success_rate ?? Number.NaN,
@@ -169,7 +180,7 @@ function normalizeModel(raw: PerformanceHealthModel): ModelRow {
     avgLatencyMs: raw.avg_latency_ms,
     p95TtftMs: raw.p95_ttft_ms ?? Number.NaN,
     tps: raw.avg_tps,
-    incidents: raw.incidents ?? 0,
+    incidents: raw.incidents ?? Number.NaN,
     series: raw.recent_success_series ?? [],
   }
 }
@@ -178,7 +189,11 @@ function weighted(
   rows: ModelRow[],
   key: keyof Pick<
     ModelRow,
-    'successRate' | 'firstAttemptRate' | 'retryRecoveryRate' | 'p95LatencyMs'
+    | 'successRate'
+    | 'firstAttemptRate'
+    | 'retryRecoveryRate'
+    | 'p95LatencyMs'
+    | 'p95TtftMs'
   >
 ) {
   const eligible = rows.filter((row) => Number.isFinite(row[key]))
@@ -245,6 +260,82 @@ function MetricTile(props: {
       </div>
     </div>
   )
+}
+
+function SignalLine(props: {
+  label: string
+  value: string
+  detail?: string
+  tone: 'success' | 'warning' | 'danger' | 'neutral'
+}) {
+  return (
+    <div className='flex items-center justify-between gap-3 border-b py-2.5 last:border-b-0'>
+      <div className='min-w-0'>
+        <div className='truncate text-sm font-medium'>{props.label}</div>
+        {props.detail && (
+          <div className='text-muted-foreground mt-0.5 truncate text-xs'>
+            {props.detail}
+          </div>
+        )}
+      </div>
+      <span
+        className={cn(
+          'shrink-0 font-mono text-sm font-semibold tabular-nums',
+          props.tone === 'success' && 'text-emerald-600 dark:text-emerald-400',
+          props.tone === 'warning' && 'text-amber-600 dark:text-amber-400',
+          props.tone === 'danger' && 'text-red-600 dark:text-red-400',
+          props.tone === 'neutral' && 'text-muted-foreground'
+        )}
+      >
+        {props.value}
+      </span>
+    </div>
+  )
+}
+
+function DiagnosticCard(props: {
+  title: string
+  description: string
+  icon: ReactNode
+  rows: Array<{ label: string; value: string }>
+}) {
+  return (
+    <Card>
+      <CardHeader className='border-b pb-3'>
+        <CardTitle className='flex items-center gap-2 text-base'>
+          <span className='text-muted-foreground'>{props.icon}</span>
+          {props.title}
+        </CardTitle>
+        <CardDescription className='text-xs'>
+          {props.description}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className='space-y-2 pt-2'>
+        {props.rows.map((row) => (
+          <div
+            key={row.label}
+            className='flex items-center justify-between gap-3 border-b py-2 last:border-b-0'
+          >
+            <span className='text-muted-foreground text-sm'>{row.label}</span>
+            <span className='font-mono text-xs tabular-nums'>{row.value}</span>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  )
+}
+
+function formatDataFreshness(
+  value: number | string | undefined,
+  locale?: string
+): string {
+  const timestamp = Number(value)
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '—'
+  return new Intl.DateTimeFormat(locale, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(timestamp * 1000))
 }
 
 function ReliabilityChart(props: {
@@ -694,7 +785,6 @@ export function ModelReliabilityDemo() {
     queryKey: ['performance-health-companies'],
     queryFn: async () =>
       requireServerSuccess(await getPerformanceHealthCompanies()),
-    enabled: configDialogOpen,
     staleTime: 60_000,
     retry: false,
   })
@@ -702,16 +792,13 @@ export function ModelReliabilityDemo() {
     () => (query.data?.data.models ?? []).map(normalizeModel),
     [query.data]
   )
-  const companies = query.data?.data.companies
+  const summaryCompanies = query.data?.data.companies
+  const configuredCompanies = configQuery.data?.data.companies
   const filteredRows = useMemo(
     () =>
       selectedCompany === 'all'
         ? rows
-        : rows.filter(
-            (row) =>
-              row.companyId === selectedCompany ||
-              row.companyName === selectedCompany
-          ),
+        : rows.filter((row) => row.companyId === selectedCompany),
     [rows, selectedCompany]
   )
   const activeModel =
@@ -730,6 +817,7 @@ export function ModelReliabilityDemo() {
   const firstRate = weighted(filteredRows, 'firstAttemptRate')
   const retryRate = weighted(filteredRows, 'retryRecoveryRate')
   const p95 = weighted(filteredRows, 'p95LatencyMs')
+  const p95Ttft = weighted(filteredRows, 'p95TtftMs')
   const visibleColumns = columnPreferences.order.filter((id) =>
     columnPreferences.visible.includes(id)
   )
@@ -738,20 +826,118 @@ export function ModelReliabilityDemo() {
     setColumnPreferences(next)
     persistColumnPreferences(order, visible)
   }
-  const availableCompanies = useMemo(
+  const availableCompanies = useMemo(() => {
+    const merged = new Map<string, PerformanceHealthCompany>()
+    for (const company of configuredCompanies ?? []) {
+      merged.set(company.id, company)
+    }
+    for (const company of summaryCompanies ?? []) {
+      if (!merged.has(company.id)) merged.set(company.id, company)
+    }
+    for (const row of rows) {
+      if (!merged.has(row.companyId)) {
+        merged.set(row.companyId, {
+          id: row.companyId,
+          name: row.companyName,
+          groups: [],
+          slo: Number.NaN,
+        })
+      }
+    }
+    return [...merged.values()]
+  }, [configuredCompanies, rows, summaryCompanies])
+  const configuredModelCount = useMemo(
     () =>
-      companies?.length
-        ? companies
-        : [
-            ...new Map(
-              rows.map((row) => [
-                row.companyId,
-                { id: row.companyId, name: row.companyName, groups: [] },
-              ])
-            ).values(),
-          ],
-    [companies, rows]
+      new Set(
+        availableCompanies.flatMap((company) =>
+          (company.groups ?? []).flatMap((group) => group.models)
+        )
+      ).size,
+    [availableCompanies]
   )
+  const mappedModelCount = rows.filter((row) => row.isAssigned).length
+  const degradedRows = rows.filter(
+    (row) => Number.isFinite(row.successRate) && row.successRate < 99
+  )
+  const unassignedRows = rows.filter((row) => !row.isAssigned)
+  const hasIncidentTelemetry =
+    rows.length > 0 && rows.every((row) => Number.isFinite(row.incidents))
+  const incidentCount = hasIncidentTelemetry
+    ? rows.reduce((sum, row) => sum + row.incidents, 0)
+    : Number.NaN
+  const terminalCoverage = query.data?.data.terminal_coverage
+  const hasTerminalCoverage =
+    query.data?.data.terminal_coverage_available === true &&
+    Number.isFinite(terminalCoverage)
+  let incidentValue = t('Not collected yet')
+  let incidentDetail = t('Attempt-level telemetry is not available yet')
+  let incidentTone: 'success' | 'warning' | 'danger' = 'warning'
+  if (hasIncidentTelemetry) {
+    incidentValue = formatNumber(incidentCount, locale)
+    if (incidentCount > 0) {
+      incidentDetail = t('{{count}} incidents in the last 24 hours', {
+        count: incidentCount,
+      })
+      incidentTone = 'danger'
+    } else {
+      incidentDetail = t('No incidents in the last 24 hours')
+      incidentTone = 'success'
+    }
+  }
+  const dataFreshness = formatDataFreshness(
+    query.data?.data.data_freshness,
+    locale
+  )
+  const modelCoverage = configuredModelCount
+    ? Math.min(100, (mappedModelCount / configuredModelCount) * 100)
+    : Number.NaN
+  const configuredSlo = useMemo(() => {
+    const candidates = availableCompanies
+      .map((company) => {
+        const companyRequests = rows
+          .filter((row) => row.companyId === company.id)
+          .reduce((sum, row) => sum + row.requests, 0)
+        return {
+          requests: companyRequests,
+          slo: company.slo,
+        }
+      })
+      .filter(
+        (item) =>
+          item.requests > 0 && Number.isFinite(item.slo) && (item.slo ?? 0) > 0
+      )
+    if (selectedCompany !== 'all') {
+      return (
+        availableCompanies.find((company) => company.id === selectedCompany)
+          ?.slo ?? Number.NaN
+      )
+    }
+    const totalRequests = candidates.reduce(
+      (sum, item) => sum + item.requests,
+      0
+    )
+    if (!totalRequests) return Number.NaN
+    return (
+      candidates.reduce(
+        (sum, item) => sum + (item.slo ?? 0) * item.requests,
+        0
+      ) / totalRequests
+    )
+  }, [availableCompanies, rows, selectedCompany])
+  const errorBudget = useMemo(() => {
+    if (!Number.isFinite(configuredSlo) || !Number.isFinite(successRate)) {
+      return Number.NaN
+    }
+    const allowedErrorRate = 100 - configuredSlo
+    if (allowedErrorRate <= 0) return successRate >= 100 ? 100 : 0
+    return Math.max(
+      0,
+      Math.min(
+        100,
+        ((allowedErrorRate - (100 - successRate)) / allowedErrorRate) * 100
+      )
+    )
+  }, [configuredSlo, successRate])
 
   if (query.isLoading) {
     return (
@@ -843,9 +1029,19 @@ export function ModelReliabilityDemo() {
             <Settings2 />
             {t('Configure models')}
           </Button>
+          <Button
+            variant='ghost'
+            size='icon-sm'
+            onClick={() => void query.refetch()}
+            disabled={query.isFetching}
+            aria-label={t('Refresh')}
+            title={t('Refresh')}
+          >
+            <RefreshCcw className={cn(query.isFetching && 'animate-spin')} />
+          </Button>
         </div>
       </div>
-      <div className='grid grid-cols-2 gap-2 sm:grid-cols-5 sm:gap-3'>
+      <div className='grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-3 xl:grid-cols-7'>
         <MetricTile
           label={t('Final request success rate')}
           value={formatUptimePct(successRate)}
@@ -855,28 +1051,203 @@ export function ModelReliabilityDemo() {
         <MetricTile
           label={t('First-attempt success')}
           value={formatUptimePct(firstRate)}
-          hint={t('Direct first route success')}
+          hint={
+            Number.isFinite(firstRate)
+              ? t('Direct first route success')
+              : t('Not collected yet')
+          }
           tone='success'
         />
         <MetricTile
           label={t('Retry recovery')}
           value={formatUptimePct(retryRate)}
-          hint={t('Recovered after first failure')}
+          hint={
+            Number.isFinite(retryRate)
+              ? t('Recovered after first failure')
+              : t('Not collected yet')
+          }
           tone='warning'
         />
         <MetricTile
           label={t('P95 latency')}
           value={formatLatency(p95)}
-          hint={t('Includes retry wait')}
+          hint={
+            Number.isFinite(p95)
+              ? t('Includes retry wait')
+              : t('Not collected yet')
+          }
           tone='warning'
         />
         <MetricTile
+          label={t('P95 TTFT')}
+          value={formatLatency(p95Ttft)}
+          hint={t('Time to first token')}
+          tone='warning'
+        />
+        <MetricTile
+          label={t('Error budget')}
+          value={formatUptimePct(errorBudget)}
+          hint={
+            Number.isFinite(configuredSlo)
+              ? `${t('SLO')}: ${formatUptimePct(configuredSlo)}`
+              : t('Not available')
+          }
+          tone={
+            !Number.isFinite(errorBudget) || errorBudget >= 50
+              ? 'info'
+              : 'warning'
+          }
+        />
+        <MetricTile
           label={t('Terminal coverage')}
-          value={formatUptimePct(
-            query.data?.data.terminal_coverage ?? Number.NaN
-          )}
-          hint={t('Data quality')}
+          value={
+            hasTerminalCoverage
+              ? formatUptimePct(terminalCoverage ?? Number.NaN)
+              : t('Not collected yet')
+          }
+          hint={
+            hasTerminalCoverage
+              ? t('Data quality')
+              : t('Attempt-level telemetry is not available yet')
+          }
           tone='info'
+        />
+      </div>
+      <div className='grid gap-4 lg:grid-cols-2'>
+        <Card>
+          <CardHeader className='border-b pb-3'>
+            <CardTitle className='flex items-center gap-2 text-base'>
+              <IconBadge tone='info' size='sm'>
+                <DatabaseZap />
+              </IconBadge>
+              {t('Data quality')}
+            </CardTitle>
+            <CardDescription>
+              {t('Performance metrics for the last 24 hours')}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className='pt-2'>
+            <SignalLine
+              label={t('Terminal coverage')}
+              value={
+                hasTerminalCoverage
+                  ? formatUptimePct(terminalCoverage ?? Number.NaN)
+                  : t('Not collected yet')
+              }
+              detail={
+                hasTerminalCoverage
+                  ? t('All requests have a terminal outcome')
+                  : t('Attempt-level telemetry is not available yet')
+              }
+              tone={
+                hasTerminalCoverage && (terminalCoverage ?? 0) >= 99
+                  ? 'success'
+                  : 'warning'
+              }
+            />
+            <SignalLine
+              label={t('Models')}
+              value={`${formatNumber(mappedModelCount, locale)} / ${formatNumber(configuredModelCount, locale)}`}
+              detail={t('Configured models with observed traffic')}
+              tone={
+                Number.isFinite(modelCoverage) && modelCoverage >= 99
+                  ? 'success'
+                  : 'warning'
+              }
+            />
+            <SignalLine
+              label={t('Last updated')}
+              value={dataFreshness}
+              detail={t('Data freshness')}
+              tone={dataFreshness === '—' ? 'warning' : 'success'}
+            />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className='border-b pb-3'>
+            <CardTitle className='flex items-center gap-2 text-base'>
+              <IconBadge
+                tone={
+                  degradedRows.length || unassignedRows.length
+                    ? 'warning'
+                    : 'success'
+                }
+                size='sm'
+              >
+                {degradedRows.length || unassignedRows.length ? (
+                  <AlertTriangle />
+                ) : (
+                  <Activity />
+                )}
+              </IconBadge>
+              {t('Routing watchpoints')}
+            </CardTitle>
+            <CardDescription>
+              {t(
+                'Watch short-window failures, latency drift, capacity saturation and traffic concentration.'
+              )}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className='pt-2'>
+            <SignalLine
+              label={t('Degraded performance recently')}
+              value={formatNumber(degradedRows.length, locale)}
+              detail={t('Models below the 99% success watch threshold')}
+              tone={degradedRows.length ? 'danger' : 'success'}
+            />
+            <SignalLine
+              label={t('Unassigned')}
+              value={formatNumber(unassignedRows.length, locale)}
+              detail={t(
+                'Models that are being used but not configured in the system'
+              )}
+              tone={unassignedRows.length ? 'warning' : 'success'}
+            />
+            <SignalLine
+              label={t('incidents')}
+              value={incidentValue}
+              detail={incidentDetail}
+              tone={incidentTone}
+            />
+          </CardContent>
+        </Card>
+      </div>
+      <div className='grid gap-4 lg:grid-cols-3'>
+        <DiagnosticCard
+          title={t('Error breakdown')}
+          description={t('Attempt-level telemetry is not available yet')}
+          icon={<TriangleAlert className='size-4' />}
+          rows={[
+            { label: t('429 rate'), value: t('Not collected yet') },
+            { label: t('5xx rate'), value: t('Not collected yet') },
+            { label: t('Timeout rate'), value: t('Not collected yet') },
+          ]}
+        />
+        <DiagnosticCard
+          title={t('Routing resilience')}
+          description={t('Retries, fallback and circuit breaker telemetry')}
+          icon={<RotateCcw className='size-4' />}
+          rows={[
+            { label: t('Retry request rate'), value: t('Not collected yet') },
+            {
+              label: t('Fallback success rate'),
+              value: t('Not collected yet'),
+            },
+            {
+              label: t('Circuit breaker trips'),
+              value: t('Not collected yet'),
+            },
+          ]}
+        />
+        <DiagnosticCard
+          title={t('Latency tail')}
+          description={t('Percentiles require mergeable latency histograms')}
+          icon={<Gauge className='size-4' />}
+          rows={[
+            { label: t('P50 latency'), value: t('Not collected yet') },
+            { label: t('P95 latency'), value: formatLatency(p95) },
+            { label: t('P99 latency'), value: t('Not collected yet') },
+          ]}
         />
       </div>
       <div className='grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(18rem,0.65fr)]'>

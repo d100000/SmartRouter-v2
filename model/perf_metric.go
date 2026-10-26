@@ -134,6 +134,36 @@ func GetRecentPerfMetricSuccessBuckets(modelName string, startTs int64, endTs in
 	return buckets, err
 }
 
+// GetRecentPerfMetricSuccessBucketsAll returns recent hourly success buckets
+// for a set of models while preserving a bounded query per model. Dashboard
+// summaries commonly inspect several models at once, and each model keeps its
+// own latest nonempty buckets without loading the full history window.
+func GetRecentPerfMetricSuccessBucketsAll(modelNames []string, startTs int64, endTs int64, groups []string, limit int) ([]PerfMetricSummaryBucket, error) {
+	if len(modelNames) == 0 || limit <= 0 || (groups != nil && len(groups) == 0) {
+		return nil, nil
+	}
+	// The supported database versions do not share a portable per-group LIMIT
+	// syntax. Keep each query bounded so a sparse model cannot force the full
+	// history window into memory, while still batching the caller's control flow.
+	seen := make(map[string]struct{}, len(modelNames))
+	buckets := make([]PerfMetricSummaryBucket, 0, len(modelNames)*limit)
+	for _, modelName := range modelNames {
+		if modelName == "" {
+			continue
+		}
+		if _, exists := seen[modelName]; exists {
+			continue
+		}
+		seen[modelName] = struct{}{}
+		modelBuckets, err := GetRecentPerfMetricSuccessBuckets(modelName, startTs, endTs, groups, limit)
+		if err != nil {
+			return nil, err
+		}
+		buckets = append(buckets, modelBuckets...)
+	}
+	return buckets, nil
+}
+
 func DeletePerfMetricsBefore(cutoffTs int64) error {
 	if cutoffTs <= 0 {
 		return nil

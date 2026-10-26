@@ -42,6 +42,33 @@ type QuotaDataLogParams struct {
 	NodeName            string
 }
 
+// CacheRatioSummary is a compact aggregate used by the performance health
+// dashboard. Token usage is kept separate from cache reads so the API can
+// explain exactly which denominator it uses for the cache share.
+type CacheRatioSummary struct {
+	ChannelID           int    `json:"channel_id"`
+	ModelName           string `json:"model_name"`
+	RequestCount        int64  `json:"request_count"`
+	TokenUsed           int64  `json:"token_used"`
+	CacheReadTokens     int64  `json:"cache_read_tokens"`
+	CacheCreationTokens int64  `json:"cache_creation_tokens"`
+}
+
+// GetCacheRatioSummary reads the existing hourly quota export instead of the
+// high-cardinality request log. The created_at index keeps the dashboard query
+// bounded by the selected time window on all supported SQL dialects.
+func GetCacheRatioSummary(startTime int64, endTime int64) ([]CacheRatioSummary, error) {
+	var summaries []CacheRatioSummary
+	err := DB.Model(&QuotaData{}).
+		Select("channel_id, model_name, SUM(count) AS request_count, SUM(token_used) AS token_used, SUM(cache_read_tokens) AS cache_read_tokens, SUM(cache_creation_tokens) AS cache_creation_tokens").
+		Where("created_at >= ? AND created_at <= ?", startTime, endTime).
+		Group("channel_id, model_name").
+		Order("cache_read_tokens DESC").
+		Limit(500).
+		Find(&summaries).Error
+	return summaries, err
+}
+
 func UpdateQuotaData() {
 	for {
 		if common.DataExportEnabled {

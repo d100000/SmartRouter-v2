@@ -264,4 +264,70 @@ describe('server performance summaries', () => {
     expect(screen.getAllByText('claude-3-7-sonnet').length).toBeGreaterThan(0)
     expect(screen.queryByText('gpt-4.1')).not.toBeInTheDocument()
   })
+
+  it('keeps unassigned models available when configured companies exist', async () => {
+    const user = userEvent.setup()
+    client.setQueryData(['performance-health-companies'], {
+      success: true,
+      data: {
+        companies: [{ id: 'openai', name: 'OpenAI', groups: [] }],
+      },
+    })
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        summary,
+        models: [
+          {
+            model_name: 'gpt-4.1',
+            company_id: 'openai',
+            company_name: 'OpenAI',
+            request_count: 100,
+            success_rate: 99.8,
+            avg_latency_ms: 400,
+            avg_tps: 12,
+          },
+          {
+            model_name: 'unmapped-model',
+            request_count: 10,
+            success_rate: 95,
+            avg_latency_ms: 700,
+            avg_tps: 4,
+          },
+        ],
+        companies: [{ id: 'unassigned', name: 'Unassigned' }],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    const companySelect = screen.getByRole('combobox', { name: 'Company' })
+    expect(
+      screen.getByRole('option', { name: 'Unassigned' })
+    ).toBeInTheDocument()
+    await user.selectOptions(companySelect, 'unassigned')
+
+    expect(screen.getAllByText('unmapped-model').length).toBeGreaterThan(0)
+    expect(screen.queryByText('gpt-4.1')).not.toBeInTheDocument()
+  })
+
+  it('shows explicit telemetry gaps in operational diagnostics', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: { summary: null, models: [], companies: [] },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByText('Error breakdown')).toBeVisible()
+    expect(screen.getByText('Routing resilience')).toBeVisible()
+    expect(screen.getByText('Latency tail')).toBeVisible()
+    expect(screen.getAllByText('Not collected yet').length).toBeGreaterThan(0)
+  })
 })

@@ -47,6 +47,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			performanceHealthRoute.GET("/summary", controller.GetPerformanceHealthSummary)
 			performanceHealthRoute.GET("/timeseries", controller.GetPerformanceHealthTimeseries)
+			performanceHealthRoute.GET("/cache-ratios", controller.GetPerformanceHealthCacheRatios)
 			performanceHealthRoute.GET("/companies", controller.GetPerformanceHealthCompanies)
 			performanceHealthRoute.POST("/companies", controller.CreatePerformanceHealthCompany)
 			performanceHealthRoute.PATCH("/companies/:company_id", controller.UpdatePerformanceHealthCompany)

@@ -124,6 +124,7 @@ export type PerformanceHealthData = {
   window_start?: number
   window_end?: number
   terminal_coverage?: number
+  terminal_coverage_available?: boolean
   data_freshness?: string | number
   definition_version?: string
 }
