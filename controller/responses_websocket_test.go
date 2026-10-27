@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/xunfei"
@@ -337,33 +338,40 @@ func (fixture *responsesWSBillingTest) closeAndWait(t *testing.T) {
 			t.Error("upstream connection was not closed")
 		}
 	}
-	// Health classification is synchronous at the request boundary; only the
-	// Redis write is asynchronous, see waitPerfCounters.
+	// Health samples are accepted into SQL at the request boundary. Counter
+	// assertions project those durable events through waitPerfCounters.
 }
 
-// waitPerfCounters waits for the asynchronous health samples of the fixture
-// model to reach wantRequests and returns the request and success counters.
+// waitPerfCounters waits for SQL acceptance, then checks the fixture's durable
+// samples and their projected request/success counters agree exactly.
 func waitPerfCounters(t *testing.T, wantRequests int64) (requests, successes int64) {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		requests, successes = 0, 0
-		keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
-		if err != nil {
-			return false
+	perfmetrics.WaitForPendingWrites()
+	var events []model.PerfMetricEvent
+	require.NoError(t, model.DB.Where("model_name = ?", "ws-billing").Find(&events).Error)
+	require.Equal(t, wantRequests, int64(len(events)), "each classified logical request has one durable health sample")
+	wantSuccesses := int64(0)
+	for _, event := range events {
+		if event.Success {
+			wantSuccesses++
 		}
-		for _, key := range keys {
-			n, _ := common.RDB.HGet(context.Background(), key, "req").Int64()
-			requests += n
-			n, _ = common.RDB.HGet(context.Background(), key, "ok").Int64()
-			successes += n
-		}
-		return requests >= wantRequests
-	}, 3*time.Second, 10*time.Millisecond)
+	}
+	_, err := model.ProjectPerfMetricEvents(context.Background(), model.DB)
+	require.NoError(t, err)
+	var metrics []model.PerfMetric
+	require.NoError(t, model.DB.Where("model_name = ?", "ws-billing").Find(&metrics).Error)
+	for _, metric := range metrics {
+		requests += metric.RequestCount
+		successes += metric.SuccessCount
+	}
+	require.Equal(t, wantRequests, requests, "SQL projection preserves every durable request sample")
+	require.Equal(t, wantSuccesses, successes, "SQL projection preserves the classified success count")
 	return requests, successes
 }
 
 func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*websocket.Conn, *http.Request), httpEvents ...string) *responsesWSBillingTest {
 	t.Helper()
+	require.NoError(t, i18n.Init())
 	user, token := setupResponsesWSRequestTest(t)
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
@@ -373,7 +381,7 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	saved := map[string]string{}
 	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
 		switch key {
-		case "billing_setting.billing_mode", "billing_setting.billing_expr", "group_ratio_setting.group_ratio", "perf_metrics_setting.enabled":
+		case "billing_setting.billing_mode", "billing_setting.billing_expr", "group_ratio_setting.group_ratio", "perf_metrics_setting.enabled", "perf_metrics_setting.bucket_time", "perf_metrics_setting.retention_days":
 			saved[key] = value
 		}
 		return nil
@@ -385,12 +393,19 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	expressions, err := common.Marshal(map[string]string{"ws-billing": expression})
 	require.NoError(t, err)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_mode":    `{"ws-billing":"tiered_expr"}`,
-		"billing_setting.billing_expr":    string(expressions),
-		"group_ratio_setting.group_ratio": `{"default":1}`,
-		"perf_metrics_setting.enabled":    "true",
+		"billing_setting.billing_mode":        `{"ws-billing":"tiered_expr"}`,
+		"billing_setting.billing_expr":        string(expressions),
+		"group_ratio_setting.group_ratio":     `{"default":1}`,
+		"perf_metrics_setting.enabled":        "true",
+		"perf_metrics_setting.bucket_time":    "hour",
+		"perf_metrics_setting.retention_days": "0",
 	}))
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.PerfMetric{}, &model.PerfMetricEvent{}))
+	for _, schema := range []any{&model.PerfMetric{}, &model.PerfMetricEvent{}} {
+		var existing int64
+		require.NoError(t, model.DB.Model(schema).Where("model_name = ?", "ws-billing").Count(&existing).Error)
+		require.Zero(t, existing, "isolated fixture telemetry must start empty")
+	}
 	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(model.DB))
 	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 100000, "setting": `{"billing_preference":"wallet_only"}`}).Error)
@@ -435,6 +450,8 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	fixture.channel = channel
 	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: channel.Id, Model: "ws-billing", Group: "default", Enabled: true}).Error)
 	t.Cleanup(func() {
+		require.NoError(t, model.DB.Where("model_name = ?", "ws-billing").Delete(&model.PerfMetricEvent{}).Error)
+		require.NoError(t, model.DB.Where("model_name = ?", "ws-billing").Delete(&model.PerfMetric{}).Error)
 		require.NoError(t, model.LOG_DB.Where("token_id = ?", token.Id).Delete(&model.Log{}).Error)
 		require.NoError(t, model.DB.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
 		require.NoError(t, model.DB.Delete(channel).Error)
@@ -523,9 +540,9 @@ func TestResponsesInterruptedStreamHealth(t *testing.T) {
 			fixture.closeAndWait(t)
 			assertResponsesWSAccounting(t, fixture, []int{1000})
 			if scenario == "sse client cancel" {
-				keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
-				require.NoError(t, err)
-				assert.Empty(t, keys, "client cancellation must not affect model health")
+				requests, successes := waitPerfCounters(t, 0)
+				assert.Zero(t, requests, "client cancellation must not affect model health")
+				assert.Zero(t, successes)
 				return
 			}
 			requests, successes := waitPerfCounters(t, 1)
@@ -779,9 +796,9 @@ func TestResponsesWebSocketDisconnectSettlesDeliveredOutputOnce(t *testing.T) {
 	assert.Equal(t, "hello", delta["delta"])
 	fixture.closeAndWait(t)
 	assertResponsesWSAccounting(t, fixture, []int{1})
-	keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
-	require.NoError(t, err)
-	assert.Empty(t, keys, "client cancellation must not affect model health")
+	requests, successes := waitPerfCounters(t, 0)
+	assert.Zero(t, requests, "client cancellation must not affect model health")
+	assert.Zero(t, successes)
 }
 
 func TestResponsesWebSocketCancelErrorDoesNotFinishActiveRequest(t *testing.T) {
@@ -1092,9 +1109,9 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 				assert.Equal(t, http.StatusOK, response.StatusCode)
 			}
 			if tc.ignored {
-				keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
-				require.NoError(t, err)
-				assert.Empty(t, keys)
+				requests, successes := waitPerfCounters(t, 0)
+				assert.Zero(t, requests)
+				assert.Zero(t, successes)
 				return
 			}
 			requests, successes := waitPerfCounters(t, 1)
@@ -1464,9 +1481,9 @@ func TestResponsesWebSocketPreRoutingRejectionsFollowHealthClassification(t *tes
 			fixture.closeAndWait(t)
 			assertResponsesWSAccounting(t, fixture, nil)
 			if !tc.sampled {
-				keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
-				require.NoError(t, err)
-				assert.Empty(t, keys, "a business rejection must not affect model health")
+				requests, successes := waitPerfCounters(t, 0)
+				assert.Zero(t, requests, "a business rejection must not affect model health")
+				assert.Zero(t, successes)
 				return
 			}
 			requests, successes := waitPerfCounters(t, 1)
@@ -1718,6 +1735,14 @@ func TestResponsesSchedulingTerminalFraming(t *testing.T) {
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 			cancel()
 			service.FinishSchedulingAttempt(c, info, nil)
+			wantOutcome := perfmetrics.OutcomeIgnored
+			if tc.counts > 0 {
+				wantOutcome = perfmetrics.OutcomeSuccess
+				if tc.failed {
+					wantOutcome = perfmetrics.OutcomeFailure
+				}
+			}
+			assert.Equal(t, wantOutcome, service.FinalRelayOutcome(c, info, nil), "request metrics and scheduler use the same delivered terminal")
 			snapshot := scheduler.Default.Snapshot(scheduler.Key{Group: "default", Model: "framing-model"}, []scheduler.Candidate{service.SchedulerCandidate(channel)}, true)
 			assert.Equal(t, tc.counts, snapshot.Summary.Requests30m)
 			assert.Equal(t, tc.counts, snapshot.Summary.Attempts30m)

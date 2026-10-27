@@ -22,6 +22,8 @@ services:
     image: new-api-dev:local
     container_name: new-api-dev
     restart: unless-stopped
+    # Allow HTTP and WebSocket terminal observers to drain before metric shutdown.
+    stop_grace_period: 150s
     ports:
       - "3000:3000"
     volumes:

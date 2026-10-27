@@ -19,6 +19,8 @@ services:
     image: calciumion/new-api:latest
     container_name: new-api
     restart: always
+    # Allow HTTP and WebSocket terminal observers to drain before metric shutdown.
+    stop_grace_period: 150s
     command: --log-dir /app/logs
     ports:
       - "3000:3000"

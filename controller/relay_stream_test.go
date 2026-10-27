@@ -19,14 +19,26 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func disableRelayStreamTestMetrics(t *testing.T) {
+	t.Helper()
+	previous := strconv.FormatBool(perf_metrics_setting.GetSetting().Enabled)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": "false"}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": previous}))
+	})
+}
+
 func TestRelayDoesNotCommitDuringImagePreparation(t *testing.T) {
+	disableRelayStreamTestMetrics(t)
 	settings := operation_setting.GetGeneralSetting()
 	previousEnabled, previousInterval := settings.PingIntervalEnabled, settings.PingIntervalSeconds
 	previousCount, previousMedia := constant.CountToken, constant.GetMediaToken
@@ -184,6 +196,7 @@ func TestStreamKeepAlivePreservesFastHTTPFailures(t *testing.T) {
 }
 
 func TestRelayKeepAliveHonorsStreamSettings(t *testing.T) {
+	disableRelayStreamTestMetrics(t)
 	settings := operation_setting.GetGeneralSetting()
 	previousEnabled := settings.PingIntervalEnabled
 	previousCount, previousMedia, previousNonStreamMedia := constant.CountToken, constant.GetMediaToken, constant.GetMediaTokenNotStream

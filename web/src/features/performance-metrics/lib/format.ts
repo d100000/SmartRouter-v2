@@ -16,10 +16,26 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-export function formatThroughput(tps: number): string {
+import { toIntlLocale } from '@/i18n/languages'
+
+export function formatThroughput(tps: number, showZero = false): string {
+  if (showZero && tps === 0) return '0 t/s'
   if (!Number.isFinite(tps) || tps <= 0) return '—'
   if (tps >= 1_000) return `${(tps / 1_000).toFixed(1)}K t/s`
   return `${tps.toFixed(tps < 10 ? 2 : 1)} t/s`
+}
+
+export function formatPerformanceTimestamp(
+  timestamp: number | null | undefined,
+  locale?: string
+): string {
+  if (!timestamp || !Number.isFinite(timestamp) || timestamp < 0) return '—'
+  const date = new Date(timestamp * 1000)
+  if (!Number.isFinite(date.getTime())) return '—'
+  return new Intl.DateTimeFormat(toIntlLocale(locale), {
+    dateStyle: 'short',
+    timeStyle: 'long',
+  }).format(date)
 }
 
 export function formatLatency(ms: number): string {

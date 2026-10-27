@@ -254,7 +254,11 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		})
 	}
 
-	dataChan := make(chan string, 10)
+	type streamEvent struct {
+		data string
+		name string
+	}
+	dataChan := make(chan streamEvent, 10)
 	sr := newStreamResult(info.StreamStatus)
 
 	wg.Add(1)
@@ -267,12 +271,13 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			stop()
 			wg.Done()
 		}()
-		for data := range dataChan {
+		for event := range dataChan {
 			sr.reset()
+			sr.Event = event.name
 			func() {
 				writeMutex.Lock()
 				defer writeMutex.Unlock()
-				dataHandler(data, sr)
+				dataHandler(event.data, sr)
 			}()
 			if sr.IsStopped() {
 				return
@@ -294,6 +299,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			wg.Done()
 		}()
 
+		var eventName string
+		var eventHasData bool
 		for scanner.Scan() {
 			// 检查是否需要停止
 			select {
@@ -308,23 +315,43 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			data := scanner.Text()
 			logger.LogDebug(c, "stream scanner data: %s", data)
 
-			if len(data) < 6 {
+			if name, ok := strings.CutPrefix(data, "event:"); ok {
+				eventName = strings.TrimSpace(name)
 				continue
 			}
-			if data[:5] != "data:" && data[:6] != "[DONE]" {
-				continue
-			}
-			data = data[5:]
-			data = strings.TrimSpace(data)
 			if data == "" {
+				if eventName == "error" && !eventHasData {
+					select {
+					case dataChan <- streamEvent{name: eventName}:
+					case <-ctx.Done():
+						return
+					case <-stopChan:
+						return
+					}
+				}
+				eventName = ""
+				eventHasData = false
 				continue
 			}
+			payload, isData := strings.CutPrefix(data, "data:")
+			if !isData {
+				if data != "[DONE]" {
+					continue
+				}
+				payload = data
+			}
+			data = payload
+			data = strings.TrimSpace(data)
+			if data == "" && eventName != "error" {
+				continue
+			}
+			eventHasData = true
 			if !strings.HasPrefix(data, "[DONE]") {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
 
 				select {
-				case dataChan <- data:
+				case dataChan <- streamEvent{data: data, name: eventName}:
 				case <-ctx.Done():
 					return
 				case <-stopChan:

@@ -17,10 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
   PerformanceHealthCompanyResponse,
   PerformanceHealthConfig,
+  PerformanceHealthPresetPreview,
   PerformanceHealthResponse,
   PerformanceMetricsData,
   PerfSummaryAllData,
@@ -51,11 +53,12 @@ export async function getPerfMetrics(
 }
 
 export async function getPerformanceHealthSummary(
-  hours = 24
+  hours = 24,
+  includePresets = false
 ): Promise<PerformanceHealthResponse> {
   const res = await api.get<PerformanceHealthResponse>(
     '/api/performance-health/summary',
-    { params: { hours } }
+    { params: { hours, ...(includePresets ? { include_presets: true } : {}) } }
   )
   return res.data
 }
@@ -73,6 +76,46 @@ export async function savePerformanceHealthConfig(
   const res = await api.put<{
     success: boolean
     data: PerformanceHealthConfig
-  }>('/api/performance-health/config', config)
-  return res.data.data
+  }>('/api/performance-health/config', {
+    ...config,
+    expected_config_version: config.version ?? config.config_version,
+  })
+  return requireServerSuccess(res.data).data
+}
+
+export async function getPerformanceHealthPresets(): Promise<PerformanceHealthConfig> {
+  const res = await api.get<{
+    success: boolean
+    data: PerformanceHealthConfig
+  }>('/api/performance-health/presets')
+  return requireServerSuccess(res.data).data
+}
+
+export async function previewPerformanceHealthPresets(): Promise<PerformanceHealthPresetPreview> {
+  const res = await api.post<{
+    success: boolean
+    data: PerformanceHealthPresetPreview
+  }>('/api/performance-health/presets/preview')
+  const preview = requireServerSuccess(res.data).data
+  return {
+    ...preview,
+    added_companies: preview.added_companies ?? [],
+    added_groups: preview.added_groups ?? [],
+    added_models: preview.added_models ?? [],
+    conflicts: preview.conflicts ?? [],
+    skipped_models: preview.skipped_models ?? [],
+  }
+}
+
+export async function applyPerformanceHealthPresets(
+  preview: Pick<
+    PerformanceHealthPresetPreview,
+    'expected_config_version' | 'preview_token'
+  >
+): Promise<PerformanceHealthConfig> {
+  const res = await api.post<{
+    success: boolean
+    data: PerformanceHealthConfig
+  }>('/api/performance-health/presets/apply', preview)
+  return requireServerSuccess(res.data).data
 }

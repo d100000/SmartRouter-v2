@@ -3,13 +3,18 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,6 +66,7 @@ func TestMain(m *testing.M) {
 		&UserSubscription{},
 		&UserOAuthBinding{},
 		&PerfMetric{},
+		&PerfMetricEvent{},
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
@@ -99,6 +105,7 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM subscription_plans")
 		DB.Exec("DELETE FROM user_subscriptions")
 		DB.Exec("DELETE FROM perf_metrics")
+		DB.Exec("DELETE FROM perf_metric_events")
 		DB.Exec("DELETE FROM system_instances")
 		DB.Exec("DELETE FROM system_task_locks")
 		DB.Exec("DELETE FROM system_tasks")
@@ -356,4 +363,119 @@ func TestUpdateWithStatus_PersistsPluginStateAndPollFailures(t *testing.T) {
 	assert.EqualValues(t, TaskStatusInProgress, reloaded.Status)
 	assert.JSONEq(t, `{"req_key":"new"}`, string(reloaded.PrivateData.PluginState))
 	assert.Equal(t, 4, reloaded.PrivateData.PollFailures)
+}
+
+func TestTerminalTaskPerformanceSurvivesCollectorFailure(t *testing.T) {
+	truncateTables(t)
+	previous := perf_metrics_setting.GetSetting()
+	config.UpdateConfigFromMap(config.GlobalConfig.Get("perf_metrics_setting"), map[string]string{"enabled": "true"})
+	t.Cleanup(func() {
+		config.UpdateConfigFromMap(config.GlobalConfig.Get("perf_metrics_setting"), map[string]string{"enabled": strconv.FormatBool(previous.Enabled)})
+	})
+	const rejectCallback = "test:reject_task_performance_event"
+	reject := true
+	require.NoError(t, DB.Callback().Create().Before("gorm:create").Register(rejectCallback, func(tx *gorm.DB) {
+		if tx.Statement.Table == (PerfMetricEvent{}).TableName() && reject {
+			tx.AddError(errors.New("metrics unavailable"))
+		}
+	}))
+	t.Cleanup(func() { DB.Callback().Create().Remove(rejectCallback) })
+
+	now := time.Now().Unix()
+	zero := int64(0)
+	task := &Task{TaskID: "terminal-with-sample", Status: TaskStatusInProgress, Group: "retired-group", SubmitTime: now - 20, StartTime: now - 10, Quota: 91,
+		Properties: Properties{OriginModelName: "private-model"}, PrivateData: TaskPrivateData{PerformanceOutputTokens: &zero}}
+	insertTask(t, task)
+	task.Status = TaskStatusSuccess
+	task.FinishTime = now
+	won, err := task.UpdateWithStatus(TaskStatusInProgress)
+	require.NoError(t, err, "the collector cannot block the terminal state or billing")
+	require.True(t, won)
+	var persisted Task
+	require.NoError(t, DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusSuccess), persisted.Status)
+	assert.Equal(t, 91, persisted.Quota)
+	assert.True(t, persisted.PerformanceSamplePending)
+	require.NotNil(t, persisted.PrivateData.PerformanceOutputTokens)
+	assert.Zero(t, *persisted.PrivateData.PerformanceOutputTokens)
+	require.Positive(t, persisted.FinishTime)
+	terminalTime := persisted.FinishTime
+
+	staged, err := StagePerfMetricTaskEvents(context.Background(), DB)
+	require.ErrorContains(t, err, "metrics unavailable")
+	assert.Zero(t, staged)
+	require.NoError(t, DB.First(&persisted, task.ID).Error)
+	assert.True(t, persisted.PerformanceSamplePending, "failed outbox insertion rolls the marker claim back")
+	assert.Equal(t, terminalTime, persisted.FinishTime)
+
+	reject = false
+	staged, err = StagePerfMetricTaskEvents(context.Background(), DB)
+	require.NoError(t, err)
+	assert.Equal(t, 1, staged)
+	var events []PerfMetricEvent
+	require.NoError(t, DB.Find(&events).Error)
+	require.Len(t, events, 1)
+	assert.Equal(t, "private-model", events[0].ModelName)
+	assert.Equal(t, "retired-group", events[0].Group)
+	assert.Equal(t, terminalTime, events[0].SampleAt)
+	assert.Equal(t, int64(0), events[0].OutputTokens)
+	assert.True(t, events[0].OutputTokensKnown)
+	assert.Equal(t, int64(10_000), events[0].GenerationMs, "explicit zero output retains a valid throughput denominator")
+	missingDuration := *task
+	missingDuration.StartTime = 0
+	hundred := int64(100)
+	missingDuration.PrivateData.PerformanceOutputTokens = &hundred
+	measurement := missingDuration.PerformanceMetricEvent()
+	require.NotNil(t, measurement)
+	assert.True(t, measurement.OutputTokensKnown, "known output remains known when its duration is missing")
+	assert.Equal(t, hundred, measurement.OutputTokens)
+	assert.Zero(t, measurement.GenerationMs, "submission time is not a generation duration")
+	require.NoError(t, DB.First(&persisted, task.ID).Error)
+	assert.False(t, persisted.PerformanceSamplePending)
+
+	staged, err = StagePerfMetricTaskEvents(context.Background(), DB)
+	require.NoError(t, err)
+	assert.Zero(t, staged)
+	won, err = task.UpdateWithStatus(TaskStatusInProgress)
+	require.NoError(t, err)
+	assert.False(t, won, "a duplicate terminal CAS cannot reactivate the marker")
+
+	immediate := &Task{TaskID: task.TaskID, Status: TaskStatusFailure, Properties: Properties{OriginModelName: "private-model"}}
+	require.NoError(t, immediate.Insert())
+	require.Positive(t, immediate.FinishTime)
+	assert.True(t, immediate.PerformanceSamplePending)
+	staged, err = StagePerfMetricTaskEvents(context.Background(), DB)
+	require.NoError(t, err)
+	assert.Equal(t, 1, staged)
+	require.NoError(t, DB.Order("id").Find(&events).Error)
+	require.Len(t, events, 2)
+	assert.NotEqual(t, events[0].ID, events[1].ID, "legacy public task IDs need not be unique")
+
+	legacy := &Task{TaskID: "already-accounted-terminal", Status: TaskStatusSuccess, FinishTime: now, Properties: Properties{OriginModelName: "private-model"}}
+	require.NoError(t, DB.Create(legacy).Error)
+	staged, err = StagePerfMetricTaskEvents(context.Background(), DB)
+	require.NoError(t, err)
+	assert.Zero(t, staged, "upgrading does not replay already-terminal historical tasks")
+
+	bad := &Task{TaskID: "bad-dimension", Status: TaskStatusFailure, Properties: Properties{OriginModelName: strings.Repeat("x", 129)}}
+	require.NoError(t, bad.Insert())
+	future := &Task{TaskID: "bad-future-time", Status: TaskStatusFailure, FinishTime: now + 120, Properties: Properties{OriginModelName: "future-task"}}
+	require.NoError(t, future.Insert())
+	good := &Task{TaskID: "after-bad-dimension", Status: TaskStatusFailure, Properties: Properties{OriginModelName: "still-collectable"}}
+	require.NoError(t, good.Insert())
+	staged, err = StagePerfMetricTaskEvents(context.Background(), DB)
+	require.ErrorContains(t, err, "invalid_dimensions")
+	assert.Equal(t, 1, staged, "an invalid sample does not block later valid tasks")
+	persisted = Task{}
+	require.NoError(t, DB.First(&persisted, bad.ID).Error)
+	assert.True(t, persisted.PerformanceSamplePending, "quarantine preserves the pending data")
+	assert.Equal(t, "invalid_dimensions", persisted.PerformanceSampleError)
+	persisted = Task{}
+	require.NoError(t, DB.First(&persisted, future.ID).Error)
+	assert.True(t, persisted.PerformanceSamplePending)
+	assert.Equal(t, "invalid_measurements", persisted.PerformanceSampleError)
+	assert.Equal(t, now+120, persisted.FinishTime, "quarantine does not rewrite provider facts")
+	staged, err = StagePerfMetricTaskEvents(context.Background(), DB)
+	require.NoError(t, err)
+	assert.Zero(t, staged, "quarantined tasks are not retried forever ahead of healthy tasks")
 }

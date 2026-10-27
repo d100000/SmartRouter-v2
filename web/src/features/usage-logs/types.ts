@@ -251,9 +251,18 @@ export interface LogOtherData {
   stream_status?: {
     status?: string
     end_reason?: string
+    response_status?: string
     error_count?: number
     end_error?: string
     errors?: string[]
+  }
+  stream_failure?: {
+    code: string
+    type: string
+    message: string
+    no_charge: boolean
+    usage_source?: string
+    has_output?: boolean
   }
   // Violation fee fields
   violation_fee?: boolean

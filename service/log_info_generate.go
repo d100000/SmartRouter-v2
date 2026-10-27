@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/base64"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -129,7 +130,46 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	appendBillingInfo(relayInfo, other)
 	appendParamOverrideInfo(relayInfo, other)
 	appendStreamStatus(relayInfo, other)
+	appendStreamFailureLogInfo(ctx, relayInfo, other, false)
 	return other
+}
+
+// appendStreamFailureLogInfo preserves the failure even when usable output or
+// upstream usage allows the normal settlement path. Consumption rows must
+// never present themselves as exempt from billing, including free models.
+func appendStreamFailureLogInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other *model.LogOther, errorLog bool) string {
+	if ctx == nil || relayInfo == nil || relayInfo.StreamFailure == nil || relayInfo.StreamFailure.Error == nil || other == nil {
+		return ""
+	}
+	failure := relayInfo.StreamFailure
+	apiErr := failure.Error
+	message := apiErr.MaskSensitiveErrorWithStatusCode(common.UpstreamAddresses(ctx)...)
+	if len(message) > common.LocalLogContentLimit {
+		limit := common.LocalLogContentLimit
+		for !utf8.ValidString(message[:limit]) {
+			limit--
+		}
+		message = message[:limit] + "..."
+	}
+	usageSource := "none"
+	if failure.HasActualUsage {
+		usageSource = "upstream"
+	} else if failure.HasEffectiveOutput {
+		usageSource = "local_estimate"
+	}
+	noCharge := errorLog && failure.NoCharge && !failure.HasActualUsage && !failure.HasEffectiveOutput &&
+		!IsViolationFeeCode(NormalizeViolationFeeError(apiErr).GetErrorCode())
+	other.SetPublic("stream_failure", map[string]any{
+		"code":         string(apiErr.GetErrorCode()),
+		"type":         apiErr.ToOpenAIError().Type,
+		"message":      message,
+		"no_charge":    noCharge,
+		"usage_source": usageSource,
+		"has_output":   failure.HasEffectiveOutput,
+	})
+	other.SetAdmin("estimated_prompt_tokens", relayInfo.GetEstimatePromptTokens())
+	logger.LogWarn(ctx, common.LogText("stream failure recorded: code=%s no_charge=%t usage_source=%s has_output=%t message=%s", apiErr.GetErrorCode(), noCharge, usageSource, failure.HasEffectiveOutput, message))
+	return message
 }
 
 func AppendResponseModelLogInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) {

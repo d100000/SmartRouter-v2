@@ -5,13 +5,20 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -69,6 +76,11 @@ type Task struct {
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
+	// The terminal transition persists this marker in the same task write.
+	// A separate collector stages its credential-free event without making
+	// task settlement depend on the metrics table being writable.
+	PerformanceSamplePending bool   `json:"-" gorm:"index"`
+	PerformanceSampleError   string `json:"-" gorm:"size:128"`
 }
 
 func (t *Task) SetData(data any) {
@@ -136,6 +148,9 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+	// nil means the upstream did not supply trustworthy output-token usage.
+	// This is independent of legacy billing counters, which may hold credits.
+	PerformanceOutputTokens *int64 `json:"performance_output_tokens,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -214,7 +229,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded {
+		!p.ResultDiscarded && p.PerformanceOutputTokens == nil {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -490,6 +505,7 @@ func (Task *Task) Insert() error {
 // (for example "data" when the submit route discards the upstream snapshot)
 // while the in-memory task keeps its values for presentation.
 func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) error {
+	Task.preparePerformanceSample(TaskStatusUnknown)
 	tx := DB.WithContext(ctx)
 	if len(omitColumns) > 0 {
 		tx = tx.Omit(omitColumns...)
@@ -555,11 +571,128 @@ func (t *Task) UpdateQuota() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
+	t.preparePerformanceSample(fromStatus)
 	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
 	if result.Error != nil {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+func (t *Task) preparePerformanceSample(fromStatus TaskStatus) {
+	if fromStatus == TaskStatusSuccess || fromStatus == TaskStatusFailure ||
+		(t.Status != TaskStatusSuccess && t.Status != TaskStatusFailure) {
+		return
+	}
+	if t.FinishTime <= 0 {
+		t.FinishTime = time.Now().Unix()
+	}
+	if perf_metrics_setting.GetSetting().Enabled && t.performanceModelName() != "" {
+		t.PerformanceSamplePending = true
+		t.PerformanceSampleError = ""
+	}
+}
+
+// PerformanceMetricEvent reconstructs only safe, immutable terminal telemetry.
+// Its stable task primary-key identity makes retries and duplicate poll replies
+// idempotent, including legacy tasks whose public/upstream task IDs collide.
+func (t *Task) PerformanceMetricEvent() *PerfMetricEvent {
+	if t == nil || t.ID <= 0 || t.FinishTime <= 0 ||
+		(t.Status != TaskStatusSuccess && t.Status != TaskStatusFailure) {
+		return nil
+	}
+	name := t.performanceModelName()
+	if name == "" {
+		return nil
+	}
+	group := strings.TrimSpace(t.Group)
+	if group == "" {
+		group = "default"
+	}
+	bucketSeconds := perf_metrics_setting.GetBucketSeconds()
+	event := &PerfMetricEvent{
+		ID: fmt.Sprintf("task:%d", t.ID), ModelName: name, Group: group,
+		BucketTs: t.FinishTime - t.FinishTime%bucketSeconds, SampleAt: t.FinishTime,
+		Success: t.Status == TaskStatusSuccess,
+	}
+	if t.SubmitTime > 0 && t.FinishTime > t.SubmitTime {
+		event.LatencyMs = min(t.FinishTime-t.SubmitTime, math.MaxInt64/1000) * 1000
+	}
+	if event.Success && t.PrivateData.PerformanceOutputTokens != nil && *t.PrivateData.PerformanceOutputTokens >= 0 {
+		event.OutputTokens = *t.PrivateData.PerformanceOutputTokens
+		event.OutputTokensKnown = true
+		if t.StartTime > 0 && t.FinishTime > t.StartTime {
+			event.GenerationMs = min(t.FinishTime-t.StartTime, math.MaxInt64/1000) * 1000
+		}
+	}
+	return event
+}
+
+func (t *Task) performanceModelName() string {
+	name := t.Properties.OriginModelName
+	if billing := t.PrivateData.BillingContext; billing != nil && billing.OriginModelName != "" {
+		name = billing.OriginModelName
+	}
+	return strings.TrimSpace(name)
+}
+
+// StagePerfMetricTaskEvents transfers committed terminal markers to the metric
+// outbox. Claim and insertion share a transaction; failure leaves the task
+// pending, while the completed task and its billing remain unaffected.
+func StagePerfMetricTaskEvents(ctx context.Context, db *gorm.DB) (int, error) {
+	if db == nil {
+		return 0, errors.New("performance metric database is unavailable")
+	}
+	var tasks []Task
+	if err := db.WithContext(ctx).
+		Select("id", "group", "status", "submit_time", "start_time", "finish_time", "properties", "private_data").
+		Where("performance_sample_pending = ? AND (performance_sample_error IS NULL OR performance_sample_error = ?) AND status IN ?", true, "", []TaskStatus{TaskStatusSuccess, TaskStatusFailure}).
+		Order("id").Limit(100).Find(&tasks).Error; err != nil {
+		return 0, err
+	}
+	staged := 0
+	var firstErr error
+	for i := range tasks {
+		task := &tasks[i]
+		event := task.PerformanceMetricEvent()
+		quarantine := ""
+		if event == nil || event.ID == "" || event.ModelName == "" || utf8.RuneCountInString(event.ID) > 96 || utf8.RuneCountInString(event.ModelName) > 128 || utf8.RuneCountInString(event.Group) > 64 {
+			quarantine = "invalid_dimensions"
+		} else if event.SampleAt <= 0 || event.SampleAt > time.Now().Unix()+60 || event.BucketTs < 0 || event.BucketTs > event.SampleAt || event.LatencyMs < 0 || event.TtftMs < 0 || event.OutputTokens < 0 || event.GenerationMs < 0 {
+			quarantine = "invalid_measurements"
+		}
+		if quarantine != "" {
+			result := db.WithContext(ctx).Model(&Task{}).Where("id = ? AND performance_sample_pending = ?", task.ID, true).Update("performance_sample_error", quarantine)
+			if result.Error != nil {
+				return staged, errors.Join(firstErr, result.Error)
+			}
+			if result.RowsAffected > 0 && firstErr == nil {
+				firstErr = fmt.Errorf("terminal task %d performance sample quarantined: %s", task.ID, quarantine)
+			}
+			continue
+		}
+		claimed := false
+		if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&Task{}).Where("id = ? AND performance_sample_pending = ?", task.ID, true).Update("performance_sample_pending", false)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return nil
+			}
+			if err := AcceptPerfMetricEvent(ctx, tx, event); err != nil {
+				return err
+			}
+			claimed = true
+			return nil
+		}); err != nil {
+			return staged, errors.Join(firstErr, err)
+		}
+		if claimed {
+			staged++
+		}
+	}
+	return staged, firstErr
 }
 
 // TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.

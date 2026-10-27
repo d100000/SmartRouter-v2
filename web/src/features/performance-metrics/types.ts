@@ -20,6 +20,7 @@ export type PerformanceSummary = {
   avg_latency_ms: number
   success_rate: number
   avg_tps: number
+  output_metrics_available?: boolean
 }
 
 export type PerformanceSeriesPoint = {
@@ -60,6 +61,7 @@ export type PerfModelSummary = {
   avg_latency_ms: number
   success_rate: number
   avg_tps: number
+  output_metrics_available?: boolean
   recent_success_series?: SuccessRatePoint[]
   request_count?: number
 }
@@ -76,7 +78,17 @@ export type PerfSummaryAllData = {
   }
 }
 
-export type PerformanceHealthModel = PerfModelSummary & {
+export type PerformanceHealthModel = Omit<
+  PerfModelSummary,
+  'avg_latency_ms' | 'success_rate' | 'avg_tps'
+> & {
+  avg_latency_ms: number | null
+  success_rate: number | null
+  avg_tps: number | null
+  effective_slo?: number | null
+  min_samples?: number
+  monitoring_enabled?: boolean
+  configured?: boolean
   company_id?: string
   company_name?: string
   group_id?: string
@@ -97,6 +109,8 @@ export type PerformanceHealthCompany = {
   name: string
   status?: number | string
   slo?: number
+  slo_confirmed?: boolean
+  preset_key?: string
   owner?: string
   note?: string
   groups?: Array<{
@@ -105,6 +119,8 @@ export type PerformanceHealthCompany = {
     models: string[]
     enabled?: boolean
     slo?: number
+    slo_confirmed?: boolean
+    preset_key?: string
     p95_latency_ms?: number
     min_samples?: number
   }>
@@ -112,8 +128,24 @@ export type PerformanceHealthCompany = {
 
 export type PerformanceHealthConfig = {
   version?: number
+  config_version?: number
   updated_at?: number
+  preset_version?: string
+  excluded_models?: string[]
+  excluded_companies?: string[]
+  excluded_groups?: string[]
   companies: PerformanceHealthCompany[]
+}
+
+export type PerformanceHealthPresetPreview = {
+  config: PerformanceHealthConfig
+  expected_config_version: number
+  preview_token: string
+  added_companies: string[]
+  added_groups: string[]
+  added_models: string[]
+  conflicts: string[]
+  skipped_models: string[]
 }
 
 export type PerformanceHealthData = {
@@ -127,6 +159,34 @@ export type PerformanceHealthData = {
   terminal_coverage_available?: boolean
   data_freshness?: string | number
   definition_version?: string
+  generated_at?: number
+  window_alignment?: string
+  bucket_seconds?: number
+  current_bucket_partial?: boolean
+  last_sample_at?: number | null
+  persisted_through?: number | null
+  collector_heartbeat_at?: number | null
+  collection?: PerformanceCollectionHealth
+}
+
+export type PerformanceCollectionHealth = {
+  enabled: boolean
+  availability: 'ready' | 'disabled' | 'delayed' | 'partial'
+  storage: 'database_outbox'
+  target_visibility_seconds: number
+  pending_events: number
+  oldest_pending_at: number | null
+  last_sample_at: number | null
+  last_accepted_at: number | null
+  last_projected_at: number | null
+  persisted_through: number | null
+  collector_heartbeat_at: number | null
+  unpersisted_events: number
+  oldest_unpersisted_at: number | null
+  dropped_events: number
+  stale_collectors: number
+  local_unpersisted_events: number
+  quarantined_events?: number
 }
 
 export type PerformanceHealthResponse = {

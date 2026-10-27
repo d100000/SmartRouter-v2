@@ -82,7 +82,8 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		})
 	}
 
-	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
+	streamFailure := relayInfo != nil && relayInfo.StreamFailure != nil && relayInfo.StreamFailure.Error != nil
+	if streamFailure || constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
 		userId := c.GetInt("id")
 		tokenName := c.GetString("token_name")
 		modelName := c.GetString("original_model")
@@ -98,11 +99,18 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		AppendRelayLogAdminInfo(c, relayInfo, other)
 		AppendResponseModelLogInfo(relayInfo, other)
 		AppendTaskPluginContextAuditInfo(c, other)
+		appendStreamStatus(relayInfo, other)
+		streamMessage := appendStreamFailureLogInfo(c, relayInfo, other, true)
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 		if startTime.IsZero() {
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(upstreamURLs...), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		isStream := common.GetContextKeyBool(c, constant.ContextKeyIsStream) || relayInfo != nil && relayInfo.IsStream
+		message := err.MaskSensitiveErrorWithStatusCode(upstreamURLs...)
+		if streamMessage != "" {
+			message = streamMessage
+		}
+		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, message, tokenId, useTimeSeconds, isStream, userGroup, other)
 	}
 }

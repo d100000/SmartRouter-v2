@@ -11,6 +11,8 @@ import (
 // to record soft errors, signal fatal stops, or mark normal completion.
 // StreamScannerHandler checks IsStopped() after each callback invocation.
 type StreamResult struct {
+	// Event is the SSE event name for this callback, or empty for unnamed data.
+	Event   string
 	status  *relaycommon.StreamStatus
 	stopped bool
 	done    bool

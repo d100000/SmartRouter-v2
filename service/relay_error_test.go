@@ -7,13 +7,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -24,6 +27,82 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestStreamFailureLogsPreserveBillingDecisionAndMaskDetails(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		failure      *relaycommon.StreamFailureInfo
+		errorLog     bool
+		wantSource   string
+		wantNoCharge bool
+	}{
+		{name: "historical log without marker"},
+		{
+			name:     "empty stream is explicitly uncharged",
+			failure:  &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("Upstream stream returned no usage or effective output"), types.ErrorCodeEmptyResponse, http.StatusBadGateway), NoCharge: true},
+			errorLog: true, wantSource: "none", wantNoCharge: true,
+		},
+		{
+			name:       "partial output keeps configured settlement",
+			failure:    &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("upstream interrupted"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), HasEffectiveOutput: true, NoCharge: true},
+			wantSource: "local_estimate",
+		},
+		{
+			name:       "upstream input-only usage is not exempted",
+			failure:    &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("upstream interrupted"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), HasActualUsage: true},
+			wantSource: "upstream",
+		},
+		{
+			name:     "existing violation fee is not marked free",
+			failure:  &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("Content violates usage guidelines"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), NoCharge: true},
+			errorLog: true, wantSource: "none",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{StreamFailure: tc.failure}
+			info.SetEstimatePromptTokens(1325020)
+			other := model.NewLogOther()
+			appendStreamFailureLogInfo(ctx, info, other, tc.errorLog)
+			stored := other.Snapshot()
+			if tc.failure == nil {
+				assert.NotContains(t, stored, "stream_failure")
+				assert.NotContains(t, stored, "admin_info")
+				return
+			}
+			marker, ok := stored["stream_failure"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, string(tc.failure.Error.GetErrorCode()), marker["code"])
+			assert.Equal(t, tc.wantNoCharge, marker["no_charge"])
+			assert.Equal(t, tc.wantSource, marker["usage_source"])
+			assert.Equal(t, tc.failure.HasEffectiveOutput, marker["has_output"])
+			assert.Contains(t, marker["message"], tc.failure.Error.Error())
+			adminInfo, ok := stored["admin_info"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, 1325020, adminInfo["estimated_prompt_tokens"])
+		})
+	}
+
+	t.Run("private upstream details are masked and bounded with unicode intact", func(t *testing.T) {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		common.SetContextKey(ctx, constant.ContextKeyChannelBaseUrl, "https://private.example.com")
+		apiErr := types.NewErrorWithStatusCode(errors.New("upstream https://private.example.com/path?token=review-token api_key:review-secret "+strings.Repeat("错误", 2048)), types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+		info := &relaycommon.RelayInfo{StreamFailure: &relaycommon.StreamFailureInfo{Error: apiErr, NoCharge: true}}
+		other := model.NewLogOther()
+		appendStreamFailureLogInfo(ctx, info, other, true)
+		marker, ok := other.Snapshot()["stream_failure"].(map[string]any)
+		require.True(t, ok)
+		message, ok := marker["message"].(string)
+		require.True(t, ok)
+		assert.NotContains(t, message, "private.example.com")
+		assert.NotContains(t, message, "review-token")
+		assert.NotContains(t, message, "review-secret")
+		assert.True(t, utf8.ValidString(message))
+		assert.LessOrEqual(t, len(message), common.LocalLogContentLimit+3)
+		assert.Equal(t, "upstream https://private.example.com/path?token=review-token api_key:review-secret "+strings.Repeat("错误", 2048), apiErr.Error())
+	})
+}
 
 func TestRequestCancellationCannotAutoDisableChannel(t *testing.T) {
 	previous := common.AutomaticDisableChannelEnabled

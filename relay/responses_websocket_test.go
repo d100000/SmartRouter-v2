@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -692,6 +693,61 @@ func TestResponsesWSErrorAttribution(t *testing.T) {
 			assert.Equal(t, tc.terminal, terminal)
 			assert.Equal(t, tc.ambiguous, ambiguous)
 			assert.Equal(t, tc.controlError, controlError)
+		})
+	}
+}
+
+func TestResponsesShutdownWaitsForTerminalObservers(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("canceled=%t", canceled), func(t *testing.T) {
+			previous := responsesShutdown
+			responsesShutdown = &responsesShutdownRegistry{sessions: make(map[*responsesWSSession]chan struct{})}
+			t.Cleanup(func() { responsesShutdown = previous })
+			registered, observed, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			finish := func() { releaseOnce.Do(func() { close(release) }) }
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				sessionCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				session := &responsesWSSession{ctx: sessionCtx, cancel: cancel, client: conn}
+				unregister := registerResponsesShutdown(session)
+				close(registered)
+				<-sessionCtx.Done()
+				<-release
+				close(observed)
+				unregister()
+			}))
+			t.Cleanup(server.Close)
+			t.Cleanup(finish)
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			require.NoError(t, err)
+			defer conn.Close()
+			<-registered
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- ShutdownResponsesWebSockets(ctx) }()
+			_, _, err = conn.ReadMessage()
+			require.Error(t, err, "shutdown closes even an idle hijacked connection")
+			select {
+			case <-result:
+				t.Fatal("shutdown returned before terminal observers drained")
+			default:
+			}
+			if canceled {
+				cancel()
+				require.ErrorIs(t, <-result, context.Canceled)
+			}
+			finish()
+			<-observed
+			if !canceled {
+				require.NoError(t, <-result)
+			}
 		})
 	}
 }
