@@ -72,6 +72,13 @@ beforeEach(() => {
     cost_coverage: 80,
     health: 80,
     latency_ms: 120,
+    cache_input_tokens: 10_000,
+    cache_read_tokens: 990,
+    cache_write_tokens: 400,
+    cache_usage_attempts: 4,
+    cache_hit_attempts: 2,
+    cache_hit_rate: 9.9,
+    cache_usage_coverage: 80,
   }
   snapshot = {
     dimension: 'channel',
@@ -86,6 +93,7 @@ beforeEach(() => {
     ranking: [{ id: '42', name: 'Primary', ...metrics }],
     distribution: [],
     models: [],
+    channels: [{ id: '42', name: 'Primary', ...metrics }],
     options: [{ id: '42', name: 'Primary' }],
     limits: { max_days: 90, max_rows: 100 },
     warnings: [],
@@ -112,6 +120,189 @@ afterEach(async () => {
 })
 
 describe('channel overview contracts', () => {
+  test('cache summary uses the server token-weighted rate and model measurements', async () => {
+    snapshot.models = [
+      {
+        ...snapshot.ranking[0],
+        id: 'small-cached-model',
+        name: 'small-cached-model',
+        cache_input_tokens: 1_000,
+        cache_read_tokens: 990,
+        cache_write_tokens: 400,
+        cache_hit_rate: 99,
+      },
+      {
+        ...snapshot.ranking[0],
+        id: 'large-uncached-model',
+        name: 'large-uncached-model',
+        cache_input_tokens: 9_000,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0,
+      },
+    ]
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    const section = await screen.findByRole('region', {
+      name: 'Cache Statistics',
+    })
+    const summary = within(section).getByRole('region', {
+      name: 'Cache Usage Samples',
+    })
+    expect(within(summary).getByText('9.9%')).toBeVisible()
+    expect(within(summary).queryByText('49.5%')).not.toBeInTheDocument()
+    expect(within(summary).getByText('990')).toBeVisible()
+    expect(within(summary).getByText('400')).toBeVisible()
+    const models = within(section).getByRole('table', {
+      name: 'Cache Statistics by Model',
+    })
+    expect(within(models).getByText('99%')).toBeVisible()
+    expect(within(models).getByText('0%')).toBeVisible()
+    expect(within(models).getByText('9,000')).toBeVisible()
+  })
+
+  test('cache views switch between models and channels without another analytics request', async () => {
+    const user = userEvent.setup()
+    snapshot.models = [
+      { ...snapshot.ranking[0], id: 'model-a', name: 'model-a' },
+    ]
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    await screen.findByRole('table', { name: 'Cache Statistics by Model' })
+    await user.click(screen.getByRole('tab', { name: 'By Channel' }))
+    expect(screen.getByRole('tab', { name: 'By Channel' })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    )
+    const channels = screen.getByRole('table', {
+      name: 'Cache Statistics by Channel',
+    })
+    expect(within(channels).getByText('Primary')).toBeVisible()
+    expect(within(channels).getByText('9.9%')).toBeVisible()
+    expect(within(channels).getByText('4 / 5 attempts')).toBeVisible()
+    await user.keyboard('{ArrowLeft}')
+    await user.keyboard('{Enter}')
+    expect(screen.getByRole('tab', { name: 'By Model' })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    )
+    expect(
+      screen.getByRole('table', { name: 'Cache Statistics by Model' })
+    ).toBeVisible()
+    expect(api.get).toHaveBeenCalledTimes(1)
+  })
+
+  test('missing cache measurements stay unavailable while measured cache misses display zero', async () => {
+    snapshot.summary = {
+      ...snapshot.summary,
+      cache_input_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      cache_usage_attempts: 0,
+      cache_hit_attempts: 0,
+      cache_hit_rate: null,
+      cache_usage_coverage: 0,
+    }
+    snapshot.models = [
+      { ...snapshot.summary, id: 'unknown-model', name: 'unknown-model' },
+      {
+        ...snapshot.summary,
+        id: 'measured-miss',
+        name: 'measured-miss',
+        attempts: 1,
+        cache_input_tokens: 100,
+        cache_usage_attempts: 1,
+        cache_hit_rate: 0,
+        cache_usage_coverage: 100,
+      },
+    ]
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    const models = await screen.findByRole('table', {
+      name: 'Cache Statistics by Model',
+    })
+    const unknownCells = within(
+      within(models).getByRole('row', { name: /unknown-model/ })
+    ).getAllByRole('cell')
+    expect(unknownCells[1]).toHaveTextContent('—')
+    expect(unknownCells[2]).toHaveTextContent('—')
+    expect(unknownCells[3]).toHaveTextContent('—')
+    expect(unknownCells[4]).toHaveTextContent('—')
+    const missCells = within(
+      within(models).getByRole('row', { name: /measured-miss/ })
+    ).getAllByRole('cell')
+    expect(missCells[1]).toHaveTextContent('0%')
+    expect(missCells[2]).toHaveTextContent('0')
+    expect(missCells[3]).toHaveTextContent('0')
+    expect(missCells[4]).toHaveTextContent('100')
+    expect(screen.getByText('No cache usage samples yet.')).toBeVisible()
+  })
+
+  test('older analytics responses without cache fields keep financial data and unknown cache values', async () => {
+    const user = userEvent.setup()
+    for (const key of Object.keys(snapshot.summary)) {
+      if (key.startsWith('cache_')) {
+        Reflect.deleteProperty(snapshot.summary, key)
+      }
+    }
+    Reflect.deleteProperty(snapshot, 'channels')
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    const summary = await screen.findByRole('region', {
+      name: 'Cache Usage Samples',
+    })
+    expect(within(summary).getAllByText('—')).toHaveLength(4)
+    const ranking = screen.getByRole('table', { name: 'Channel Ranking' })
+    expect(within(ranking).getAllByRole('cell')[3]).toHaveTextContent('$12')
+    await user.click(screen.getByRole('tab', { name: 'By Channel' }))
+    expect(
+      screen.getByRole('table', { name: 'Cache Statistics by Channel' })
+    ).toHaveTextContent('No cache usage samples yet.')
+    expect(screen.queryByText('NaN')).not.toBeInTheDocument()
+  })
+
+  test('cache statistics refresh with the current period and selected analysis object', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockImplementation(async (_url, config) => {
+      const selected =
+        config?.params.days === 30 && config?.params.object_id === '42'
+      const cache = {
+        ...snapshot.summary,
+        cache_hit_rate: selected ? 37.5 : 9.9,
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            ...snapshot,
+            summary: cache,
+            models: [{ ...cache, id: 'model-a', name: 'model-a' }],
+            channels: [{ ...cache, id: '42', name: 'Primary' }],
+          },
+        },
+      }
+    })
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    await screen.findByRole('table', { name: 'Cache Statistics by Model' })
+    await user.click(screen.getByRole('button', { name: '30 Days' }))
+    await user.click(await screen.findByRole('button', { name: 'Primary' }))
+    await waitFor(() =>
+      expect(
+        within(
+          screen.getByRole('table', { name: 'Cache Statistics by Model' })
+        ).getByText('37.5%')
+      ).toBeVisible()
+    )
+    await user.click(screen.getByRole('tab', { name: 'By Channel' }))
+    expect(
+      within(
+        screen.getByRole('table', { name: 'Cache Statistics by Channel' })
+      ).getByText('37.5%')
+    ).toBeVisible()
+    expect(api.get).toHaveBeenLastCalledWith(
+      '/api/channel-overview',
+      expect.objectContaining({
+        params: { dimension: 'channel', days: 30, object_id: '42' },
+      })
+    )
+  })
+
   test('typing an object ID sends no analytics queries until Enter commits it', async () => {
     const user = userEvent.setup()
     render(<ChannelOverview />, { wrapper: Wrapper })
@@ -187,12 +378,19 @@ describe('channel overview contracts', () => {
   test('language switches reformat the loaded monetary values without another API request', async () => {
     snapshot.summary.revenue = 12.5
     snapshot.ranking[0].revenue = 12.5
+    snapshot.models = [
+      { ...snapshot.ranking[0], id: 'model-a', name: 'model-a' },
+    ]
     i18next.addResourceBundle('fr', 'translation', {
       'Channel Overview': 'Vue des canaux',
     })
     render(<ChannelOverview />, { wrapper: Wrapper })
     const table = await screen.findByRole('table', { name: 'Channel Ranking' })
     expect(within(table).getAllByRole('cell')[3]).toHaveTextContent('$12.5')
+    const cache = screen.getByRole('table', {
+      name: 'Cache Statistics by Model',
+    })
+    expect(within(cache).getByText('10,000')).toBeVisible()
     await act(async () => {
       await i18next.changeLanguage('fr')
     })
@@ -200,6 +398,7 @@ describe('channel overview contracts', () => {
       screen.getByRole('heading', { name: 'Vue des canaux' })
     ).toBeVisible()
     expect(within(table).getAllByRole('cell')[3]).toHaveTextContent('12,5')
+    expect(within(cache).getByText(/10\s000/)).toBeVisible()
     expect(api.get).toHaveBeenCalledTimes(1)
   })
 
@@ -299,7 +498,9 @@ describe('channel overview contracts', () => {
     })
     await waitFor(() =>
       expect(
-        within(screen.getByRole('table')).getAllByText('80%')
+        within(
+          screen.getByRole('table', { name: 'Channel Ranking' })
+        ).getAllByText('80%')
       ).toHaveLength(2)
     )
   })

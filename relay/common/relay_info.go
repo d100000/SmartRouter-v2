@@ -91,6 +91,12 @@ type OverviewBillingSnapshot struct {
 	InputTokens          int64
 	OutputTokens         int64
 	UsageSource          string
+	// Cache observations retain upstream quantities, independently of pricing
+	// remaps, settlement confirmation, and cache lifetime price multipliers.
+	CacheUsageKnown  bool
+	CacheInputTokens int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
 }
 
 // OverviewAttempt contains only non-secret frozen procurement metadata.

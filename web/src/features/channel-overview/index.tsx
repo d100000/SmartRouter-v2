@@ -35,6 +35,7 @@ import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getChannelOverview } from './api'
+import { OverviewCacheStatistics } from './components/overview-cache-statistics'
 import { OverviewCoverage } from './components/overview-coverage'
 import {
   OverviewFiltersBar,
@@ -154,6 +155,7 @@ export function ChannelOverview() {
                 />
               ) : (
                 <>
+                  <OverviewCacheStatistics snapshot={data} />
                   <Suspense fallback={<LoadingState />}>
                     <OverviewCharts snapshot={data} />
                   </Suspense>

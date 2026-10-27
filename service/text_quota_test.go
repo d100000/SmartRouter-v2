@@ -112,6 +112,14 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 				PostTextConsumeQuota(ctx, info, usage, nil)
 			}
 			require.NotNil(t, info.AnalyticsBilling)
+			if tc.mode == "" || tc.mode == "audio" {
+				assert.Equal(t, !tc.local && !tc.missing, info.AnalyticsBilling.CacheUsageKnown)
+				if info.AnalyticsBilling.CacheUsageKnown {
+					assert.EqualValues(t, usage.PromptTokens, info.AnalyticsBilling.CacheInputTokens)
+					assert.EqualValues(t, 20, info.AnalyticsBilling.CacheReadTokens)
+					assert.EqualValues(t, 5, info.AnalyticsBilling.CacheWriteTokens)
+				}
+			}
 			assert.Equal(t, !tc.changedUnit || tc.group == 0, info.AnalyticsBilling.RevenueConfirmed)
 			assert.Equal(t, tc.revenue, info.AnalyticsBilling.RevenueQuota)
 			unit := common.QuotaPerUnit
@@ -128,6 +136,56 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 			if tc.local || tc.missing {
 				assert.Equal(t, "local_estimate", info.AnalyticsBilling.UsageSource)
 			}
+		})
+	}
+}
+
+func TestOverviewCacheUsagePreservesNativeCounts(t *testing.T) {
+	nativeOpenAI := dto.NewOpenAIResponsesBillingUsage(&dto.Usage{
+		InputTokens: 1000, InputTokensDetails: &dto.InputTokenDetails{CachedTokens: 700, CacheWriteTokens: 500, CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL30mTokens: 200, TTL12hTokens: 300}},
+	})
+	nativeClaude := dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+		InputTokens: 100, CacheReadInputTokens: 500, CacheCreationInputTokens: 400,
+		CacheCreation: &dto.ClaudeCacheCreationUsage{Ephemeral5mInputTokens: 100, Ephemeral1hInputTokens: 300},
+	})
+	estimated := dto.NewOpenAIChatBillingUsage(&dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 700}})
+	require.NotNil(t, estimated)
+	estimated.Estimated = true
+	for _, tc := range []struct {
+		name               string
+		usage              *dto.Usage
+		local              bool
+		known              bool
+		input, read, write int64
+	}{
+		{name: "native Responses usage overrides remapped public tokens and retains physical TTL counts", usage: &dto.Usage{PromptTokens: 5, BillingUsage: nativeOpenAI}, known: true, input: 1000, read: 700, write: 500},
+		{name: "native Claude adds reads and writes exactly once", usage: &dto.Usage{PromptTokens: 1000, BillingUsage: nativeClaude}, known: true, input: 1000, read: 500, write: 400},
+		{name: "Claude split without aggregate is physical write usage", usage: &dto.Usage{UsageSemantic: dto.BillingUsageSemanticAnthropic, PromptTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 500}, ClaudeCacheCreation5mTokens: 100, ClaudeCacheCreation1hTokens: 300}, known: true, input: 1000, read: 500, write: 400},
+		{name: "Gemini includes cache and tool prompt in the total", usage: &dto.Usage{BillingUsage: dto.NewGeminiChatBillingUsage(&dto.GeminiUsageMetadata{PromptTokenCount: 1000, ToolUsePromptTokenCount: 100, CachedContentTokenCount: 500})}, known: true, input: 1100, read: 500},
+		{name: "compatible cache alias is retained", usage: &dto.Usage{PromptTokens: 1000, PromptCacheHitTokens: 600}, known: true, input: 1000, read: 600},
+		{name: "unwrapped Responses input details are retained", usage: &dto.Usage{InputTokens: 1000, InputTokensDetails: &dto.InputTokenDetails{CachedTokens: 600}}, known: true, input: 1000, read: 600},
+		{name: "upstream usage without cache reports a known zero", usage: &dto.Usage{PromptTokens: 1000}, known: true, input: 1000},
+		{name: "output-only usage has no rate denominator", usage: &dto.Usage{CompletionTokens: 5}, known: true},
+		{name: "local estimate is excluded", usage: &dto.Usage{PromptTokens: 1000}, local: true},
+		{name: "estimated native usage is excluded", usage: &dto.Usage{BillingUsage: estimated}},
+		{name: "missing usage is unknown"},
+		{name: "empty usage is unknown", usage: &dto.Usage{}},
+		{name: "negative cache is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: -1}}},
+		{name: "read exceeding total is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 1001}}},
+		{name: "oversized input is unknown", usage: &dto.Usage{PromptTokens: int(common.MaxQuota) + 1}},
+		{name: "negative TTL count is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CacheWriteTokens: 10, CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL12hTokens: -1}}}},
+		{name: "oversized TTL count is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL12hTokens: int(common.MaxQuota) + 1}}}},
+		{name: "inconsistent OpenAI split is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CacheWriteTokens: 10, CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL30mTokens: 6, TTL12hTokens: 5}}}},
+		{name: "inconsistent Claude split is unknown", usage: &dto.Usage{UsageSemantic: dto.BillingUsageSemanticAnthropic, PromptTokens: 100, PromptTokensDetails: dto.InputTokenDetails{CachedCreationTokens: 10}, ClaudeCacheCreation5mTokens: 6, ClaudeCacheCreation1hTokens: 5}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI}
+			snapshot := &relaycommon.OverviewBillingSnapshot{}
+			captureOverviewCacheUsage(snapshot, info, tc.usage, tc.local)
+			assert.Equal(t, tc.known, snapshot.CacheUsageKnown)
+			assert.Equal(t, tc.input, snapshot.CacheInputTokens)
+			assert.Equal(t, tc.read, snapshot.CacheReadTokens)
+			assert.Equal(t, tc.write, snapshot.CacheWriteTokens)
 		})
 	}
 }

@@ -18,7 +18,17 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { OverviewDimension } from './components/overview-filters'
 
-export interface OverviewMetrics {
+export interface OverviewCacheMetrics {
+  cache_input_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cache_usage_attempts: number
+  cache_hit_attempts: number
+  cache_hit_rate: number | null
+  cache_usage_coverage: number | null
+}
+
+export interface OverviewMetrics extends OverviewCacheMetrics {
   requests: number
   attempts: number
   successes: number
@@ -58,6 +68,7 @@ export interface OverviewSnapshot {
   ranking: OverviewRow[]
   distribution: OverviewDistribution[]
   models: OverviewModel[]
+  channels: OverviewRow[]
   options: Array<{ id: string; name: string }>
   refreshed_at: number
   collected_since: number | null
@@ -66,7 +77,7 @@ export interface OverviewSnapshot {
   warnings: string[]
 }
 
-export interface OverviewModel {
+export interface OverviewModel extends OverviewCacheMetrics {
   id: string
   name: string
   revenue: number

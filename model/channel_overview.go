@@ -56,6 +56,10 @@ type OverviewAttemptEvent struct {
 	Success                 bool
 	Failure                 bool
 	LatencyMS               int64
+	CacheUsageKnown         bool
+	CacheInputTokens        int64
+	CacheReadTokens         int64
+	CacheWriteTokens        int64
 }
 
 // Sparse daily cube: one row per occupied procurement/routing/model cohort.
@@ -89,6 +93,11 @@ type OverviewDaily struct {
 	CompleteAttempts           int64
 	LatencyTotalMS             int64
 	LatencySamples             int64
+	CacheInputTokens           int64
+	CacheReadTokens            int64
+	CacheWriteTokens           int64
+	CacheUsageAttempts         int64
+	CacheHitAttempts           int64
 }
 
 type OverviewCollectionState struct {
@@ -174,6 +183,13 @@ func ProjectOverviewEvents(ctx context.Context, db *gorm.DB) (int, error) {
 			}
 			hash := sha256.Sum256(identity)
 			row := OverviewDaily{ID: hex.EncodeToString(hash[:]), Day: event.Day, ChannelID: event.ChannelID, ChannelName: event.ChannelName, GroupName: event.GroupName, ModelName: event.ModelName, CredentialID: event.CredentialID, CredentialName: event.CredentialName, SupplierID: event.SupplierID, SupplierName: event.SupplierName, OwnershipVersionID: event.OwnershipVersionID, CostVersionID: event.CostVersionID, QuotaPerUnit: event.QuotaPerUnit, Revenue: event.RevenueQuota, Attempts: 1, LatencyTotalMS: event.LatencyMS, LatencySamples: 1}
+			if event.CacheUsageKnown {
+				row.CacheUsageAttempts = 1
+				row.CacheInputTokens, row.CacheReadTokens, row.CacheWriteTokens = event.CacheInputTokens, event.CacheReadTokens, event.CacheWriteTokens
+				if event.CacheReadTokens > 0 {
+					row.CacheHitAttempts = 1
+				}
+			}
 			if event.CostKnown {
 				row.Cost = event.CostQuota
 			} else {
@@ -217,6 +233,11 @@ func ProjectOverviewEvents(ctx context.Context, db *gorm.DB) (int, error) {
 				previous.CompleteAttempts += row.CompleteAttempts
 				previous.LatencyTotalMS += row.LatencyTotalMS
 				previous.LatencySamples += row.LatencySamples
+				previous.CacheInputTokens += row.CacheInputTokens
+				previous.CacheReadTokens += row.CacheReadTokens
+				previous.CacheWriteTokens += row.CacheWriteTokens
+				previous.CacheUsageAttempts += row.CacheUsageAttempts
+				previous.CacheHitAttempts += row.CacheHitAttempts
 			} else {
 				rows[row.ID] = &row
 			}
@@ -236,6 +257,11 @@ func ProjectOverviewEvents(ctx context.Context, db *gorm.DB) (int, error) {
 			}
 			for column, delta := range map[string]float64{"cost": row.Cost, "complete_cost": row.CompleteCost} {
 				updates[column] = gorm.Expr("? + ?", clause.Column{Table: tx.NamingStrategy.TableName("OverviewDaily"), Name: column}, delta)
+			}
+			// Newly added columns are NULL on historical rows. New samples in an
+			// existing cohort must still accumulate without rewriting its history.
+			for column, delta := range map[string]int64{"cache_input_tokens": row.CacheInputTokens, "cache_read_tokens": row.CacheReadTokens, "cache_write_tokens": row.CacheWriteTokens, "cache_usage_attempts": row.CacheUsageAttempts, "cache_hit_attempts": row.CacheHitAttempts} {
+				updates[column] = gorm.Expr("COALESCE(?, 0) + ?", clause.Column{Table: tx.NamingStrategy.TableName("OverviewDaily"), Name: column}, delta)
 			}
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoUpdates: clause.Assignments(updates)}).Create(row).Error; err != nil {
 				return err
@@ -299,6 +325,13 @@ type OverviewMetrics struct {
 	LatencyMS                  *float64 `json:"latency_ms"`
 	LatencyTotalMS             int64    `json:"-"`
 	LatencySamples             int64    `json:"-"`
+	CacheInputTokens           int64    `json:"cache_input_tokens"`
+	CacheReadTokens            int64    `json:"cache_read_tokens"`
+	CacheWriteTokens           int64    `json:"cache_write_tokens"`
+	CacheUsageAttempts         int64    `json:"cache_usage_attempts"`
+	CacheHitAttempts           int64    `json:"cache_hit_attempts"`
+	CacheHitRate               *float64 `json:"cache_hit_rate"`
+	CacheUsageCoverage         *float64 `json:"cache_usage_coverage"`
 }
 
 type OverviewRow struct {
@@ -325,6 +358,7 @@ type OverviewResult struct {
 	Ranking        []OverviewRow    `json:"ranking"`
 	Distribution   []OverviewRow    `json:"distribution"`
 	Models         []OverviewRow    `json:"models"`
+	Channels       []OverviewRow    `json:"channels"`
 	Options        []OverviewOption `json:"options"`
 	Limits         map[string]int   `json:"limits"`
 	Warnings       []string         `json:"warnings"`
@@ -341,6 +375,12 @@ func (m *OverviewMetrics) Finalize() {
 	if m.Attempts > 0 {
 		value := float64(m.Attempts-m.UnknownCostAttempts) / float64(m.Attempts) * 100
 		m.CostCoverage = &value
+		cacheCoverage := float64(m.CacheUsageAttempts) / float64(m.Attempts) * 100
+		m.CacheUsageCoverage = &cacheCoverage
+	}
+	if m.CacheUsageAttempts > 0 && m.CacheInputTokens > 0 {
+		value := float64(m.CacheReadTokens) / float64(m.CacheInputTokens) * 100
+		m.CacheHitRate = &value
 	}
 	if ended := m.Successes + m.Failures; ended > 0 {
 		value := float64(m.Successes) / float64(ended) * 100
@@ -375,8 +415,8 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 	now := time.Now().UTC()
 	start := now.AddDate(0, 0, -days+1).Format("2006-01-02")
 	end := now.Format("2006-01-02")
-	result := &OverviewResult{Dimension: dimension, Days: days, Currency: "USD", RefreshedAt: now.Unix(), Scope: "synchronous_relay", Daily: []OverviewRow{}, Ranking: []OverviewRow{}, Distribution: []OverviewRow{}, Models: []OverviewRow{}, Options: []OverviewOption{}, Warnings: []string{}, Limits: map[string]int{"max_days": 90, "max_rows": 100}}
-	// Main DB transaction gives one snapshot to all six business queries.
+	result := &OverviewResult{Dimension: dimension, Days: days, Currency: "USD", RefreshedAt: now.Unix(), Scope: "synchronous_relay", Daily: []OverviewRow{}, Ranking: []OverviewRow{}, Distribution: []OverviewRow{}, Models: []OverviewRow{}, Channels: []OverviewRow{}, Options: []OverviewOption{}, Warnings: []string{}, Limits: map[string]int{"max_days": 90, "max_rows": 100}}
+	// Main DB transaction gives one snapshot to all seven business queries.
 	options := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		// The SQLite driver uses BEGIN IMMEDIATE for ordinary transactions.
@@ -400,6 +440,7 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 			result.Warnings = append(result.Warnings, "Unfinished attempts are excluded; collection may be incomplete")
 		}
 		sums := "COALESCE(SUM(revenue * 1.0 / NULLIF(quota_per_unit,0)),0) AS revenue, COALESCE(SUM(cost * 1.0 / NULLIF(quota_per_unit,0)),0) AS cost, COALESCE(SUM(complete_revenue * 1.0 / NULLIF(quota_per_unit,0)),0) AS complete_revenue, COALESCE(SUM(complete_cost * 1.0 / NULLIF(quota_per_unit,0)),0) AS complete_cost, COALESCE(SUM(subscription_revenue * 1.0 / NULLIF(quota_per_unit,0)),0) AS subscription_revenue, COALESCE(SUM(unconfirmed_revenue_requests),0) AS unconfirmed_revenue_requests, COALESCE(SUM(requests),0) AS requests, COALESCE(SUM(attempts),0) AS attempts, COALESCE(SUM(successes),0) AS successes, COALESCE(SUM(failures),0) AS failures, COALESCE(SUM(unknown_cost_attempts),0) AS unknown_cost_attempts, COALESCE(SUM(complete_attempts),0) AS complete_attempts, COALESCE(SUM(complete_requests),0) AS complete_requests, COALESCE(SUM(latency_total_ms),0) AS latency_total_ms, COALESCE(SUM(latency_samples),0) AS latency_samples"
+		sums += ", COALESCE(SUM(cache_input_tokens),0) AS cache_input_tokens, COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, COALESCE(SUM(cache_usage_attempts),0) AS cache_usage_attempts, COALESCE(SUM(cache_hit_attempts),0) AS cache_hit_attempts"
 		base := tx.Model(&OverviewDaily{}).Where("day >= ? AND day <= ?", start, end)
 		filtered := base.Session(&gorm.Session{})
 		if objectID != "" {
@@ -419,6 +460,9 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 			return err
 		}
 		if err := filtered.Session(&gorm.Session{}).Select("model_name AS id, model_name AS name, " + sums).Group("model_name").Order("SUM(attempts) DESC, model_name ASC").Limit(100).Scan(&result.Models).Error; err != nil {
+			return err
+		}
+		if err := filtered.Session(&gorm.Session{}).Select("channel_id AS id, MAX(channel_name) AS name, " + sums).Group("channel_id").Order("SUM(attempts) DESC, channel_id ASC").Limit(100).Scan(&result.Channels).Error; err != nil {
 			return err
 		}
 		if err := base.Session(&gorm.Session{}).Select(column + " AS id, MAX(" + nameColumn + ") AS name").Group(column).Order(column + " ASC").Limit(101).Scan(&result.Options).Error; err != nil {
@@ -453,9 +497,14 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 		result.Summary.CompleteAttempts += row.CompleteAttempts
 		result.Summary.LatencyTotalMS += row.LatencyTotalMS
 		result.Summary.LatencySamples += row.LatencySamples
+		result.Summary.CacheInputTokens += row.CacheInputTokens
+		result.Summary.CacheReadTokens += row.CacheReadTokens
+		result.Summary.CacheWriteTokens += row.CacheWriteTokens
+		result.Summary.CacheUsageAttempts += row.CacheUsageAttempts
+		result.Summary.CacheHitAttempts += row.CacheHitAttempts
 	}
 	result.Summary.Finalize()
-	for _, rows := range [][]OverviewRow{result.Daily, result.Ranking, result.Distribution, result.Models} {
+	for _, rows := range [][]OverviewRow{result.Daily, result.Ranking, result.Distribution, result.Models, result.Channels} {
 		for i := range rows {
 			rows[i].Finalize()
 		}

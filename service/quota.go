@@ -447,6 +447,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 	snapshot := &relaycommon.OverviewBillingSnapshot{
 		InputTokens: int64(usage.PromptTokens), OutputTokens: int64(usage.CompletionTokens), UsageSource: "upstream",
 	}
+	captureOverviewCacheUsage(snapshot, relayInfo, usage, !actualUsage)
 	if !actualUsage {
 		snapshot.UsageSource = "local_estimate"
 	} else if usage.UsageSource != "" {

@@ -484,6 +484,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	relayInfo.AnalyticsBilling = &relaycommon.OverviewBillingSnapshot{
 		InputTokens: int64(summary.PromptTokens), OutputTokens: int64(summary.CompletionTokens), UsageSource: "upstream", QuotaPerUnit: summary.QuotaPerUnit,
 	}
+	captureOverviewCacheUsage(relayInfo.AnalyticsBilling, relayInfo, originUsage, common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens))
 	if snap != nil && snap.BillingMode == "tiered_expr" {
 		relayInfo.AnalyticsBilling.QuotaPerUnit = snap.QuotaPerUnit
 		if snap.QuotaPerUnit != summary.QuotaPerUnit && !summary.ToolCallSurchargeQuota.IsZero() {

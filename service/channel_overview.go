@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -109,6 +110,10 @@ func CompleteOverviewRelay(info *relaycommon.RelayInfo) {
 		}
 		if attempt.Billing != nil {
 			billing := attempt.Billing
+			event.CacheUsageKnown = billing.CacheUsageKnown
+			event.CacheInputTokens = billing.CacheInputTokens
+			event.CacheReadTokens = billing.CacheReadTokens
+			event.CacheWriteTokens = billing.CacheWriteTokens
 			event.BaseQuota = billing.BaseQuota
 			if billing.QuotaPerUnit > 0 {
 				event.QuotaPerUnit = billing.QuotaPerUnit
@@ -158,6 +163,59 @@ func CompleteOverviewRelay(info *relaycommon.RelayInfo) {
 	if err := model.CompleteOverviewRequest(events); err != nil {
 		common.SysError("channel overview completion failed: " + err.Error())
 	}
+}
+
+// Cache analysis uses actual upstream counts, never the local token estimate or
+// the input categories adjusted for pricing. In particular, cache-write TTLs
+// change prices but do not multiply the number of tokens observed here.
+func captureOverviewCacheUsage(snapshot *relaycommon.OverviewBillingSnapshot, info *relaycommon.RelayInfo, usage *dto.Usage, localEstimate bool) {
+	if snapshot == nil || usage == nil || localEstimate || (usage.BillingUsage != nil && usage.BillingUsage.Estimated) {
+		return
+	}
+	if usage.BillingUsage != nil {
+		usage = effectiveBillingUsage(usage)
+	} else if usageSemanticFromUsage(info, usage) != dto.BillingUsageSemanticAnthropic {
+		// The same native normalizer handles Responses' input_tokens_details
+		// and compatible providers' prompt_cache_hit_tokens aliases.
+		if native := dto.NewOpenAIChatBillingUsage(usage); native != nil {
+			usage, _ = native.CanonicalUsage()
+		}
+	}
+	input, read := int64(usage.PromptTokens), int64(usage.PromptTokensDetails.CachedTokens)
+	creation := usage.PromptTokensDetails
+	for _, count := range []int{usage.PromptTokens, creation.CachedTokens, creation.CachedCreationTokens, creation.CacheWriteTokens, usage.ClaudeCacheCreation5mTokens, usage.ClaudeCacheCreation1hTokens} {
+		if count < 0 || int64(count) > int64(common.MaxQuota) {
+			return
+		}
+	}
+	write := int64(creation.CacheCreationTokensTotal())
+	if detail := creation.CacheWriteTokensDetails; detail != nil {
+		if detail.TTL30mTokens < 0 || detail.TTL12hTokens < 0 || int64(detail.TTL30mTokens) > int64(common.MaxQuota) || int64(detail.TTL12hTokens) > int64(common.MaxQuota) {
+			return
+		}
+		split := int64(detail.TTL30mTokens) + int64(detail.TTL12hTokens)
+		if write > 0 && split > write {
+			return
+		}
+		write = max(write, split)
+	}
+	if usageSemanticFromUsage(info, usage) == dto.BillingUsageSemanticAnthropic {
+		split := int64(usage.ClaudeCacheCreation5mTokens) + int64(usage.ClaudeCacheCreation1hTokens)
+		if write > 0 && split > write {
+			return
+		}
+		write = max(write, split)
+		input += read + write
+	}
+	if input > int64(common.MaxQuota) || write < 0 || write > int64(common.MaxQuota) || read > input {
+		return
+	}
+	// An empty usage object carries no evidence that input tokens were measured.
+	if input == 0 && (usage.CompletionTokens <= 0 || write > 0) {
+		return
+	}
+	snapshot.CacheUsageKnown = true
+	snapshot.CacheInputTokens, snapshot.CacheReadTokens, snapshot.CacheWriteTokens = input, read, write
 }
 
 func overviewEvent(attempt *relaycommon.OverviewAttempt) model.OverviewAttemptEvent {
