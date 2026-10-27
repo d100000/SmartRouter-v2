@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { AlertTriangle } from 'lucide-react'
+import { AlertTriangle, RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -41,7 +41,9 @@ export function LogRequestStatus(props: {
   const other = parseLogOther(props.log.other)
   const config = getLogTypeConfig(props.log.type)
 
-  if (!other?.stream_failure) {
+  const recovered =
+    other?.stream_retry?.recovered === true && !other.stream_failure
+  if (!other?.stream_failure && !recovered) {
     return (
       <StatusBadge
         label={t(config.label)}
@@ -54,9 +56,10 @@ export function LogRequestStatus(props: {
     )
   }
 
-  const label = isUnchargedStreamFailure(props.log, other)
+  let label = isUnchargedStreamFailure(props.log, other)
     ? `${t('Error')} · ${t('Not charged')}`
     : t('Error')
+  if (recovered) label = t('Succeeded after retry')
 
   return (
     <>
@@ -73,8 +76,8 @@ export function LogRequestStatus(props: {
       >
         <StatusBadge
           label={label}
-          variant='danger'
-          icon={AlertTriangle}
+          variant={recovered ? 'success' : 'danger'}
+          icon={recovered ? RotateCcw : AlertTriangle}
           copyable={false}
           className='h-auto min-h-5 px-0 text-xs [&_span]:whitespace-normal'
         />

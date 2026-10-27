@@ -250,6 +250,11 @@ type RelayInfo struct {
 
 	StreamStatus  *StreamStatus
 	StreamFailure *StreamFailureInfo
+	// Only native HTTP Responses requests with verified replay-safe outbound
+	// parameters may buffer their initialization events. Attempts never settle.
+	ResponsesRetryEligible bool
+	StreamRetryCount       int
+	StreamRetryHistory     []StreamRetryAttempt
 	// VendorToolUsage reads the upstream's own billed tool counts from a raw
 	// response body (non-stream) or the raw terminal stream frame. The channel
 	// adaptor's Init sets it for upstreams whose usage extension names a billed
@@ -307,6 +312,20 @@ type StreamFailureInfo struct {
 	HasActualUsage     bool
 	HasEffectiveOutput bool
 	NoCharge           bool
+	ErrorDelivered     bool // The upstream error frame already reached the client.
+	RetryableOverload  bool
+	RetryAfter         time.Duration
+}
+
+// StreamRetryAttempt is a bounded, masked diagnostic, never request content.
+type StreamRetryAttempt struct {
+	Attempt           int    `json:"attempt"`
+	ChannelID         int    `json:"channel_id"`
+	Code              string `json:"code"`
+	Message           string `json:"message"`
+	Decision          string `json:"decision"`
+	Reason            string `json:"reason"`
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
 }
 
 // UpdateImageCount replaces the billable quantity without changing the frozen
@@ -1074,6 +1093,17 @@ func (info *RelayInfo) SetFirstResponseTime() {
 		info.FirstResponseTime = time.Now()
 		info.isFirstResponse = false
 	}
+}
+
+// BeginStreamRetry runs only after a discarded, unbilled attempt has joined all
+// stream goroutines. BillingSession and the frozen manual prices stay intact.
+func (info *RelayInfo) BeginStreamRetry() {
+	info.StreamRetryCount++
+	info.isFirstResponse = true
+	info.FirstResponseTime = info.StartTime.Add(-time.Second)
+	info.ReceivedResponseCount = 0
+	info.SendResponseCount = 0
+	info.ResponseModel = nil
 }
 
 func (info *RelayInfo) HasSendResponse() bool {

@@ -1307,6 +1307,31 @@ export function DetailsDialog(props: DetailsDialogProps) {
             />
           )}
 
+        {props.isAdmin && other?.admin_info?.stream_retry_attempts && (
+          <DetailSection label={t('Stream retry details')}>
+            {other.admin_info.stream_retry_attempts.map((attempt) => (
+              <div key={attempt.attempt} className='space-y-2'>
+                <DetailRow label={t('Attempt')} value={attempt.attempt} />
+                <DetailRow label={t('Channel ID')} value={attempt.channel_id} />
+                <DetailRow label={t('Error Code')} value={attempt.code} mono />
+                <DetailRow label={t('Error Message')} value={attempt.message} />
+                <DetailRow
+                  label={t('Retry decision')}
+                  value={`${attempt.decision} · ${attempt.reason}`}
+                  mono
+                />
+                {attempt.upstream_request_id && (
+                  <DetailRow
+                    label={t('Upstream Request ID')}
+                    value={attempt.upstream_request_id}
+                    mono
+                  />
+                )}
+              </div>
+            ))}
+          </DetailSection>
+        )}
+
         {/* Stream status details */}
         {other?.stream_status && other.stream_status.status !== 'ok' && (
           <DetailSection label={t('Stream Status')}>

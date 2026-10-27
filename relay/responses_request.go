@@ -23,6 +23,7 @@ import (
 // The returned adaptor retains route/conversion state for DoRequest/DoResponse.
 func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.OpenAIResponsesRequest) (relaychannel.Adaptor, common.ReplayableBody, io.Closer, *types.NewAPIError) {
 	info.InitChannelMeta(c)
+	info.ResponsesRetryEligible = false
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
 		!common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
 		return nil, nil, nil, types.NewErrorWithStatusCode(
@@ -79,6 +80,7 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 	}
 
 	logger.LogDebug(c, "requestBody: %s", jsonData)
+	info.ResponsesRetryEligible = responsesRequestAllowsOverloadRetry(c, info, jsonData)
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {
 		return nil, nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())

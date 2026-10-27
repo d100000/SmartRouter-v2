@@ -179,19 +179,17 @@ func requestContextDone(c *gin.Context) bool {
 }
 
 func SetEventStreamHeaders(c *gin.Context) {
-	// 检查是否已经设置过头部
-	if _, exists := c.Get("event_stream_headers_set"); exists {
-		return
-	}
-
-	// 设置标志，表示头部已经设置过
-	c.Set("event_stream_headers_set", true)
-
+	// A discarded attempt restores its original headers. Reapply the SSE
+	// headers on the next attempt, but install the write-budget wrapper once.
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("Transfer-Encoding", "chunked")
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	if _, exists := c.Get("event_stream_headers_set"); exists {
+		return
+	}
+	c.Set("event_stream_headers_set", true)
 	writer := &streamResponseWriter{ResponseWriter: c.Writer}
 	if c.Request != nil {
 		writer.requestDeadline, _ = c.Request.Context().Deadline()

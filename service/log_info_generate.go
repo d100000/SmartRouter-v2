@@ -73,6 +73,13 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
 	}
 	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
 	if relayInfo != nil {
+		if len(relayInfo.StreamRetryHistory) > 0 {
+			other.SetAdmin("stream_retry_attempts", relayInfo.StreamRetryHistory)
+			other.SetPublic("stream_retry", map[string]any{
+				"count":     relayInfo.StreamRetryCount,
+				"recovered": relayInfo.StreamRetryCount > 0 && relayInfo.StreamFailure == nil && relayInfo.StreamStatus != nil && relayInfo.StreamStatus.ResponseOutcome() == "completed" && !relayInfo.StreamStatus.HasErrors(),
+			})
+		}
 		if billingModel := relayInfo.GetBillingModelName(); billingModel != "" && billingModel != relayInfo.OriginModelName {
 			other.SetAdmin("billing_model", billingModel)
 		}

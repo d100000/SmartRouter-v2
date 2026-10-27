@@ -479,6 +479,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// Bind externally built requests as well as adaptor requests to the same
 	// client cancellation/deadline, which remains active while reading the body.
 	req = req.WithContext(c.Request.Context())
+	if info.ResponsesRetryEligible && req.Header.Get("X-Codex-Turn-State") != "" {
+		info.ResponsesRetryEligible = false
+	}
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	service.MarkOverviewUpstreamSent(info)
 	resp, err := relayClient.Do(req)

@@ -1328,6 +1328,36 @@ test.each(['stacked', 'inline'])(
   }
 )
 
+test('safe stream retry defaults off and preserves manual settings when enabled', async () => {
+  const user = userEvent.setup()
+  editingChannel.setting = JSON.stringify({
+    system_prompt: 'Manual system prompt',
+    responses_websocket_enabled: true,
+    manual_extension: { retained: true },
+  })
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Request & Response/ }))
+  const toggle = screen.getByRole('switch', {
+    name: 'Retry streaming overload once',
+  })
+  expect(toggle).not.toBeChecked()
+  await user.click(toggle)
+  expect(toggle).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
+  const payload = put.mock.calls[0]?.[1] as { setting: string }
+  expect(JSON.parse(payload.setting)).toMatchObject({
+    responses_overload_retry_enabled: true,
+    responses_websocket_enabled: true,
+    system_prompt: 'Manual system prompt',
+    manual_extension: { retained: true },
+  })
+})
+
 test('quick options show only applicable shortcuts when the provider changes', async () => {
   const user = userEvent.setup()
   render(<ConfigurationHarness />)

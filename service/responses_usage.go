@@ -37,13 +37,13 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	}
 	if event.Response != nil {
 		a.info.ObserveResponseModel(event.Response.Model)
+		ApplyResponsesUsage(a.usage, event.Response.Usage)
 	}
 	a.started = true
 	ObserveResponsesOutcome(a.info, event)
 	switch event.Type {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil {
-			ApplyResponsesUsage(a.usage, event.Response.Usage)
 			if a.outputText.Len() == 0 {
 				// Some upstreams carry the output only on the terminal event.
 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
