@@ -16,6 +16,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -103,6 +104,7 @@ func (w *responsesLifecycleWriter) FlushError() error {
 }
 
 func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
+	require.NoError(t, i18n.Init())
 	oldMode, oldTimeout := gin.Mode(), constant.StreamingTimeout
 	gin.SetMode(gin.TestMode)
 	constant.StreamingTimeout = 1

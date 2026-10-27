@@ -180,6 +180,45 @@ test('opens an uncharged stream failure from its error marker with the keyboard'
   expect(marker).toHaveFocus()
 })
 
+test('opens recovered retry details without marking the successful response as uncharged', async () => {
+  const user = userEvent.setup()
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <DetailPreview
+          columnId='created_at'
+          quota={500}
+          isAdmin
+          other={{
+            stream_retry: { count: 1, recovered: true },
+            admin_info: {
+              stream_retry_attempts: [
+                {
+                  attempt: 1,
+                  channel_id: 6,
+                  code: 'server_is_overloaded',
+                  message: 'Upstream temporarily overloaded',
+                  decision: 'retry',
+                  reason: 'retry_status_matched',
+                },
+              ],
+            },
+          }}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  await user.click(
+    screen.getByRole('button', { name: 'Succeeded after retry' })
+  )
+  const dialog = await screen.findByRole('dialog')
+  expect(
+    within(dialog).getByText('Upstream temporarily overloaded')
+  ).toBeVisible()
+  expect(within(dialog).getByText('server_is_overloaded')).toBeVisible()
+  expect(within(dialog).queryByText('Not charged')).not.toBeInTheDocument()
+})
+
 test.each([
   { quota: 5000, noCharge: false },
   { quota: 0, noCharge: false },

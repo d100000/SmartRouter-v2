@@ -947,6 +947,9 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 			{name: "completed-zero-fixed", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"response.completed","response":{"id":"first","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
 		} {
 			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				// Empty HTTP stream failures refund the reservation and produce an
+				// error log. WebSocket settlement is outside the HTTP retry change.
+				uncharged := transport == "http-sse" && tc.failed && !tc.delta && tc.name != "failed-actual-usage"
 				events := []string{`{"type":"response.created","response":{"id":"first","status":"in_progress"}}`}
 				if tc.delta {
 					events = append(events, `{"type":"response.output_text.delta","delta":"hello"}`)
@@ -995,6 +998,7 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 					require.NoError(t, response.Body.Close())
 					assert.Equal(t, http.StatusOK, response.StatusCode)
 					assert.Contains(t, string(body), terminal)
+					assert.Equal(t, len(events), strings.Count(string(body), "data: "), "no synthetic error may follow the upstream terminal")
 				} else {
 					require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","stream_id":"planner","model":"ws-billing","input":"hi","max_output_tokens":1}`)))
 					for _, expected := range events {
@@ -1004,6 +1008,9 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 					}
 				}
 				quotas := []int{1000}
+				if uncharged {
+					quotas = nil
+				}
 				if tc.failed {
 					// The first terminal must complete settlement and middleware before
 					// admitting this immediately following request.
@@ -1017,12 +1024,25 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 				assert.Equal(t, "planner", limited["stream_id"])
 				assert.Equal(t, "limited", limited["event_id"])
 				fixture.closeAndWait(t)
+				if uncharged {
+					require.Eventually(t, func() bool {
+						return model.DB.First(fixture.token, fixture.token.Id).Error == nil && fixture.token.RemainQuota == 2000 &&
+							model.DB.First(fixture.user, fixture.user.Id).Error == nil && fixture.user.Quota == 99000
+					}, 3*time.Second, time.Millisecond, "failed HTTP attempt must finish refunding before inspecting the ledger")
+				}
 				assertResponsesWSAccounting(t, fixture, quotas)
 				var logs []model.Log
 				require.NoError(t, model.LOG_DB.Where("token_id = ? AND type = ?", fixture.token.Id, model.LogTypeConsume).Order("id").Find(&logs).Error)
 				require.Len(t, logs, len(quotas))
+				outcomeLog := logs[0]
+				if uncharged {
+					outcomeLog = model.Log{}
+					require.NoError(t, model.LOG_DB.Where("token_id = ? AND type = ?", fixture.token.Id, model.LogTypeError).Order("id").First(&outcomeLog).Error)
+					assert.Zero(t, outcomeLog.Quota)
+					assert.Contains(t, outcomeLog.Other, `"no_charge":true`)
+				}
 				var other map[string]any
-				require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+				require.NoError(t, common.UnmarshalJsonStr(outcomeLog.Other, &other))
 				stream := other["stream_status"].(map[string]any)
 				if tc.failed {
 					assert.Equal(t, "error", stream["status"])
@@ -1035,8 +1055,13 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 						assert.Equal(t, "completed", stream["response_status"])
 					}
 				}
-				assert.NotContains(t, logs[0].Other, "sensitive upstream detail")
-				expectedRequests := int64(len(quotas))
+				if !uncharged {
+					assert.NotContains(t, logs[0].Other, "sensitive upstream detail")
+				}
+				expectedRequests := int64(1)
+				if tc.failed {
+					expectedRequests++
+				}
 				if tc.ignored {
 					expectedRequests--
 				}

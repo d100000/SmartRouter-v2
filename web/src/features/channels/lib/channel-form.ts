@@ -41,6 +41,7 @@ import {
   validateAdvancedCustomConfig,
 } from './advanced-custom'
 import { readTaskExtendPluginKeys } from './channel-plugin-extensions'
+import { parseChannelSettings } from './channel-utils'
 import { supportsResponsesWebSocket } from './responses-websocket'
 
 // ============================================================================
@@ -272,6 +273,7 @@ export const channelFormSchema = z
     tls_insecure_skip_verify: z.boolean().optional(),
     pass_through_body_enabled: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
+    responses_overload_retry_enabled: z.boolean().optional(),
     system_prompt: z.string().optional(),
     system_prompt_override: z.boolean().optional(),
     // Type-specific settings (stored in settings JSON)
@@ -466,6 +468,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   tls_insecure_skip_verify: false,
   pass_through_body_enabled: false,
   responses_websocket_enabled: false,
+  responses_overload_retry_enabled: false,
   system_prompt: '',
   system_prompt_override: false,
   // Type-specific settings
@@ -513,6 +516,7 @@ export function transformChannelToFormDefaults(
     tls_insecure_skip_verify: false,
     pass_through_body_enabled: false,
     responses_websocket_enabled: false,
+    responses_overload_retry_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
   }
@@ -536,6 +540,8 @@ export function transformChannelToFormDefaults(
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         responses_websocket_enabled:
           parsed.responses_websocket_enabled === true,
+        responses_overload_retry_enabled:
+          parsed.responses_overload_retry_enabled === true,
         system_prompt: parsed.system_prompt || '',
         system_prompt_override: parsed.system_prompt_override || false,
       }
@@ -658,6 +664,7 @@ export function transformChannelToFormDefaults(
  */
 export function buildSettingJSON(formData: ChannelFormValues): string {
   const settingObj: Record<string, unknown> = {
+    ...parseChannelSettings(formData.setting),
     task_plugin_key:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN
         ? formData.task_plugin_key?.trim() || ''
@@ -678,6 +685,12 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
     system_prompt_override: formData.system_prompt_override || false,
   }
 
+  if (formData.responses_overload_retry_enabled === true) {
+    settingObj.responses_overload_retry_enabled = true
+  } else {
+    delete settingObj.responses_overload_retry_enabled
+  }
+
   const protocol = normalizeHttpProtocol(formData.http_protocol)
   const shards =
     protocol === HTTP_PROTOCOL_HTTP1
@@ -685,6 +698,9 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
       : normalizeHttp2ConnectionShards(formData.http2_connection_shards)
 
   // Omit defaults so unchanged channels keep equivalent JSON.
+  delete settingObj.http_protocol
+  delete settingObj.http2_connection_shards
+  delete settingObj.tls_insecure_skip_verify
   if (protocol === HTTP_PROTOCOL_HTTP1) {
     settingObj.http_protocol = HTTP_PROTOCOL_HTTP1
   } else if (shards > 1) {

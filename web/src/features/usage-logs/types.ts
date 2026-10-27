@@ -146,6 +146,15 @@ export interface LogOtherData {
     }
     // Reject / intercept reason (admin only)
     reject_reason?: string
+    stream_retry_attempts?: {
+      attempt: number
+      channel_id: number
+      code: string
+      message: string
+      decision: string
+      reason: string
+      upstream_request_id?: string
+    }[]
     task_plugin?: TaskPluginInfo
   }
   root_info?: {
@@ -264,6 +273,7 @@ export interface LogOtherData {
     usage_source?: string
     has_output?: boolean
   }
+  stream_retry?: { count: number; recovered: boolean }
   // Violation fee fields
   violation_fee?: boolean
   violation_fee_code?: string

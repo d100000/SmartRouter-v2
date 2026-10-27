@@ -141,6 +141,7 @@ import {
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   CHANNEL_STATUS_LABELS,
   CHANNEL_TYPE_NEW_API,
+  CHANNEL_TYPE_SUB2API,
   CHANNEL_TYPE_OLLAMA,
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_TASK_PLUGIN,
@@ -304,6 +305,7 @@ const SENSITIVE_FORM_FIELDS = [
   'tls_insecure_skip_verify',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
+  'responses_overload_retry_enabled',
   'system_prompt',
   'system_prompt_override',
   'allow_service_tier',
@@ -4755,6 +4757,38 @@ export function ChannelMutateDrawer({
                   channelType={currentType}
                   disabled={sensitiveLocked || isSubmitting}
                 />
+                {[1, CHANNEL_TYPE_SUB2API, CHANNEL_TYPE_NEW_API].includes(
+                  currentType
+                ) && (
+                  <FormField
+                    control={form.control}
+                    name='responses_overload_retry_enabled'
+                    render={({ field }) => (
+                      <FormItem className='flex items-center justify-between gap-4 px-4 py-3'>
+                        <div className='space-y-0.5'>
+                          <FormLabel>
+                            {t('Retry streaming overload once')}
+                          </FormLabel>
+                          <FormDescription>
+                            {t(
+                              'Retry an explicit Responses overload before sending data to the client. Requires an available fallback channel and existing retry policy permission. Stateful requests, hosted tools and body passthrough are excluded.'
+                            )}
+                          </FormDescription>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            checked={field.value === true}
+                            onCheckedChange={field.onChange}
+                            onBlur={field.onBlur}
+                            name={field.name}
+                            ref={field.ref}
+                            disabled={sensitiveLocked || isSubmitting}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                )}
                 {formatFields}
                 {ollamaOpenAIChatFields}
                 {thinkingFields}

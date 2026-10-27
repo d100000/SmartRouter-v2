@@ -127,7 +127,7 @@ func (w *streamResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult), startBuffers ...*StreamStartBuffer) {
 
 	if resp == nil || dataHandler == nil {
 		return
@@ -137,6 +137,17 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// subsequent ping and data writes through its shared write mutex.
 	if writer, ok := c.Writer.(*streamKeepAliveWriter); ok {
 		writer.stop()
+	}
+	var startBuffer *StreamStartBuffer
+	var startDeadline <-chan time.Time
+	if len(startBuffers) > 0 {
+		startBuffer = startBuffers[0]
+		startBuffer.initialize(c)
+		if startBuffer != nil && startBuffer.active {
+			timer := time.NewTimer(time.Until(startBuffer.deadline))
+			defer timer.Stop()
+			startDeadline = timer.C
+		}
 	}
 
 	// 无条件新建 StreamStatus
@@ -231,6 +242,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					func() {
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
+						if startBuffer != nil && (startBuffer.active || startBuffer.discarded) {
+							return
+						}
 						err = PingData(c)
 					}()
 					if err != nil {
@@ -384,18 +398,37 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	})
 
 	// 主循环等待完成或超时
-	select {
-	case <-ticker.C:
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
-	case <-stopChan:
-		// EndReason already set by the goroutine that triggered stopChan
-	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+waitForStream:
+	for {
+		select {
+		case <-startDeadline:
+			startDeadline = nil
+			writeMutex.Lock()
+			err := startBuffer.Flush(c)
+			writeMutex.Unlock()
+			if err != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+				break waitForStream
+			}
+		case <-ticker.C:
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+			break waitForStream
+		case <-stopChan:
+			// EndReason already set by the goroutine that triggered stopChan
+			break waitForStream
+		case <-c.Request.Context().Done():
+			// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
+			// 避免为已放弃的请求继续消费上游 token。
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			break waitForStream
+		}
 	}
 
 	cleanup()
+	if err := startBuffer.Flush(c); err != nil {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+		info.StreamStatus.RecordError(err.Error())
+	}
 	// All stream goroutines have joined. Done from a successfully delivered
 	// protocol completion can now correct a cancellation that won while its
 	// callback was still running. Bare EOF and failed writes never qualify.

@@ -79,6 +79,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	var (
 		newAPIError *types.NewAPIError
+		relayInfo   *relaycommon.RelayInfo
 		ws          *websocket.Conn
 	)
 
@@ -96,6 +97,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			if relayInfo != nil && relayInfo.StreamFailure != nil && relayInfo.StreamFailure.ErrorDelivered {
+				return
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			upstreamURLs := common.UpstreamAddresses(c)
 			if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() &&
@@ -133,7 +137,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
-	relayInfo, err := relaycommon.GenRelayInfo(c, relayFormat, request, ws)
+	relayInfo, err = relaycommon.GenRelayInfo(c, relayFormat, request, ws)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
@@ -190,6 +194,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			if relayInfo.StreamRetryCount > 0 && relayInfo.LastError != nil {
+				// No fallback route must not hide the original upstream failure.
+				newAPIError = relayInfo.LastError
+			}
 			break
 		}
 		service.AppendUsedChannel(c, channel.Id)
@@ -241,11 +249,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if reason := service.SchedulingRetryStopReason(c); reason != "" {
 			decision = service.PolicyDecision{Action: "stop", Reason: reason, Source: "scheduler"}
 		}
+		decision = service.PrepareStreamOverloadRetry(c, relayInfo, newAPIError, decision)
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 
 		if decision.Action != "retry" {
 			break
+		}
+		if relayInfo.StreamFailure != nil && relayInfo.StreamFailure.RetryableOverload {
+			relayInfo.BeginStreamRetry()
+			c.Set(common.UpstreamRequestIdKey, "")
 		}
 	}
 
