@@ -180,6 +180,11 @@ export function MonitoringSettingsSection({
               'Collect relay latency and success-rate metrics for the model square.'
             )}
           </p>
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'Terminal samples are stored before aggregation. Metrics are aggregated every 5 seconds.'
+            )}
+          </p>
 
           <div className='grid grid-cols-1 gap-4 md:grid-cols-4'>
             <FormField
@@ -206,16 +211,20 @@ export function MonitoringSettingsSection({
               name='perf_metrics_setting.flush_interval'
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>{t('Flush interval (minutes)')}</FormLabel>
+                  <FormLabel>{t('Maintenance interval (minutes)')}</FormLabel>
                   <FormControl>
                     <Input
                       type='number'
                       min={1}
                       step={1}
                       {...safeNumberFieldProps(field)}
-                      disabled={!perfMetricsEnabled}
                     />
                   </FormControl>
+                  <FormDescription>
+                    {t(
+                      'Controls retention maintenance, not sample persistence or aggregation frequency.'
+                    )}
+                  </FormDescription>
                   <FormMessage />
                 </FormItem>
               )}
@@ -265,7 +274,6 @@ export function MonitoringSettingsSection({
                       min={0}
                       step={1}
                       {...safeNumberFieldProps(field)}
-                      disabled={!perfMetricsEnabled}
                     />
                   </FormControl>
                   <FormDescription>

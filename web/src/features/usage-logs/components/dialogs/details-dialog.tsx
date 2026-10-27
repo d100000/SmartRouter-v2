@@ -83,6 +83,7 @@ import {
   logTokenName,
   renderAuditContent,
   renderLogContent,
+  isUnchargedStreamFailure,
 } from '../../lib/format'
 import { buildQuotaAuditOperation } from '../../lib/quota-audit-operation'
 import {
@@ -521,6 +522,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { t } = useTranslation()
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
+  const streamFailure = other?.stream_failure
   const typeConfig = getLogTypeConfig(props.log.type)
 
   const isViolation = isViolationFeeLog(other)
@@ -675,8 +677,12 @@ export function DetailsDialog(props: DetailsDialogProps) {
         <>
           {t('Log Details')}
           <StatusBadge
-            label={t(typeConfig.label)}
-            variant={typeConfig.color as StatusBadgeProps['variant']}
+            label={streamFailure ? t('Error') : t(typeConfig.label)}
+            variant={
+              streamFailure
+                ? 'danger'
+                : (typeConfig.color as StatusBadgeProps['variant'])
+            }
             size='sm'
             copyable={false}
           />
@@ -837,6 +843,42 @@ export function DetailsDialog(props: DetailsDialogProps) {
                 </div>
               </div>
             </div>
+          </DetailSection>
+        )}
+
+        {streamFailure && (
+          <DetailSection
+            label={t('Error Details')}
+            icon={<AlertTriangle className='size-3.5' aria-hidden='true' />}
+            variant='danger'
+          >
+            <DetailRow
+              label={t('Cost')}
+              value={
+                isUnchargedStreamFailure(props.log, other)
+                  ? t('Not charged')
+                  : formatLogQuota(props.log.quota)
+              }
+            />
+            {streamFailure.code && (
+              <DetailRow
+                label={t('Error Code')}
+                value={streamFailure.code}
+                mono
+              />
+            )}
+            {streamFailure.type && (
+              <DetailRow
+                label={t('Error Type')}
+                value={streamFailure.type}
+                mono
+              />
+            )}
+            {streamFailure.message && (
+              <p className='text-xs [overflow-wrap:anywhere] whitespace-pre-wrap'>
+                {streamFailure.message}
+              </p>
+            )}
           </DetailSection>
         )}
 
@@ -1245,6 +1287,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
         {/* Admin billing mode indicator for non-consume */}
         {props.isAdmin &&
           !isConsume &&
+          !isUnchargedStreamFailure(props.log, other) &&
           props.log.type !== 6 &&
           other?.admin_info && (
             <DetailRow

@@ -242,7 +242,8 @@ type RelayInfo struct {
 	// 若为空，调用 GetFinalRequestRelayFormat 会回退到 RequestConversionChain 的最后一项或 RelayFormat。
 	FinalRequestRelayFormat types.RelayFormat
 
-	StreamStatus *StreamStatus
+	StreamStatus  *StreamStatus
+	StreamFailure *StreamFailureInfo
 	// VendorToolUsage reads the upstream's own billed tool counts from a raw
 	// response body (non-stream) or the raw terminal stream frame. The channel
 	// adaptor's Init sets it for upstreams whose usage extension names a billed
@@ -268,6 +269,9 @@ type RelayInfo struct {
 	// the request boundary, independently of billing success or failure.
 	PerformanceOutputTokens      int64
 	PerformanceBusinessRejection bool
+	// PerformanceEventID belongs to this logical request, across channel retries.
+	// It is assigned once at the terminal collection boundary and is not a token.
+	PerformanceEventID string
 
 	// convOptions caches the converter settings snapshot (see ConvOptions).
 	convOptions *convmeta.Options
@@ -286,6 +290,17 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+// StreamFailureInfo separates a failed stream from its billable usage. A
+// partially delivered response may still be settled under the configured price,
+// while a failure without upstream usage or output must skip settlement.
+// Error stays in memory; log writers persist only its masked, bounded message.
+type StreamFailureInfo struct {
+	Error              *types.NewAPIError
+	HasActualUsage     bool
+	HasEffectiveOutput bool
+	NoCharge           bool
 }
 
 // UpdateImageCount replaces the billable quantity without changing the frozen
@@ -1169,17 +1184,21 @@ func (t *TaskSubmitReq) UnmarshalMetadata(v any) error {
 }
 
 type TaskInfo struct {
-	Code             int             `json:"code"`
-	TaskID           string          `json:"task_id"`
-	Status           string          `json:"status"`
-	Reason           string          `json:"reason,omitempty"`
-	Url              string          `json:"url,omitempty"`
-	RemoteUrl        string          `json:"remote_url,omitempty"`
-	Progress         string          `json:"progress,omitempty"`
-	CompletionTokens int             `json:"completion_tokens,omitempty"` // 用于按倍率计费
-	TotalTokens      int             `json:"total_tokens,omitempty"`      // 用于按倍率计费
-	UsageFacts       map[string]any  `json:"usage_facts,omitempty"`
-	PluginState      json.RawMessage `json:"plugin_state,omitempty"`
+	Code             int    `json:"code"`
+	TaskID           string `json:"task_id"`
+	Status           string `json:"status"`
+	Reason           string `json:"reason,omitempty"`
+	Url              string `json:"url,omitempty"`
+	RemoteUrl        string `json:"remote_url,omitempty"`
+	Progress         string `json:"progress,omitempty"`
+	CompletionTokens int    `json:"completion_tokens,omitempty"` // 用于按倍率计费
+	TotalTokens      int    `json:"total_tokens,omitempty"`      // 用于按倍率计费
+	// PerformanceOutputTokens is trustworthy output-token telemetry, separate
+	// from legacy billing counters that can represent non-token units.
+	// nil means unavailable; a non-nil zero is explicit zero output.
+	PerformanceOutputTokens *int64          `json:"-"`
+	UsageFacts              map[string]any  `json:"usage_facts,omitempty"`
+	PluginState             json.RawMessage `json:"plugin_state,omitempty"`
 }
 
 func FailTaskInfo(reason string) *TaskInfo {

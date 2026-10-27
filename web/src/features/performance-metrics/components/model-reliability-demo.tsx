@@ -6,9 +6,8 @@ it under the terms of the GNU Affero General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 */
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity,
   ArrowDown,
   ArrowUp,
   AlertTriangle,
@@ -19,12 +18,14 @@ import {
   RefreshCcw,
   RotateCcw,
   Settings2,
-  ShieldCheck,
   TriangleAlert,
 } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
+import { LoadingState } from '@/components/loading-state'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -35,6 +36,11 @@ import {
 } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -42,74 +48,41 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { IconBadge } from '@/components/ui/icon-badge'
-import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Skeleton } from '@/components/ui/skeleton'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatNumber } from '@/lib/format'
+import {
+  getServerErrorMessage,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
+import { cn } from '@/lib/utils'
+
 import {
   getPerformanceHealthCompanies,
   getPerformanceHealthSummary,
-  savePerformanceHealthConfig,
-} from '@/features/performance-metrics/api'
+} from '../api'
+import { formatLatency, formatThroughput, formatUptimePct } from '../lib/format'
 import {
-  formatLatency,
-  formatThroughput,
-  formatUptimePct,
-  getSuccessRateTextClass,
-} from '@/features/performance-metrics/lib/format'
-import type {
-  PerformanceHealthCompany,
-  PerformanceHealthModel,
-  SuccessRatePoint,
-} from '@/features/performance-metrics/types'
-import { toIntlLocale } from '@/i18n/languages'
-import { formatNumber } from '@/lib/format'
-import { requireServerSuccess } from '@/lib/server-error-message'
-import { cn } from '@/lib/utils'
+  getPerformanceModelStatus,
+  normalizePerformanceModel,
+  type PerformanceColumnId,
+} from '../lib/model-status'
+import type { PerformanceHealthCompany } from '../types'
+import { PerformanceCollectionHealthStatus } from './performance-collection-health'
+import { PerformanceConfigDialog } from './performance-config-dialog'
+import { PerformanceModelTable } from './performance-model-table'
+import { PerformanceReliabilityChart } from './performance-reliability-chart'
 
 const PERFORMANCE_WINDOW_HOURS = 24
 const COLUMN_STORAGE_KEY = 'performance-health-model-columns-v1'
-type ColumnId =
-  | 'model'
-  | 'company'
-  | 'requests'
-  | 'success'
-  | 'first'
-  | 'retry'
-  | 'p95'
-  | 'avg'
-  | 'ttft'
-  | 'tps'
-  | 'incidents'
-  | 'status'
-type ModelRow = {
-  model: string
-  companyId: string
-  companyName: string
-  groupName: string
-  isAssigned: boolean
-  requests: number
-  successRate: number
-  firstAttemptRate: number
-  retryRecoveryRate: number
-  p95LatencyMs: number
-  avgLatencyMs: number
-  p95TtftMs: number
-  tps: number
-  incidents: number
-  series: SuccessRatePoint[]
-}
+type ColumnId = PerformanceColumnId
 
 const DEFAULT_COLUMNS: ColumnId[] = [
   'model',
   'company',
   'requests',
   'success',
-  'first',
-  'retry',
-  'p95',
   'avg',
-  'ttft',
   'tps',
   'status',
 ]
@@ -128,23 +101,24 @@ const ALL_COLUMNS: Array<{ id: ColumnId; label: string; required?: boolean }> =
     { id: 'incidents', label: 'Incidents' },
     { id: 'status', label: 'Status' },
   ]
+const ALL_COLUMN_ORDER = ALL_COLUMNS.map((column) => column.id)
 
 function loadColumnPreferences(): { order: ColumnId[]; visible: ColumnId[] } {
-  const fallback = { order: DEFAULT_COLUMNS, visible: DEFAULT_COLUMNS }
+  const fallback = { order: ALL_COLUMN_ORDER, visible: DEFAULT_COLUMNS }
   if (typeof window === 'undefined') return fallback
   try {
     const parsed = JSON.parse(
       window.localStorage.getItem(COLUMN_STORAGE_KEY) ?? '{}'
     ) as { order?: ColumnId[]; visible?: ColumnId[] }
     const valid = new Set(ALL_COLUMNS.map((column) => column.id))
-    const order = (parsed.order ?? DEFAULT_COLUMNS).filter((id) =>
+    const order = (parsed.order ?? ALL_COLUMN_ORDER).filter((id) =>
       valid.has(id)
     )
     const visible = (parsed.visible ?? DEFAULT_COLUMNS).filter((id) =>
       valid.has(id)
     )
     return {
-      order: [...new Set([...order, ...DEFAULT_COLUMNS])] as ColumnId[],
+      order: [...new Set([...order, ...ALL_COLUMN_ORDER])] as ColumnId[],
       visible: [...new Set([...visible, 'model', 'success'])] as ColumnId[],
     }
   } catch {
@@ -154,84 +128,15 @@ function loadColumnPreferences(): { order: ColumnId[]; visible: ColumnId[] } {
 
 function persistColumnPreferences(order: ColumnId[], visible: ColumnId[]) {
   if (typeof window !== 'undefined') {
-    window.localStorage.setItem(
-      COLUMN_STORAGE_KEY,
-      JSON.stringify({ order, visible })
-    )
+    try {
+      window.localStorage.setItem(
+        COLUMN_STORAGE_KEY,
+        JSON.stringify({ order, visible })
+      )
+    } catch {
+      // Keep the current view usable when browser storage is unavailable.
+    }
   }
-}
-
-function normalizeModel(raw: PerformanceHealthModel): ModelRow {
-  const companyId = raw.company_id?.trim() || 'unassigned'
-  const isAssigned = Boolean(raw.company_id?.trim())
-  const companyName =
-    raw.company_name || (isAssigned ? companyId : 'Unassigned')
-  return {
-    model: raw.model_name,
-    companyId,
-    companyName,
-    groupName: raw.group_name || raw.group || raw.group_id || 'Unassigned',
-    isAssigned,
-    requests: raw.request_count ?? 0,
-    successRate: raw.success_rate,
-    firstAttemptRate: raw.first_attempt_success_rate ?? Number.NaN,
-    retryRecoveryRate: raw.retry_recovery_rate ?? Number.NaN,
-    p95LatencyMs: raw.p95_latency_ms ?? Number.NaN,
-    avgLatencyMs: raw.avg_latency_ms,
-    p95TtftMs: raw.p95_ttft_ms ?? Number.NaN,
-    tps: raw.avg_tps,
-    incidents: raw.incidents ?? Number.NaN,
-    series: raw.recent_success_series ?? [],
-  }
-}
-
-function weighted(
-  rows: ModelRow[],
-  key: keyof Pick<
-    ModelRow,
-    | 'successRate'
-    | 'firstAttemptRate'
-    | 'retryRecoveryRate'
-    | 'p95LatencyMs'
-    | 'p95TtftMs'
-  >
-) {
-  const eligible = rows.filter((row) => Number.isFinite(row[key]))
-  const total = eligible.reduce((sum, row) => sum + row.requests, 0)
-  if (!total) return Number.NaN
-  return (
-    eligible.reduce((sum, row) => sum + Number(row[key]) * row.requests, 0) /
-    total
-  )
-}
-
-function statusForRate(rate: number) {
-  if (!Number.isFinite(rate)) return { label: 'Unknown', tone: 'unknown' }
-  if (rate >= 99.5) return { label: 'Healthy', tone: 'healthy' }
-  if (rate >= 99) return { label: 'Watch', tone: 'watch' }
-  return { label: 'Degraded', tone: 'degraded' }
-}
-
-function HealthStatus(props: { rate: number; t: (key: string) => string }) {
-  const status = statusForRate(props.rate)
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium',
-        status.tone === 'healthy' &&
-          'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300',
-        status.tone === 'watch' &&
-          'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300',
-        status.tone === 'degraded' &&
-          'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-        status.tone === 'unknown' &&
-          'border-border bg-muted text-muted-foreground'
-      )}
-    >
-      <span className='size-1.5 rounded-full bg-current' aria-hidden='true' />
-      {props.t(status.label)}
-    </span>
-  )
 }
 
 function MetricTile(props: {
@@ -269,7 +174,11 @@ function SignalLine(props: {
   tone: 'success' | 'warning' | 'danger' | 'neutral'
 }) {
   return (
-    <div className='flex items-center justify-between gap-3 border-b py-2.5 last:border-b-0'>
+    <div
+      role='group'
+      aria-label={props.label}
+      className='flex items-center justify-between gap-3 border-b py-2.5 last:border-b-0'
+    >
       <div className='min-w-0'>
         <div className='truncate text-sm font-medium'>{props.label}</div>
         {props.detail && (
@@ -325,112 +234,6 @@ function DiagnosticCard(props: {
   )
 }
 
-function formatDataFreshness(
-  value: number | string | undefined,
-  locale?: string
-): string {
-  const timestamp = Number(value)
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return '—'
-  return new Intl.DateTimeFormat(locale, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).format(new Date(timestamp * 1000))
-}
-
-function ReliabilityChart(props: {
-  model?: ModelRow
-  t: (key: string) => string
-}) {
-  const values = props.model?.series ?? []
-  if (values.length < 2) {
-    return (
-      <div className='text-muted-foreground flex h-64 items-center justify-center rounded-xl border text-sm'>
-        {props.t('No performance data available')}
-      </div>
-    )
-  }
-  const width = 720
-  const height = 206
-  const min = 98
-  const max = 100
-  const path = values
-    .map((point, index) => {
-      const x = (index / (values.length - 1)) * width
-      const y = height - ((point.success_rate - min) / (max - min)) * height
-      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`
-    })
-    .join(' ')
-  return (
-    <div className='space-y-3'>
-      <div className='flex flex-wrap items-center justify-between gap-2'>
-        <div>
-          <p className='text-sm font-semibold'>
-            {props.model?.model ?? props.t('All models')}
-          </p>
-          <p className='text-muted-foreground text-xs'>
-            {props.model?.companyName ?? props.t('All companies')} ·{' '}
-            {formatUptimePct(props.model?.successRate ?? Number.NaN)}
-          </p>
-        </div>
-        <span className='text-muted-foreground inline-flex items-center gap-1.5 text-xs'>
-          <span className='bg-primary size-2 rounded-full' />
-          {props.t('Final success rate')}
-        </span>
-      </div>
-      <div className='bg-muted/20 overflow-hidden rounded-xl border px-2 py-3 sm:px-4'>
-        <svg
-          viewBox='0 0 720 240'
-          className='h-56 w-full'
-          role='img'
-          aria-label={props.t('24-hour success rate curve')}
-          preserveAspectRatio='none'
-        >
-          {[0, 1, 2, 3, 4].map((line) => {
-            const y = 16 + line * 47
-            return (
-              <g key={line}>
-                <line
-                  x1='0'
-                  x2='720'
-                  y1={y}
-                  y2={y}
-                  className='text-border'
-                  stroke='currentColor'
-                  strokeDasharray='3 7'
-                />
-                <text
-                  x='716'
-                  y={y - 4}
-                  textAnchor='end'
-                  className='fill-muted-foreground font-mono text-[11px]'
-                >
-                  {(100 - line * 0.5).toFixed(1)}%
-                </text>
-              </g>
-            )
-          })}
-          <path d={`${path} L 720 206 L 0 206 Z`} className='fill-primary/10' />
-          <path
-            d={path}
-            fill='none'
-            stroke='currentColor'
-            className='text-primary'
-            strokeLinecap='round'
-            strokeLinejoin='round'
-            strokeWidth='3'
-            vectorEffect='non-scaling-stroke'
-          />
-        </svg>
-        <div className='text-muted-foreground mt-1 flex justify-between px-1 font-mono text-[10px]'>
-          <span>{props.t('24 hours ago')}</span>
-          <span>{props.t('Now')}</span>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function ColumnSettings(props: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -468,7 +271,7 @@ function ColumnSettings(props: {
     setDraftOrder(order)
   }
   const reset = () => {
-    setDraftOrder(DEFAULT_COLUMNS)
+    setDraftOrder(ALL_COLUMN_ORDER)
     setDraftVisible(DEFAULT_COLUMNS)
   }
   return (
@@ -566,220 +369,38 @@ function ColumnSettings(props: {
   )
 }
 
-function ConfigDialog(props: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  companies: PerformanceHealthCompany[]
-  onSaved: () => void
-  t: (key: string) => string
-}) {
-  const [draft, setDraft] = useState<PerformanceHealthCompany[]>([])
-  const saveMutation = useMutation({
-    mutationFn: () => savePerformanceHealthConfig({ companies: draft }),
-    onSuccess: props.onSaved,
-  })
-  useEffect(() => {
-    if (props.open) setDraft(structuredClone(props.companies))
-  }, [props.open, props.companies])
-  const updateCompany = (
-    id: string,
-    patch: Partial<PerformanceHealthCompany>
-  ) => {
-    setDraft((items) =>
-      items.map((item) => (item.id === id ? { ...item, ...patch } : item))
-    )
-  }
-  const updateGroup = (
-    companyId: string,
-    groupId: string,
-    patch: Record<string, unknown>
-  ) => {
-    setDraft((items) =>
-      items.map((company) =>
-        company.id !== companyId
-          ? company
-          : {
-              ...company,
-              groups: (company.groups ?? []).map((group) =>
-                group.id === groupId ? { ...group, ...patch } : group
-              ),
-            }
-      )
-    )
-  }
-  const createId = (prefix: string) =>
-    `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-  const addCompany = () =>
-    setDraft((items) => [
-      ...items,
-      {
-        id: createId('company'),
-        name: props.t('New company'),
-        status: 'active',
-        slo: 99.9,
-        groups: [],
-      },
-    ])
-  const addGroup = (companyId: string) =>
-    setDraft((items) =>
-      items.map((company) =>
-        company.id !== companyId
-          ? company
-          : {
-              ...company,
-              groups: [
-                ...(company.groups ?? []),
-                {
-                  id: createId('group'),
-                  name: props.t('New model group'),
-                  models: [],
-                  enabled: true,
-                  slo: company.slo ?? 99.9,
-                  p95_latency_ms: 0,
-                  min_samples: 10,
-                },
-              ],
-            }
-      )
-    )
-  return (
-    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className='sm:max-w-2xl'>
-        <DialogHeader>
-          <DialogTitle>{props.t('Company and model groups')}</DialogTitle>
-          <DialogDescription>
-            {props.t('Configure companies, groups, models and SLO policies')}
-          </DialogDescription>
-        </DialogHeader>
-        {saveMutation.isError && (
-          <p className='text-destructive text-sm' role='alert'>
-            {props.t('Save failed, please retry')}
-          </p>
-        )}
-        <div className='max-h-[55vh] space-y-3 overflow-y-auto'>
-          {draft.length === 0 && (
-            <p className='text-muted-foreground text-sm'>
-              {props.t('No company configuration available')}
-            </p>
-          )}
-          {draft.map((company) => (
-            <div key={company.id} className='space-y-3 rounded-xl border p-3'>
-              <div className='grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem]'>
-                <Input
-                  value={company.name}
-                  aria-label={props.t('Company name')}
-                  onChange={(event) =>
-                    updateCompany(company.id, { name: event.target.value })
-                  }
-                />
-                <Input
-                  type='number'
-                  min='0'
-                  max='100'
-                  step='0.01'
-                  value={company.slo ?? ''}
-                  aria-label={props.t('SLO')}
-                  onChange={(event) =>
-                    updateCompany(company.id, {
-                      slo: Number(event.target.value),
-                    })
-                  }
-                />
-              </div>
-              <div className='space-y-2'>
-                {(company.groups ?? []).map((group) => (
-                  <div
-                    key={group.id}
-                    className='bg-muted/40 grid gap-2 rounded-lg p-2 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)_6rem]'
-                  >
-                    <Input
-                      value={group.name}
-                      aria-label={props.t('Model group')}
-                      onChange={(event) =>
-                        updateGroup(company.id, group.id, {
-                          name: event.target.value,
-                        })
-                      }
-                    />
-                    <Input
-                      value={group.models.join(', ')}
-                      aria-label={props.t('Models')}
-                      placeholder='gpt-4.1, claude-3-7-sonnet'
-                      onChange={(event) =>
-                        updateGroup(company.id, group.id, {
-                          models: event.target.value
-                            .split(',')
-                            .map((model) => model.trim())
-                            .filter(Boolean),
-                        })
-                      }
-                    />
-                    <Input
-                      type='number'
-                      min='0'
-                      max='100'
-                      step='0.01'
-                      value={group.slo ?? ''}
-                      aria-label={props.t('SLO')}
-                      onChange={(event) =>
-                        updateGroup(company.id, group.id, {
-                          slo: Number(event.target.value),
-                        })
-                      }
-                    />
-                  </div>
-                ))}
-                <Button
-                  variant='ghost'
-                  size='sm'
-                  onClick={() => addGroup(company.id)}
-                >
-                  {props.t('Add model group')}
-                </Button>
-              </div>
-            </div>
-          ))}
-        </div>
-        <DialogFooter>
-          <Button variant='ghost' onClick={addCompany}>
-            {props.t('Add company')}
-          </Button>
-          <Button variant='outline' onClick={() => props.onOpenChange(false)}>
-            {props.t('Cancel')}
-          </Button>
-          <Button
-            disabled={saveMutation.isPending}
-            onClick={() => saveMutation.mutate()}
-          >
-            {saveMutation.isPending
-              ? props.t('Saving')
-              : props.t('Save changes')}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 export function ModelReliabilityDemo() {
   const { t, i18n } = useTranslation()
   const queryClient = useQueryClient()
-  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language) ?? 'en-US'
   const [selectedCompany, setSelectedCompany] = useState('all')
   const [selectedModel, setSelectedModel] = useState('')
+  const [includePresets, setIncludePresets] = useState(false)
+  const [refreshEnabled, setRefreshEnabled] = useState(true)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [columnPreferences, setColumnPreferences] = useState(
     loadColumnPreferences
   )
   const [columnDialogOpen, setColumnDialogOpen] = useState(false)
   const [configDialogOpen, setConfigDialogOpen] = useState(false)
   const query = useQuery({
-    queryKey: ['performance-health-summary', PERFORMANCE_WINDOW_HOURS],
+    queryKey: [
+      'performance-health-summary',
+      PERFORMANCE_WINDOW_HOURS,
+      ...(includePresets ? ['all-presets'] : []),
+    ],
     queryFn: async () =>
       requireServerSuccess(
-        await getPerformanceHealthSummary(PERFORMANCE_WINDOW_HOURS)
+        await getPerformanceHealthSummary(
+          PERFORMANCE_WINDOW_HOURS,
+          includePresets
+        )
       ),
     staleTime: 60_000,
     retry: false,
+    refetchInterval: refreshEnabled ? 60_000 : false,
+    refetchIntervalInBackground: false,
+    meta: { errorToast: false },
   })
   const configQuery = useQuery({
     queryKey: ['performance-health-companies'],
@@ -787,45 +408,14 @@ export function ModelReliabilityDemo() {
       requireServerSuccess(await getPerformanceHealthCompanies()),
     staleTime: 60_000,
     retry: false,
+    meta: { errorToast: false },
   })
   const rows = useMemo(
-    () => (query.data?.data.models ?? []).map(normalizeModel),
+    () => (query.data?.data.models ?? []).map(normalizePerformanceModel),
     [query.data]
   )
-  const summaryCompanies = query.data?.data.companies
   const configuredCompanies = configQuery.data?.data.companies
-  const filteredRows = useMemo(
-    () =>
-      selectedCompany === 'all'
-        ? rows
-        : rows.filter((row) => row.companyId === selectedCompany),
-    [rows, selectedCompany]
-  )
-  const activeModel =
-    filteredRows.find((row) => row.model === selectedModel) ?? filteredRows[0]
-  useEffect(() => {
-    if (activeModel && activeModel.model !== selectedModel) {
-      setSelectedModel(activeModel.model)
-    }
-  }, [activeModel, selectedModel])
-  const summary = query.data?.data.summary
-  const requests = filteredRows.reduce((sum, row) => sum + row.requests, 0)
-  const successRate =
-    Number.isFinite(summary?.success_rate) && selectedCompany === 'all'
-      ? (summary?.success_rate ?? Number.NaN)
-      : weighted(filteredRows, 'successRate')
-  const firstRate = weighted(filteredRows, 'firstAttemptRate')
-  const retryRate = weighted(filteredRows, 'retryRecoveryRate')
-  const p95 = weighted(filteredRows, 'p95LatencyMs')
-  const p95Ttft = weighted(filteredRows, 'p95TtftMs')
-  const visibleColumns = columnPreferences.order.filter((id) =>
-    columnPreferences.visible.includes(id)
-  )
-  const saveColumns = (order: ColumnId[], visible: ColumnId[]) => {
-    const next = { order, visible }
-    setColumnPreferences(next)
-    persistColumnPreferences(order, visible)
-  }
+  const summaryCompanies = query.data?.data.companies
   const availableCompanies = useMemo(() => {
     const merged = new Map<string, PerformanceHealthCompany>()
     for (const company of configuredCompanies ?? []) {
@@ -840,184 +430,140 @@ export function ModelReliabilityDemo() {
           id: row.companyId,
           name: row.companyName,
           groups: [],
-          slo: Number.NaN,
         })
       }
     }
     return [...merged.values()]
   }, [configuredCompanies, rows, summaryCompanies])
-  const configuredModelCount = useMemo(
+  const filteredRows = useMemo(
     () =>
-      new Set(
-        availableCompanies.flatMap((company) =>
-          (company.groups ?? []).flatMap((group) => group.models)
-        )
-      ).size,
-    [availableCompanies]
+      selectedCompany === 'all'
+        ? rows
+        : rows.filter((row) => row.companyId === selectedCompany),
+    [rows, selectedCompany]
   )
-  const mappedModelCount = rows.filter((row) => row.isAssigned).length
-  const degradedRows = rows.filter(
-    (row) => Number.isFinite(row.successRate) && row.successRate < 99
-  )
-  const unassignedRows = rows.filter((row) => !row.isAssigned)
-  const hasIncidentTelemetry =
-    rows.length > 0 && rows.every((row) => Number.isFinite(row.incidents))
-  const incidentCount = hasIncidentTelemetry
-    ? rows.reduce((sum, row) => sum + row.incidents, 0)
-    : Number.NaN
-  const terminalCoverage = query.data?.data.terminal_coverage
-  const hasTerminalCoverage =
-    query.data?.data.terminal_coverage_available === true &&
-    Number.isFinite(terminalCoverage)
-  let incidentValue = t('Not collected yet')
-  let incidentDetail = t('Attempt-level telemetry is not available yet')
-  let incidentTone: 'success' | 'warning' | 'danger' = 'warning'
-  if (hasIncidentTelemetry) {
-    incidentValue = formatNumber(incidentCount, locale)
-    if (incidentCount > 0) {
-      incidentDetail = t('{{count}} incidents in the last 24 hours', {
-        count: incidentCount,
-      })
-      incidentTone = 'danger'
-    } else {
-      incidentDetail = t('No incidents in the last 24 hours')
-      incidentTone = 'success'
+  const activeModel =
+    filteredRows.find((row) => row.model === selectedModel) ??
+    filteredRows.find((row) => row.requests > 0) ??
+    filteredRows[0]
+  useEffect(() => {
+    if (activeModel && activeModel.model !== selectedModel) {
+      setSelectedModel(activeModel.model)
     }
-  }
-  const dataFreshness = formatDataFreshness(
-    query.data?.data.data_freshness,
-    locale
-  )
-  const modelCoverage = configuredModelCount
-    ? Math.min(100, (mappedModelCount / configuredModelCount) * 100)
-    : Number.NaN
-  const configuredSlo = useMemo(() => {
-    const candidates = availableCompanies
-      .map((company) => {
-        const companyRequests = rows
-          .filter((row) => row.companyId === company.id)
-          .reduce((sum, row) => sum + row.requests, 0)
-        return {
-          requests: companyRequests,
-          slo: company.slo,
-        }
-      })
-      .filter(
-        (item) =>
-          item.requests > 0 && Number.isFinite(item.slo) && (item.slo ?? 0) > 0
-      )
-    if (selectedCompany !== 'all') {
-      return (
-        availableCompanies.find((company) => company.id === selectedCompany)
-          ?.slo ?? Number.NaN
-      )
-    }
-    const totalRequests = candidates.reduce(
-      (sum, item) => sum + item.requests,
-      0
-    )
-    if (!totalRequests) return Number.NaN
-    return (
-      candidates.reduce(
-        (sum, item) => sum + (item.slo ?? 0) * item.requests,
+  }, [activeModel, selectedModel])
+  const trafficRows = filteredRows.filter((row) => row.requests > 0)
+  const requests = trafficRows.reduce((sum, row) => sum + row.requests, 0)
+  const summary = query.data?.data.summary
+  let successRate = Number.NaN
+  if (
+    requests > 0 &&
+    selectedCompany === 'all' &&
+    Number.isFinite(summary?.success_rate)
+  ) {
+    successRate = summary?.success_rate ?? Number.NaN
+  } else if (requests > 0) {
+    successRate =
+      trafficRows.reduce(
+        (sum, row) => sum + row.successRate * row.requests,
         0
-      ) / totalRequests
-    )
-  }, [availableCompanies, rows, selectedCompany])
-  const errorBudget = useMemo(() => {
-    if (!Number.isFinite(configuredSlo) || !Number.isFinite(successRate)) {
-      return Number.NaN
-    }
-    const allowedErrorRate = 100 - configuredSlo
-    if (allowedErrorRate <= 0) return successRate >= 100 ? 100 : 0
-    return Math.max(
-      0,
-      Math.min(
-        100,
-        ((allowedErrorRate - (100 - successRate)) / allowedErrorRate) * 100
-      )
-    )
-  }, [configuredSlo, successRate])
-
-  if (query.isLoading) {
-    return (
-      <div className='space-y-4'>
-        <Skeleton className='h-28 w-full rounded-2xl' />
-        <div className='grid grid-cols-2 gap-2 sm:grid-cols-4'>
-          <Skeleton className='h-24 rounded-xl' />
-          <Skeleton className='h-24 rounded-xl' />
-          <Skeleton className='h-24 rounded-xl' />
-          <Skeleton className='h-24 rounded-xl' />
-        </div>
-        <Skeleton className='h-96 w-full rounded-2xl' />
-      </div>
-    )
+      ) / requests
   }
-  if (query.isError) {
-    return (
-      <Card>
-        <CardContent className='flex flex-col items-center gap-3 py-16 text-center'>
-          <IconBadge tone='destructive' size='lg'>
-            <HeartPulse />
-          </IconBadge>
-          <CardTitle>{t('Unable to load model reliability')}</CardTitle>
-          <CardDescription>
-            {t(
-              'Refresh the page or check that performance monitoring is enabled.'
-            )}
-          </CardDescription>
-          <Button variant='outline' onClick={() => query.refetch()}>
-            <RefreshCcw />
-            {t('Retry')}
-          </Button>
-        </CardContent>
-      </Card>
+  const averageLatency =
+    requests > 0
+      ? trafficRows.reduce(
+          (sum, row) => sum + row.avgLatencyMs * row.requests,
+          0
+        ) / requests
+      : Number.NaN
+  let throughput = Number.NaN
+  if (
+    requests > 0 &&
+    selectedCompany === 'all' &&
+    summary &&
+    summary.output_metrics_available !== false &&
+    (summary.avg_tps > 0 ||
+      (summary.avg_tps === 0 && summary.output_metrics_available === true))
+  ) {
+    throughput = summary.avg_tps
+  }
+  const configuredModelCount = new Set(
+    (configuredCompanies ?? []).flatMap((company) =>
+      (company.groups ?? []).flatMap((group) => group.models ?? [])
     )
+  ).size
+  const mappedTrafficCount = trafficRows.filter((row) => row.isAssigned).length
+  const unassignedRows = trafficRows.filter((row) => !row.isAssigned)
+  const belowTargetRows = trafficRows.filter(
+    (row) => getPerformanceModelStatus(row).tone === 'degraded'
+  )
+  const generatedAt = Number(
+    query.data?.data.generated_at ?? query.data?.data.data_freshness
+  )
+  const refreshedAt =
+    Number.isFinite(generatedAt) && generatedAt > 0
+      ? new Intl.DateTimeFormat(locale, {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }).format(new Date(generatedAt * 1000))
+      : '—'
+  const visibleColumns = columnPreferences.order.flatMap((id) => {
+    const column = ALL_COLUMNS.find((item) => item.id === id)
+    return column && columnPreferences.visible.includes(id) ? [column] : []
+  })
+
+  const refresh = () => {
+    void query.refetch()
+    void configQuery.refetch()
+  }
+  const onConfigurationSaved = () => {
+    void queryClient.invalidateQueries({
+      queryKey: ['performance-health-summary'],
+    })
+    void queryClient.invalidateQueries({
+      queryKey: ['performance-health-companies'],
+    })
   }
 
   return (
     <div className='space-y-4 sm:space-y-5'>
-      <div className='flex flex-col justify-between gap-3 rounded-2xl border bg-[linear-gradient(120deg,color-mix(in_oklch,var(--card)_96%,var(--chart-2)_4%),color-mix(in_oklch,var(--card)_88%,var(--chart-4)_12%))] p-4 shadow-xs sm:flex-row sm:items-end sm:p-5'>
+      <div className='bg-card flex flex-col justify-between gap-3 rounded-xl border p-4 sm:p-5'>
         <div>
-          <div className='mb-2 flex items-center gap-2'>
-            <IconBadge tone='success' size='sm'>
-              <HeartPulse />
-            </IconBadge>
-            <span className='text-primary rounded-full border px-2 py-0.5 text-[11px] font-medium'>
-              {t('Live data')}
-            </span>
-          </div>
-          <h3 className='text-xl font-semibold tracking-tight sm:text-2xl'>
+          <h3 className='flex items-center gap-2 text-xl font-semibold'>
+            <HeartPulse className='text-primary size-5' />
             {t('Model reliability')}
           </h3>
-          <p className='text-muted-foreground mt-1 max-w-2xl text-sm'>
+          <p className='text-muted-foreground mt-1 text-sm'>
             {t(
-              'Final request success counts a retry-recovered request once, while upstream attempts remain visible for diagnosis.'
+              'Request-level metrics count a retry-recovered request once. Attempt-level diagnostics are not connected yet.'
             )}
           </p>
+          <p className='text-muted-foreground mt-1 text-xs'>
+            {t('24 hourly buckets, including the current partial hour')}
+          </p>
         </div>
-        <div className='flex flex-wrap items-end gap-2'>
+        <div className='flex flex-wrap items-center gap-2'>
           <label
-            className='text-muted-foreground text-xs'
             htmlFor='company-filter'
+            className='text-muted-foreground text-xs'
           >
             {t('Company')}
           </label>
           <NativeSelect
             id='company-filter'
             value={selectedCompany}
+            size='sm'
             onChange={(event) => {
               setSelectedCompany(event.target.value)
               setSelectedModel('')
             }}
-            size='sm'
           >
             <NativeSelectOption value='all'>
               {t('All companies')}
             </NativeSelectOption>
             {availableCompanies.map((company) => (
               <NativeSelectOption key={company.id} value={company.id}>
-                {company.name}
+                {company.name === 'Unassigned' ? t('Unassigned') : company.name}
               </NativeSelectOption>
             ))}
           </NativeSelect>
@@ -1032,446 +578,366 @@ export function ModelReliabilityDemo() {
           <Button
             variant='ghost'
             size='icon-sm'
-            onClick={() => void query.refetch()}
+            onClick={refresh}
             disabled={query.isFetching}
             aria-label={t('Refresh')}
-            title={t('Refresh')}
           >
             <RefreshCcw className={cn(query.isFetching && 'animate-spin')} />
           </Button>
+          <Button
+            variant='ghost'
+            size='sm'
+            onClick={() => setRefreshEnabled((value) => !value)}
+            aria-pressed={refreshEnabled}
+          >
+            {refreshEnabled ? t('Pause refresh') : t('Resume refresh')}
+          </Button>
+          <label className='ml-auto flex cursor-pointer items-center gap-2 text-xs'>
+            <Checkbox
+              checked={includePresets}
+              onCheckedChange={(value) => setIncludePresets(value === true)}
+            />
+            {t('Show all preset models')}
+          </label>
         </div>
       </div>
-      <div className='grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-3 xl:grid-cols-7'>
-        <MetricTile
-          label={t('Final request success rate')}
-          value={formatUptimePct(successRate)}
-          hint={`${formatNumber(requests, locale)} ${t('requests')}`}
-          tone='success'
-        />
-        <MetricTile
-          label={t('First-attempt success')}
-          value={formatUptimePct(firstRate)}
-          hint={
-            Number.isFinite(firstRate)
-              ? t('Direct first route success')
-              : t('Not collected yet')
+      {query.isLoading && <LoadingState />}
+      {query.isError && (
+        <ErrorState
+          title={
+            query.data
+              ? t('Unable to refresh model reliability')
+              : t('Unable to load model reliability')
           }
-          tone='success'
+          description={getServerErrorMessage(
+            query.error,
+            t('Company configuration is still available.')
+          )}
+          onRetry={refresh}
         />
-        <MetricTile
-          label={t('Retry recovery')}
-          value={formatUptimePct(retryRate)}
-          hint={
-            Number.isFinite(retryRate)
-              ? t('Recovered after first failure')
-              : t('Not collected yet')
-          }
-          tone='warning'
-        />
-        <MetricTile
-          label={t('P95 latency')}
-          value={formatLatency(p95)}
-          hint={
-            Number.isFinite(p95)
-              ? t('Includes retry wait')
-              : t('Not collected yet')
-          }
-          tone='warning'
-        />
-        <MetricTile
-          label={t('P95 TTFT')}
-          value={formatLatency(p95Ttft)}
-          hint={t('Time to first token')}
-          tone='warning'
-        />
-        <MetricTile
-          label={t('Error budget')}
-          value={formatUptimePct(errorBudget)}
-          hint={
-            Number.isFinite(configuredSlo)
-              ? `${t('SLO')}: ${formatUptimePct(configuredSlo)}`
-              : t('Not available')
-          }
-          tone={
-            !Number.isFinite(errorBudget) || errorBudget >= 50
-              ? 'info'
-              : 'warning'
-          }
-        />
-        <MetricTile
-          label={t('Terminal coverage')}
-          value={
-            hasTerminalCoverage
-              ? formatUptimePct(terminalCoverage ?? Number.NaN)
-              : t('Not collected yet')
-          }
-          hint={
-            hasTerminalCoverage
-              ? t('Data quality')
-              : t('Attempt-level telemetry is not available yet')
-          }
-          tone='info'
-        />
-      </div>
-      <div className='grid gap-4 lg:grid-cols-2'>
-        <Card>
-          <CardHeader className='border-b pb-3'>
-            <CardTitle className='flex items-center gap-2 text-base'>
-              <IconBadge tone='info' size='sm'>
-                <DatabaseZap />
-              </IconBadge>
-              {t('Data quality')}
-            </CardTitle>
-            <CardDescription>
-              {t('Performance metrics for the last 24 hours')}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='pt-2'>
-            <SignalLine
-              label={t('Terminal coverage')}
-              value={
-                hasTerminalCoverage
-                  ? formatUptimePct(terminalCoverage ?? Number.NaN)
-                  : t('Not collected yet')
+      )}
+      {query.isError && query.data && (
+        <Alert role='status' aria-label={t('Cached metrics')}>
+          <AlertDescription>
+            {t(
+              'Showing previously loaded metrics from {{time}}. The latest query failed.',
+              { time: refreshedAt }
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
+      {!query.isLoading && (!query.isError || query.data) && (
+        <>
+          <div className='grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3'>
+            <MetricTile
+              label={t('Requests (24h)')}
+              value={formatNumber(requests, locale)}
+              hint={t('Completed request samples')}
+              tone='info'
+            />
+            <MetricTile
+              label={t('Final request success rate')}
+              value={formatUptimePct(successRate)}
+              hint={`${formatNumber(requests, locale)} ${t('requests')}`}
+              tone='info'
+            />
+            <MetricTile
+              label={t('Average latency')}
+              value={formatLatency(averageLatency)}
+              hint={t('All sampled request outcomes')}
+              tone='info'
+            />
+            <MetricTile
+              label={t('Output throughput')}
+              value={formatThroughput(throughput, true)}
+              hint={
+                selectedCompany === 'all'
+                  ? t('Performance metrics for the last 24 hours')
+                  : t('Not available for this scope')
               }
-              detail={
-                hasTerminalCoverage
-                  ? t('All requests have a terminal outcome')
-                  : t('Attempt-level telemetry is not available yet')
-              }
-              tone={
-                hasTerminalCoverage && (terminalCoverage ?? 0) >= 99
-                  ? 'success'
-                  : 'warning'
-              }
+              tone='info'
             />
-            <SignalLine
-              label={t('Models')}
-              value={`${formatNumber(mappedModelCount, locale)} / ${formatNumber(configuredModelCount, locale)}`}
-              detail={t('Configured models with observed traffic')}
-              tone={
-                Number.isFinite(modelCoverage) && modelCoverage >= 99
-                  ? 'success'
-                  : 'warning'
-              }
-            />
-            <SignalLine
-              label={t('Last updated')}
-              value={dataFreshness}
-              detail={t('Data freshness')}
-              tone={dataFreshness === '—' ? 'warning' : 'success'}
-            />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className='border-b pb-3'>
-            <CardTitle className='flex items-center gap-2 text-base'>
-              <IconBadge
-                tone={
-                  degradedRows.length || unassignedRows.length
-                    ? 'warning'
-                    : 'success'
-                }
-                size='sm'
-              >
-                {degradedRows.length || unassignedRows.length ? (
-                  <AlertTriangle />
-                ) : (
-                  <Activity />
-                )}
-              </IconBadge>
-              {t('Routing watchpoints')}
-            </CardTitle>
-            <CardDescription>
-              {t(
-                'Watch short-window failures, latency drift, capacity saturation and traffic concentration.'
-              )}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='pt-2'>
-            <SignalLine
-              label={t('Degraded performance recently')}
-              value={formatNumber(degradedRows.length, locale)}
-              detail={t('Models below the 99% success watch threshold')}
-              tone={degradedRows.length ? 'danger' : 'success'}
-            />
-            <SignalLine
-              label={t('Unassigned')}
-              value={formatNumber(unassignedRows.length, locale)}
-              detail={t(
-                'Models that are being used but not configured in the system'
-              )}
-              tone={unassignedRows.length ? 'warning' : 'success'}
-            />
-            <SignalLine
-              label={t('incidents')}
-              value={incidentValue}
-              detail={incidentDetail}
-              tone={incidentTone}
-            />
-          </CardContent>
-        </Card>
-      </div>
-      <div className='grid gap-4 lg:grid-cols-3'>
-        <DiagnosticCard
-          title={t('Error breakdown')}
-          description={t('Attempt-level telemetry is not available yet')}
-          icon={<TriangleAlert className='size-4' />}
-          rows={[
-            { label: t('429 rate'), value: t('Not collected yet') },
-            { label: t('5xx rate'), value: t('Not collected yet') },
-            { label: t('Timeout rate'), value: t('Not collected yet') },
-          ]}
-        />
-        <DiagnosticCard
-          title={t('Routing resilience')}
-          description={t('Retries, fallback and circuit breaker telemetry')}
-          icon={<RotateCcw className='size-4' />}
-          rows={[
-            { label: t('Retry request rate'), value: t('Not collected yet') },
-            {
-              label: t('Fallback success rate'),
-              value: t('Not collected yet'),
-            },
-            {
-              label: t('Circuit breaker trips'),
-              value: t('Not collected yet'),
-            },
-          ]}
-        />
-        <DiagnosticCard
-          title={t('Latency tail')}
-          description={t('Percentiles require mergeable latency histograms')}
-          icon={<Gauge className='size-4' />}
-          rows={[
-            { label: t('P50 latency'), value: t('Not collected yet') },
-            { label: t('P95 latency'), value: formatLatency(p95) },
-            { label: t('P99 latency'), value: t('Not collected yet') },
-          ]}
-        />
-      </div>
-      <div className='grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(18rem,0.65fr)]'>
-        <Card>
-          <CardHeader className='border-b'>
-            <CardTitle className='flex items-center gap-2'>
-              <IconBadge tone='success' size='sm'>
-                <ShieldCheck />
-              </IconBadge>
-              {t('24-hour success rate curve')}
-            </CardTitle>
-            <CardDescription>
-              {activeModel
-                ? `${activeModel.model} · ${activeModel.companyName}`
-                : t('Select a model to inspect its trend')}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='pt-4'>
-            <ReliabilityChart model={activeModel} t={t} />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className='border-b'>
-            <CardTitle className='flex items-center gap-2'>
-              <IconBadge tone='info' size='sm'>
-                <Settings2 />
-              </IconBadge>
-              {t('Company model groups')}
-            </CardTitle>
-            <CardDescription>
-              {t('Health grouped by configured company')}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='space-y-2 pt-4'>
-            {availableCompanies.map((company) => {
-              const companyRows = rows.filter(
-                (row) => row.companyId === company.id
-              )
-              const rate = weighted(companyRows, 'successRate')
-              return (
-                <button
-                  key={company.id}
-                  type='button'
-                  onClick={() => {
-                    setSelectedCompany(company.id)
-                    setSelectedModel('')
-                  }}
-                  className={cn(
-                    'hover:bg-muted/60 flex w-full items-center justify-between gap-3 rounded-xl border p-3 text-left transition-colors',
-                    selectedCompany === company.id &&
-                      'border-primary/40 bg-primary/5'
+          </div>
+          <div className='grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(18rem,0.65fr)]'>
+            <Card>
+              <CardHeader>
+                <CardTitle>{t('24-hour success rate curve')}</CardTitle>
+                <CardDescription>
+                  {activeModel
+                    ? `${activeModel.model} · ${activeModel.companyName === 'Unassigned' ? t('Unassigned') : activeModel.companyName}`
+                    : t('Select a model to inspect its trend')}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <PerformanceReliabilityChart
+                  model={activeModel}
+                  windowStart={query.data?.data.window_start}
+                  windowEnd={query.data?.data.window_end}
+                  bucketSeconds={query.data?.data.bucket_seconds}
+                  locale={locale}
+                />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>{t('Company model groups')}</CardTitle>
+                <CardDescription>
+                  {t(
+                    'Configured models and models with traffic are counted separately'
                   )}
-                  aria-pressed={selectedCompany === company.id}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className='space-y-2'>
+                {availableCompanies.map((company) => {
+                  const companyRows = rows.filter(
+                    (row) => row.companyId === company.id
+                  )
+                  const count = companyRows.reduce(
+                    (sum, row) => sum + row.requests,
+                    0
+                  )
+                  const rate =
+                    count > 0
+                      ? companyRows
+                          .filter((row) => row.requests > 0)
+                          .reduce(
+                            (sum, row) => sum + row.successRate * row.requests,
+                            0
+                          ) / count
+                      : Number.NaN
+                  return (
+                    <Button
+                      key={company.id}
+                      variant={
+                        selectedCompany === company.id ? 'secondary' : 'outline'
+                      }
+                      className='h-auto w-full min-w-0 justify-between gap-3 py-3 text-left'
+                      aria-pressed={selectedCompany === company.id}
+                      onClick={() => {
+                        setSelectedCompany((current) =>
+                          current === company.id ? 'all' : company.id
+                        )
+                        setSelectedModel('')
+                      }}
+                    >
+                      <span className='min-w-0'>
+                        <span className='block truncate'>
+                          {company.name === 'Unassigned'
+                            ? t('Unassigned')
+                            : company.name}
+                        </span>
+                        <span className='text-muted-foreground block text-xs'>
+                          {formatNumber(
+                            companyRows.filter((row) => row.requests > 0)
+                              .length,
+                            locale
+                          )}{' '}
+                          {t('Models with traffic')}
+                        </span>
+                      </span>
+                      <span className='shrink-0 text-right'>
+                        <span className='block font-mono'>
+                          {formatUptimePct(rate)}
+                        </span>
+                        <span className='text-muted-foreground block text-xs'>
+                          {formatNumber(count, locale)} {t('requests')}
+                        </span>
+                      </span>
+                    </Button>
+                  )
+                })}
+              </CardContent>
+            </Card>
+          </div>
+          <Card>
+            <CardHeader>
+              <div className='flex flex-wrap items-center justify-between gap-2'>
+                <div>
+                  <CardTitle>{t('Model performance metrics')}</CardTitle>
+                  <CardDescription>
+                    {t('Edit fields and order to match your analysis workflow')}
+                  </CardDescription>
+                </div>
+                <Button
+                  variant='outline'
+                  size='sm'
+                  onClick={() => setColumnDialogOpen(true)}
                 >
-                  <span className='min-w-0'>
-                    <span className='block font-medium'>{company.name}</span>
-                    <span className='text-muted-foreground block truncate text-xs'>
-                      {company.groups?.map((group) => group.name).join(' · ') ||
-                        `${companyRows.length} ${t('models')}`}
-                    </span>
-                  </span>
-                  <span className='shrink-0 text-right'>
-                    <span
-                      className={cn(
-                        'block font-mono text-sm font-semibold',
-                        getSuccessRateTextClass(rate)
-                      )}
-                    >
-                      {formatUptimePct(rate)}
-                    </span>
-                    <span className='text-muted-foreground text-[10px]'>
-                      {formatNumber(
-                        companyRows.reduce((sum, row) => sum + row.requests, 0),
-                        locale
-                      )}{' '}
-                      {t('requests')}
-                    </span>
-                  </span>
-                </button>
-              )
-            })}
-          </CardContent>
-        </Card>
-      </div>
-      <Card>
-        <CardHeader className='border-b'>
-          <div className='flex flex-wrap items-center justify-between gap-2'>
-            <div>
-              <CardTitle>{t('Model performance metrics')}</CardTitle>
-              <CardDescription>
-                {t('Edit fields and order to match your analysis workflow')}
-              </CardDescription>
-            </div>
-            <Button
-              variant='outline'
-              size='sm'
-              onClick={() => setColumnDialogOpen(true)}
-            >
-              <Columns3 />
-              {t('Fields')}
-            </Button>
+                  <Columns3 />
+                  {t('Fields')}
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <PerformanceModelTable
+                rows={filteredRows}
+                columns={visibleColumns}
+                selectedModel={activeModel?.model}
+                onSelectModel={setSelectedModel}
+                locale={locale}
+              />
+            </CardContent>
+          </Card>
+          <div className='grid gap-4 lg:grid-cols-2'>
+            <Card>
+              <CardHeader>
+                <CardTitle className='flex items-center gap-2'>
+                  <DatabaseZap className='size-4' />
+                  {t('Data quality')}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <SignalLine
+                  label={t('Assigned models with traffic')}
+                  value={`${formatNumber(mappedTrafficCount, locale)} / ${formatNumber(trafficRows.length, locale)}`}
+                  detail={t(
+                    'Assigned / all models with traffic in this window'
+                  )}
+                  tone={
+                    mappedTrafficCount === trafficRows.length
+                      ? 'neutral'
+                      : 'warning'
+                  }
+                />
+                <SignalLine
+                  label={t('Configured models')}
+                  value={
+                    configQuery.isSuccess
+                      ? formatNumber(configuredModelCount, locale)
+                      : '—'
+                  }
+                  detail={t('Saved company model memberships')}
+                  tone='neutral'
+                />
+                <SignalLine
+                  label={t('Query refreshed at')}
+                  value={refreshedAt}
+                  tone='neutral'
+                />
+                <PerformanceCollectionHealthStatus
+                  collection={query.data?.data.collection}
+                  lastSampleAt={query.data?.data.last_sample_at}
+                  stale={query.isError}
+                />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className='flex items-center gap-2'>
+                  <AlertTriangle className='size-4' />
+                  {t('Routing watchpoints')}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <SignalLine
+                  label={t('Models below target')}
+                  value={formatNumber(belowTargetRows.length, locale)}
+                  detail={t('Confirmed SLO targets with sufficient samples')}
+                  tone={belowTargetRows.length ? 'danger' : 'neutral'}
+                />
+                <SignalLine
+                  label={t('Unassigned')}
+                  value={formatNumber(unassignedRows.length, locale)}
+                  detail={t(
+                    'Models that are being used but not configured in the system'
+                  )}
+                  tone={unassignedRows.length ? 'warning' : 'neutral'}
+                />
+                <p className='text-muted-foreground py-2 text-xs'>
+                  {t(
+                    'Performance history is grouped by the current model ownership configuration.'
+                  )}
+                </p>
+                <p className='text-muted-foreground pb-2 text-xs'>
+                  {t(
+                    'Historical buckets keep their original token measurements; output-token splits cannot be backfilled.'
+                  )}
+                </p>
+              </CardContent>
+            </Card>
           </div>
-        </CardHeader>
-        <CardContent className='pt-2'>
-          <div className='overflow-x-auto'>
-            <table className='w-full min-w-[780px] text-left text-sm'>
-              <thead className='text-muted-foreground border-b text-xs'>
-                <tr>
-                  {visibleColumns.map((id) => {
-                    const column = ALL_COLUMNS.find((item) => item.id === id)
-                    return (
-                      <th key={id} className='px-2 py-3 font-medium'>
-                        {column ? t(column.label) : id}
-                      </th>
-                    )
-                  })}
-                </tr>
-              </thead>
-              <tbody>
-                {filteredRows.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={visibleColumns.length}
-                      className='text-muted-foreground px-2 py-12 text-center'
-                    >
-                      {t('No performance data available')}
-                    </td>
-                  </tr>
-                ) : (
-                  filteredRows.map((row) => (
-                    <tr
-                      key={row.model}
-                      className={cn(
-                        'border-b last:border-0',
-                        row.model === activeModel?.model && 'bg-primary/5'
-                      )}
-                      onClick={() => setSelectedModel(row.model)}
-                    >
-                      {visibleColumns.map((id) => (
-                        <td
-                          key={id}
-                          className={cn(
-                            'px-2 py-3',
-                            [
-                              'model',
-                              'requests',
-                              'success',
-                              'first',
-                              'retry',
-                              'p95',
-                              'avg',
-                              'ttft',
-                              'tps',
-                              'incidents',
-                            ].includes(id) && 'font-mono tabular-nums'
-                          )}
-                        >
-                          {id === 'model' && (
-                            <span className='font-semibold'>{row.model}</span>
-                          )}
-                          {id === 'company' && (
-                            <span>
-                              <span className='block'>{row.companyName}</span>
-                              <span className='text-muted-foreground text-xs'>
-                                {row.groupName}
-                              </span>
-                            </span>
-                          )}
-                          {id === 'requests' &&
-                            formatNumber(row.requests, locale)}
-                          {id === 'success' && (
-                            <span
-                              className={cn(
-                                'font-semibold',
-                                getSuccessRateTextClass(row.successRate)
-                              )}
-                            >
-                              {formatUptimePct(row.successRate)}
-                            </span>
-                          )}
-                          {id === 'first' &&
-                            formatUptimePct(row.firstAttemptRate)}
-                          {id === 'retry' &&
-                            formatUptimePct(row.retryRecoveryRate)}
-                          {id === 'p95' && formatLatency(row.p95LatencyMs)}
-                          {id === 'avg' && formatLatency(row.avgLatencyMs)}
-                          {id === 'ttft' && formatLatency(row.p95TtftMs)}
-                          {id === 'tps' && formatThroughput(row.tps)}
-                          {id === 'incidents' && (row.incidents || '—')}
-                          {id === 'status' && (
-                            <HealthStatus rate={row.successRate} t={t} />
-                          )}
-                        </td>
-                      ))}
-                    </tr>
-                  ))
+          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+            <CollapsibleTrigger render={<Button variant='outline' size='sm' />}>
+              {t('Advanced diagnostics')}
+            </CollapsibleTrigger>
+            <CollapsibleContent className='space-y-3 pt-3'>
+              <p className='text-muted-foreground text-sm'>
+                {t(
+                  'Attempt-level metrics, percentiles and terminal coverage are not connected yet.'
                 )}
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
+              </p>
+              <div className='grid gap-4 lg:grid-cols-3'>
+                <DiagnosticCard
+                  title={t('Error breakdown')}
+                  description={t(
+                    'Attempt-level telemetry is not available yet'
+                  )}
+                  icon={<TriangleAlert className='size-4' />}
+                  rows={[
+                    { label: t('429 rate'), value: t('Not collected yet') },
+                    { label: t('5xx rate'), value: t('Not collected yet') },
+                    { label: t('Timeout rate'), value: t('Not collected yet') },
+                  ]}
+                />
+                <DiagnosticCard
+                  title={t('Routing resilience')}
+                  description={t(
+                    'Retries, fallback and circuit breaker telemetry'
+                  )}
+                  icon={<RotateCcw className='size-4' />}
+                  rows={[
+                    {
+                      label: t('Retry request rate'),
+                      value: t('Not collected yet'),
+                    },
+                    {
+                      label: t('Fallback success rate'),
+                      value: t('Not collected yet'),
+                    },
+                    {
+                      label: t('Circuit breaker trips'),
+                      value: t('Not collected yet'),
+                    },
+                  ]}
+                />
+                <DiagnosticCard
+                  title={t('Latency tail')}
+                  description={t(
+                    'Percentiles require mergeable latency histograms'
+                  )}
+                  icon={<Gauge className='size-4' />}
+                  rows={[
+                    { label: t('P50 latency'), value: t('Not collected yet') },
+                    { label: t('P95 latency'), value: t('Not collected yet') },
+                    { label: t('P99 latency'), value: t('Not collected yet') },
+                  ]}
+                />
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        </>
+      )}
       <ColumnSettings
         open={columnDialogOpen}
         onOpenChange={setColumnDialogOpen}
         order={columnPreferences.order}
         visible={columnPreferences.visible}
-        onSave={saveColumns}
-        t={t}
-      />
-      <ConfigDialog
-        open={configDialogOpen}
-        onOpenChange={setConfigDialogOpen}
-        companies={configQuery.data?.data.companies ?? []}
-        onSaved={() => {
-          setConfigDialogOpen(false)
-          void queryClient.invalidateQueries({
-            queryKey: ['performance-health-summary'],
-          })
-          void queryClient.invalidateQueries({
-            queryKey: ['performance-health-companies'],
-          })
+        onSave={(order, visible) => {
+          setColumnPreferences({ order, visible })
+          persistColumnPreferences(order, visible)
         }}
         t={t}
+      />
+      <PerformanceConfigDialog
+        open={configDialogOpen}
+        onOpenChange={setConfigDialogOpen}
+        onSaved={onConfigurationSaved}
+        observedModels={rows
+          .filter((row) => row.requests > 0)
+          .map((row) => row.model)}
+        channelModels={rows
+          .filter((row) => row.configured)
+          .map((row) => row.model)}
       />
     </div>
   )

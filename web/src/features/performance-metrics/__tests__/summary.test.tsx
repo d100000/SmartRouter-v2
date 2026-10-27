@@ -17,7 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -26,6 +32,7 @@ import { PerformanceHealthPanel } from '@/features/dashboard/components/overview
 import { ModelReliabilityDemo } from '@/features/performance-metrics/components/model-reliability-demo'
 import { ModelDetailsPerformance } from '@/features/pricing/components/model-details-performance'
 import { UptimeSparkline } from '@/features/pricing/components/model-details-uptime-sparkline'
+import { api } from '@/lib/api'
 
 const chart = vi.hoisted(() =>
   vi.fn(
@@ -42,11 +49,15 @@ vi.mock('@visactor/vchart', () => ({
 let client: QueryClient
 beforeEach(() => {
   chart.mockClear()
+  window.localStorage.removeItem('performance-health-model-columns-v1')
   client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
 })
-afterEach(() => client.clear())
+afterEach(() => {
+  client.clear()
+  vi.restoreAllMocks()
+})
 
 const summary = { success_rate: 99.01, avg_latency_ms: 1009, avg_tps: 5 }
 const windowStart = 1789387200
@@ -314,7 +325,8 @@ describe('server performance summaries', () => {
     expect(screen.queryByText('gpt-4.1')).not.toBeInTheDocument()
   })
 
-  it('shows explicit telemetry gaps in operational diagnostics', () => {
+  it('shows explicit telemetry gaps after opening advanced diagnostics', async () => {
+    const user = userEvent.setup()
     client.setQueryData(['performance-health-summary', 24], {
       success: true,
       data: { summary: null, models: [], companies: [] },
@@ -325,9 +337,483 @@ describe('server performance summaries', () => {
       </QueryClientProvider>
     )
 
-    expect(screen.getByText('Error breakdown')).toBeVisible()
+    expect(screen.queryByText('Error breakdown')).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', { name: 'Advanced diagnostics' })
+    )
+    expect(await screen.findByText('Error breakdown')).toBeVisible()
     expect(screen.getByText('Routing resilience')).toBeVisible()
     expect(screen.getByText('Latency tail')).toBeVisible()
     expect(screen.getAllByText('Not collected yet').length).toBeGreaterThan(0)
+  })
+
+  it('keeps company configuration reachable when performance loading fails', async () => {
+    vi.spyOn(api, 'get').mockRejectedValue(new Error('Metrics unavailable'))
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    await waitFor(() =>
+      expect(screen.getByText('Unable to load model reliability')).toBeVisible()
+    )
+    expect(
+      screen.getByRole('button', { name: 'Configure models' })
+    ).toBeVisible()
+  })
+
+  it('shows the full success range and low values in the trend', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        window_start: windowStart,
+        window_end: windowEnd,
+        models: [
+          {
+            model_name: 'unreliable-model',
+            request_count: 100,
+            success_rate: 77,
+            avg_latency_ms: 400,
+            avg_tps: 12,
+            recent_success_series: [
+              { ts: windowStart, success_rate: 0 },
+              { ts: windowStart + 12 * 3600, success_rate: 77 },
+            ],
+          },
+        ],
+        companies: [],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    const trend = screen.getByRole('img', {
+      name: '24-hour success rate curve',
+    })
+    expect(within(trend).getByText('0%')).toBeVisible()
+    expect(trend).toHaveTextContent('77.00%')
+  })
+
+  it('keeps configured models without requests unknown instead of degraded', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        summary: { success_rate: 0, avg_latency_ms: 0, avg_tps: 0 },
+        companies: [],
+        models: [
+          {
+            model_name: 'waiting-model',
+            company_id: 'moonshot',
+            company_name: 'Kimi',
+            request_count: 0,
+            success_rate: null,
+            avg_latency_ms: null,
+            avg_tps: null,
+            effective_slo: 99.9,
+            min_samples: 100,
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByText('waiting-model')).toBeVisible()
+    expect(screen.getByText('No requests')).toBeVisible()
+    expect(screen.queryByText('0.00%')).not.toBeInTheDocument()
+    expect(screen.queryByText('Degraded')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('columnheader', { name: 'P95 latency' })
+    ).not.toBeInTheDocument()
+  })
+
+  it('uses the saved effective SLO instead of a fixed success threshold', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        companies: [],
+        models: [
+          {
+            model_name: 'manual-target-model',
+            company_id: 'custom-openai',
+            company_name: 'Openai',
+            request_count: 100,
+            success_rate: 98,
+            avg_latency_ms: 400,
+            avg_tps: 12,
+            effective_slo: 97,
+            min_samples: 100,
+            monitoring_enabled: true,
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByText('Meets target')).toBeVisible()
+    expect(screen.queryByText('Degraded')).not.toBeInTheDocument()
+  })
+
+  it('keeps a company success rate unknown when traffic has no success metric', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        companies: [{ id: 'custom', name: 'Custom company' }],
+        models: [
+          {
+            model_name: 'unknown-result',
+            company_id: 'custom',
+            company_name: 'Custom company',
+            request_count: 100,
+            success_rate: null,
+            avg_latency_ms: null,
+            avg_tps: null,
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    const company = screen.getByRole('button', {
+      name: /Custom company.*Models with traffic/,
+    })
+    expect(within(company).getByText('—')).toBeVisible()
+    expect(within(company).queryByText('0.00%')).not.toBeInTheDocument()
+  })
+
+  it('does not count legacy null model arrays as configured models', () => {
+    client.setQueryData(['performance-health-companies'], {
+      success: true,
+      data: {
+        version: 4,
+        companies: [
+          {
+            id: 'legacy',
+            name: 'Legacy',
+            groups: [{ id: 'empty', name: 'Empty', models: null }],
+          },
+        ],
+      },
+    })
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: { summary: null, models: [], companies: [] },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(
+      within(
+        screen.getByRole('group', { name: 'Configured models' })
+      ).getByText('0')
+    ).toBeVisible()
+  })
+
+  it('keeps optional columns selectable and applies them when browser storage is unavailable', async () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: { summary: null, models: [], companies: [] },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+    const user = userEvent.setup()
+    expect(
+      screen.queryByRole('columnheader', { name: 'P95 latency' })
+    ).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Fields' }))
+    const dialog = screen.getByRole('dialog', { name: 'Model table columns' })
+    const p95 = within(dialog).getByRole('checkbox', { name: 'P95 latency' })
+    expect(p95).not.toBeChecked()
+    await user.click(p95)
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('Storage blocked')
+    })
+    await user.click(within(dialog).getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Model table columns' })
+      ).not.toBeInTheDocument()
+    )
+    expect(
+      screen.getByRole('columnheader', { name: 'P95 latency' })
+    ).toBeVisible()
+  })
+  it('keeps legacy metrics visible without claiming unavailable collection health', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        summary,
+        generated_at: windowEnd,
+        models: [
+          {
+            model_name: 'legacy-model',
+            request_count: 100,
+            success_rate: 99.01,
+            avg_latency_ms: 1009,
+            avg_tps: 5,
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(
+      screen.getByRole('status', { name: 'Collection health' })
+    ).toHaveTextContent('Collection status unavailable')
+    expect(screen.getByRole('button', { name: 'legacy-model' })).toBeVisible()
+    expect(
+      screen.getByText(
+        'The server does not report collection health. Existing metrics remain available.'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByRole('definition', { name: 'Latest sample' })
+    ).toHaveTextContent('—')
+  })
+
+  it('shows durable acceptance, projection backlog and unpersisted risk independently of query refresh', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        generated_at: windowEnd,
+        summary: null,
+        models: [],
+        collection: {
+          enabled: true,
+          availability: 'partial',
+          storage: 'database_outbox',
+          target_visibility_seconds: 60,
+          pending_events: 4,
+          oldest_pending_at: windowStart + 10,
+          last_sample_at: windowStart,
+          last_accepted_at: windowStart + 20,
+          last_projected_at: windowStart + 5,
+          persisted_through: null,
+          collector_heartbeat_at: windowStart + 30,
+          unpersisted_events: 2,
+          oldest_unpersisted_at: windowStart + 1,
+          dropped_events: 1,
+          stale_collectors: 1,
+          local_unpersisted_events: 1,
+          quarantined_events: 3,
+        },
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(
+      screen.getByRole('alert', { name: 'Collection health' })
+    ).toHaveTextContent('Collection may be incomplete')
+    expect(
+      screen
+        .getByRole('definition', { name: 'Latest sample' })
+        .querySelector('time')
+    ).toHaveAttribute('dateTime', new Date(windowStart * 1000).toISOString())
+    expect(
+      screen
+        .getByRole('definition', { name: 'Durably accepted at' })
+        .querySelector('time')
+    ).toHaveAttribute(
+      'dateTime',
+      new Date((windowStart + 20) * 1000).toISOString()
+    )
+    expect(
+      screen.getByRole('definition', { name: 'Pending projection' })
+    ).toHaveTextContent('4')
+    expect(
+      screen.getByRole('definition', { name: 'Unpersisted samples' })
+    ).toHaveTextContent('2')
+    expect(
+      screen.getByRole('definition', { name: 'Dropped samples' })
+    ).toHaveTextContent('1')
+    expect(
+      screen.getByRole('definition', { name: 'Stale collectors' })
+    ).toHaveTextContent('1')
+    expect(
+      screen.getByRole('definition', { name: 'Quarantined samples' })
+    ).toHaveTextContent('3')
+    expect(
+      screen.getByText('See the server logs for the quarantine reason.')
+    ).toBeVisible()
+    expect(
+      screen.getByRole('definition', { name: 'Persistence watermark' })
+    ).toHaveTextContent('Not available')
+  })
+
+  it('distinguishes disabled collection from delayed projection and keeps persisted history', async () => {
+    const data = {
+      generated_at: windowEnd,
+      summary: null,
+      models: [],
+      collection: {
+        enabled: false,
+        availability: 'disabled',
+        storage: 'database_outbox',
+        target_visibility_seconds: 60,
+        pending_events: 0,
+        oldest_pending_at: null,
+        last_sample_at: null,
+        last_accepted_at: null,
+        last_projected_at: null,
+        persisted_through: null,
+        collector_heartbeat_at: windowStart,
+        unpersisted_events: 0,
+        oldest_unpersisted_at: null,
+        dropped_events: 0,
+        stale_collectors: 0,
+        local_unpersisted_events: 0,
+      },
+    }
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data,
+    })
+    const rootRoute = createRootRoute({
+      component: () => (
+        <QueryClientProvider client={client}>
+          <ModelReliabilityDemo />
+        </QueryClientProvider>
+      ),
+    })
+    const router = createRouter({
+      routeTree: rootRoute,
+      history: createMemoryHistory({ initialEntries: ['/'] }),
+    })
+    await router.load()
+    render(<RouterProvider router={router} />)
+
+    expect(
+      screen.getByRole('status', { name: 'Collection health' })
+    ).toHaveTextContent('Collection is disabled')
+    expect(
+      screen.getByText(
+        'New samples are not collected. Previously persisted data remains available.'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByText(
+        'No sample timestamp is available. Older buckets may not include one.'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByRole('link', { name: 'Open collection settings' })
+    ).toHaveAttribute('href', '/system-settings/operations/alerts')
+  })
+
+  it('shows a confirmed zero output rate while keeping unavailable output metrics unknown', () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        summary: {
+          success_rate: 100,
+          avg_latency_ms: 100,
+          avg_tps: 0,
+          output_metrics_available: true,
+        },
+        models: [
+          {
+            model_name: 'zero-output',
+            request_count: 100,
+            success_rate: 100,
+            avg_latency_ms: 100,
+            avg_tps: 0,
+            output_metrics_available: true,
+          },
+          {
+            model_name: 'unknown-output',
+            request_count: 100,
+            success_rate: 100,
+            avg_latency_ms: 100,
+            avg_tps: 0,
+            output_metrics_available: false,
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+
+    expect(screen.getAllByText('0 t/s')).toHaveLength(2)
+    const unknown = screen
+      .getByRole('button', { name: 'unknown-output' })
+      .closest('tr')
+    expect(unknown).not.toHaveTextContent('0 t/s')
+  })
+  it('keeps the last successful metrics visible and marks them stale when refresh fails', async () => {
+    client.setQueryData(['performance-health-summary', 24], {
+      success: true,
+      data: {
+        summary,
+        generated_at: windowEnd,
+        models: [
+          {
+            model_name: 'persisted-model',
+            request_count: 100,
+            success_rate: 99.01,
+            avg_latency_ms: 1009,
+            avg_tps: 5,
+          },
+        ],
+      },
+    })
+    vi.spyOn(api, 'get').mockRejectedValue(new Error('Refresh failed'))
+    render(
+      <QueryClientProvider client={client}>
+        <ModelReliabilityDemo />
+      </QueryClientProvider>
+    )
+    await userEvent
+      .setup()
+      .click(screen.getByRole('button', { name: 'Refresh' }))
+
+    expect(
+      await screen.findByText('Unable to refresh model reliability')
+    ).toBeVisible()
+    expect(
+      screen.getByRole('status', { name: 'Cached metrics' })
+    ).toHaveTextContent('The latest query failed.')
+    expect(
+      screen.getByRole('alert', { name: 'Collection health' })
+    ).toHaveTextContent('Collection status unavailable')
+    expect(
+      screen.getByRole('button', { name: 'persisted-model' })
+    ).toBeVisible()
+    expect(
+      screen.getByRole('button', { name: 'Configure models' })
+    ).toBeVisible()
   })
 })

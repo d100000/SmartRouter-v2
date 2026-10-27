@@ -321,6 +321,11 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	profile, _ := createMiddlewareScopedToken(t, admin.Id, 0, "profile:read")
 	channel, _ := createMiddlewareScopedToken(t, admin.Id, time.Now().Unix()+3600, "channel:read")
 	expired, _ := createMiddlewareScopedToken(t, admin.Id, time.Now().Unix()-1, "profile:read")
+	modelRead, _ := createMiddlewareScopedToken(t, admin.Id, 0, "model:read")
+	modelWrite, _ := createMiddlewareScopedToken(t, admin.Id, 0, "model:write")
+	expiredModel, _ := createMiddlewareScopedToken(t, admin.Id, time.Now().Unix()-1, "model:write")
+	member := createMiddlewarePATUser(t, "preset-member", "preset-member-legacy")
+	memberModels, _ := createMiddlewareScopedToken(t, member.Id, 0, "model:read", "model:write")
 
 	ok := func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id")}) }
 	router := gin.New()
@@ -329,6 +334,34 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	router.GET("/api/undeclared", UserAuth(), ok)
 	router.GET("/api/channel/", AdminAuth(), RequirePermission(authz.ChannelRead), ok)
 	router.GET("/api/pricing", TryUserAuth(), ok)
+	router.GET("/api/performance-health/presets", AdminAuth(), ok)
+	router.POST("/api/performance-health/presets/preview", AdminAuth(), ok)
+	router.POST("/api/performance-health/presets/apply", AdminAuth(), ok)
+
+	for _, test := range []struct {
+		name, method, path, token string
+		status                    int
+	}{
+		{"read presets", http.MethodGet, "/api/performance-health/presets", modelRead, http.StatusOK},
+		{"preview is read only", http.MethodPost, "/api/performance-health/presets/preview", modelRead, http.StatusOK},
+		{"read scope cannot apply", http.MethodPost, "/api/performance-health/presets/apply", modelRead, http.StatusForbidden},
+		{"write scope can apply", http.MethodPost, "/api/performance-health/presets/apply", modelWrite, http.StatusOK},
+		{"unrelated scope cannot read", http.MethodGet, "/api/performance-health/presets", profile, http.StatusForbidden},
+		{"expired write scope", http.MethodPost, "/api/performance-health/presets/apply", expiredModel, http.StatusUnauthorized},
+		{"anonymous preview", http.MethodPost, "/api/performance-health/presets/preview", "", http.StatusUnauthorized},
+		{"scope cannot elevate member read", http.MethodGet, "/api/performance-health/presets", memberModels, http.StatusForbidden},
+		{"scope cannot elevate member write", http.MethodPost, "/api/performance-health/presets/apply", memberModels, http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			if test.token != "" {
+				request.Header.Set("Authorization", "Bearer "+test.token)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assert.Equal(t, test.status, response.Code, response.Body.String())
+		})
+	}
 
 	for _, test := range []struct {
 		name, path, token, code, reason string

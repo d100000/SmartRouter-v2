@@ -235,6 +235,52 @@ func StartSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo) {
 	state.started = true
 }
 
+// FinalRelayOutcome applies the same delivery evidence to request metrics as
+// to scheduling. It evaluates the current request, never a cached prior attempt.
+func FinalRelayOutcome(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) perfmetrics.Outcome {
+	if c == nil {
+		return perfmetrics.ClassifyRelayOutcome(context.Background(), info, apiErr)
+	}
+	state := schedulingState(c)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.finalRelayOutcome(c, info, apiErr)
+}
+
+// The caller holds state.mu; response writer observations stay consistent.
+func (state *schedulingRequest) finalRelayOutcome(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) perfmetrics.Outcome {
+	classificationContext := context.Background()
+	if c.Request != nil {
+		classificationContext = c.Request.Context()
+	}
+	// HTTP clients can close as soon as the complete non-stream response
+	// arrives, while settlement is still finishing. Successful completion
+	// with no short/failed writes is not a client-aborted channel attempt.
+	if info != nil && !info.IsStream && apiErr == nil && state.output && !state.writeFailedBeforeTerminal {
+		classificationContext = context.WithoutCancel(classificationContext)
+	}
+	classification := perfmetrics.ClassifyRelayOutcome(classificationContext, info, apiErr)
+	if state.writeFailedBeforeTerminal || info != nil && info.IsStream && classificationContext.Err() != nil && state.writtenOutcome == relaycommon.ResponseOutcomeUnknown {
+		classification = perfmetrics.OutcomeIgnored
+	} else if info != nil && info.IsStream && state.writtenOutcome != relaycommon.ResponseOutcomeUnknown && apiErr == nil && !info.PerformanceBusinessRejection && (classificationContext.Err() == nil || errors.Is(classificationContext.Err(), context.Canceled)) {
+		stream := info.StreamStatus.OutcomeSnapshot()
+		// The caller may close after receiving the complete terminal SSE
+		// event, before upstream EOF or quota settlement. Only terminal
+		// output observed by our writer can override that late cancellation;
+		// parsing a terminal upstream event alone is insufficient.
+		if state.writtenOutcome == relaycommon.ResponseOutcomeFailed && stream.Response == relaycommon.ResponseOutcomeFailed {
+			// Preserve the existing channel-vs-business error classification.
+			classification = perfmetrics.ClassifyRelayOutcome(context.WithoutCancel(classificationContext), info, apiErr)
+		} else if state.writtenOutcome == relaycommon.ResponseOutcomeCompleted && stream.Response == relaycommon.ResponseOutcomeCompleted && !stream.HasErrors {
+			switch stream.EndReason {
+			case relaycommon.StreamEndReasonDone, relaycommon.StreamEndReasonEOF, relaycommon.StreamEndReasonClientGone:
+				classification = perfmetrics.OutcomeSuccess
+			}
+		}
+	}
+	return classification
+}
+
 func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
 	state := schedulingState(c)
 	state.mu.Lock()
@@ -244,32 +290,7 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 	}
 	outcome := scheduler.Outcome{}
 	if state.started {
-		classificationContext := c.Request.Context()
-		// HTTP clients can close as soon as the complete non-stream response
-		// arrives, while settlement is still finishing. Successful completion
-		// with no short/failed writes is not a client-aborted channel attempt.
-		if info != nil && !info.IsStream && apiErr == nil && state.output && !state.writeFailedBeforeTerminal {
-			classificationContext = context.WithoutCancel(classificationContext)
-		}
-		classification := perfmetrics.ClassifyRelayOutcome(classificationContext, info, apiErr)
-		if state.writeFailedBeforeTerminal || info != nil && info.IsStream && classificationContext.Err() != nil && state.writtenOutcome == relaycommon.ResponseOutcomeUnknown {
-			classification = perfmetrics.OutcomeIgnored
-		} else if info != nil && info.IsStream && state.writtenOutcome != relaycommon.ResponseOutcomeUnknown && apiErr == nil && !info.PerformanceBusinessRejection && (classificationContext.Err() == nil || errors.Is(classificationContext.Err(), context.Canceled)) {
-			stream := info.StreamStatus.OutcomeSnapshot()
-			// The caller may close after receiving the complete terminal SSE
-			// event, before upstream EOF or quota settlement. Only terminal
-			// output observed by our writer can override that late cancellation;
-			// parsing a terminal upstream event alone is insufficient.
-			if state.writtenOutcome == relaycommon.ResponseOutcomeFailed && stream.Response == relaycommon.ResponseOutcomeFailed {
-				// Preserve the existing channel-vs-business error classification.
-				classification = perfmetrics.ClassifyRelayOutcome(context.WithoutCancel(classificationContext), info, apiErr)
-			} else if state.writtenOutcome == relaycommon.ResponseOutcomeCompleted && stream.Response == relaycommon.ResponseOutcomeCompleted && !stream.HasErrors {
-				switch stream.EndReason {
-				case relaycommon.StreamEndReasonDone, relaycommon.StreamEndReasonEOF, relaycommon.StreamEndReasonClientGone:
-					classification = perfmetrics.OutcomeSuccess
-				}
-			}
-		}
+		classification := state.finalRelayOutcome(c, info, apiErr)
 		state.lastOutcome = classification
 		outcome.Success = classification == perfmetrics.OutcomeSuccess
 		outcome.ChannelFailure = classification == perfmetrics.OutcomeFailure

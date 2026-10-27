@@ -152,7 +152,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		service.FinishOverviewAttempt(c, relayInfo, resultErr)
 		service.CompleteOverviewRelay(relayInfo)
 		if relayFormat != types.RelayFormatOpenAIRealtime {
-			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
+			perfmetrics.RecordRelayOutcome(c.Request.Context(), relayInfo, service.FinalRelayOutcome(c, relayInfo, resultErr))
 		}
 		if recovered != nil {
 			panic(recovered)
@@ -182,6 +182,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.StreamStatus = nil
+		relayInfo.StreamFailure = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -234,6 +235,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
+		if relayInfo.StreamFailure != nil && types.IsSkipRetryError(newAPIError) {
+			decision = service.PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}
+		}
 		if reason := service.SchedulingRetryStopReason(c); reason != "" {
 			decision = service.PolicyDecision{Action: "stop", Reason: reason, Source: "scheduler"}
 		}
@@ -725,10 +729,14 @@ func executeTaskSubmissionWith(
 	}
 	task.Action = relayInfo.Action
 	if immediate := result.Immediate; immediate != nil {
+		task.PrivateData.PerformanceOutputTokens = immediate.PerformanceOutputTokens
 		task.Status = model.TaskStatus(immediate.Status)
 		task.Progress = immediate.Progress
 		if immediate.Status == model.TaskStatusSuccess || immediate.Status == model.TaskStatusFailure {
 			task.FinishTime = time.Now().Unix()
+			if !relayInfo.StartTime.IsZero() && relayInfo.StartTime.Unix() > 0 && relayInfo.StartTime.Unix() <= task.FinishTime {
+				task.SubmitTime = relayInfo.StartTime.Unix()
+			}
 		}
 		if immediate.Status == model.TaskStatusFailure {
 			task.FailReason = immediate.Reason

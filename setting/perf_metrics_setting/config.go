@@ -1,6 +1,10 @@
 package perf_metrics_setting
 
-import "github.com/QuantumNous/new-api/setting/config"
+import (
+	"time"
+
+	"github.com/QuantumNous/new-api/setting/config"
+)
 
 type PerfMetricsSetting struct {
 	Enabled       bool   `json:"enabled"`
@@ -42,4 +46,14 @@ func GetFlushIntervalMinutes() int {
 		return 1
 	}
 	return perfMetricsSetting.FlushInterval
+}
+
+// Invalid legacy retention values keep history instead of overflowing a
+// duration into a destructive cutoff. The saved administrator value is intact.
+func GetRetentionCutoff(now time.Time) int64 {
+	days := perfMetricsSetting.RetentionDays
+	if days <= 0 || days > 36500 {
+		return 0
+	}
+	return max(0, now.UTC().AddDate(0, 0, -days).Unix())
 }

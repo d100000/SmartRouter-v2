@@ -83,16 +83,16 @@ type submitResponse struct {
 	State     any         `json:"state"`
 }
 type taskResult struct {
-	Code             int     `json:"code"`
-	TaskID           string  `json:"taskId"`
-	Status           string  `json:"status"`
-	Progress         string  `json:"progress"`
-	Reason           string  `json:"reason"`
-	URL              string  `json:"url"`
-	RemoteURL        string  `json:"remoteUrl"`
-	CompletionTokens float64 `json:"completionTokens"`
-	TotalTokens      float64 `json:"totalTokens"`
-	State            any     `json:"state"`
+	Code             int      `json:"code"`
+	TaskID           string   `json:"taskId"`
+	Status           string   `json:"status"`
+	Progress         string   `json:"progress"`
+	Reason           string   `json:"reason"`
+	URL              string   `json:"url"`
+	RemoteURL        string   `json:"remoteUrl"`
+	CompletionTokens *float64 `json:"completionTokens"`
+	TotalTokens      float64  `json:"totalTokens"`
+	State            any      `json:"state"`
 }
 
 var taskArtifactKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
@@ -594,6 +594,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		Status: parsed.Immediate.Status, Progress: parsed.Immediate.Progress,
 		Reason: parsed.Immediate.Reason, Url: parsed.Immediate.URL, RemoteUrl: parsed.Immediate.RemoteURL,
 		CompletionTokens: positiveInt(parsed.Immediate.CompletionTokens), TotalTokens: positiveInt(parsed.Immediate.TotalTokens),
+		PerformanceOutputTokens: a.performanceOutputTokens(parsed.Immediate.CompletionTokens, info.UpstreamModelName, info.OriginModelName),
 	}
 	response.Immediate = immediate
 	if immediate.Status != model.TaskStatusSuccess || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
@@ -945,16 +946,19 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		logger.LogDebug(context.Background(), "task_plugin subsystem=adaptor event=parse_task_failed plugin=%q reason=invalid_result body_bytes=%d elapsed_ms=%d", a.plugin.Meta.Key, len(body), time.Since(started).Milliseconds())
 		return nil, err
 	}
+	upstreamModel, _ := ctx["upstreamModel"].(string)
+	originModel, _ := ctx["model"].(string)
 	result := &relaycommon.TaskInfo{
-		Code:             parsed.Code,
-		TaskID:           parsed.TaskID,
-		Status:           parsed.Status,
-		Progress:         parsed.Progress,
-		Reason:           parsed.Reason,
-		Url:              parsed.URL,
-		RemoteUrl:        parsed.RemoteURL,
-		CompletionTokens: positiveInt(parsed.CompletionTokens),
-		TotalTokens:      positiveInt(parsed.TotalTokens),
+		Code:                    parsed.Code,
+		TaskID:                  parsed.TaskID,
+		Status:                  parsed.Status,
+		Progress:                parsed.Progress,
+		Reason:                  parsed.Reason,
+		Url:                     parsed.URL,
+		RemoteUrl:               parsed.RemoteURL,
+		CompletionTokens:        positiveInt(parsed.CompletionTokens),
+		TotalTokens:             positiveInt(parsed.TotalTokens),
+		PerformanceOutputTokens: a.performanceOutputTokens(parsed.CompletionTokens, upstreamModel, originModel),
 	}
 	if pluginState, present := encodeReturnedPluginState(value); present {
 		if len(pluginState) > maxTaskPluginPersistedJSONBytes {
@@ -995,6 +999,9 @@ func (a *TaskAdaptor) applyCompletionUsageFacts(result *relaycommon.TaskInfo, fa
 		return nil
 	}
 	result.UsageFacts = values
+	if _, legacyUnits := values["upstreamUnits"]; legacyUnits {
+		result.PerformanceOutputTokens = nil
+	}
 	if units := positiveInt(values["upstreamUnits"]); units > 0 {
 		result.CompletionTokens = units
 		result.TotalTokens = units
@@ -1002,11 +1009,52 @@ func (a *TaskAdaptor) applyCompletionUsageFacts(result *relaycommon.TaskInfo, fa
 	}
 	if completionTokens, exists := values["completionTokens"]; exists {
 		result.CompletionTokens = positiveInt(completionTokens)
+		result.PerformanceOutputTokens = a.performanceOutputTokens(completionTokens, models...)
 	}
 	if totalTokens, exists := values["totalTokens"]; exists {
 		result.TotalTokens = positiveInt(totalTokens)
 	}
 	return nil
+}
+
+func (a *TaskAdaptor) performanceOutputTokens(value any, models ...string) *int64 {
+	var tokens float64
+	switch number := value.(type) {
+	case *float64:
+		if number == nil {
+			return nil
+		}
+		tokens = *number
+	case float64:
+		tokens = number
+	case int64:
+		tokens = float64(number)
+	default:
+		return nil
+	}
+	if math.IsNaN(tokens) || math.IsInf(tokens, 0) || tokens < 0 || tokens > float64(common.MaxQuota) || math.Trunc(tokens) != tokens {
+		return nil
+	}
+	// Some legacy plugins encode credits or image counts in these counters.
+	// An explicit non-token usage schema is evidence they are not output tokens.
+	schema, _ := a.plugin.Meta.UsageForModels(models...)
+	if len(schema) > 0 {
+		if field, exists := schema["completionTokens"]; exists && field.Unit != "token" {
+			return nil
+		}
+		hasTokens := false
+		for _, field := range schema {
+			if field.Unit == "token" {
+				hasTokens = true
+				break
+			}
+		}
+		if !hasTokens {
+			return nil
+		}
+	}
+	count := int64(tokens)
+	return &count
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
@@ -1972,6 +2020,11 @@ func cloneJSONValue(value any, depth int) (any, bool) {
 }
 func positiveInt(value any) int {
 	switch number := value.(type) {
+	case *float64:
+		if number == nil {
+			return 0
+		}
+		return positiveInt(*number)
 	case int64:
 		if number <= 0 {
 			return 0

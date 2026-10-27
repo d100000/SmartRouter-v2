@@ -767,6 +767,8 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	require.NoError(t, model.DB.First(&reloadedModern, modernTask.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, reloadedLegacy.Status)
 	assert.EqualValues(t, model.TaskStatusFailure, reloadedModern.Status)
+	assert.True(t, reloadedLegacy.PerformanceSamplePending, "timeout telemetry is saved with the terminal CAS")
+	assert.True(t, reloadedModern.PerformanceSamplePending)
 	assert.Zero(t, reloadedLegacy.Quota)
 	assert.Zero(t, reloadedModern.Quota)
 	assert.Contains(t, reloadedLegacy.FailReason, "old system")

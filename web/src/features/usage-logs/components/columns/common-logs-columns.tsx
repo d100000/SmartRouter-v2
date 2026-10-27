@@ -22,7 +22,7 @@ import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { GroupBadge } from '@/components/group-badge'
-import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
+import { StatusBadge } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import {
   Popover,
@@ -69,12 +69,12 @@ import {
 import {
   isDisplayableLogType,
   isTimingLogType,
-  getLogTypeConfig,
   isPerCallBilling,
 } from '../../lib/utils'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
 import { LogCostDisplay } from '../log-cost-display'
+import { LogRequestStatus } from '../log-request-status'
 import { ModelBadge } from '../model-badge'
 import { TimingMetricsCell, StreamTpsCell } from '../timing-metrics-cell'
 import { useUsageLogsContext } from '../usage-logs-provider'
@@ -363,18 +363,16 @@ export function useCommonLogsColumns(
         cell: ({ row }) => {
           const log = row.original
           const timestamp = row.getValue('created_at') as number
-          const config = getLogTypeConfig(log.type)
 
           return (
             <div className='flex min-w-0 flex-col gap-0.5'>
               <span className='truncate font-mono text-xs tabular-nums'>
                 {formatTimestampToDate(timestamp)}
               </span>
-              <StatusBadge
-                label={t(config.label)}
-                variant={config.color as StatusBadgeProps['variant']}
-                size='sm'
-                copyable={false}
+              <LogRequestStatus
+                log={log}
+                isAdmin={isAdmin}
+                isRoot={isRoot}
                 className='-ml-1.5 !text-xs [&_span]:!text-xs'
               />
             </div>

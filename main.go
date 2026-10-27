@@ -27,6 +27,9 @@ import (
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/moonshot"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/router"
 	"github.com/QuantumNous/new-api/service"
@@ -241,6 +244,16 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(common.LogText("server forced to shutdown: %v", err))
 	}
+	websocketCtx, websocketCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := relay.ShutdownResponsesWebSockets(websocketCtx); err != nil {
+		common.SysError(common.LogText("responses websocket shutdown did not fully drain: %s", err.Error()))
+	}
+	websocketCancel()
+	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := perfmetrics.Shutdown(metricsCtx); err != nil {
+		common.SysError(common.LogText("performance metric shutdown did not fully drain: %s", err.Error()))
+	}
+	metricsCancel()
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {
 		model.SaveQuotaDataCache()
@@ -338,6 +351,18 @@ func InitResources() error {
 		}
 	}
 	model.InitOptionMap()
+	for company, models := range map[string][]string{
+		"moonshot":  moonshot.ModelList,
+		"openai":    openai.ModelList,
+		"anthropic": claude.ModelList,
+	} {
+		if err := model.SetPerformanceHealthPresetModels(company, models); err != nil {
+			return err
+		}
+	}
+	if err := model.InitPerformanceHealthConfig(); err != nil {
+		return fmt.Errorf("initialize performance health configuration: %w", err)
+	}
 
 	// 清理旧的磁盘缓存文件
 	common.CleanupOldCacheFiles()

@@ -1,12 +1,9 @@
 package perfmetrics
 
 import (
-	"cmp"
 	"context"
-	"fmt"
 	"math"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,19 +11,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
-
-	"github.com/bytedance/gopkg/util/gopool"
-	"github.com/go-redis/redis/v8"
 )
-
-var hotBuckets sync.Map
-var pendingRedisWrites sync.WaitGroup
-
-// WaitForPendingWrites drains best-effort Redis updates after relay producers
-// have stopped, before closing the client or replacing test-global state.
-func WaitForPendingWrites() {
-	pendingRedisWrites.Wait()
-}
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
 // hiding fields or making response-only privacy hardening changes.
@@ -37,111 +22,55 @@ const MaxRecentModels = 50
 const recentSuccessSampleLimit = 24
 const recentSuccessHistoryHours = 7 * 24
 
-func Init() {
-	go flushLoop()
+// RecordRelayResult remains the context-only entry point for callers without
+// delivery state. HTTP/Responses callers use the shared delivery-aware outcome.
+func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
+	RecordRelayOutcome(ctx, info, ClassifyRelayOutcome(ctx, info, apiErr))
 }
 
-// RecordRelayResult samples one finished relay exactly once, at the request
-// boundary, regardless of how many channel attempts it took.
-func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
-	if info == nil {
+func RecordRelayOutcome(_ context.Context, info *relaycommon.RelayInfo, outcome Outcome) {
+	if info == nil || outcome == OutcomeIgnored {
 		return
 	}
-	outcome := ClassifyRelayOutcome(ctx, info, apiErr)
-	if outcome == OutcomeIgnored {
-		return
+	if info.PerformanceEventID == "" {
+		info.PerformanceEventID = "relay:" + common.NewRequestId()
 	}
 	now := time.Now()
+	latencyMs := int64(0)
+	if !info.StartTime.IsZero() && now.After(info.StartTime) {
+		latencyMs = now.Sub(info.StartTime).Milliseconds()
+	}
 	hasTtft := info.IsStream && info.HasSendResponse()
-	ttftMs := int64(0)
+	ttftMs, generationMs := int64(0), latencyMs
 	if hasTtft {
 		ttftMs = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
-	}
-	latencyMs := now.Sub(info.StartTime).Milliseconds()
-	generationMs := latencyMs
-	if hasTtft {
 		generationMs = now.Sub(info.FirstResponseTime).Milliseconds()
 	}
-	if generationMs <= 0 {
-		generationMs = latencyMs
-	}
 	Record(Sample{
-		Model:        info.OriginModelName,
-		Group:        info.UsingGroup,
-		LatencyMs:    latencyMs,
-		TtftMs:       ttftMs,
-		HasTtft:      hasTtft,
-		Success:      outcome == OutcomeSuccess,
-		OutputTokens: info.PerformanceOutputTokens,
-		GenerationMs: generationMs,
+		EventID: info.PerformanceEventID, OccurredAt: now.Unix(),
+		Model: info.OriginModelName, Group: info.UsingGroup,
+		LatencyMs: latencyMs, TtftMs: ttftMs, HasTtft: hasTtft,
+		Success:           outcome == OutcomeSuccess,
+		OutputTokens:      info.PerformanceOutputTokens,
+		OutputTokensKnown: info.PerformanceOutputTokens > 0,
+		GenerationMs:      generationMs,
 	})
 }
 
-// RecordTaskResult samples one async task exactly once, at its terminal
-// transition, after the polling status CAS is won. Latency is the end-to-end
-// task duration (second resolution, unlike the ms-resolution relay samples);
-// throughput is only present when the provider reports tokens.
+// RecordTaskResult is retained for integrations outside the polling pipeline.
+// The production task path persists a pending marker with its terminal CAS and
+// stages the same task:<primary key> identity without a crash window.
 func RecordTaskResult(task *model.Task, result *relaycommon.TaskInfo) {
-	if task == nil {
+	if task == nil || !perf_metrics_setting.GetSetting().Enabled {
 		return
 	}
-	modelName := task.Properties.OriginModelName
-	if bc := task.PrivateData.BillingContext; bc != nil && bc.OriginModelName != "" {
-		modelName = bc.OriginModelName
+	copy := *task
+	if result != nil && result.PerformanceOutputTokens != nil {
+		copy.PrivateData.PerformanceOutputTokens = result.PerformanceOutputTokens
 	}
-	endTs := task.FinishTime
-	if endTs <= 0 {
-		endTs = time.Now().Unix()
+	if event := copy.PerformanceMetricEvent(); event != nil {
+		recordEvent(*event)
 	}
-	sample := Sample{
-		Model:   modelName,
-		Group:   task.Group,
-		Success: task.Status == model.TaskStatusSuccess,
-	}
-	if task.SubmitTime > 0 && endTs > task.SubmitTime {
-		sample.LatencyMs = (endTs - task.SubmitTime) * 1000
-	}
-	if sample.Success && result != nil {
-		tokens := int64(cmp.Or(result.TotalTokens, result.CompletionTokens))
-		genStart := cmp.Or(task.StartTime, task.SubmitTime)
-		if tokens > 0 && genStart > 0 && endTs > genStart {
-			sample.OutputTokens = tokens
-			sample.GenerationMs = (endTs - genStart) * 1000
-		}
-	}
-	Record(sample)
-}
-
-func Record(sample Sample) {
-	setting := perf_metrics_setting.GetSetting()
-	if !setting.Enabled || sample.Model == "" {
-		return
-	}
-	if sample.Group == "" {
-		sample.Group = "default"
-	}
-	if sample.LatencyMs < 0 {
-		sample.LatencyMs = 0
-	}
-
-	key := bucketKey{
-		model:    sample.Model,
-		group:    sample.Group,
-		bucketTs: bucketStart(time.Now().Unix()),
-	}
-	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
-	actual.(*atomicBucket).add(sample)
-	// Resolve process configuration before dispatch. A queued task must never
-	// read a later test's (or shutdown's) RedisEnabled/RDB values.
-	client := common.RDB
-	if !common.RedisEnabled || client == nil {
-		return
-	}
-	pendingRedisWrites.Add(1)
-	gopool.Go(func() {
-		defer pendingRedisWrites.Done()
-		recordRedis(client, key, sample)
-	})
 }
 
 // queryWindow covers the current partial hour plus the preceding complete
@@ -185,23 +114,6 @@ func Query(params QueryParams) (QueryResult, error) {
 		})
 	}
 
-	hotBuckets.Range(func(key, value any) bool {
-		k := key.(bucketKey)
-		if k.model != params.Model || k.bucketTs < startTs || k.bucketTs > endTs {
-			return true
-		}
-		if params.Group != "" && k.group != params.Group {
-			return true
-		}
-		if allowedGroups != nil {
-			if _, ok := allowedGroups[k.group]; !ok {
-				return true
-			}
-		}
-		mergeCounters(merged, k, value.(*atomicBucket).snapshot())
-		return true
-	})
-
 	result := buildQueryResult(params.Model, merged)
 	result.WindowStart, result.WindowEnd = startTs, endTs
 	return result, nil
@@ -214,7 +126,6 @@ func QuerySummaryAll(hours int, groups []string, recentModels ...string) (Summar
 	now := time.Now()
 	startTs, endTs := queryWindow(now, hours)
 	recentStartTs, _ := queryWindow(now, recentSuccessHistoryHours)
-	allowedGroups := allowedGroupSet(groups)
 	queryStartTs := startTs
 
 	recentBuckets := make(map[string]map[int64]counters, len(recentModels))
@@ -253,30 +164,6 @@ func QuerySummaryAll(hours int, groups []string, recentModels ...string) (Summar
 		}
 		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
 	}
-
-	hotBuckets.Range(func(key, value any) bool {
-		k := key.(bucketKey)
-		if k.bucketTs > endTs {
-			return true
-		}
-		if allowedGroups != nil {
-			if _, ok := allowedGroups[k.group]; !ok {
-				return true
-			}
-		}
-		snap := value.(*atomicBucket).snapshot()
-		if snap.requestCount == 0 {
-			return true
-		}
-		if _, requested := recentBuckets[k.model]; requested && k.bucketTs >= recentStartTs {
-			mergeModelBucket(recentBuckets, k.model, k.bucketTs, snap)
-		}
-		if k.bucketTs < queryStartTs {
-			return true
-		}
-		mergeModelBucket(modelBuckets, k.model, k.bucketTs, snap)
-		return true
-	})
 
 	recentSeries := make(map[string][]SuccessRatePoint, len(recentBuckets))
 	for name, buckets := range recentBuckets {
@@ -321,12 +208,13 @@ func QuerySummaryAll(hours int, groups []string, recentModels ...string) (Summar
 			avgTps = float64(total.outputTokens) / (float64(total.generationMs) / 1000.0)
 		}
 		models = append(models, ModelSummary{
-			ModelName:           name,
-			AvgLatencyMs:        avgLatency,
-			SuccessRate:         math.Round(successRate*100) / 100,
-			AvgTps:              math.Round(avgTps*100) / 100,
-			RecentSuccessSeries: recentSuccessSeries(modelBuckets[name]),
-			RequestCount:        total.requestCount,
+			ModelName:              name,
+			AvgLatencyMs:           avgLatency,
+			SuccessRate:            math.Round(successRate*100) / 100,
+			AvgTps:                 math.Round(avgTps*100) / 100,
+			OutputMetricsAvailable: total.generationMs > 0,
+			RecentSuccessSeries:    recentSuccessSeries(modelBuckets[name]),
+			RequestCount:           total.requestCount,
 		})
 	}
 	sort.Slice(models, func(i, j int) bool {
@@ -493,12 +381,13 @@ func buildQueryResult(modelName string, merged map[bucketKey]counters) QueryResu
 		all.generationMs += total.generationMs
 
 		results = append(results, GroupResult{
-			Group:        group,
-			AvgTtftMs:    avg(total.ttftSumMs, total.ttftCount),
-			AvgLatencyMs: avg(total.totalLatencyMs, total.requestCount),
-			SuccessRate:  successRate(total),
-			AvgTps:       avgTps(total),
-			Series:       series,
+			Group:                  group,
+			OutputMetricsAvailable: total.generationMs > 0,
+			AvgTtftMs:              avg(total.ttftSumMs, total.ttftCount),
+			AvgLatencyMs:           avg(total.totalLatencyMs, total.requestCount),
+			SuccessRate:            successRate(total),
+			AvgTps:                 avgTps(total),
+			Series:                 series,
 		})
 	}
 
@@ -526,19 +415,21 @@ func summarize(total counters) *Summary {
 		return nil
 	}
 	return &Summary{
-		AvgLatencyMs: avg(total.totalLatencyMs, total.requestCount),
-		SuccessRate:  math.Round(successRate(total)*100) / 100,
-		AvgTps:       math.Round(avgTps(total)*100) / 100,
+		AvgLatencyMs:           avg(total.totalLatencyMs, total.requestCount),
+		SuccessRate:            math.Round(successRate(total)*100) / 100,
+		AvgTps:                 math.Round(avgTps(total)*100) / 100,
+		OutputMetricsAvailable: total.generationMs > 0,
 	}
 }
 
 func bucketPoint(ts int64, value counters) BucketPoint {
 	return BucketPoint{
-		Ts:           ts,
-		AvgTtftMs:    avg(value.ttftSumMs, value.ttftCount),
-		AvgLatencyMs: avg(value.totalLatencyMs, value.requestCount),
-		SuccessRate:  successRate(value),
-		AvgTps:       avgTps(value),
+		Ts:                     ts,
+		OutputMetricsAvailable: value.generationMs > 0,
+		AvgTtftMs:              avg(value.ttftSumMs, value.ttftCount),
+		AvgLatencyMs:           avg(value.totalLatencyMs, value.requestCount),
+		SuccessRate:            successRate(value),
+		AvgTps:                 avgTps(value),
 	}
 }
 
@@ -561,51 +452,4 @@ func avgTps(value counters) float64 {
 		return 0
 	}
 	return float64(value.outputTokens) / (float64(value.generationMs) / 1000)
-}
-
-func recordRedis(client *redis.Client, key bucketKey, sample Sample) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	redisKey := redisBucketKey(key)
-	pipe := client.TxPipeline()
-	pipe.HIncrBy(ctx, redisKey, "req", 1)
-	if sample.Success {
-		pipe.HIncrBy(ctx, redisKey, "ok", 1)
-	}
-	if sample.LatencyMs > 0 {
-		pipe.HIncrBy(ctx, redisKey, "lat", sample.LatencyMs)
-	}
-	if sample.HasTtft && sample.TtftMs >= 0 {
-		pipe.HIncrBy(ctx, redisKey, "ttft", sample.TtftMs)
-		pipe.HIncrBy(ctx, redisKey, "ttft_n", 1)
-	}
-	if sample.OutputTokens > 0 && sample.GenerationMs > 0 {
-		pipe.HIncrBy(ctx, redisKey, "out", sample.OutputTokens)
-		pipe.HIncrBy(ctx, redisKey, "gen_ms", sample.GenerationMs)
-	}
-	pipe.Expire(ctx, redisKey, time.Hour)
-	_, _ = pipe.Exec(ctx)
-}
-
-func mergeRedisActiveBuckets(merged map[bucketKey]counters, params QueryParams, startTs int64, endTs int64) {
-	if !common.RedisEnabled || common.RDB == nil || params.Model == "" || params.Group == "" {
-		return
-	}
-	active := bucketStart(time.Now().Unix())
-	if active < startTs || active > endTs {
-		return
-	}
-	key := bucketKey{model: params.Model, group: params.Group, bucketTs: active}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	values, err := common.RDB.HGetAll(ctx, redisBucketKey(key)).Result()
-	if err != nil || len(values) == 0 {
-		return
-	}
-	mergeCounters(merged, key, redisCounters(values))
-}
-
-func redisBucketKey(key bucketKey) string {
-	return fmt.Sprintf("perf:%s:%s:%d", key.model, key.group, key.bucketTs)
 }

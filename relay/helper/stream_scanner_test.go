@@ -179,6 +179,35 @@ func TestStreamScannerHandler_EmptyBody(t *testing.T) {
 	assert.False(t, called.Load(), "handler should not be called for empty body")
 }
 
+func TestStreamScannerHandlerPassesErrorEventWithoutLeakingItsName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "named error followed by unnamed data",
+			body: "event: error\ndata: {\"message\":\"upstream rejected input\"}\n\ndata: next\n\ndata: [DONE]\n\n",
+			want: []string{`error:{"message":"upstream rejected input"}`, ":next"},
+		},
+		{
+			name: "error event without a payload",
+			body: "event: error\n\ndata: [DONE]\n\n",
+			want: []string{"error:"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, response, info := setupStreamTest(t, strings.NewReader(tc.body))
+			info.DisablePing = true
+			var got []string
+			StreamScannerHandler(ctx, response, info, func(data string, result *StreamResult) {
+				got = append(got, result.Event+":"+data)
+			})
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 func TestStreamScannerHandler_1000Chunks(t *testing.T) {
 	t.Parallel()
 

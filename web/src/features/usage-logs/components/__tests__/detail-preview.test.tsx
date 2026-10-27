@@ -23,6 +23,7 @@ import {
   useReactTable,
 } from '@tanstack/react-table'
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { createInstance } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
 import { afterAll, afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -78,16 +79,23 @@ function DetailPreview(props: {
   other: LogOtherData
   isAdmin: boolean
   type?: number
+  columnId?: string
+  quota?: number
 }) {
   const table = useReactTable({
-    data: [makeLog(props.other, props.type)],
+    data: [
+      {
+        ...makeLog(props.other, props.type),
+        quota: props.quota ?? 5000,
+      },
+    ],
     columns: useCommonLogsColumns(props.isAdmin, false),
     getCoreRowModel: getCoreRowModel(),
   })
   const cell = table
     .getRowModel()
     .rows[0].getAllCells()
-    .find((item) => item.column.id === 'content')
+    .find((item) => item.column.id === (props.columnId ?? 'content'))
   if (!cell) throw new Error('The log must have a content column')
   return flexRender(cell.column.columnDef.cell, cell.getContext())
 }
@@ -131,6 +139,133 @@ function renderPreview(other: LogOtherData, isAdmin = true, type?: number) {
   )
   return screen.getByRole('button', { name: /./ })
 }
+
+test('opens an uncharged stream failure from its error marker with the keyboard', async () => {
+  const user = userEvent.setup()
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <DetailPreview
+          columnId='created_at'
+          quota={0}
+          type={5}
+          isAdmin={false}
+          other={{
+            stream_failure: {
+              code: 'context_length_exceeded',
+              type: 'invalid_request_error',
+              message: 'The input exceeds the upstream context limit.',
+              no_charge: true,
+              usage_source: 'none',
+              has_output: false,
+            },
+          }}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+
+  const marker = screen.getByRole('button', { name: 'Error · Not charged' })
+  expect(marker).toHaveAttribute('aria-haspopup', 'dialog')
+  marker.focus()
+  await user.keyboard('{Enter}')
+  const dialog = await screen.findByRole('dialog')
+  expect(within(dialog).getByText('Error Details')).toBeVisible()
+  expect(within(dialog).getByText('context_length_exceeded')).toBeVisible()
+  expect(
+    within(dialog).getByText('The input exceeds the upstream context limit.')
+  ).toBeVisible()
+  expect(within(dialog).getByText('Not charged')).toBeVisible()
+  await user.keyboard('{Escape}')
+  expect(marker).toHaveFocus()
+})
+
+test.each([
+  { quota: 5000, noCharge: false },
+  { quota: 0, noCharge: false },
+  { quota: 5000, noCharge: true },
+])(
+  'does not label a stream failure as uncharged without a zero quota and explicit marker ($quota / $noCharge)',
+  ({ quota, noCharge }) => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <DetailPreview
+            columnId='created_at'
+            quota={quota}
+            isAdmin
+            other={{
+              stream_failure: {
+                code: 'upstream_stream_error',
+                type: 'upstream_error',
+                message: 'The stream failed after producing output.',
+                no_charge: noCharge,
+                has_output: true,
+              },
+            }}
+          />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    expect(screen.getByRole('button', { name: 'Error' })).toBeVisible()
+    expect(screen.queryByText(/Not charged/)).not.toBeInTheDocument()
+  }
+)
+
+test('localizes the stream failure interface while preserving the upstream diagnostic text', async () => {
+  const message =
+    'Provider error {{context}} $t(Error) <script>details</script>'
+  i18n.addResourceBundle('zh', 'translation', zh.translation)
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <DetailPreview
+          columnId='created_at'
+          quota={0}
+          type={5}
+          isAdmin={false}
+          other={{
+            stream_failure: {
+              code: 'upstream_stream_error',
+              type: 'upstream_error',
+              message,
+              no_charge: true,
+            },
+          }}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(
+    screen.getByRole('button', { name: 'Error · Not charged' })
+  ).toBeVisible()
+  await act(() => i18n.changeLanguage('zh'))
+  fireEvent.click(screen.getByRole('button', { name: '错误 · 不计费' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(within(dialog).getByText('错误详情')).toBeVisible()
+  expect(within(dialog).getByText('不计费')).toBeVisible()
+  expect(within(dialog).getByText(message)).toBeVisible()
+  expect(dialog.querySelector('script')).toBeNull()
+})
+
+test.each([
+  { type: 2, label: 'Consume' },
+  { type: 5, label: 'Error' },
+])(
+  'does not reinterpret a historical zero-output $label log as an uncharged error',
+  ({ type, label }) => {
+    render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <DetailPreview columnId='created_at' type={type} isAdmin other={{}} />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    expect(screen.getByText(label)).toBeVisible()
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Not charged/)).not.toBeInTheDocument()
+  }
+)
 
 test('keeps log details open when the parent refreshes with unchanged data', async () => {
   const other = { model_price: 0.25 }

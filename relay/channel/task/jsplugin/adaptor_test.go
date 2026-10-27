@@ -1452,6 +1452,7 @@ export function extractUsageOnComplete() { return {units: 3.5}; }
 		require.NoError(t, err)
 		assert.Equal(t, 5000, result.TotalTokens)
 		assert.EqualValues(t, 5000, result.UsageFacts["upstreamUnits"])
+		assert.Nil(t, result.PerformanceOutputTokens, "legacy upstream billing units are not output-token telemetry")
 	})
 
 	t.Run("invalid post-submit adjustment is discarded before recalculation", func(t *testing.T) {
@@ -1500,22 +1501,50 @@ export function extractUsage(ctx) {
 }
 
 func TestTaskAdaptorAcceptsNormalizedLegacyTokenCounters(t *testing.T) {
-	source := `
-export const meta = {apiVersion:1,key:"normalized-tokens",name:"Normalized Tokens",version:"1.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task"};
+	for _, spec := range []struct {
+		name, schema string
+		credit       bool
+	}{
+		{name: "legacy token counters"},
+		{name: "credit counters", schema: `,usageSchema:{units:{type:"number",unit:"credit",description:{en:"Credit unit price",zh:"额度单位单价"}}}`, credit: true},
+	} {
+		t.Run(spec.name, func(t *testing.T) {
+			source := `
+export const meta = {apiVersion:1,key:"normalized-tokens",name:"Normalized Tokens",version:"1.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task"` + spec.schema + `};
 export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/submit"}; }
 export function parseSubmitResponse() { return {taskId: "task"}; }
 export function buildQueryRequest(ctx) { return {url: ctx.baseUrl + "/query"}; }
 export function parseTaskResult(ctx, body) { return {status: "SUCCESS", completionTokens: body.completion, totalTokens: body.total}; }
 `
-	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
-	require.NoError(t, err)
-	adaptor := New(plugin)
-
-	result, err := adaptor.ParseTaskResult(&model.Task{}, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, []byte(`{"completion":13,"total":17}`))
-	require.NoError(t, err)
-	assert.Equal(t, 13, result.CompletionTokens)
-	assert.Equal(t, 17, result.TotalTokens)
-	assert.Nil(t, result.UsageFacts)
+			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+			require.NoError(t, err)
+			adaptor := New(plugin)
+			for _, tc := range []struct {
+				name, body        string
+				completion, total int
+				known             bool
+			}{
+				{"different output and total", `{"completion":13,"total":17}`, 13, 17, true},
+				{"only total", `{"total":17}`, 0, 17, false},
+				{"explicit zero output", `{"completion":0,"total":17}`, 0, 17, true},
+				{"invalid negative output", `{"completion":-1,"total":17}`, 0, 17, false},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					result, err := adaptor.ParseTaskResult(&model.Task{}, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, []byte(tc.body))
+					require.NoError(t, err)
+					assert.Equal(t, tc.completion, result.CompletionTokens, "billing counters retain their existing meaning")
+					assert.Equal(t, tc.total, result.TotalTokens)
+					assert.Nil(t, result.UsageFacts)
+					if tc.known && !spec.credit {
+						require.NotNil(t, result.PerformanceOutputTokens)
+						assert.Equal(t, int64(tc.completion), *result.PerformanceOutputTokens)
+					} else {
+						assert.Nil(t, result.PerformanceOutputTokens, "missing output and billing credits are not output tokens")
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestSubmitContextExposesOriginTasks(t *testing.T) {

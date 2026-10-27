@@ -97,6 +97,43 @@ function renderLogs(props: Parameters<typeof Fixture>[0] = {}) {
   )
 }
 
+it('opens uncharged stream failure details from the mobile error marker', async () => {
+  const user = userEvent.setup()
+  renderLogs({
+    logs: [
+      {
+        ...log,
+        type: 5,
+        quota: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        is_stream: true,
+        other: JSON.stringify({
+          stream_failure: {
+            code: 'empty_stream',
+            type: 'upstream_error',
+            message: 'The upstream stream ended without usage or output.',
+            no_charge: true,
+            usage_source: 'none',
+            has_output: false,
+          },
+        }),
+      },
+    ],
+  })
+  const marker = screen.getByRole('button', { name: 'Error · Not charged' })
+  expect(marker).toHaveAttribute('aria-expanded', 'false')
+  await user.click(marker)
+  const dialog = await screen.findByRole('dialog')
+  expect(within(dialog).getByText('empty_stream')).toBeVisible()
+  expect(
+    within(dialog).getByText(
+      'The upstream stream ended without usage or output.'
+    )
+  ).toBeVisible()
+  expect(within(dialog).getByText('Not charged')).toBeVisible()
+})
+
 it('shows model mismatch evidence when tapping the mobile model badge', async () => {
   const user = userEvent.setup()
   renderLogs({

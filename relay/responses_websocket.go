@@ -126,6 +126,7 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: client, runner: runner,
 		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
+	unregisterShutdown := registerResponsesShutdown(s)
 	if s.requestID == "" {
 		s.requestID = common.NewRequestId()
 	}
@@ -139,11 +140,18 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 		// Gorilla already answered a client close frame, so this tells the upstream.
 		s.shutdown(websocket.CloseNormalClosure, "")
 		s.workers.Wait()
+		unregisterShutdown()
 	}()
 
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		_, message, err := client.ReadMessage()
 		if err != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
 			return nil
 		}
 		envelope, streamID, err := parseResponsesWSEnvelope(message)
@@ -254,7 +262,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
 		service.FinishSchedulingAttempt(c, info, apiErr)
-		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
+		perfmetrics.RecordRelayOutcome(c.Request.Context(), info, service.FinalRelayOutcome(c, info, apiErr))
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
 		// so neither policy record belongs here.

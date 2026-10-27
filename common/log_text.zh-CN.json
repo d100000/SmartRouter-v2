@@ -727,6 +727,8 @@
   "stream ended: %s": "流式响应结束: %s",
   "stream ended: %s, received=%d": "流式响应结束: %s, received=%d",
   "stream event error: %v %v": "流事件报错: %v %v",
+  "stream failure recorded: code=%s no_charge=%t usage_source=%s has_output=%t message=%s": "已记录流式请求错误: code=%s 不计费=%t 用量来源=%s 有效输出=%t 错误=%s",
+  "stream request failed: code=%s, no_charge=%t, actual_usage=%t, effective_output=%t, message=%s": "流式请求失败: code=%s, 不计费=%t, 真实用量=%t, 有效输出=%t, 错误=%s",
   "stream scanner data: %s": "收到流数据: %s",
   "streaming timeout seconds: %d": "流式超时: %d 秒",
   "stripe topup": "Stripe 充值",

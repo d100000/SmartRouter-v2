@@ -163,8 +163,7 @@ func processCompletionsStreamResponse(streamResponse dto.CompletionsStreamRespon
 }
 
 func handleLastResponse(lastStreamData string, responseId *string, createAt *int64,
-	systemFingerprint *string, model *string, usage **dto.Usage,
-	containStreamUsage *bool, info *relaycommon.RelayInfo,
+	systemFingerprint *string, model *string, info *relaycommon.RelayInfo,
 	shouldSendLastResp *bool) error {
 
 	var lastStreamResponse dto.ChatCompletionsStreamResponse
@@ -178,8 +177,6 @@ func handleLastResponse(lastStreamData string, responseId *string, createAt *int
 	*model = lastStreamResponse.Model
 
 	if service.ValidUsage(lastStreamResponse.Usage) {
-		*containStreamUsage = true
-		*usage = dto.MergeUsageNonZero(*usage, lastStreamResponse.Usage)
 		if !info.ShouldIncludeUsage {
 			*shouldSendLastResp = lo.SomeBy(lastStreamResponse.Choices, func(choice dto.ChatCompletionsStreamResponseChoice) bool {
 				return choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != ""

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,6 +21,7 @@ type PerfMetric struct {
 	TtftCount      int64  `json:"-" gorm:"default:0"`
 	OutputTokens   int64  `json:"-" gorm:"default:0"`
 	GenerationMs   int64  `json:"-" gorm:"default:0"`
+	LastSampleAt   int64  `json:"-" gorm:"default:0;index:idx_perf_last_sample"`
 }
 
 func (PerfMetric) TableName() string {
@@ -27,10 +29,14 @@ func (PerfMetric) TableName() string {
 }
 
 func UpsertPerfMetric(metric *PerfMetric) error {
+	return upsertPerfMetric(DB, metric)
+}
+
+func upsertPerfMetric(db *gorm.DB, metric *PerfMetric) error {
 	if metric == nil || metric.RequestCount == 0 {
 		return nil
 	}
-	return DB.Clauses(clause.OnConflict{
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "model_name"},
 			{Name: "group"},
@@ -44,6 +50,7 @@ func UpsertPerfMetric(metric *PerfMetric) error {
 			"ttft_count":       gorm.Expr("perf_metrics.ttft_count + ?", metric.TtftCount),
 			"output_tokens":    gorm.Expr("perf_metrics.output_tokens + ?", metric.OutputTokens),
 			"generation_ms":    gorm.Expr("perf_metrics.generation_ms + ?", metric.GenerationMs),
+			"last_sample_at":   gorm.Expr("CASE WHEN ? > ? THEN ? ELSE ? END", clause.Column{Table: metric.TableName(), Name: "last_sample_at"}, metric.LastSampleAt, clause.Column{Table: metric.TableName(), Name: "last_sample_at"}, metric.LastSampleAt),
 		}),
 	}).Create(metric).Error
 }
@@ -165,10 +172,14 @@ func GetRecentPerfMetricSuccessBucketsAll(modelNames []string, startTs int64, en
 }
 
 func DeletePerfMetricsBefore(cutoffTs int64) error {
+	return DeletePerfMetricsBeforeContext(context.Background(), cutoffTs)
+}
+
+func DeletePerfMetricsBeforeContext(ctx context.Context, cutoffTs int64) error {
 	if cutoffTs <= 0 {
 		return nil
 	}
-	return DB.Where("bucket_ts < ?", cutoffTs).Delete(&PerfMetric{}).Error
+	return DB.WithContext(ctx).Where("bucket_ts < ?", cutoffTs).Delete(&PerfMetric{}).Error
 }
 
 func PerfMetricStartTime(hours int) int64 {

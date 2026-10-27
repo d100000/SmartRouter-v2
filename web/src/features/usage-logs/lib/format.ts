@@ -170,6 +170,13 @@ export function parseLogOther(other: string): LogOtherData | null {
   }
 }
 
+export function isUnchargedStreamFailure(
+  log: UsageLog,
+  other: LogOtherData | null
+): boolean {
+  return other?.stream_failure?.no_charge === true && log.quota === 0
+}
+
 export function getReasoningEffortVariant(
   effort: string | undefined
 ): StatusBadgeProps['variant'] {

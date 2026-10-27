@@ -2,6 +2,7 @@ package claude
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -94,7 +96,17 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		if len(claudeError.Type) > 128 {
+			claudeError.Type = "upstream_error"
+		}
+		for _, ch := range claudeError.Type {
+			if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '.' {
+				continue
+			}
+			claudeError.Type = "upstream_error"
+			break
+		}
+		return types.WithClaudeError(*claudeError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
 	}
 	if claudeResponse.Type == "message_start" && claudeResponse.Message != nil {
 		info.ObserveResponseModel(claudeResponse.Message.Model)
@@ -340,13 +352,76 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		Usage:        &dto.Usage{},
 	}
 	var err *types.NewAPIError
+	var hasMediaOutput bool
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		var frame dto.ClaudeResponse
+		if common.UnmarshalJsonStr(data, &frame) == nil {
+			upstreamError := frame.GetClaudeError()
+			if (frame.Type == "error" || strings.EqualFold(sr.Event, "error") || frame.Error != nil) && (upstreamError == nil || upstreamError.Type == "") {
+				message := i18n.T(c, i18n.MsgRelayStreamUpstreamError)
+				if upstreamError != nil && strings.TrimSpace(upstreamError.Message) != "" {
+					message = common.MaskSensitiveInfo(upstreamError.Message, common.UpstreamAddresses(c)...)
+				}
+				if len(message) > common.LocalLogContentLimit {
+					message = strings.ToValidUTF8(message[:common.LocalLogContentLimit], "")
+				}
+				err = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+				sr.Stop(err)
+				return
+			}
+		}
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
+			message := err.MaskSensitiveError(common.UpstreamAddresses(c)...)
+			if len(message) > common.LocalLogContentLimit {
+				message = strings.ToValidUTF8(message[:common.LocalLogContentLimit], "")
+			}
+			err.SetMessage(message)
+			types.ErrOptionWithSkipRetry()(err)
 			sr.Stop(err)
+			return
+		}
+		for _, block := range []*dto.ClaudeMediaMessage{frame.ContentBlock, frame.Delta} {
+			if block == nil {
+				continue
+			}
+			hasMediaOutput = hasMediaOutput || strings.TrimSpace(block.GetText()+block.Data) != ""
+			if block.Thinking != nil && strings.TrimSpace(*block.Thinking) != "" {
+				hasMediaOutput = true
+			}
+			if block.Source != nil {
+				data, _ := block.Source.Data.(string)
+				hasMediaOutput = hasMediaOutput || strings.TrimSpace(data+block.Source.Url) != ""
+			}
 		}
 	})
 	info.StreamStatus.RequireTerminal()
+	actualUsage := claudeInfo.Usage
+	if canonical, ok := actualUsage.BillingUsage.CanonicalUsage(); ok {
+		actualUsage = canonical
+	}
+	hasActualUsage := dto.HasOpenAIUsageTokens(dto.MergeUsageNonZero(nil, actualUsage)) &&
+		(claudeInfo.Usage.BillingUsage == nil || !claudeInfo.Usage.BillingUsage.Estimated)
+	hasOutput := hasMediaOutput || strings.TrimSpace(claudeInfo.ResponseText.String()) != ""
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	failure := err
+	if failure == nil && (!info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors() ||
+		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
+		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	if failure == nil && !hasActualUsage && !hasOutput {
+		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	if failure != nil {
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasOutput, NoCharge: !hasActualUsage && !hasOutput}
+		info.StreamStatus.MarkFailed(string(failure.GetErrorCode()), failure.ToOpenAIError().Type, failure.StatusCode)
+		if !info.StreamStatus.HasErrors() {
+			info.StreamStatus.RecordError(failure.Error())
+		}
+		if info.StreamFailure.NoCharge {
+			return nil, failure
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

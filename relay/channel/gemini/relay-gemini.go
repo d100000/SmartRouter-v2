@@ -12,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -205,12 +206,32 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	var usage = &dto.Usage{}
 	var imageCount int
 	var hasBillableUsageMetadata bool
+	var hasEffectiveOutput bool
 	var streamErr error
 	var accumulatedUsageMetadata *dto.GeminiUsageMetadata
 	var grounding geminiGroundingCounter
 	responseText := strings.Builder{}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		upstreamError := gjson.Get(data, "error")
+		if upstreamError.Exists() && upstreamError.Type != gjson.Null && upstreamError.Type != gjson.False || strings.EqualFold(sr.Event, "error") {
+			message := i18n.T(c, i18n.MsgRelayStreamUpstreamError)
+			if detail := upstreamError.Get("message"); detail.Type == gjson.String && strings.TrimSpace(detail.Str) != "" {
+				message = common.MaskSensitiveInfo(detail.Str, common.UpstreamAddresses(c)...)
+			} else if upstreamError.Type == gjson.String && strings.TrimSpace(upstreamError.Str) != "" {
+				message = common.MaskSensitiveInfo(upstreamError.Str, common.UpstreamAddresses(c)...)
+			}
+			if len(message) > common.LocalLogContentLimit {
+				message = strings.ToValidUTF8(message[:common.LocalLogContentLimit], "")
+			}
+			status := upstreamError.Get("code").Int()
+			if status < http.StatusBadRequest || status > 599 {
+				status = http.StatusBadGateway
+			}
+			streamErr = types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponse, int(status), types.ErrOptionWithSkipRetry())
+			sr.Stop(streamErr)
+			return
+		}
 		var geminiResponse dto.GeminiChatResponse
 		if err := common.UnmarshalJsonStr(data, &geminiResponse); err != nil {
 			streamErr = fmt.Errorf("unmarshal Gemini stream response: %w", err)
@@ -242,6 +263,14 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		// 统计图片数量
 		for _, candidate := range geminiResponse.Candidates {
 			for _, part := range candidate.Content.Parts {
+				hasEffectiveOutput = hasEffectiveOutput || strings.TrimSpace(part.Text) != ""
+				if part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.FunctionName) != "" ||
+					part.InlineData != nil && strings.TrimSpace(part.InlineData.Data) != "" ||
+					part.FileData != nil && strings.TrimSpace(part.FileData.FileUri) != "" ||
+					part.ExecutableCode != nil && strings.TrimSpace(part.ExecutableCode.Code) != "" ||
+					part.CodeExecutionResult != nil && strings.TrimSpace(part.CodeExecutionResult.Output) != "" {
+					hasEffectiveOutput = true
+				}
 				if part.InlineData != nil && part.InlineData.MimeType != "" {
 					imageCount++
 				}
@@ -267,6 +296,35 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 	})
 	info.StreamStatus.RequireTerminal()
+	observedUsage := buildUsageFromGeminiMetadata(accumulatedUsageMetadata, 0)
+	if canonical, ok := observedUsage.BillingUsage.CanonicalUsage(); ok {
+		observedUsage = *canonical
+	}
+	hasActualUsage := dto.HasOpenAIUsageTokens(dto.MergeUsageNonZero(nil, &observedUsage)) &&
+		(accumulatedUsageMetadata == nil || accumulatedUsageMetadata.BillingUsage == nil || !accumulatedUsageMetadata.BillingUsage.Estimated)
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	var failure *types.NewAPIError
+	if streamErr != nil && !errors.As(streamErr, &failure) {
+		failure = types.NewOpenAIError(streamErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+	}
+	if failure == nil && (!info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors() ||
+		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
+		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	if failure == nil && !hasActualUsage && !hasEffectiveOutput {
+		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	if failure != nil {
+		types.ErrOptionWithSkipRetry()(failure)
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasEffectiveOutput, NoCharge: !hasActualUsage && !hasEffectiveOutput}
+		info.StreamStatus.MarkFailed(string(failure.GetErrorCode()), failure.ToOpenAIError().Type, failure.StatusCode)
+		if !info.StreamStatus.HasErrors() {
+			info.StreamStatus.RecordError(failure.Error())
+		}
+		if info.StreamFailure.NoCharge {
+			return nil, failure
+		}
+	}
 
 	if !hasBillableUsageMetadata {
 		if info.ReceivedResponseCount > 0 {
@@ -285,7 +343,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 
 	if streamErr != nil {
-		return usage, types.NewOpenAIError(streamErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		return usage, failure
 	}
 	if info.StreamStatus != nil && !info.StreamStatus.IsNormalEnd() {
 		logger.LogWarn(c, common.LogText("Gemini stream ended unexpectedly: %s", info.StreamStatus.Summary()))

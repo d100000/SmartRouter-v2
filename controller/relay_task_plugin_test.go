@@ -242,12 +242,13 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 // retrieval depend on it.
 func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 	retainFalse := false
+	zero := int64(0)
 	for _, tc := range []struct {
 		name          string
 		immediate     *relaycommon.TaskInfo
 		wantDiscarded bool
 	}{
-		{"immediate success is discarded", &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%"}, true},
+		{"immediate success is discarded", &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%", PerformanceOutputTokens: &zero}, true},
 		{"immediate failure is discarded", &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "rejected"}, true},
 		{"asynchronous result is retained", nil, false},
 	} {
@@ -268,6 +269,7 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 				Route:  pluginruntime.Route{Method: http.MethodPost, Path: "/sync/images", Type: pluginruntime.RouteTypeSubmit, RetainResult: &retainFalse},
 			})
 			info := taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &events})
+			info.StartTime = time.Now().Add(-3 * time.Second)
 			upstream := []byte(`{"data":[{"url":"https://cdn.example/a.png"}]}`)
 
 			outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
@@ -287,6 +289,11 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 			var stored model.Task
 			require.NoError(t, database.Where("task_id = ?", "task_public").First(&stored).Error)
 			assert.Equal(t, tc.wantDiscarded, stored.PrivateData.ResultDiscarded)
+			assert.Equal(t, tc.immediate != nil, stored.PerformanceSamplePending, "immediate terminal telemetry survives the submission request")
+			if tc.immediate != nil {
+				assert.Equal(t, tc.immediate.PerformanceOutputTokens, stored.PrivateData.PerformanceOutputTokens)
+				assert.Equal(t, info.StartTime.Unix(), stored.SubmitTime, "immediate latency includes the upstream operation before task insertion")
+			}
 			var nullCount int64
 			require.NoError(t, database.Model(&model.Task{}).Where("task_id = ? AND data IS NULL", "task_public").Count(&nullCount).Error)
 			if tc.wantDiscarded {
