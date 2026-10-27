@@ -219,20 +219,18 @@ func QuerySummaryAll(hours int, groups []string, recentModels ...string) (Summar
 
 	recentBuckets := make(map[string]map[int64]counters, len(recentModels))
 	for _, name := range recentModels {
-		if name == "" {
-			continue
+		if name != "" {
+			recentBuckets[name] = map[int64]counters{}
 		}
-		if _, exists := recentBuckets[name]; exists {
-			continue
-		}
-		recentBuckets[name] = map[int64]counters{}
-		buckets, err := model.GetRecentPerfMetricSuccessBuckets(name, recentStartTs, endTs, groups, recentSuccessSampleLimit)
+	}
+	if len(recentBuckets) > 0 {
+		buckets, err := model.GetRecentPerfMetricSuccessBucketsAll(recentModels, recentStartTs, endTs, groups, recentSuccessSampleLimit)
 		if err != nil {
 			return SummaryAllResult{}, err
 		}
 		for _, bucket := range buckets {
 			queryStartTs = min(queryStartTs, bucket.BucketTs)
-			mergeModelBucket(recentBuckets, name, bucket.BucketTs, counters{
+			mergeModelBucket(recentBuckets, bucket.ModelName, bucket.BucketTs, counters{
 				requestCount: bucket.RequestCount,
 				successCount: bucket.SuccessCount,
 			})
