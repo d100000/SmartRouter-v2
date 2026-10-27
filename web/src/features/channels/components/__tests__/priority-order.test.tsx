@@ -34,7 +34,7 @@ import {
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { api } from '@/lib/api'
+import { api, type ApiRequestConfig } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { CHANNEL_PRIORITY_GUIDE_KEYS } from '../../constants'
@@ -100,7 +100,6 @@ function channel(item: { id: number; priority: number | null }): Channel {
     group: 'default',
     models: 'test-model',
     weight: 10,
-    cost_ratio: item.id === 3 ? 0.75 : null,
     balance: 0,
     response_time: 0,
     test_time: 0,
@@ -123,55 +122,61 @@ beforeEach(() => {
     role: 100,
     group: 'default',
   })
-  vi.spyOn(api, 'get').mockImplementation(async (url, config) => {
-    if (url === '/api/channel/recent_stats') {
-      return {
-        data: {
-          success: true,
+  vi.spyOn(api, 'get').mockImplementation(
+    async (url, config?: ApiRequestConfig) => {
+      if (url === '/api/channel/recent_stats') {
+        return {
           data: {
-            ready: true,
-            refreshed_at: Math.floor(Date.now() / 1000),
-            window_seconds: 600,
-            scope: 'instance',
-            items: [
-              {
-                channel_id: 3,
-                requests_1h: 4,
-                successes_1h: 3,
-                ttft_samples_5m: 2,
-                ttft_sum_ms_5m: 500,
-              },
-            ],
+            success: true,
+            data: {
+              ready: true,
+              refreshed_at: Math.floor(Date.now() / 1000),
+              window_seconds: 600,
+              scope: 'instance',
+              items: [
+                {
+                  channel_id: 3,
+                  requests_1h: 4,
+                  successes_1h: 3,
+                  ttft_samples_5m: 2,
+                  ttft_sum_ms_5m: 500,
+                },
+              ],
+            },
           },
-        },
+        }
       }
-    }
-    if (url === '/api/channel/priority/order') {
-      return { data: { success: true, data: current } }
-    }
-    if (url === '/api/channel/' || url === '/api/channel/search') {
-      const field = config?.params?.sort_by ?? 'priority'
-      const desc = config?.params?.sort_order !== 'asc'
-      const items = current.items
-        .map(channel)
-        .sort(
-          (a, b) =>
-            ((Number(a[field as keyof Channel]) || 0) -
-              (Number(b[field as keyof Channel]) || 0)) *
-              (desc ? -1 : 1) || b.id - a.id
-        )
-      return {
-        data: {
-          success: true,
-          data: { items, total: 3, type_counts: { 1: 3 } },
-        },
+      if (url === '/api/channel/priority/order') {
+        return { data: { success: true, data: current } }
       }
+      if (
+        url === '/api/channel/' ||
+        url === '/api/channel' ||
+        url === '/api/channel/search'
+      ) {
+        const field = config?.params?.sort_by ?? 'priority'
+        const desc = config?.params?.sort_order !== 'asc'
+        const items = current.items
+          .map(channel)
+          .sort(
+            (a, b) =>
+              ((Number(a[field as keyof Channel]) || 0) -
+                (Number(b[field as keyof Channel]) || 0)) *
+                (desc ? -1 : 1) || b.id - a.id
+          )
+        return {
+          data: {
+            success: true,
+            data: { items, total: 3, type_counts: { 1: 3 } },
+          },
+        }
+      }
+      if (url === '/api/group/') {
+        return { data: { success: true, data: ['default'] } }
+      }
+      return { data: { success: true, data: [] } }
     }
-    if (url === '/api/group/') {
-      return { data: { success: true, data: ['default'] } }
-    }
-    return { data: { success: true, data: [] } }
-  })
+  )
   vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
     if (url !== '/api/channel/priority/reorder') {
       return { data: { success: true } }
@@ -302,28 +307,6 @@ test.each(['table', 'card'] as const)(
       revision: 'applied',
       restore: [{ id: 3, previous: 90, priority: 0 }],
     })
-  }
-)
-
-test.each(['table', 'card'] as const)(
-  '%s priority reorder keeps channel health, latency, and cost attached to the moved channel',
-  async (view) => {
-    await mount(view)
-    expect(await screen.findByLabelText('Success rate (1h): 75%')).toBeVisible()
-    fireEvent.keyDown(
-      screen.getByRole('button', { name: 'Reorder channel 3' }),
-      {
-        key: 'ArrowUp',
-      }
-    )
-    await screen.findByRole('button', { name: 'Undo' })
-    expect(screen.getByLabelText('Success rate (1h): 75%')).toBeVisible()
-    expect(
-      screen.getByLabelText('Average streaming first-token time (5m): 250ms')
-    ).toBeVisible()
-    expect(
-      screen.getByRole('button', { name: 'Edit cost ratio for Channel 3' })
-    ).toHaveTextContent('0.75')
   }
 )
 

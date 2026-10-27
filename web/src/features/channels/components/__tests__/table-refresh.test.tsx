@@ -207,7 +207,8 @@ it('fetches fresh statistics when refresh changes the page back to a recently ca
     get.mock.calls.filter(
       ([url, config]) =>
         url === '/api/channel/recent_stats' &&
-        config?.params?.channel_ids === '3'
+        (config?.params as { channel_ids?: string } | undefined)
+          ?.channel_ids === '3'
     )
   await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'false'))
   expect(originalScopeRequests()).toHaveLength(1)

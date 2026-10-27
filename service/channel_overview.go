@@ -183,7 +183,7 @@ func captureOverviewCacheUsage(snapshot *relaycommon.OverviewBillingSnapshot, in
 	}
 	input, read := int64(usage.PromptTokens), int64(usage.PromptTokensDetails.CachedTokens)
 	creation := usage.PromptTokensDetails
-	for _, count := range []int{usage.PromptTokens, creation.CachedTokens, creation.CachedCreationTokens, creation.CacheWriteTokens, usage.ClaudeCacheCreation5mTokens, usage.ClaudeCacheCreation1hTokens} {
+	for _, count := range []int{usage.PromptTokens, creation.CachedTokens, creation.CachedCreationTokens, creation.CacheWriteTokens, creation.CacheCreationInputTokens, usage.ClaudeCacheCreation5mTokens, usage.ClaudeCacheCreation1hTokens} {
 		if count < 0 || int64(count) > int64(common.MaxQuota) {
 			return
 		}

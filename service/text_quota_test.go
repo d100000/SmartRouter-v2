@@ -171,6 +171,8 @@ func TestOverviewCacheUsagePreservesNativeCounts(t *testing.T) {
 		{name: "missing usage is unknown"},
 		{name: "empty usage is unknown", usage: &dto.Usage{}},
 		{name: "negative cache is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: -1}}},
+		{name: "negative cache creation alias is unknown even with a valid legacy count", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedCreationTokens: 10, CacheCreationInputTokens: -1}}},
+		{name: "oversized cache creation alias is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CacheCreationInputTokens: int(common.MaxQuota) + 1}}},
 		{name: "read exceeding total is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 1001}}},
 		{name: "oversized input is unknown", usage: &dto.Usage{PromptTokens: int(common.MaxQuota) + 1}},
 		{name: "negative TTL count is unknown", usage: &dto.Usage{PromptTokens: 1000, PromptTokensDetails: dto.InputTokenDetails{CacheWriteTokens: 10, CacheWriteTokensDetails: &dto.CacheWriteTokenDetails{TTL12hTokens: -1}}}},
@@ -1180,6 +1182,101 @@ func TestCalculateTextQuotaSummaryBillsOpenAICacheWriteTokens(t *testing.T) {
 		// max(3619-2921-3616, 0) + 2921*0.1 + 3616*1.25 + 36*2 = 4884.1 => 4884
 		require.Equal(t, 4884, summary.Quota)
 	})
+}
+
+func TestCalculateTextQuotaSummaryBillsCacheCreationInputTokens(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+
+	relayInfo := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatOpenAI,
+		OriginModelName: "cache-creation-input",
+		PriceData: hosttypes.PriceData{
+			ModelRatio:         1,
+			CompletionRatio:    1,
+			CacheRatio:         0.1,
+			CacheCreationRatio: 1.25,
+			GroupRatioInfo:     hosttypes.GroupRatioInfo{GroupRatio: 1},
+		},
+		StartTime: time.Now(),
+	}
+
+	t.Run("creation tokens billed at creation ratio", func(t *testing.T) {
+		var usage dto.Usage
+		require.NoError(t, common.Unmarshal([]byte(`{"prompt_tokens":1510,"completion_tokens":20,"total_tokens":1530,"prompt_tokens_details":{"cached_tokens":1200,"cache_creation_input_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":300}}}`), &usage))
+		summary := calculateTextQuotaSummary(ctx, relayInfo, &usage)
+
+		assert.Equal(t, 1510, summary.PromptTokens)
+		assert.Equal(t, 1200, summary.CacheTokens)
+		assert.Equal(t, 300, summary.CacheCreationTokens)
+		assert.Zero(t, summary.CacheCreationTokens5m)
+		assert.Zero(t, summary.CacheCreationTokens1h)
+		// (1510-1200-300) + 1200*0.1 + 300*1.25 + 20 = 525
+		assert.Equal(t, 525, summary.Quota)
+	})
+
+	t.Run("missing creation field stays in prompt price", func(t *testing.T) {
+		var usage dto.Usage
+		require.NoError(t, common.Unmarshal([]byte(`{"prompt_tokens":1510,"completion_tokens":20,"total_tokens":1530,"prompt_tokens_details":{"cached_tokens":1200}}`), &usage))
+		summary := calculateTextQuotaSummary(ctx, relayInfo, &usage)
+
+		assert.Zero(t, summary.CacheCreationTokens)
+		// (1510-1200) + 1200*0.1 + 20 = 450
+		assert.Equal(t, 450, summary.Quota)
+	})
+
+	t.Run("cache write and creation scalar take the larger count", func(t *testing.T) {
+		var usage dto.Usage
+		require.NoError(t, common.Unmarshal([]byte(`{"prompt_tokens":1510,"completion_tokens":20,"total_tokens":1530,"prompt_tokens_details":{"cached_tokens":1200,"cache_write_tokens":100,"cache_creation_input_tokens":300}}`), &usage))
+		summary := calculateTextQuotaSummary(ctx, relayInfo, &usage)
+
+		assert.Equal(t, 300, summary.CacheCreationTokens)
+		assert.Zero(t, summary.CacheCreationTokens5m)
+		assert.Zero(t, summary.CacheCreationTokens1h)
+		assert.Equal(t, 525, summary.Quota)
+	})
+}
+
+func TestPostTextConsumeQuotaPreservesCacheCreationAliasSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "native creation field", body: `{"prompt_tokens":1510,"completion_tokens":20,"total_tokens":1530,"prompt_tokens_details":{"cached_tokens":1200,"cache_creation_input_tokens":300}}`},
+		{name: "overlapping legacy fields do not duplicate writes", body: `{"prompt_tokens":1510,"completion_tokens":20,"total_tokens":1530,"prompt_tokens_details":{"cached_tokens":1200,"cache_write_tokens":100,"cached_creation_tokens":200,"cache_creation_input_tokens":300}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			const userID, channelID = 834, 834
+			seedUser(t, userID, 1_000_000)
+			seedChannel(t, channelID)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{
+				UserId: userID, IsPlayground: true, UserQuota: 1_000_000,
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+				OriginModelName: "cache-alias-snapshot-test", StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAI,
+				PriceData: hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 1, CacheRatio: .1, CacheCreationRatio: 2, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: .8}},
+			}
+			info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: userID}}
+			var usage dto.Usage
+			require.NoError(t, common.Unmarshal([]byte(tc.body), &usage))
+
+			PostTextConsumeQuota(ctx, info, &usage, nil)
+
+			require.NotNil(t, info.AnalyticsBilling)
+			assert.True(t, info.AnalyticsBilling.CacheUsageKnown)
+			assert.EqualValues(t, 1510, info.AnalyticsBilling.CacheInputTokens)
+			assert.EqualValues(t, 1200, info.AnalyticsBilling.CacheReadTokens)
+			assert.EqualValues(t, 300, info.AnalyticsBilling.CacheWriteTokens)
+			assert.True(t, info.AnalyticsBilling.RevenueConfirmed)
+			// The manually selected creation/group ratios remain in force:
+			// ((1510-1200-300) + 1200*.1 + 300*2 + 20) * .8 = 600.
+			assert.EqualValues(t, 600, info.AnalyticsBilling.RevenueQuota)
+			assert.Equal(t, 2.0, info.PriceData.CacheCreationRatio)
+		})
+	}
 }
 
 // OpenAI 12h cache writes bill at twice the write price and keep their own

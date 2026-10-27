@@ -98,16 +98,21 @@ beforeEach(() => {
     limits: { max_days: 90, max_rows: 100 },
     warnings: [],
   }
-  vi.spyOn(api, 'get').mockImplementation(async (_url, config) => ({
-    data: {
-      success: true,
+  vi.spyOn(api, 'get').mockImplementation(async (_url, config) => {
+    const params = config?.params as
+      | { dimension?: OverviewSnapshot['dimension']; days?: number }
+      | undefined
+    return {
       data: {
-        ...snapshot,
-        dimension: config?.params.dimension,
-        days: config?.params.days,
+        success: true,
+        data: {
+          ...snapshot,
+          dimension: params?.dimension,
+          days: params?.days,
+        },
       },
-    },
-  }))
+    }
+  })
 })
 
 afterEach(async () => {
@@ -260,8 +265,10 @@ describe('channel overview contracts', () => {
   test('cache statistics refresh with the current period and selected analysis object', async () => {
     const user = userEvent.setup()
     vi.mocked(api.get).mockImplementation(async (_url, config) => {
-      const selected =
-        config?.params.days === 30 && config?.params.object_id === '42'
+      const params = config?.params as
+        | { days?: number; object_id?: string }
+        | undefined
+      const selected = params?.days === 30 && params?.object_id === '42'
       const cache = {
         ...snapshot.summary,
         cache_hit_rate: selected ? 37.5 : 9.9,

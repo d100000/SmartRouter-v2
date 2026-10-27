@@ -146,17 +146,22 @@ beforeEach(() => {
       },
     ],
   }
-  vi.spyOn(api, 'get').mockImplementation(async (_url, config) => ({
-    data: {
-      success: true,
+  vi.spyOn(api, 'get').mockImplementation(async (_url, config) => {
+    const params = config?.params as
+      | { group?: string; model?: string; stream?: boolean }
+      | undefined
+    return {
       data: {
-        ...snapshot,
-        group: config?.params?.group || snapshot.group,
-        model: config?.params?.model || snapshot.model,
-        stream: config?.params?.stream ?? true,
+        success: true,
+        data: {
+          ...snapshot,
+          group: params?.group || snapshot.group,
+          model: params?.model || snapshot.model,
+          stream: params?.stream ?? true,
+        },
       },
-    },
-  }))
+    }
+  })
   vi.spyOn(api, 'post').mockResolvedValue({ data: { success: true } })
 })
 
