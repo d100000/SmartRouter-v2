@@ -141,6 +141,7 @@ func main() {
 	// Report this process as a system instance so the System Info page can show
 	// all currently alive nodes in multi-instance deployments.
 	service.StartSystemInstanceReporter()
+	service.StartSystemResourceMonitor()
 
 	// Keep channel-list health statistics off the management request path.
 	service.StartChannelRecentStatsTask()

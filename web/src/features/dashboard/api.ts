@@ -17,7 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
+import type {
+  SystemResourceHistory,
+  SystemResourceSnapshot,
+} from './lib/system-resources'
 import type {
   FlowQuotaDataItem,
   QuotaDataItem,
@@ -54,6 +59,32 @@ export async function getUserQuotaDates(
 // ----------------------------------------------------------------------------
 // System Monitoring
 // ----------------------------------------------------------------------------
+
+export async function getSystemResources(
+  signal?: AbortSignal
+): Promise<SystemResourceSnapshot> {
+  const response = await api.get<{
+    success: boolean
+    data: SystemResourceSnapshot
+  }>('/api/performance/resources', { signal, disableDuplicate: true })
+  return requireServerSuccess(response.data).data
+}
+
+export async function getSystemResourceHistory(
+  node: string,
+  hours: number,
+  signal?: AbortSignal
+): Promise<SystemResourceHistory> {
+  const response = await api.get<{
+    success: boolean
+    data: SystemResourceHistory
+  }>('/api/performance/resources/history', {
+    params: { node, hours },
+    signal,
+    disableDuplicate: true,
+  })
+  return requireServerSuccess(response.data).data
+}
 
 export async function getUserQuotaDataByUsers(params: {
   start_timestamp: number

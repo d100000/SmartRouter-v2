@@ -381,6 +381,7 @@ func migrateDB() error {
 		&PerfMetricEvent{},
 		&PerfMetricCollector{},
 		&SystemInstance{},
+		&SystemResourceSample{},
 		&SystemTask{},
 		&SystemTaskLock{},
 		&CasbinRule{},

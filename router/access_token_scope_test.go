@@ -165,6 +165,18 @@ func TestErrorAnalysisRoutesRequireDashboardSession(t *testing.T) {
 	}
 }
 
+func TestSystemResourceRoutesRequireOpsRead(t *testing.T) {
+	engine := newAccessTokenScopeTestEngine(t)
+	for _, path := range []string{"/api/performance/resources", "/api/performance/resources/history"} {
+		rule, exists := middleware.AccessTokenRouteRule("GET " + path)
+		require.True(t, exists)
+		assert.Equal(t, "ops:read", rule.Scope())
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	}
+}
+
 func TestAccessTokenCatalogCoversEveryPermission(t *testing.T) {
 	catalog := service.AccessTokenCatalog(1, common.RoleRootUser)
 	scopes := map[string]bool{}
