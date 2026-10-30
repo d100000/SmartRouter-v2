@@ -295,6 +295,10 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	snapshot := &relaycommon.OverviewBillingSnapshot{
 		InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens), UsageSource: "upstream_realtime",
 	}
+	captureOverviewCacheUsage(snapshot, relayInfo, &dto.Usage{
+		PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens,
+		PromptTokensDetails: usage.InputTokenDetails,
+	}, common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens))
 	if common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens) {
 		snapshot.UsageSource = "local_estimate"
 	}

@@ -401,7 +401,109 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("database: %s", version)
 			runFixedPriceAccountingCases(t, db, logDB)
+			t.Run("audio cache statistics", func(t *testing.T) {
+				runAudioCacheStatisticsCases(t, db, logDB)
+			})
 		})
+	}
+}
+
+func runAudioCacheStatisticsCases(t *testing.T, db, logDB *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.AutoMigrate(&model.QuotaData{}))
+	previousExport, previousLog := common.DataExportEnabled, common.LogConsumeEnabled
+	common.DataExportEnabled, common.LogConsumeEnabled = true, true
+	model.CacheQuotaDataLock.Lock()
+	previousCache := model.CacheQuotaData
+	model.CacheQuotaData = make(map[string]*model.QuotaData)
+	model.CacheQuotaDataLock.Unlock()
+	t.Cleanup(func() {
+		common.DataExportEnabled, common.LogConsumeEnabled = previousExport, previousLog
+		model.CacheQuotaDataLock.Lock()
+		model.CacheQuotaData = previousCache
+		model.CacheQuotaDataLock.Unlock()
+	})
+	for _, realtime := range []bool{false, true} {
+		for _, tc := range []struct {
+			name      string
+			cached    int
+			written   int
+			local     bool
+			estimated bool
+			known     bool
+		}{
+			{name: "measured cache reads and writes", cached: 20, written: 5, known: true},
+			{name: "measured zero cache usage", known: true},
+			{name: "local estimate is excluded", cached: 20, written: 5, local: true},
+			{name: "invalid cache read is excluded", cached: 101, written: 5},
+			{name: "estimated native usage is excluded", cached: 20, written: 5, estimated: true},
+		} {
+			if realtime && tc.estimated {
+				continue // Realtime usage carries its estimate marker on the request context.
+			}
+			t.Run(fmt.Sprintf("realtime=%t/%s", realtime, tc.name), func(t *testing.T) {
+				const userID, channelID = 918, 918
+				require.NoError(t, db.Unscoped().Where("id = ?", userID).Delete(&model.User{}).Error)
+				require.NoError(t, db.Unscoped().Where("id = ?", channelID).Delete(&model.Channel{}).Error)
+				require.NoError(t, db.Where("user_id = ?", userID).Delete(&model.QuotaData{}).Error)
+				require.NoError(t, logDB.Where("user_id = ?", userID).Delete(&model.Log{}).Error)
+				require.NoError(t, db.Create(&model.User{Id: userID, Username: "cache-statistics-audio", Quota: 10000, Status: common.UserStatusEnabled}).Error)
+				seedChannel(t, channelID)
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest("POST", "/v1/audio", nil)
+				common.SetContextKey(ctx, constant.ContextKeyLocalCountTokens, tc.local)
+				info := &relaycommon.RelayInfo{
+					UserId: userID, IsPlayground: true, UserQuota: 10000,
+					ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+					OriginModelName: "cache-statistics-audio", StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAI,
+					PriceData: hosttypes.PriceData{ModelRatio: 1, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
+				}
+				info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: userID}}
+				usage := &dto.Usage{
+					PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120,
+					PromptTokensDetails:    dto.InputTokenDetails{TextTokens: 100, CachedTokens: tc.cached, CacheWriteTokens: tc.written},
+					CompletionTokenDetails: dto.OutputTokenDetails{TextTokens: 20},
+				}
+				if tc.estimated {
+					usage.BillingUsage = dto.NewOpenAIChatBillingUsage(usage)
+					usage.BillingUsage.Estimated = true
+				}
+				if realtime {
+					PostWssConsumeQuota(ctx, info, info.OriginModelName, &dto.RealtimeUsage{
+						InputTokens: 100, OutputTokens: 20, TotalTokens: 120,
+						InputTokenDetails: usage.PromptTokensDetails, OutputTokenDetails: usage.CompletionTokenDetails,
+					}, nil)
+				} else {
+					PostAudioConsumeQuota(ctx, info, usage, nil)
+				}
+				require.NotNil(t, info.AnalyticsBilling)
+				assert.Equal(t, tc.known, info.AnalyticsBilling.CacheUsageKnown)
+				var read, write int64
+				if tc.known {
+					read, write = int64(tc.cached), int64(tc.written)
+					assert.EqualValues(t, 100, info.AnalyticsBilling.CacheInputTokens)
+				}
+				assert.Equal(t, read, info.AnalyticsBilling.CacheReadTokens)
+				assert.Equal(t, write, info.AnalyticsBilling.CacheWriteTokens)
+				var log model.Log
+				require.NoError(t, logDB.Where("user_id = ?", userID).First(&log).Error)
+				assert.Equal(t, 120, log.Quota, "recording cache observations must not change the audio tariff")
+				var other map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+				assert.Equal(t, float64(read), other["cache_tokens"])
+				if write > 0 {
+					assert.Equal(t, float64(write), other["cache_write_tokens"])
+				} else {
+					assert.NotContains(t, other, "cache_write_tokens")
+				}
+				model.SaveQuotaDataCache()
+				var persisted model.QuotaData
+				require.NoError(t, db.Where("user_id = ?", userID).First(&persisted).Error)
+				assert.Equal(t, read, persisted.CacheReadTokens)
+				assert.Equal(t, write, persisted.CacheCreationTokens)
+				assert.Equal(t, 120, persisted.TokenUsed)
+			})
+		}
 	}
 }
 
