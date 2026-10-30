@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -143,6 +145,23 @@ func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 		require.True(t, ok, key)
 		assert.Equal(t, "scope", rule.Kind(), key)
 		assert.Equal(t, service.AccessTokenScopeOf(permission), rule.Scope(), key)
+	}
+}
+
+func TestErrorAnalysisRoutesRequireDashboardSession(t *testing.T) {
+	engine := newAccessTokenScopeTestEngine(t)
+	for _, route := range engine.Routes() {
+		if !strings.HasPrefix(route.Path, "/api/error-analysis") {
+			continue
+		}
+		key := route.Method + " " + route.Path
+		rule, exists := middleware.AccessTokenRouteRule(key)
+		require.True(t, exists)
+		assert.Equal(t, "session", rule.Kind())
+		path := strings.ReplaceAll(route.Path, ":task_id", "not-a-report")
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(route.Method, path, nil))
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code, key)
 	}
 }
 

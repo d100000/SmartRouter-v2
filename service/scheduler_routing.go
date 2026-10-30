@@ -356,6 +356,9 @@ type schedulingResponseWriter struct {
 }
 
 func ObserveSchedulingResponse(c *gin.Context) {
+	if _, exists := c.Get(failureObservationKey); !exists {
+		c.Set(failureObservationKey, &failureOutputObservation{})
+	}
 	if _, ok := c.Writer.(*schedulingResponseWriter); !ok && c.Writer != nil {
 		c.Writer = &schedulingResponseWriter{ResponseWriter: c.Writer, ctx: c}
 	}
@@ -379,6 +382,7 @@ func (w *schedulingResponseWriter) Write(body []byte) (int, error) {
 		state.mu.Unlock()
 	}
 	if n > 0 {
+		observeFailureOutput(w.ctx, body[:n])
 		ObserveSchedulingOutput(w.ctx, body[:n])
 	}
 	return n, err

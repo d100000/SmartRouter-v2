@@ -17,7 +17,7 @@ import (
 func SetApiRouter(router *gin.Engine) {
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
-	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
+	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{`^/api/error-analysis/reports/[^/]+/stream$`})))
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
@@ -350,6 +350,16 @@ func SetApiRouter(router *gin.Engine) {
 		logRoute.GET("/self/export", middleware.UserAuth(), controller.ExportUserLogs)
 		logRoute.GET("/self/search", middleware.UserAuth(), middleware.SearchRateLimit(), controller.SearchUserLogs)
 
+		errorAnalysisRoute := apiRouter.Group("/error-analysis", middleware.AdminAuth(), middleware.DisableCache())
+		{
+			errorAnalysisRoute.GET("", controller.GetErrorAnalysis)
+			errorAnalysisRoute.GET("/config", controller.GetErrorAnalysisConfig)
+			errorAnalysisRoute.PUT("/config", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), controller.SaveErrorAnalysisConfig)
+			errorAnalysisRoute.POST("/reports", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), controller.StartErrorAnalysis)
+			errorAnalysisRoute.GET("/reports", controller.ListErrorAnalysisReports)
+			errorAnalysisRoute.GET("/reports/:task_id", controller.GetErrorAnalysisReport)
+			errorAnalysisRoute.GET("/reports/:task_id/stream", controller.StreamErrorAnalysis)
+		}
 		systemTaskRoute := apiRouter.Group("/system-task")
 		systemTaskRoute.Use(middleware.RootAuth())
 		{
