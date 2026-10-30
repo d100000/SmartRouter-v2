@@ -134,6 +134,12 @@ export function useSidebarData(): SidebarData {
         title: t('Admin'),
         items: [
           {
+            title: t('Error analysis'),
+            url: '/error-analysis',
+            icon: HeartPulse,
+            requiredRole: ROLE.ADMIN,
+          },
+          {
             title: t('Scheduling Center'),
             url: '/scheduling',
             configUrls: ['/channels'],

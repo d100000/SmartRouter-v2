@@ -39,6 +39,7 @@ import { Route as AuthenticatedChannelsIndexRouteImport } from './routes/_authen
 import { Route as AuthenticatedChatChatIdRouteImport } from './routes/_authenticated/chat/$chatId'
 import { Route as AuthenticatedDashboardIndexRouteImport } from './routes/_authenticated/dashboard/index'
 import { Route as AuthenticatedDashboardSectionRouteImport } from './routes/_authenticated/dashboard/$section'
+import { Route as AuthenticatedErrorAnalysisIndexRouteImport } from './routes/_authenticated/error-analysis/index'
 import { Route as AuthenticatedErrorsErrorRouteImport } from './routes/_authenticated/errors/$error'
 import { Route as AuthenticatedKeysIndexRouteImport } from './routes/_authenticated/keys/index'
 import { Route as AuthenticatedModelsIndexRouteImport } from './routes/_authenticated/models/index'
@@ -226,6 +227,12 @@ const AuthenticatedDashboardSectionRoute =
   AuthenticatedDashboardSectionRouteImport.update({
     id: '/dashboard/$section',
     path: '/dashboard/$section',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedErrorAnalysisIndexRoute =
+  AuthenticatedErrorAnalysisIndexRouteImport.update({
+    id: '/error-analysis/',
+    path: '/error-analysis/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedErrorsErrorRoute =
@@ -469,6 +476,7 @@ export interface FileRoutesByFullPath {
   '/channel-overview/': typeof AuthenticatedChannelOverviewIndexRoute
   '/channels/': typeof AuthenticatedChannelsIndexRoute
   '/dashboard/': typeof AuthenticatedDashboardIndexRoute
+  '/error-analysis/': typeof AuthenticatedErrorAnalysisIndexRoute
   '/keys/': typeof AuthenticatedKeysIndexRoute
   '/models/': typeof AuthenticatedModelsIndexRoute
   '/playground/': typeof AuthenticatedPlaygroundIndexRoute
@@ -533,6 +541,7 @@ export interface FileRoutesByTo {
   '/channel-overview': typeof AuthenticatedChannelOverviewIndexRoute
   '/channels': typeof AuthenticatedChannelsIndexRoute
   '/dashboard': typeof AuthenticatedDashboardIndexRoute
+  '/error-analysis': typeof AuthenticatedErrorAnalysisIndexRoute
   '/keys': typeof AuthenticatedKeysIndexRoute
   '/models': typeof AuthenticatedModelsIndexRoute
   '/playground': typeof AuthenticatedPlaygroundIndexRoute
@@ -601,6 +610,7 @@ export interface FileRoutesById {
   '/_authenticated/channel-overview/': typeof AuthenticatedChannelOverviewIndexRoute
   '/_authenticated/channels/': typeof AuthenticatedChannelsIndexRoute
   '/_authenticated/dashboard/': typeof AuthenticatedDashboardIndexRoute
+  '/_authenticated/error-analysis/': typeof AuthenticatedErrorAnalysisIndexRoute
   '/_authenticated/keys/': typeof AuthenticatedKeysIndexRoute
   '/_authenticated/models/': typeof AuthenticatedModelsIndexRoute
   '/_authenticated/playground/': typeof AuthenticatedPlaygroundIndexRoute
@@ -668,6 +678,7 @@ export interface FileRouteTypes {
     | '/channel-overview/'
     | '/channels/'
     | '/dashboard/'
+    | '/error-analysis/'
     | '/keys/'
     | '/models/'
     | '/playground/'
@@ -732,6 +743,7 @@ export interface FileRouteTypes {
     | '/channel-overview'
     | '/channels'
     | '/dashboard'
+    | '/error-analysis'
     | '/keys'
     | '/models'
     | '/playground'
@@ -799,6 +811,7 @@ export interface FileRouteTypes {
     | '/_authenticated/channel-overview/'
     | '/_authenticated/channels/'
     | '/_authenticated/dashboard/'
+    | '/_authenticated/error-analysis/'
     | '/_authenticated/keys/'
     | '/_authenticated/models/'
     | '/_authenticated/playground/'
@@ -1061,6 +1074,13 @@ declare module '@tanstack/react-router' {
       path: '/dashboard/$section'
       fullPath: '/dashboard/$section'
       preLoaderRoute: typeof AuthenticatedDashboardSectionRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/error-analysis/': {
+      id: '/_authenticated/error-analysis/'
+      path: '/error-analysis'
+      fullPath: '/error-analysis/'
+      preLoaderRoute: typeof AuthenticatedErrorAnalysisIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/errors/$error': {
@@ -1412,6 +1432,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedChannelOverviewIndexRoute: typeof AuthenticatedChannelOverviewIndexRoute
   AuthenticatedChannelsIndexRoute: typeof AuthenticatedChannelsIndexRoute
   AuthenticatedDashboardIndexRoute: typeof AuthenticatedDashboardIndexRoute
+  AuthenticatedErrorAnalysisIndexRoute: typeof AuthenticatedErrorAnalysisIndexRoute
   AuthenticatedKeysIndexRoute: typeof AuthenticatedKeysIndexRoute
   AuthenticatedModelsIndexRoute: typeof AuthenticatedModelsIndexRoute
   AuthenticatedPlaygroundIndexRoute: typeof AuthenticatedPlaygroundIndexRoute
@@ -1441,6 +1462,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
     AuthenticatedChannelOverviewIndexRoute,
   AuthenticatedChannelsIndexRoute: AuthenticatedChannelsIndexRoute,
   AuthenticatedDashboardIndexRoute: AuthenticatedDashboardIndexRoute,
+  AuthenticatedErrorAnalysisIndexRoute: AuthenticatedErrorAnalysisIndexRoute,
   AuthenticatedKeysIndexRoute: AuthenticatedKeysIndexRoute,
   AuthenticatedModelsIndexRoute: AuthenticatedModelsIndexRoute,
   AuthenticatedPlaygroundIndexRoute: AuthenticatedPlaygroundIndexRoute,

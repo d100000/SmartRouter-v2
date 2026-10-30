@@ -22,6 +22,7 @@ import { SkipToMain } from '@/components/skip-to-main'
 import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar'
 import { LayoutProvider } from '@/context/layout-provider'
 import { SearchProvider } from '@/context/search-provider'
+import { ProjectVersion } from '@/features/project-version/project-version'
 import { getCookie } from '@/lib/cookies'
 import { cn } from '@/lib/utils'
 
@@ -52,6 +53,9 @@ export function AuthenticatedLayout(props: AuthenticatedLayoutProps) {
               )}
             >
               {props.children ?? <AnimatedOutlet />}
+              <footer className='bg-background shrink-0 border-t px-3 py-1 sm:px-4'>
+                <ProjectVersion />
+              </footer>
             </SidebarInset>
           </div>
         </SidebarProvider>

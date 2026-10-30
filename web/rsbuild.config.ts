@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -10,6 +11,36 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig(({ envMode }) => {
   const env = loadEnv({ mode: envMode, prefixes: ['VITE_'] })
+  let projectRevision = ''
+  let projectVersionDate = new Date().toISOString()
+  try {
+    const [revision, committedAt] = execFileSync(
+      'git',
+      ['show', '-s', '--format=%H%n%cI', 'HEAD'],
+      { cwd: __dirname, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    )
+      .trim()
+      .split('\n')
+    const dirty =
+      execFileSync('git', ['status', '--porcelain'], {
+        cwd: path.resolve(__dirname, '..'),
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim().length > 0
+    projectRevision = dirty
+      ? `${revision.slice(0, 7)}-local`
+      : revision.slice(0, 7)
+    if (!dirty) projectVersionDate = committedAt
+  } catch {
+    // Source archives and Docker builds may omit Git metadata. CI can supply
+    // the custom version and its date without changing the upstream version.
+  }
+  if (
+    process.env.GITHUB_REPOSITORY?.toLowerCase() === 'd100000/smartrouter-v2' &&
+    process.env.GITHUB_REF_TYPE === 'tag'
+  ) {
+    projectRevision = process.env.GITHUB_REF_NAME || projectRevision
+  }
   const serverUrl =
     process.env.VITE_REACT_APP_SERVER_URL ||
     env.rawPublicVars.VITE_REACT_APP_SERVER_URL ||
@@ -53,6 +84,18 @@ export default defineConfig(({ envMode }) => {
       },
     },
     source: {
+      define: {
+        'import.meta.env.VITE_PROJECT_VERSION': JSON.stringify(
+          process.env.VITE_PROJECT_VERSION ||
+            env.rawPublicVars.VITE_PROJECT_VERSION ||
+            projectRevision
+        ),
+        'import.meta.env.VITE_PROJECT_VERSION_DATE': JSON.stringify(
+          process.env.VITE_PROJECT_VERSION_DATE ||
+            env.rawPublicVars.VITE_PROJECT_VERSION_DATE ||
+            projectVersionDate
+        ),
+      },
       entry: {
         index: './src/main.tsx',
       },

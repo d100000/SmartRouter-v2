@@ -5,6 +5,8 @@ COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY ./web ./
 COPY ./VERSION /build/VERSION
+ARG VITE_PROJECT_VERSION
+ARG VITE_PROJECT_VERSION_DATE
 RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun run build
 
 FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS builder2

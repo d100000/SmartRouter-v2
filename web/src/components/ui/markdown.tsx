@@ -28,6 +28,8 @@ import { cn } from '@/lib/utils'
 interface MarkdownProps {
   /** Resolve relative document links against their source, never the dashboard URL. */
   baseUrl?: string
+  /** Prevent generated reports from loading remote images or CSS resources. */
+  blockRemoteContent?: boolean
   breaks?: boolean
   children: string
   className?: string
@@ -751,21 +753,36 @@ function addExternalLinkAttributes(html: string, baseUrl?: string): string {
 function renderMarkdown(
   markdown: string,
   breaks = false,
-  baseUrl?: string
+  baseUrl?: string,
+  blockRemoteContent = false
 ): string {
   const parsedHtml = markdownParser.parse(markdown, {
     ...markdownOptions,
     breaks,
   })
-  const html = DOMPurify.sanitize(parsedHtml, sanitizeOptions)
+  const html = DOMPurify.sanitize(parsedHtml, {
+    ...sanitizeOptions,
+    ...(blockRemoteContent
+      ? {
+          FORBID_TAGS: ['img', 'image', 'video', 'audio', 'source', 'style'],
+          FORBID_ATTR: ['style', 'background', 'src', 'srcset'],
+        }
+      : {}),
+  })
 
   return addExternalLinkAttributes(html, baseUrl)
 }
 
 export function Markdown(props: MarkdownProps) {
   const html = useMemo(
-    () => renderMarkdown(props.children, props.breaks, props.baseUrl),
-    [props.breaks, props.children, props.baseUrl]
+    () =>
+      renderMarkdown(
+        props.children,
+        props.breaks,
+        props.baseUrl,
+        props.blockRemoteContent
+      ),
+    [props.breaks, props.children, props.baseUrl, props.blockRemoteContent]
   )
 
   return (

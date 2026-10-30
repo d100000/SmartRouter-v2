@@ -284,9 +284,17 @@ func runSystemTaskScheduler() {
 			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
 				continue // an active row already exists
 			}
-			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
+			_, calendarScheduled := scheduled.(interface {
+				Due(time.Time, *model.SystemTask) bool
+			})
+			if !calendarScheduled && now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
 				continue // not due yet
 			}
+		}
+		if calendar, ok := scheduled.(interface {
+			Due(time.Time, *model.SystemTask) bool
+		}); ok && !calendar.Due(time.Unix(now, 0), latest) {
+			continue
 		}
 		if _, err := model.CreateSystemTask(scheduled.Type(), scheduled.NewPayload(), nil); err != nil {
 			activeTask, activeErr := model.GetActiveSystemTask(scheduled.Type())

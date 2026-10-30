@@ -21,6 +21,27 @@ import { expect, test } from 'vitest'
 
 import { Markdown } from '../markdown'
 
+test('generated reports cannot load remote resources but retain readable tables and links', () => {
+  const view = render(
+    <Markdown blockRemoteContent>
+      {
+        '![tracking](https://example.com/collect)\n\n<p style="background:url(https://example.com/pixel)">Evidence</p>\n\n[Reference](https://example.com/guide)\n\n| Model | Errors |\n|---|---|\n| example | 2 |'
+      }
+    </Markdown>
+  )
+  expect(
+    view.container.querySelector(
+      'img, image, video, audio, source, style, [style], [src], [srcset]'
+    )
+  ).toBeNull()
+  expect(view.getByRole('table')).toHaveTextContent('example')
+  expect(view.getByRole('link', { name: 'Reference' })).toHaveAttribute(
+    'rel',
+    'noopener noreferrer'
+  )
+  expect(view.container).toHaveTextContent('Evidence')
+})
+
 test.each([
   ['inline', 'Formula: $$\\frac{1}{2}$$.'],
   ['display', '$$\n\\frac{1}{2}\n$$'],
