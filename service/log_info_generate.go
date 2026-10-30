@@ -322,6 +322,7 @@ func appendFinalRequestFormat(relayInfo *relaycommon.RelayInfo, other *model.Log
 
 func GenerateWssOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage, modelRatio, groupRatio, completionRatio, audioRatio, audioCompletionRatio, modelPrice, userGroupRatio float64) *model.LogOther {
 	info := GenerateTextOtherInfo(ctx, relayInfo, modelRatio, groupRatio, completionRatio, 0, 0.0, modelPrice, userGroupRatio)
+	appendAudioCacheUsage(info, relayInfo.AnalyticsBilling)
 	info.SetPublic("ws", true)
 	info.SetPublic("audio_input", usage.InputTokenDetails.AudioTokens)
 	info.SetPublic("audio_output", usage.OutputTokenDetails.AudioTokens)
@@ -334,6 +335,7 @@ func GenerateWssOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 func GenerateAudioOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, modelRatio, groupRatio, completionRatio, audioRatio, audioCompletionRatio, modelPrice, userGroupRatio float64) *model.LogOther {
 	info := GenerateTextOtherInfo(ctx, relayInfo, modelRatio, groupRatio, completionRatio, 0, 0.0, modelPrice, userGroupRatio)
+	appendAudioCacheUsage(info, relayInfo.AnalyticsBilling)
 	info.SetPublic("audio", true)
 	info.SetPublic("audio_input", usage.PromptTokensDetails.AudioTokens)
 	info.SetPublic("audio_output", usage.CompletionTokenDetails.AudioTokens)
@@ -342,6 +344,22 @@ func GenerateAudioOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, 
 	info.SetPublic("audio_ratio", audioRatio)
 	info.SetPublic("audio_completion_ratio", audioCompletionRatio)
 	return info
+}
+
+func appendAudioCacheUsage(other *model.LogOther, snapshot *relaycommon.OverviewBillingSnapshot) {
+	if snapshot == nil || !snapshot.CacheUsageKnown {
+		return
+	}
+	// Reuse validated upstream measurements for logs and hourly exports. Legacy
+	// audio pricing does not discount cache tokens; expression prices, when used,
+	// are recorded separately by InjectTieredBillingInfo.
+	other.SetPublic("cache_tokens", int(snapshot.CacheReadTokens))
+	other.SetPublic("cache_ratio", 1.0)
+	if snapshot.CacheWriteTokens > 0 {
+		other.SetPublic("cache_creation_tokens", int(snapshot.CacheWriteTokens))
+		other.SetPublic("cache_write_tokens", int(snapshot.CacheWriteTokens))
+		other.SetPublic("cache_creation_ratio", 1.0)
+	}
 }
 
 func GenerateClaudeOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelRatio, groupRatio, completionRatio float64,
