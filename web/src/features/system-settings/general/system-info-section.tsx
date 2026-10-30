@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
+import { useMemo, useState } from 'react'
 import type { Resolver } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import * as z from 'zod'
@@ -44,13 +45,14 @@ import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useSettingsForm } from '../hooks/use-settings-form'
 import { useUpdateOption } from '../hooks/use-update-option'
+import { LogoUploadField } from './logo-upload-field'
 import { isValidTaskPublicAddress } from './task-public-address'
 
 const _systemInfoSchema = z.object({
   SystemName: z.string().min(1),
   ServerAddress: z.string().optional(),
   TaskPublicAddress: z.string().refine(isValidTaskPublicAddress),
-  Logo: z.string().url().optional().or(z.literal('')),
+  Logo: z.string().optional(),
   Footer: z.string().optional(),
   About: z.string().optional(),
   HomePageContent: z.string().optional(),
@@ -77,23 +79,38 @@ function normalizeValue(value: unknown): string {
 export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
+  const [isReadingLogo, setIsReadingLogo] = useState(false)
 
-  const normalizedDefaults: SystemInfoFormValues = {
-    SystemName: normalizeValue(defaultValues.SystemName),
-    ServerAddress: normalizeValue(defaultValues.ServerAddress),
-    TaskPublicAddress: normalizeValue(defaultValues.TaskPublicAddress),
-    Logo: normalizeValue(defaultValues.Logo),
-    Footer: normalizeValue(defaultValues.Footer),
-    About: normalizeValue(defaultValues.About),
-    HomePageContent: normalizeValue(defaultValues.HomePageContent),
-    general_setting: {
-      docs_link: normalizeValue(defaultValues.general_setting?.docs_link),
-    },
-    legal: {
-      user_agreement: normalizeValue(defaultValues.legal?.user_agreement),
-      privacy_policy: normalizeValue(defaultValues.legal?.privacy_policy),
-    },
-  }
+  const normalizedDefaults = useMemo<SystemInfoFormValues>(
+    () => ({
+      SystemName: normalizeValue(defaultValues.SystemName),
+      ServerAddress: normalizeValue(defaultValues.ServerAddress),
+      TaskPublicAddress: normalizeValue(defaultValues.TaskPublicAddress),
+      Logo: normalizeValue(defaultValues.Logo),
+      Footer: normalizeValue(defaultValues.Footer),
+      About: normalizeValue(defaultValues.About),
+      HomePageContent: normalizeValue(defaultValues.HomePageContent),
+      general_setting: {
+        docs_link: normalizeValue(defaultValues.general_setting?.docs_link),
+      },
+      legal: {
+        user_agreement: normalizeValue(defaultValues.legal?.user_agreement),
+        privacy_policy: normalizeValue(defaultValues.legal?.privacy_policy),
+      },
+    }),
+    [
+      defaultValues.SystemName,
+      defaultValues.ServerAddress,
+      defaultValues.TaskPublicAddress,
+      defaultValues.Logo,
+      defaultValues.Footer,
+      defaultValues.About,
+      defaultValues.HomePageContent,
+      defaultValues.general_setting?.docs_link,
+      defaultValues.legal?.user_agreement,
+      defaultValues.legal?.privacy_policy,
+    ]
+  )
 
   const systemInfoSchemaWithI18n = z.object({
     SystemName: z.string().min(1, {
@@ -106,7 +123,7 @@ export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
           'Enter an absolute HTTP(S) URL without credentials, query parameters, or fragments'
         ),
     }),
-    Logo: z.string().url().optional().or(z.literal('')),
+    Logo: z.string().optional(),
     Footer: z.string().optional(),
     About: z.string().optional(),
     HomePageContent: z.string().optional(),
@@ -141,18 +158,29 @@ export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
       },
     })
 
+  const submitSettings: typeof handleSubmit = async (event) => {
+    event?.preventDefault()
+    if (isReadingLogo) return
+    try {
+      await handleSubmit(event)
+    } catch {
+      // The mutation displays the server error; keep the unsaved form values.
+    }
+  }
+
   return (
     <>
-      <FormNavigationGuard when={isDirty} />
+      <FormNavigationGuard when={isDirty || isReadingLogo} />
 
       <SettingsSection title={t('System Information')}>
         <Form {...form}>
-          <SettingsForm onSubmit={handleSubmit}>
+          <SettingsForm onSubmit={submitSettings}>
             <SettingsPageFormActions
-              onSave={handleSubmit}
+              onSave={submitSettings}
               onReset={handleReset}
               isSaving={isSubmitting || updateOption.isPending}
-              isResetDisabled={!isDirty}
+              isSaveDisabled={isReadingLogo}
+              isResetDisabled={!isDirty || isReadingLogo}
             />
             <FormDirtyIndicator isDirty={isDirty} />
             <SettingsFormGrid>
@@ -214,24 +242,10 @@ export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
                 )}
               />
 
-              <FormField
-                control={form.control}
-                name='Logo'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Logo URL')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder={t('https://example.com/logo.png')}
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('URL to your logo image (optional)')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
+              <LogoUploadField
+                disabled={isSubmitting || updateOption.isPending}
+                isReading={isReadingLogo}
+                onReadingChange={setIsReadingLogo}
               />
 
               <FormField
