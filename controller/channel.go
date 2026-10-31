@@ -59,6 +59,8 @@ func parseStatusFilter(statusParam string) int {
 	switch strings.ToLower(statusParam) {
 	case "enabled", "1":
 		return common.ChannelStatusEnabled
+	case "outside_schedule", "4":
+		return common.ChannelStatusOutsideSchedule
 	case "disabled", "0":
 		return 0
 	default:
@@ -66,7 +68,12 @@ func parseStatusFilter(statusParam string) int {
 	}
 }
 
-func clearChannelInfo(channel *model.Channel) {
+func clearChannelInfo(channel *model.Channel, evaluatedAt ...time.Time) {
+	now := time.Now()
+	if len(evaluatedAt) > 0 {
+		now = evaluatedAt[0]
+	}
+	channel.PopulateAvailabilityState(now)
 	if channel.ChannelInfo.IsMultiKey {
 		channel.ChannelInfo.MultiKeyDisabledReason = nil
 		channel.ChannelInfo.MultiKeyDisabledTime = nil
@@ -136,13 +143,7 @@ func restoreMultiKeyChannelIfAvailable(channel *model.Channel) {
 }
 
 func applyChannelStatusFilter(query *gorm.DB, statusFilter int) *gorm.DB {
-	if statusFilter == common.ChannelStatusEnabled {
-		return query.Where("status = ?", common.ChannelStatusEnabled)
-	}
-	if statusFilter == 0 {
-		return query.Where("status != ?", common.ChannelStatusEnabled)
-	}
-	return query
+	return model.ApplyChannelEffectiveStatusFilter(query, statusFilter, time.Now())
 }
 
 func buildChannelListQuery(group string, statusFilter int, typeFilter int) *gorm.DB {
@@ -208,15 +209,22 @@ func GetAllChannels(c *gin.Context) {
 	}
 
 	var total int64
+	now := time.Now()
+	baseQuery := model.ApplyChannelGroupFilter(model.DB.Model(&model.Channel{}), groupFilter)
+	baseQuery = model.ApplyChannelEffectiveStatusFilter(baseQuery, statusFilter, now)
+	listQuery := baseQuery.Session(&gorm.Session{})
+	if typeFilter >= 0 {
+		listQuery = listQuery.Where("type = ?", typeFilter)
+	}
 
 	if enableTagMode {
-		tags, err := model.GetPaginatedChannelTags(buildChannelListQuery(groupFilter, statusFilter, typeFilter), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+		tags, err := model.GetPaginatedChannelTags(listQuery.Session(&gorm.Session{}), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 		if err != nil {
 			common.SysError(common.LogText("failed to get paginated tags: %s", err.Error()))
 			common.ApiErrorT(c, "Failed to fetch tags. Please try again later")
 			return
 		}
-		total, err = model.CountChannelTags(buildChannelListQuery(groupFilter, statusFilter, typeFilter))
+		total, err = model.CountChannelTags(listQuery.Session(&gorm.Session{}))
 		if err != nil {
 			common.SysError(common.LogText("failed to count tags: %s", err.Error()))
 			common.ApiErrorT(c, "Failed to count tags. Please try again later")
@@ -227,7 +235,7 @@ func GetAllChannels(c *gin.Context) {
 				continue
 			}
 			var tagChannels []*model.Channel
-			err := sortOptions.Apply(buildChannelListQuery(groupFilter, statusFilter, typeFilter).Where("tag = ?", *tag)).
+			err := sortOptions.Apply(listQuery.Session(&gorm.Session{}).Where("tag = ?", *tag)).
 				Omit("key", "upstream_credential_snapshot_data").
 				Find(&tagChannels).Error
 			if err != nil {
@@ -238,13 +246,13 @@ func GetAllChannels(c *gin.Context) {
 			channelData = append(channelData, tagChannels...)
 		}
 	} else {
-		if err := buildChannelListQuery(groupFilter, statusFilter, typeFilter).Count(&total).Error; err != nil {
+		if err := listQuery.Session(&gorm.Session{}).Count(&total).Error; err != nil {
 			common.SysError(common.LogText("failed to count channels: %s", err.Error()))
 			common.ApiErrorT(c, "Failed to count channels. Please try again later")
 			return
 		}
 
-		err := sortOptions.Apply(buildChannelListQuery(groupFilter, statusFilter, typeFilter)).
+		err := sortOptions.Apply(listQuery.Session(&gorm.Session{})).
 			Limit(pageInfo.GetPageSize()).
 			Offset(pageInfo.GetStartIdx()).
 			Omit("key", "upstream_credential_snapshot_data").
@@ -257,10 +265,10 @@ func GetAllChannels(c *gin.Context) {
 	}
 
 	for _, datum := range channelData {
-		clearChannelInfo(datum)
+		clearChannelInfo(datum, now)
 	}
 
-	countQuery := buildChannelListQuery(groupFilter, statusFilter, -1)
+	countQuery := baseQuery.Session(&gorm.Session{})
 	var results []struct {
 		Type  int64
 		Count int64
@@ -398,13 +406,18 @@ func SearchChannels(c *gin.Context) {
 		channelData = channels
 	}
 
-	if statusFilter == common.ChannelStatusEnabled || statusFilter == 0 {
+	now := time.Now()
+	if statusFilter == common.ChannelStatusEnabled || statusFilter == 0 || statusFilter == common.ChannelStatusOutsideSchedule {
 		filtered := make([]*model.Channel, 0, len(channelData))
 		for _, ch := range channelData {
-			if statusFilter == common.ChannelStatusEnabled && ch.Status != common.ChannelStatusEnabled {
+			status := ch.EffectiveStatusAt(now)
+			if statusFilter == common.ChannelStatusOutsideSchedule && status != statusFilter {
 				continue
 			}
-			if statusFilter == 0 && ch.Status == common.ChannelStatusEnabled {
+			if statusFilter == common.ChannelStatusEnabled && status != common.ChannelStatusEnabled {
+				continue
+			}
+			if statusFilter == 0 && status == common.ChannelStatusEnabled {
 				continue
 			}
 			filtered = append(filtered, ch)
@@ -452,7 +465,7 @@ func SearchChannels(c *gin.Context) {
 	pagedData := channelData[startIdx:endIdx]
 
 	for _, datum := range pagedData {
-		clearChannelInfo(datum)
+		clearChannelInfo(datum, now)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -529,6 +542,9 @@ const maxTaskExtendPluginKeys = 32
 func validateChannel(channel *model.Channel, isAdd bool) error {
 	if channel == nil {
 		return fmt.Errorf("channel cannot be empty")
+	}
+	if channel.Status == common.ChannelStatusOutsideSchedule {
+		return common.NewMessage("Invalid parameters")
 	}
 	if err := model.ValidateUpstreamCostRatio(channel.CostRatio); err != nil {
 		return err
@@ -1089,6 +1105,9 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	clearChannelReadOnlyFields(&channel, requestData)
+	if _, provided := requestData["availability"]; provided && strings.TrimSpace(channel.Availability) == "" {
+		channel.Availability = "{}"
+	}
 	_, channel.CostRatioSet = requestData["cost_ratio"]
 
 	if channel.Type == constant.ChannelTypeTaskPlugin &&

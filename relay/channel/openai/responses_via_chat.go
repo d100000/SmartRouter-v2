@@ -1,11 +1,13 @@
 package openai
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -47,6 +49,9 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if !ok {
 		return nil, types.NewOpenAIError(fmt.Errorf("expected OpenAI responses response, got %T", convertResult.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
+	if !responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: responsesResp}, nil) {
+		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
 	usage := convertResult.Usage
 	if usage == nil || usage.TotalTokens == 0 {
 		text := service.ExtractOutputTextFromResponses(responsesResp)
@@ -82,6 +87,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	// upstreamFailure is the upstream or conversion failure the client was
 	// told about with response.failed.
 	var upstreamFailure *types.NewAPIError
+	var hasOutput, errorDelivered bool
 
 	sendEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
 		data, err := common.Marshal(event.Payload)
@@ -89,6 +95,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
 			return false
 		}
+		var outputEvent dto.ResponsesStreamResponse
+		_ = common.Unmarshal(data, &outputEvent)
+		hasOutput = hasOutput || responsesEventHasOutput(&outputEvent, data)
 		if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data)); err != nil {
 			// When the client went away the upstream already produced output,
 			// so the stream stops and settles normally instead of failing; any
@@ -100,6 +109,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 			return false
 		}
+		errorDelivered = errorDelivered || event.Type == "response.failed" || event.Type == "error"
 		return true
 	}
 	failResponsesStream := func(err error) bool {
@@ -182,15 +192,22 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	})
 
 	if streamErr != nil {
+		markOpenAIStreamFailure(c, info, streamErr, streamHasActualUsage(state.Usage()), hasOutput)
+		info.StreamFailure.ErrorDelivered = errorDelivered
 		return nil, streamErr
 	}
 
 	usage := state.Usage()
 	noUpstreamUsage := usage == nil || usage.TotalTokens == 0
-	if upstreamFailure != nil && noUpstreamUsage && state.UsageText() == "" {
-		// The stream failed before any output reached the client, which
-		// already received response.failed: the request is not charged.
-		return nil, upstreamFailure
+	if upstreamFailure == nil && !hasOutput {
+		upstreamFailure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	if upstreamFailure != nil {
+		markOpenAIStreamFailure(c, info, upstreamFailure, streamHasActualUsage(usage), hasOutput)
+		info.StreamFailure.ErrorDelivered = errorDelivered
+		if info.StreamFailure.NoCharge {
+			return nil, upstreamFailure
+		}
 	}
 	if noUpstreamUsage {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())

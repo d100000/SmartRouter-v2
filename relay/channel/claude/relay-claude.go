@@ -313,6 +313,15 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 		claudeInfo.Usage.UsageSemantic = "anthropic"
 	}
 	relayconvert.FinalizeClaudeStreamBillingUsage(claudeInfo)
+	if info.StreamFailure != nil {
+		failure := info.StreamFailure.Error
+		if info.RelayFormat == types.RelayFormatClaude {
+			_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: failure.ToClaudeError(common.UpstreamAddresses(c)...)})
+		} else {
+			_ = helper.ObjectData(c, gin.H{"error": failure.ToOpenAIError(common.UpstreamAddresses(c)...)})
+		}
+		return
+	}
 
 	if info.RelayFormat == types.RelayFormatClaude {
 		//
@@ -369,6 +378,11 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 				sr.Stop(err)
 				return
 			}
+			if frame.Type == "message_stop" && !hasMediaOutput && strings.TrimSpace(claudeInfo.ResponseText.String()) == "" {
+				err = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+				sr.Stop(err)
+				return
+			}
 		}
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
@@ -385,14 +399,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 			if block == nil {
 				continue
 			}
-			hasMediaOutput = hasMediaOutput || strings.TrimSpace(block.GetText()+block.Data) != ""
-			if block.Thinking != nil && strings.TrimSpace(*block.Thinking) != "" {
-				hasMediaOutput = true
-			}
-			if block.Source != nil {
-				data, _ := block.Source.Data.(string)
-				hasMediaOutput = hasMediaOutput || strings.TrimSpace(data+block.Source.Url) != ""
-			}
+			hasMediaOutput = hasMediaOutput || claudeBlockHasOutput(block)
 		}
 	})
 	info.StreamStatus.RequireTerminal()
@@ -409,11 +416,11 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if failure == nil && !hasActualUsage && !hasOutput {
+	if failure == nil && !hasOutput {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if failure != nil {
-		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasOutput, NoCharge: !hasActualUsage && !hasOutput}
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasOutput, NoCharge: !hasOutput}
 		info.StreamStatus.MarkFailed(string(failure.GetErrorCode()), failure.ToOpenAIError().Type, failure.StatusCode)
 		if !info.StreamStatus.HasErrors() {
 			info.StreamStatus.RecordError(failure.Error())
@@ -422,12 +429,24 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 			return nil, failure
 		}
 	}
-	if err != nil {
-		return nil, err
-	}
-
 	HandleStreamFinalResponse(c, info, claudeInfo)
 	return claudeInfo.Usage, nil
+}
+
+func claudeBlockHasOutput(block *dto.ClaudeMediaMessage) bool {
+	if strings.TrimSpace(block.GetText()+block.Data+block.Name) != "" ||
+		block.Thinking != nil && strings.TrimSpace(*block.Thinking) != "" ||
+		block.PartialJson != nil && strings.TrimSpace(*block.PartialJson) != "" {
+		return true
+	}
+	if block.Source != nil {
+		data, _ := block.Source.Data.(string)
+		if strings.TrimSpace(data+block.Source.Url) != "" {
+			return true
+		}
+	}
+	// A server tool can legitimately return an empty result list.
+	return strings.HasSuffix(block.Type, "tool_result") && block.Content != nil
 }
 
 func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, httpResp *http.Response, data []byte) *types.NewAPIError {
@@ -441,6 +460,13 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	}
 	info.ObserveResponseModel(claudeResponse.Model)
 	maybeMarkClaudeRefusal(c, info, claudeResponse.StopReason)
+	hasOutput := false
+	for i := range claudeResponse.Content {
+		hasOutput = hasOutput || claudeBlockHasOutput(&claudeResponse.Content[i])
+	}
+	if !hasOutput {
+		return types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
 	if claudeInfo.Usage == nil {
 		claudeInfo.Usage = &dto.Usage{}
 	}

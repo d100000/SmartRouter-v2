@@ -38,6 +38,9 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	if !responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: &responsesResponse}, responseBody) {
+		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
 
 	info.ObserveResponseModel(responsesResponse.Model)
 	responseBody = rewriteSGLangResponsesCreatedAt(info, responseBody, "created_at", responsesResponse.CreatedAt)
@@ -138,7 +141,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if streamResponse.Response != nil {
 			hasActualUsage = hasActualUsage || dto.HasOpenAIUsageTokens(streamResponse.Response.Usage)
 		}
-		hasOutput = hasOutput || responsesEventHasOutput(&streamResponse)
+		hasOutput = hasOutput || responsesEventHasOutput(&streamResponse, common.StringToByteSlice(data))
 		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
 		if frameErr != nil {
 			streamErr = frameErr
@@ -150,6 +153,12 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			} else {
 				sr.Error(err)
 			}
+			sr.Stop(streamErr)
+			return
+		}
+		if !hasOutput && (streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" || streamResponse.Type == "response.incomplete") {
+			streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+			protocolFailure = true
 			sr.Stop(streamErr)
 			return
 		}
@@ -172,6 +181,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		info.StreamStatus.ResponseOutcome() == "") {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(info.StreamStatus.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
+	if streamErr == nil && !hasOutput {
+		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		protocolFailure = true
+	}
 	if streamErr != nil {
 		if protocolFailure || retryable {
 			markOpenAIStreamFailure(c, info, streamErr, hasActualUsage, hasOutput)
@@ -180,7 +193,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			// Keep the original completion/cancellation outcome for health metrics.
 			sanitizeStreamError(c, streamErr)
 			info.StreamFailure = &relaycommon.StreamFailureInfo{Error: streamErr, HasActualUsage: hasActualUsage,
-				HasEffectiveOutput: hasOutput, NoCharge: !hasActualUsage && !hasOutput}
+				HasEffectiveOutput: hasOutput, NoCharge: !hasOutput}
 			if !info.StreamStatus.HasErrors() {
 				info.StreamStatus.RecordError(streamErr.Error())
 			}

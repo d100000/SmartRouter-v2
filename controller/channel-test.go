@@ -74,6 +74,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !channel.ScheduleAllowsAt(time.Now()) {
+		return testResult{localErr: model.ErrChannelOutsideSchedule}
+	}
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
@@ -920,11 +923,14 @@ type channelTestSummary struct {
 
 func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
 	summary := channelTestSummary{}
+	if !channel.ScheduleAllowsAt(time.Now()) {
+		return summary
+	}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 	tik := time.Now()
 	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
 	milliseconds := time.Since(tik).Milliseconds()
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || errors.Is(result.localErr, model.ErrChannelOutsideSchedule) {
 		return summary
 	}
 

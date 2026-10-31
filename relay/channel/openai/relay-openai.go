@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -134,24 +135,14 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 		hasActualUsage := streamHasActualUsage(frame.Usage)
 		hasOutput := frame.hasJSONOutput(info)
-		if apiErr == nil && !hasActualUsage && !hasOutput {
+		if apiErr == nil && !hasOutput {
 			apiErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		}
 		if apiErr != nil {
-			// A JSON error envelope is delivered as an error, not as the
-			// incidental choices it might contain. Only real usage survives it.
+			// A JSON error envelope does not deliver its incidental choices.
+			// Usage alone never makes an empty response billable.
 			markOpenAIStreamFailure(c, info, apiErr, hasActualUsage, false)
-			if info.StreamFailure.NoCharge {
-				return nil, apiErr
-			}
-			helper.SetEventStreamHeaders(c)
-			if info.RelayFormat == types.RelayFormatClaude {
-				_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiErr.ToClaudeError(common.UpstreamAddresses(c)...)})
-			} else {
-				_ = helper.ObjectData(c, gin.H{"error": apiErr.ToOpenAIError(common.UpstreamAddresses(c)...)})
-			}
-			applyUsagePostProcessing(info, frame.Usage, body)
-			return frame.Usage, nil
+			return nil, apiErr
 		}
 		service.CloseResponseBodyGracefully(resp)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -248,7 +239,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if streamErr == nil && !hasActualUsage && !hasOutput {
+	if streamErr == nil && !hasOutput {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if streamErr != nil {
@@ -404,17 +395,33 @@ func (frame *openAIStreamFrame) hasJSONOutput(info *relaycommon.RelayInfo) bool 
 				Data       string `json:"data"`
 				Transcript string `json:"transcript"`
 			} `json:"audio"`
+			ToolCalls []struct {
+				Custom struct {
+					Name  string `json:"name"`
+					Input string `json:"input"`
+				} `json:"custom"`
+			} `json:"tool_calls"`
 		}
 		_ = common.Unmarshal(choice.Message, &message)
 		_ = common.Unmarshal(choice.Message, &extra)
-		if strings.TrimSpace(choice.Text+message.StringContent()+message.GetReasoningContent()) != "" || len(message.ParseToolCalls()) > 0 {
+		if strings.TrimSpace(choice.Text+message.StringContent()+message.GetReasoningContent()) != "" {
 			return true
+		}
+		for _, tool := range message.ParseToolCalls() {
+			if strings.TrimSpace(tool.Function.Name+tool.Function.Arguments) != "" {
+				return true
+			}
 		}
 		if info.RelayFormat != types.RelayFormatOpenAI || info.ChannelSetting.ForceFormat || info.ChannelSetting.ThinkingToContent {
 			continue
 		}
 		if strings.TrimSpace(extra.Refusal+extra.Audio.Data+extra.Audio.Transcript) != "" || extra.FunctionCall != nil && strings.TrimSpace(extra.FunctionCall.Name+extra.FunctionCall.Arguments) != "" {
 			return true
+		}
+		for _, tool := range extra.ToolCalls {
+			if strings.TrimSpace(tool.Custom.Name+tool.Custom.Input) != "" {
+				return true
+			}
 		}
 	}
 	return false
@@ -467,7 +474,7 @@ func markOpenAIStreamFailure(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 	sanitizeStreamError(c, apiErr)
 	info.StreamFailure = &relaycommon.StreamFailureInfo{
 		Error: apiErr, HasActualUsage: actualUsage, HasEffectiveOutput: hasOutput,
-		NoCharge: !actualUsage && !hasOutput,
+		NoCharge: !hasOutput,
 	}
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
@@ -572,6 +579,15 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			info.PerformanceBusinessRejection = true
 			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "openai_finish_reason=content_filter")
 			break
+		}
+	}
+	// Embeddings and other non-generation responses also use this handler.
+	// Only generation requires output before any local usage estimate or charge.
+	if info.RelayMode == relayconstant.RelayModeChatCompletions || info.RelayMode == relayconstant.RelayModeCompletions {
+		var frame openAIStreamFrame
+		_ = common.Unmarshal(responseBody, &frame)
+		if !frame.hasJSONOutput(info) {
+			return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		}
 	}
 

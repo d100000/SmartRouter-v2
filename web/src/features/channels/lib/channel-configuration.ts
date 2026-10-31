@@ -25,6 +25,7 @@ import {
   OPENAI_FIELD_PASSTHROUGH_TYPES,
 } from '../constants'
 import { CHANNEL_TYPE_ADVANCED_CUSTOM } from './advanced-custom'
+import { readAvailability } from './channel-availability'
 import { channelFormSchema, type ChannelFormValues } from './channel-form'
 import { supportsResponsesWebSocket } from './responses-websocket'
 
@@ -45,6 +46,7 @@ export type ChannelConfigurationStatus =
   | 'error'
 
 const CONFIGURATION_BLOCKS = {
+  availability: { section: 'routing', fields: ['availability'] },
   modelMapping: { section: 'routing', fields: ['model_mapping'] },
   routingStrategy: {
     section: 'routing',
@@ -140,6 +142,9 @@ export function getChannelConfigurationState(
   const openaiPassthrough = OPENAI_FIELD_PASSTHROUGH_TYPES.has(values.type)
   const claudePassthrough = CLAUDE_FIELD_PASSTHROUGH_TYPES.has(values.type)
   const configured: Record<ChannelConfigurationBlock, boolean> = {
+    availability:
+      readAvailability(values.availability)?.enabled ??
+      Boolean(values.availability),
     modelMapping: hasConfiguredJson(values.model_mapping),
     routingStrategy: Boolean(
       values.priority ||

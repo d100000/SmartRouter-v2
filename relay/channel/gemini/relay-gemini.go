@@ -260,17 +260,10 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		grounding.commit(info)
 		countGeminiBillableFunctionCalls(info, &geminiResponse)
 
+		hasEffectiveOutput = hasEffectiveOutput || geminiResponseHasOutput(&geminiResponse)
 		// 统计图片数量
 		for _, candidate := range geminiResponse.Candidates {
 			for _, part := range candidate.Content.Parts {
-				hasEffectiveOutput = hasEffectiveOutput || strings.TrimSpace(part.Text) != ""
-				if part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.FunctionName) != "" ||
-					part.InlineData != nil && strings.TrimSpace(part.InlineData.Data) != "" ||
-					part.FileData != nil && strings.TrimSpace(part.FileData.FileUri) != "" ||
-					part.ExecutableCode != nil && strings.TrimSpace(part.ExecutableCode.Code) != "" ||
-					part.CodeExecutionResult != nil && strings.TrimSpace(part.CodeExecutionResult.Output) != "" {
-					hasEffectiveOutput = true
-				}
 				if part.InlineData != nil && part.InlineData.MimeType != "" {
 					imageCount++
 				}
@@ -284,6 +277,11 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			mappedUsage := buildUsageFromGeminiMetadata(accumulatedUsageMetadata, info.GetEstimatePromptTokens())
 			*usage = mappedUsage
 			hasBillableUsageMetadata = true
+		}
+		if !hasEffectiveOutput && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
+			streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+			sr.Stop(streamErr)
+			return
 		}
 
 		if !callback(data, &geminiResponse) {
@@ -311,12 +309,12 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if failure == nil && !hasActualUsage && !hasEffectiveOutput {
+	if failure == nil && !hasEffectiveOutput {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if failure != nil {
 		types.ErrOptionWithSkipRetry()(failure)
-		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasEffectiveOutput, NoCharge: !hasActualUsage && !hasEffectiveOutput}
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasEffectiveOutput, NoCharge: !hasEffectiveOutput}
 		info.StreamStatus.MarkFailed(string(failure.GetErrorCode()), failure.ToOpenAIError().Type, failure.StatusCode)
 		if !info.StreamStatus.HasErrors() {
 			info.StreamStatus.RecordError(failure.Error())
@@ -342,8 +340,16 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		patchGeminiZeroCompletionUsage(c, info, usage, responseText.String(), imageCount)
 	}
 
-	if streamErr != nil {
-		return usage, failure
+	if failure != nil {
+		if info.RelayFormat == types.RelayFormatOpenAIResponses {
+			return usage, failure
+		}
+		if info.RelayFormat == types.RelayFormatClaude {
+			_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: failure.ToClaudeError(common.UpstreamAddresses(c)...)})
+		} else {
+			_ = helper.ObjectData(c, gin.H{"error": failure.ToOpenAIError(common.UpstreamAddresses(c)...)})
+		}
+		return usage, nil
 	}
 	if info.StreamStatus != nil && !info.StreamStatus.IsNormalEnd() {
 		logger.LogWarn(c, common.LogText("Gemini stream ended unexpectedly: %s", info.StreamStatus.Summary()))
@@ -451,7 +457,7 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 		return true
 	})
 
-	if err != nil {
+	if err != nil || info.StreamFailure != nil {
 		return usage, err
 	}
 
@@ -484,9 +490,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	grounding.observe(&geminiResponse)
 	grounding.commit(info)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
-	if len(geminiResponse.Candidates) == 0 {
-		usage := buildUsageFromGeminiResponse(c, info, &geminiResponse)
-
+	if !geminiResponseHasOutput(&geminiResponse) {
 		var newAPIError *types.NewAPIError
 		if geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
 			info.PerformanceBusinessRejection = true
@@ -501,24 +505,13 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			newAPIError = types.NewOpenAIError(
 				errors.New("empty response from Gemini API"),
 				types.ErrorCodeEmptyResponse,
-				http.StatusInternalServerError,
+				http.StatusBadGateway,
 			)
 		}
 
 		service.ResetStatusCode(newAPIError, c.GetString("status_code_mapping"))
 
-		switch info.RelayFormat {
-		case types.RelayFormatClaude:
-			c.JSON(newAPIError.StatusCode, gin.H{
-				"type":  "error",
-				"error": newAPIError.ToClaudeError(common.UpstreamAddresses(c)...),
-			})
-		default:
-			c.JSON(newAPIError.StatusCode, gin.H{
-				"error": newAPIError.ToOpenAIError(common.UpstreamAddresses(c)...),
-			})
-		}
-		return &usage, nil
+		return nil, newAPIError
 	}
 	fullTextResponse := responseGeminiChat2OpenAI(c, &geminiResponse)
 	fullTextResponse.Model = info.UpstreamModelName
@@ -549,6 +542,22 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	return &usage, nil
+}
+
+func geminiResponseHasOutput(response *dto.GeminiChatResponse) bool {
+	for _, candidate := range response.Candidates {
+		for _, part := range candidate.Content.Parts {
+			if strings.TrimSpace(part.Text) != "" ||
+				part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.FunctionName) != "" ||
+				part.InlineData != nil && strings.TrimSpace(part.InlineData.Data) != "" ||
+				part.FileData != nil && strings.TrimSpace(part.FileData.FileUri) != "" ||
+				part.ExecutableCode != nil && strings.TrimSpace(part.ExecutableCode.Code) != "" ||
+				part.CodeExecutionResult != nil && strings.TrimSpace(part.CodeExecutionResult.Output) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

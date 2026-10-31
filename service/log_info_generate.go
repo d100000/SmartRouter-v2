@@ -142,9 +142,10 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	return other
 }
 
-// appendStreamFailureLogInfo preserves the failure even when usable output or
-// upstream usage allows the normal settlement path. Consumption rows must
-// never present themselves as exempt from billing, including free models.
+// appendStreamFailureLogInfo preserves the failure when usable output allows
+// the normal settlement path. Upstream usage alone never permits a charge.
+// Consumption rows must never present themselves as exempt from billing,
+// including free models.
 func appendStreamFailureLogInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other *model.LogOther, errorLog bool) string {
 	if ctx == nil || relayInfo == nil || relayInfo.StreamFailure == nil || relayInfo.StreamFailure.Error == nil || other == nil {
 		return ""
@@ -165,8 +166,7 @@ func appendStreamFailureLogInfo(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	} else if failure.HasEffectiveOutput {
 		usageSource = "local_estimate"
 	}
-	noCharge := errorLog && failure.NoCharge && !failure.HasActualUsage && !failure.HasEffectiveOutput &&
-		!IsViolationFeeCode(NormalizeViolationFeeError(apiErr).GetErrorCode())
+	noCharge := errorLog && failure.NoCharge && !failure.HasEffectiveOutput
 	other.SetPublic("stream_failure", map[string]any{
 		"code":         string(apiErr.GetErrorCode()),
 		"type":         apiErr.ToOpenAIError().Type,

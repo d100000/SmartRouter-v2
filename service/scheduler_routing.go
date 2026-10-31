@@ -173,6 +173,9 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 	if fresh.Status != common.ChannelStatusEnabled {
 		return scheduler.ErrNoEligibleChannel
 	}
+	if apiErr := ChannelAvailabilityError(c, fresh); apiErr != nil {
+		return apiErr
+	}
 	channel = fresh
 	if group == "" || group == "auto" {
 		group = common.GetContextKeyString(c, constant.ContextKeyAutoGroup)

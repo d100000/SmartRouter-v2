@@ -36,6 +36,7 @@ type ChannelPin struct {
 type ChannelFilterKind string
 
 const (
+	FilterAvailability       ChannelFilterKind = "channel_outside_schedule"
 	FilterRequestPath        ChannelFilterKind = "request_path"
 	FilterTaskPluginEndpoint ChannelFilterKind = "task_plugin_endpoint"
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"

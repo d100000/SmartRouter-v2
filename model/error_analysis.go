@@ -185,6 +185,12 @@ func ClassifyFailureLog(log Log) FailureLog {
 			d.HasOutput = &value
 		}
 	}
+	// Empty responses rejected before writing a body have no writer observation.
+	// Their explicit error code is evidence of zero output, including JSON calls.
+	if d.HasOutput == nil && d.ErrorCode == "empty_response" {
+		output := false
+		d.HasOutput = &output
+	}
 	d.ErrorCode, d.ErrorType = SafeFailureFact(d.ErrorCode, 100), SafeFailureFact(d.ErrorType, 100)
 	d.UpstreamModel, d.Node = SafeFailureFact(d.UpstreamModel, 200), SafeFailureFact(d.Node, 100)
 	d.Path, _, _ = strings.Cut(d.Path, "?")

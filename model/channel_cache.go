@@ -97,6 +97,7 @@ func InitChannelCache() {
 	var channels []*Channel
 	DB.Find(&channels)
 	for _, channel := range channels {
+		channel.compiledAvailability = channel.availabilityPlan()
 		newChannelId2channel[channel.Id] = channel
 		if channel.Type == constant.ChannelTypeAdvancedCustom {
 			if config := channel.GetOtherSettings().AdvancedCustom; config != nil {
@@ -343,7 +344,9 @@ func CacheUpdateChannel(channel *Channel) {
 	if oldChannel, ok := channelsIDM[channel.Id]; ok {
 		logger.LogDebug(nil, "CacheUpdateChannel before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ChannelInfo.MultiKeyPollingIndex)
 	}
-	channelsIDM[channel.Id] = channel
+	copy := *channel
+	copy.compiledAvailability = channel.availabilityPlan()
+	channelsIDM[channel.Id] = &copy
 	if channel2advancedCustomConfig == nil {
 		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)
 	}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -16,6 +17,15 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
+
+// ChannelAvailabilityError is a local admission rejection, never an upstream
+// failure. Existing streams and task-result polling do not re-enter admission.
+func ChannelAvailabilityError(c *gin.Context, channel *model.Channel) *types.NewAPIError {
+	if channel == nil || channel.ScheduleAllowsAt(time.Now()) {
+		return nil
+	}
+	return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgDistributorOutsideSchedule)), types.ErrorCode(dto.FilterAvailability), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+}
 
 func GetChannelConstraints(c *gin.Context) *dto.ChannelConstraints {
 	if c == nil {
@@ -307,6 +317,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		}
 		if channel.Status != common.ChannelStatusEnabled {
 			return nil, "", pinnedChannelUnavailable(pin, http.StatusForbidden, i18n.MsgDistributorChannelDisabled)
+		}
+		if apiErr := ChannelAvailabilityError(c, channel); apiErr != nil {
+			return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCode(dto.FilterAvailability), MessageID: i18n.MsgDistributorOutsideSchedule, FilterKind: dto.FilterAvailability, Channel: channel}
 		}
 		if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
 			return nil, "", &ChannelSelectError{

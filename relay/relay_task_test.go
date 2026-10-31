@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -16,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	kittypes "github.com/QuantumNous/new-api/relaykit/types"
@@ -83,6 +85,33 @@ func TestRealtimeFetchAppliesChannelHeaderOverrides(t *testing.T) {
 	assert.Equal(t, "/v1beta/operations/task-1", request.URL.Path)
 	assert.Equal(t, "saved-key", request.Header.Get("X-API-Key"))
 	assert.Equal(t, "saved-key", request.Header.Get("X-Goog-Api-Key"))
+}
+
+func TestMidjourneyOriginChannelOutsideAvailability(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	require.NoError(t, i18n.Init())
+	require.NoError(t, database.AutoMigrate(&model.Midjourney{}, &model.User{}))
+	config := model.ChannelAvailability{Enabled: true, Timezone: "UTC", Mode: "daily", Rules: []model.ChannelAvailabilityRule{{ChannelAvailabilityWindow: model.ChannelAvailabilityWindow{Start: "00:00", End: "24:00"}}}}
+	for _, offset := range []int{-1, 0, 1} {
+		config.Exceptions = append(config.Exceptions, model.ChannelAvailabilityException{Date: time.Now().UTC().AddDate(0, 0, offset).Format("2006-01-02")})
+	}
+	raw, err := common.Marshal(config)
+	require.NoError(t, err)
+	channel := &model.Channel{Name: "closed-origin", Status: common.ChannelStatusEnabled, Availability: string(raw)}
+	require.NoError(t, database.Create(channel).Error)
+	require.NoError(t, database.Create(&model.User{Id: 7, Username: "origin-owner", Quota: 1000}).Error)
+	require.NoError(t, database.Create(&model.Midjourney{UserId: 7, MjId: "original-task", ChannelId: channel.Id, Status: "SUCCESS"}).Error)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/mj/submit/change", strings.NewReader(`{"taskId":"original-task","action":"UPSCALE","index":1}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{UserId: 7, RelayMode: relayconstant.RelayModeMidjourneyChange}
+	mjErr := RelayMidjourneySubmit(c, info)
+	require.NotNil(t, mjErr)
+	assert.Equal(t, i18n.T(c, i18n.MsgDistributorOutsideSchedule), mjErr.Description)
+	assert.Zero(t, service.RequestPolicy(c).Attempts, "reject before any upstream attempt")
+	var user model.User
+	require.NoError(t, database.First(&user, 7).Error)
+	assert.Equal(t, 1000, user.Quota, "reject before charging for the derived task")
 }
 
 func TestRealtimeFetchRefundsTaskItFindsFailed(t *testing.T) {

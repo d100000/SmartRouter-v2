@@ -39,7 +39,7 @@ relay.group_upstream_saturated: "The upstream of the current group is at capacit
 relay.retry_get_channel_failed: "Failed to get available channel for model {{.Model}} under group {{.Group}} (retry): {{.Error}}"
 relay.retry_no_available_channel: "No available channel for model {{.Model}} under group {{.Group}} (retry)"
 relay.access_token_unsupported: "Access tokens are not supported here"
-relay.stream_empty: "Upstream stream returned no valid usage or effective output"
+relay.stream_empty: "Upstream returned no effective output"
 relay.stream_invalid_response: "Upstream returned an invalid stream response"
 relay.stream_interrupted: "Upstream stream ended unexpectedly ({{.Reason}})"
 relay.stream_upstream_error: "Upstream stream returned an error"
@@ -95,3 +95,5 @@ channel.upstream_update_added_models: "Added model examples (showing {{.Shown}}/
 channel.upstream_update_removed_models: "Removed model examples (showing {{.Shown}}/{{.Total}}): {{.Models}}"
 channel.upstream_update_failed_channels: "Failed channel IDs (showing {{.Shown}}/{{.Total}}): {{.Ids}}"
 channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
+
+distributor.channel_outside_schedule: "This channel is outside its availability schedule"

@@ -305,7 +305,8 @@ type RelayInfo struct {
 
 // StreamFailureInfo separates a failed stream from its billable usage. A
 // partially delivered response may still be settled under the configured price,
-// while a failure without upstream usage or output must skip settlement.
+// while a failure without effective output must skip settlement even if the
+// upstream reports usage.
 // Error stays in memory; log writers persist only its masked, bounded message.
 type StreamFailureInfo struct {
 	Error              *types.NewAPIError

@@ -135,15 +135,11 @@ func TestResponsesRetryStartupBoundaries(t *testing.T) {
 				}()
 				response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: reader}
 				_, apiErr = adaptor.DoResponse(c, response, info)
-				if tc.usage {
-					require.Nil(t, apiErr)
-				} else {
-					require.NotNil(t, apiErr)
-				}
+				require.NotNil(t, apiErr)
 				require.NotNil(t, info.StreamFailure)
 				assert.Equal(t, tc.retry, info.StreamFailure.RetryableOverload)
 				assert.Equal(t, tc.usage, info.StreamFailure.HasActualUsage)
-				assert.Equal(t, !tc.usage, info.StreamFailure.NoCharge)
+				assert.True(t, info.StreamFailure.NoCharge, "usage cannot make empty output billable")
 				assert.Equal(t, tc.committed, c.Writer.Written())
 				if tc.retry {
 					assert.Empty(t, recorder.Body.String())
@@ -250,8 +246,8 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 				{name: "no fallback preserves original overload and refunds", noFallback: true, wantAttempts: 1},
 				{name: "plain EOF never retries", failure: "EOF", wantAttempts: 1},
 				{name: "message alone is insufficient", failure: strings.ReplaceAll(retryOverloadEvent, "server_is_overloaded", "server_error"), wantAttempts: 1},
-				{name: "usage on failed event prevents replay", failure: strings.ReplaceAll(retryOverloadEvent, `"usage":null`, `"usage":{"input_tokens":7,"output_tokens":0}`), wantAttempts: 1, wantQuota: 500},
-				{name: "duplicate response fields cannot hide usage", failure: strings.TrimSuffix(retryOverloadEvent, "}") + `,"response":{"status":"failed","error":{"code":"server_is_overloaded"},"usage":{"input_tokens":7}}}`, wantAttempts: 1, wantQuota: 500},
+				{name: "usage on failed event prevents replay", failure: strings.ReplaceAll(retryOverloadEvent, `"usage":null`, `"usage":{"input_tokens":7,"output_tokens":0}`), wantAttempts: 1},
+				{name: "duplicate response fields cannot hide usage", failure: strings.TrimSuffix(retryOverloadEvent, "}") + `,"response":{"status":"failed","error":{"code":"server_is_overloaded"},"usage":{"input_tokens":7}}}`, wantAttempts: 1},
 				{name: "zero usage object is not proof of rejection", failure: strings.ReplaceAll(retryOverloadEvent, `"usage":null`, `"usage":{"input_tokens":0,"output_tokens":0}`), wantAttempts: 1},
 				{name: "delivered output prevents retry", prefix: `{"type":"response.output_text.delta","delta":"hello"}`, wantAttempts: 1, wantQuota: 500},
 				{name: "unpriced function activity prevents retry", prefix: `{"type":"response.output_item.added","item":{"type":"function_call","id":"call-1","name":"unpriced","arguments":""}}`, wantAttempts: 1, wantQuota: 500},

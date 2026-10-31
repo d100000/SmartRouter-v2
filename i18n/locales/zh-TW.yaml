@@ -40,7 +40,7 @@ relay.group_upstream_saturated: "目前分組上游負載已飽和，請稍後�
 relay.retry_get_channel_failed: "獲取分組 {{.Group}} 下模型 {{.Model}} 的可用管道失敗（retry）：{{.Error}}"
 relay.retry_no_available_channel: "分組 {{.Group}} 下模型 {{.Model}} 的可用管道不存在（retry）"
 relay.access_token_unsupported: "暫不支援使用 access token"
-relay.stream_empty: "上游串流回應未傳回有效用量或有效輸出"
+relay.stream_empty: "上游未傳回有效輸出內容"
 relay.stream_invalid_response: "上游傳回了無效的串流回應"
 relay.stream_interrupted: "上游串流回應異常結束（{{.Reason}}）"
 relay.stream_upstream_error: "上游串流回應傳回錯誤"
@@ -96,3 +96,5 @@ channel.upstream_update_added_models: "新增模型範例（顯示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "刪除模型範例（顯示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失敗管道 ID（顯示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其餘 {{.Count}} 個已省略）"
+
+distributor.channel_outside_schedule: "渠道目前不在有效時間內"

@@ -40,6 +40,7 @@ import {
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
 } from './advanced-custom'
+import { availabilityValidationError } from './channel-availability'
 import { readTaskExtendPluginKeys } from './channel-plugin-extensions'
 import { parseChannelSettings } from './channel-utils'
 import { supportsResponsesWebSocket } from './responses-websocket'
@@ -226,6 +227,13 @@ export const channelFormSchema = z
     test_model: z.string().optional(),
     auto_ban: z.number().optional(),
     status: z.number(),
+    availability: z
+      .string()
+      .optional()
+      .superRefine((value, context) => {
+        const message = availabilityValidationError(value)
+        if (message) context.addIssue({ code: 'custom', message })
+      }),
     status_code_mapping: z
       .string()
       .optional()
@@ -450,6 +458,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   status_code_mapping: '',
   tag: '',
   remark: '',
+  availability: '{}',
   setting: '',
   param_override: '',
   header_override: '',
@@ -625,6 +634,7 @@ export function transformChannelToFormDefaults(
     status_code_mapping: channel.status_code_mapping || '',
     tag: channel.tag || '',
     remark: channel.remark || '',
+    availability: channel.availability || '{}',
     setting: channel.setting || '',
     param_override: channel.param_override || '',
     header_override: channel.header_override || '',
@@ -900,6 +910,7 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
     status_code_mapping: formData.status_code_mapping || null,
     tag: formData.tag || null,
     remark: formData.remark || '',
+    availability: formData.availability || '{}',
     setting: buildSettingJSON(formData),
     param_override: formData.param_override || null,
     header_override: formData.header_override || null,
@@ -947,6 +958,7 @@ export function transformFormDataToUpdatePayload(
     status_code_mapping: formData.status_code_mapping || null,
     tag: formData.tag || null,
     remark: formData.remark || '',
+    availability: formData.availability || '{}',
     setting: buildSettingJSON(formData),
     param_override: formData.param_override || null,
     header_override: formData.header_override || null,

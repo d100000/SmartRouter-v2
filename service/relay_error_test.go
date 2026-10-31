@@ -48,14 +48,14 @@ func TestStreamFailureLogsPreserveBillingDecisionAndMaskDetails(t *testing.T) {
 			wantSource: "local_estimate",
 		},
 		{
-			name:       "upstream input-only usage is not exempted",
-			failure:    &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("upstream interrupted"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), HasActualUsage: true},
-			wantSource: "upstream",
+			name:     "upstream input-only usage is uncharged without output",
+			failure:  &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("upstream interrupted"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), HasActualUsage: true, NoCharge: true},
+			errorLog: true, wantSource: "upstream", wantNoCharge: true,
 		},
 		{
-			name:     "existing violation fee is not marked free",
+			name:     "zero output also exempts post-refund violation fee",
 			failure:  &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("Content violates usage guidelines"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), NoCharge: true},
-			errorLog: true, wantSource: "none",
+			errorLog: true, wantSource: "none", wantNoCharge: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

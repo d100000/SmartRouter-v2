@@ -68,6 +68,7 @@ func TestErrorAnalysisOutputEvidence(t *testing.T) {
 		stream      bool
 		want        []string
 	}{
+		{"empty JSON rejected before body write", `{"request_path":"/v1/chat/completions","error_code":"empty_response"}`, false, []string{"zero_output"}},
 		{"legacy zero tokens", `{"request_path":"/v1/chat/completions"}`, false, []string{"unknown_output"}},
 		{"embedding zero tokens", `{"request_path":"/v1/embeddings"}`, false, []string{}},
 		{"client cancel", `{"stream_status":{"end_reason":"client_gone","response_status":"cancelled"}}`, true, []string{"client_cancelled"}},

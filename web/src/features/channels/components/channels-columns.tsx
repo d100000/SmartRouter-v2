@@ -86,6 +86,7 @@ import {
   isTagAggregateRow,
   type TagRow,
 } from '../lib'
+import { formatAvailabilityTime } from '../lib/channel-availability'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelCostCell } from './channel-cost-cell'
@@ -962,8 +963,9 @@ export function useChannelsColumns(
         meta: { mobileBadge: true },
         cell: ({ row }) => {
           const isTagRow = isTagAggregateRow(row.original)
-          const status = row.getValue('status') as number
           const channel = row.original as Channel
+          const status =
+            channel.effective_status ?? (row.getValue('status') as number)
 
           // Tag row: show aggregated status
           if (isTagRow) {
@@ -1009,6 +1011,71 @@ export function useChannelsColumns(
             isMultiKey && keySize > 0
               ? `${t(config.label)} (${enabledCount}/${keySize})`
               : t(config.label)
+
+          if (
+            channel.availability_state?.enabled &&
+            (status === 1 || status === 4)
+          ) {
+            const availability = channel.availability_state
+            const timezone = availability.timezone || 'UTC'
+            return (
+              <Tooltip>
+                <TooltipTrigger render={<span tabIndex={0} />}>
+                  <StatusBadge
+                    label={
+                      availability.invalid
+                        ? t('Invalid availability configuration')
+                        : label
+                    }
+                    variant={config.variant}
+                    size='sm'
+                    copyable={false}
+                  />
+                </TooltipTrigger>
+                <TooltipContent side='top' className='max-w-xs'>
+                  <div className='space-y-1 text-xs'>
+                    {availability.invalid ? (
+                      <div>
+                        {t(
+                          'Fix the availability configuration to resume requests.'
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <div>
+                          {t('Time zone')}: {timezone}
+                        </div>
+                        <div>
+                          {availability.next_change_at
+                            ? t(
+                                availability.open
+                                  ? 'Available until {{time}}'
+                                  : 'Available again at {{time}}',
+                                {
+                                  time: formatAvailabilityTime(
+                                    availability.next_change_at,
+                                    timezone,
+                                    locale
+                                  ),
+                                }
+                              )
+                            : t(
+                                'No availability change within the next {{days}} days',
+                                { days: availability.preview_days }
+                              )}
+                        </div>
+                      </>
+                    )}
+                    <div>
+                      {t(
+                        'The administrator switch remains enabled. Availability hours control new requests.'
+                      )}
+                    </div>
+                  </div>
+                </TooltipContent>
+              </Tooltip>
+            )
+          }
 
           // Auto-disabled: show reason and time tooltip
           if (status === 3) {
@@ -1074,10 +1141,13 @@ export function useChannelsColumns(
           if (!value || value.length === 0 || value.includes('all')) {
             return true
           }
-          const status = row.getValue(id) as number
+          const status =
+            (row.original as Channel).effective_status ??
+            (row.getValue(id) as number)
           if (value.includes('enabled')) {
             return status === 1
           }
+          if (value.includes('outside_schedule')) return status === 4
           if (value.includes('disabled')) {
             return status !== 1
           }
