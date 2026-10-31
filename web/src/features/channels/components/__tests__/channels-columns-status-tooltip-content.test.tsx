@@ -75,3 +75,43 @@ test('keeps the long string inside the status tooltip is wrapped when show', asy
     'wrap-anywhere'
   )
 })
+
+test('scheduled closure displays its own status and the next opening in the channel time zone', async () => {
+  const channel = channelSchema.parse({
+    id: 2,
+    type: 1,
+    key: '',
+    name: 'Scheduled',
+    status: 1,
+    effective_status: 4,
+    created_time: 0,
+    test_time: 0,
+    response_time: 0,
+    balance_updated_time: 0,
+    availability_state: {
+      enabled: true,
+      open: false,
+      timezone: 'Asia/Shanghai',
+      evaluated_at: 0,
+      preview_days: 8,
+      next_change_at: Date.parse('2026-11-01T01:00:00Z') / 1000,
+    },
+  })
+  const queryClient = new QueryClient()
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={queryClient}>
+      <ChannelsProvider>
+        <ExampleAutoDisabledStatusCell channel={channel} />
+      </ChannelsProvider>
+    </QueryClientProvider>
+  )
+  await user.hover(screen.getByText('Outside availability hours'))
+  expect(
+    await screen.findByText('Time zone: Asia/Shanghai')
+  ).toBeInTheDocument()
+  expect(
+    await screen.findByText(/Available again at .*09:00/)
+  ).toBeInTheDocument()
+  queryClient.clear()
+})

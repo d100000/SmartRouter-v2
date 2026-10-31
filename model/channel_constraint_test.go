@@ -3,6 +3,7 @@ package model
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -316,6 +317,48 @@ func TestChannelRoutingDatabaseMatrix(t *testing.T) {
 				require.NoError(t, candidateErr)
 				assert.Len(t, candidates, 3)
 			}
+			// Closed higher-priority channels must not prevent a live fallback,
+			// regardless of cache mode or the caller's optional channel filters.
+			closed := ChannelAvailability{Enabled: true, Timezone: "UTC", Mode: "daily", Rules: []ChannelAvailabilityRule{{ChannelAvailabilityWindow: ChannelAvailabilityWindow{Start: "00:00", End: "24:00"}}}}
+			for _, offset := range []int{-1, 0, 1} {
+				closed.Exceptions = append(closed.Exceptions, ChannelAvailabilityException{Date: time.Now().UTC().AddDate(0, 0, offset).Format("2006-01-02")})
+			}
+			encoded, marshalErr := common.Marshal(closed)
+			require.NoError(t, marshalErr)
+			first.Availability, second.Availability = string(encoded), string(encoded)
+			require.NoError(t, first.Update())
+			require.NoError(t, second.Update())
+			for _, cached := range []bool{false, true} {
+				common.MemoryCacheEnabled = cached
+				InitChannelCache()
+				selected, err := GetRandomSatisfiedChannel("default", "routing-matrix", 0, nil)
+				require.NoError(t, err)
+				require.NotNil(t, selected)
+				assert.Equal(t, last.Id, selected.Id)
+				assert.False(t, IsChannelEnabledForGroupModel("default", "routing-matrix", first.Id))
+				candidates, err := GetSatisfiedChannelCandidates("default", "routing-matrix", nil)
+				require.NoError(t, err)
+				require.Len(t, candidates, 1)
+				assert.Equal(t, last.Id, candidates[0].Id)
+			}
+			for _, status := range []int{common.ChannelStatusEnabled, common.ChannelStatusOutsideSchedule, 0} {
+				query := ApplyChannelEffectiveStatusFilter(db.Model(&Channel{}), status, time.Now())
+				var count int64
+				require.NoError(t, query.Count(&count).Error)
+				if status == common.ChannelStatusEnabled {
+					assert.EqualValues(t, 1, count)
+				} else {
+					assert.EqualValues(t, 2, count)
+				}
+				var page []Channel
+				require.NoError(t, query.Limit(1).Find(&page).Error)
+				require.Len(t, page, 1)
+				assert.Equal(t, common.ChannelStatusEnabled, page[0].Status, "the persisted switch is never replaced")
+			}
+			first.Availability, second.Availability = "{}", "{}"
+			require.NoError(t, first.Update())
+			require.NoError(t, second.Update())
+			InitChannelCache()
 			before := RoutingMetadataVersion()
 			first.Group, first.Models = "vip", "other-model"
 			require.NoError(t, first.Update())

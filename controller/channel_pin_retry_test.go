@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -216,4 +217,114 @@ func TestRequestPolicyRoutingDatabaseMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestChannelAvailabilityAdmissionAndManagement(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	db := modelManagementDB(t, "sqlite", "")
+	config := model.ChannelAvailability{Enabled: true, Timezone: "UTC", Mode: "daily", Rules: []model.ChannelAvailabilityRule{{ChannelAvailabilityWindow: model.ChannelAvailabilityWindow{Start: "00:00", End: "24:00"}}}}
+	for _, offset := range []int{-1, 0, 1} {
+		config.Exceptions = append(config.Exceptions, model.ChannelAvailabilityException{Date: time.Now().UTC().AddDate(0, 0, offset).Format("2006-01-02")})
+	}
+	raw, err := common.Marshal(config)
+	require.NoError(t, err)
+	scheduled := model.Channel{Name: "scheduled", Type: 1, Key: "fixture-key", Status: 1, Models: "availability-model", Group: "default", Availability: string(raw), Tag: common.GetPointer("scheduled-tag")}
+	enabled := model.Channel{Name: "always-open", Type: 1, Key: "fixture-key", Status: 1, Models: "availability-model", Group: "default", Tag: common.GetPointer("open-tag")}
+	for _, ch := range []*model.Channel{&scheduled, &enabled} {
+		require.NoError(t, db.Create(ch).Error)
+		require.NoError(t, ch.AddAbilities(db))
+	}
+	for _, cached := range []bool{false, true} {
+		common.MemoryCacheEnabled = cached
+		model.InitChannelCache()
+		c := newPinRetryContext()
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+		service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: scheduled.Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+		ch, _, selectErr := service.SelectChannelForRequest(c, "availability-model", &service.RetryParam{Ctx: c, TokenGroup: "default", ModelName: "availability-model", Retry: common.GetPointer(0)})
+		require.Nil(t, ch)
+		require.NotNil(t, selectErr)
+		assert.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+		assert.Equal(t, types.ErrorCode(dto.FilterAvailability), selectErr.Code)
+		apiErr := middleware.SetupContextForSelectedChannel(c, &scheduled, "availability-model")
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		assert.False(t, service.ShouldDisableChannel(apiErr))
+		service.EndSchedulingRequest(c)
+		// Automatic probes cannot turn planned closure into success/failure samples.
+		assert.Equal(t, channelTestSummary{}, testChannelForHealthCheck(c.Request.Context(), &scheduled, 0, true, 1))
+	}
+	// Reading an accepted task (including result callbacks) does not admit new
+	// work. A token pin must not stop these requests when its channel closes.
+	for _, request := range []struct{ method, path, body string }{
+		{http.MethodGet, "/mj/task/task-1/fetch", ""},
+		{http.MethodPost, "/mj/task/list-by-condition", `{}`},
+		{http.MethodGet, "/mj/task/task-1/image-seed", ""},
+		{http.MethodPost, "/mj/notify", `{}`},
+		{http.MethodGet, "/v1/videos/task-1", ""},
+		{http.MethodGet, "/v1/video/generations/task-1", ""},
+		{http.MethodPost, "/v1/videos/task-1/remix", `{}`},
+	} {
+		t.Run(request.path, func(t *testing.T) {
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+				service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: scheduled.Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+			}, middleware.Distribute())
+			router.Handle(request.method, request.path, func(c *gin.Context) { c.Status(http.StatusNoContent) })
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(request.method, request.path, strings.NewReader(request.body))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, req)
+			if strings.HasSuffix(request.path, "/remix") {
+				assert.Equal(t, http.StatusServiceUnavailable, recorder.Code, "remixing starts new work and stays gated")
+			} else {
+				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+	for _, tagMode := range []bool{false, true} {
+		for _, search := range []bool{false, true} {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/channel?status=outside_schedule&p=1&page_size=1&tag_mode=%t", tagMode), nil)
+			if search {
+				SearchChannels(ctx)
+			} else {
+				GetAllChannels(ctx)
+			}
+			var response struct {
+				Success bool
+				Data    struct {
+					Items      []model.Channel
+					Total      int
+					TypeCounts map[string]int `json:"type_counts"`
+				}
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success, recorder.Body.String())
+			require.Len(t, response.Data.Items, 1)
+			assert.Equal(t, 1, response.Data.Total)
+			assert.Equal(t, scheduled.Id, response.Data.Items[0].Id)
+			assert.Equal(t, common.ChannelStatusEnabled, response.Data.Items[0].Status)
+			assert.Equal(t, common.ChannelStatusOutsideSchedule, response.Data.Items[0].EffectiveStatus)
+			assert.Equal(t, 1, response.Data.TypeCounts["1"])
+			assert.Empty(t, response.Data.Items[0].Key)
+		}
+	}
+	// Partial channel edits must preserve a configured schedule; explicit reset
+	// must reopen it. Read-only effective status cannot be written back.
+	patch := model.Channel{Id: scheduled.Id, Name: "renamed"}
+	require.NoError(t, patch.Update())
+	assert.Equal(t, string(raw), patch.Availability)
+	patch.Availability = "{}"
+	require.NoError(t, patch.Update())
+	assert.True(t, patch.ScheduleAllowsAt(time.Now()))
+}
+
+func TestChannelAvailabilityStatusCannotBePersistedByCreate(t *testing.T) {
+	channel := model.Channel{Name: "scheduled", Type: 1, Key: "fixture-key", Models: "fixture-model", Group: "default", Status: common.ChannelStatusEnabled}
+	require.NoError(t, validateChannel(&channel, true))
+	channel.Status = common.ChannelStatusOutsideSchedule
+	require.Error(t, validateChannel(&channel, true))
 }

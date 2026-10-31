@@ -82,6 +82,8 @@ var channelOperationalFields = map[string]struct{}{
 // channelReadOnlyFields lists server-managed/accounting fields that the general
 // channel edit endpoint must ignore even if a client sends them.
 var channelReadOnlyFields = map[string]struct{}{
+	"effective_status":     {},
+	"availability_state":   {},
 	"cost_version_id":      {},
 	"created_time":         {},
 	"test_time":            {},
@@ -92,6 +94,8 @@ var channelReadOnlyFields = map[string]struct{}{
 }
 
 func clearChannelReadOnlyFields(channel *PatchChannel, requestData map[string]any) {
+	channel.EffectiveStatus = 0
+	channel.AvailabilityState = nil
 	if _, ok := requestData["cost_version_id"]; ok {
 		channel.CostVersionID = ""
 	}
@@ -122,6 +126,7 @@ func clearChannelReadOnlyFields(channel *PatchChannel, requestData map[string]an
 // to the fail-closed branch and is treated as sensitive. The
 // TestChannelFieldsAreClassified guard test enforces this.
 var channelNonSensitiveFields = map[string]struct{}{
+	"availability":        {},
 	"cost_ratio":          {},
 	"id":                  {},
 	"test_model":          {},

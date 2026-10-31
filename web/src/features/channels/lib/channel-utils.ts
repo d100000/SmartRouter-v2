@@ -711,11 +711,11 @@ export function aggregateChannelsByTag(
       })
     }
 
-    // Aggregate status (enabled if any child is enabled)
-    if (channel.status === 1) {
+    // Aggregate effective availability, while child power controls use base status.
+    if ((channel.effective_status ?? channel.status) === 1) {
       tagRow.status = 1
     } else if (tagRow.status === undefined) {
-      tagRow.status = channel.status
+      tagRow.status = channel.effective_status ?? channel.status
     }
   }
 

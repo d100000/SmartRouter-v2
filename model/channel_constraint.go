@@ -2,6 +2,7 @@ package model
 
 import (
 	"slices"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
@@ -20,6 +21,9 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
+	}
+	if !ch.ScheduleAllowsAt(time.Now()) {
+		return false, dto.FilterAvailability
 	}
 	for _, kind := range filterEvalOrder {
 		for _, filter := range filters {
@@ -42,7 +46,16 @@ func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter
 	if len(ids) == 0 {
 		return ids, ""
 	}
-	kept = ids
+	now := time.Now()
+	kept = make([]int, 0, len(ids))
+	for _, id := range ids {
+		if channel := channelsIDM[id]; channel == nil || channel.ScheduleAllowsAt(now) {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == 0 {
+		return kept, dto.FilterAvailability
+	}
 	for _, kind := range filterEvalOrder {
 		kindFilters := filtersByKind(filters, kind)
 		if len(kindFilters) == 0 {

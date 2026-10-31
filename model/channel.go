@@ -62,6 +62,11 @@ type Channel struct {
 
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
+	Availability         string                    `json:"availability" gorm:"type:text"`
+	EffectiveStatus      int                       `json:"effective_status" gorm:"-"`
+	AvailabilityState    *ChannelAvailabilityState `json:"availability_state,omitempty" gorm:"-"`
+	compiledAvailability *channelAvailabilityPlan
+
 	// cache info
 	Keys                           []string               `json:"-" gorm:"-"`
 	CostRatioSet                   bool                   `json:"-" gorm:"-"`
@@ -631,6 +636,9 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
+	if err := channel.ValidateAvailability(); err != nil {
+		return err
+	}
 	defer invalidateRoutingMetadata()
 	if err := ValidateUpstreamCostRatio(channel.CostRatio); err != nil {
 		return err
@@ -651,6 +659,9 @@ func (channel *Channel) Insert() error {
 }
 
 func (channel *Channel) Update() error {
+	if err := channel.ValidateAvailability(); err != nil {
+		return err
+	}
 	defer invalidateRoutingMetadata()
 	channel.CostRuleChange = nil
 	if err := ValidateUpstreamCostRatio(channel.CostRatio); err != nil {
@@ -1154,6 +1165,9 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 }
 
 func (channel *Channel) ValidateSettings() error {
+	if err := channel.ValidateAvailability(); err != nil {
+		return err
+	}
 	channelParams := &dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
 		err := common.Unmarshal([]byte(*channel.Setting), channelParams)

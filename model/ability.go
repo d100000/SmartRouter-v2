@@ -196,7 +196,7 @@ func configuredWeightIndex(weights []uint, draw float64) int {
 
 // filterAbilitiesByConstraints applies the same ChannelSatisfiesFilters
 // predicate used by the memory-cache path. A failed channel lookup fails
-// closed when a task-plugin identity is required and fails open otherwise.
+// closed because the channel's availability cannot be verified.
 func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters []dto.ChannelFilter) []Ability {
 	if len(abilities) == 0 {
 		return nil
@@ -214,10 +214,8 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 
 	var channels []*Channel
 	if err := DB.Where("id IN ?", channelIds).Find(&channels).Error; err != nil {
-		if identityFilterRequiresKey(filters) {
-			return nil
-		}
-		return abilities
+		// Availability is mandatory: a failed lookup must never route blindly.
+		return nil
 	}
 
 	channelsByID := make(map[int]*Channel, len(channels))

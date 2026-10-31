@@ -104,7 +104,19 @@ func Distribute() func(c *gin.Context) {
 				}
 			}
 		}
-		if pinned || shouldSelectChannel {
+		selectForRequest := pinned || shouldSelectChannel
+		if !shouldSelectChannel {
+			switch c.GetInt("relay_mode") {
+			case relayconstant.RelayModeMidjourneyTaskFetch, relayconstant.RelayModeMidjourneyTaskFetchByCondition,
+				relayconstant.RelayModeMidjourneyTaskImageSeed, relayconstant.RelayModeMidjourneyNotify,
+				relayconstant.RelayModeVideoFetchByID:
+				// Accepted tasks keep their own channel and ownership checks.
+				// Reading results does not admit new work, even with a token pin.
+				// Remix submissions also defer selection, but remain gated.
+				selectForRequest = false
+			}
+		}
+		if selectForRequest {
 			usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 			var selectErr *service.ChannelSelectError
 			if value, exists := c.Get(contextKeyTaskPluginEndpointSelection); exists && !pinned {
@@ -585,6 +597,9 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	if channel == nil {
 		logTaskPluginChannelDecision(c, nil, modelName, "channel_rejected", "nil_channel")
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+	if apiErr := service.ChannelAvailabilityError(c, channel); apiErr != nil {
+		return apiErr
 	}
 	if expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
 		logTaskPluginChannelDecision(c, channel, modelName, "channel_rejected", "identity_mismatch")

@@ -149,7 +149,11 @@ export function ChannelsTable() {
           const stored = localStorage.getItem(
             CHANNELS_STATUS_FILTER_STORAGE_KEY
           )
-          return stored === 'enabled' || stored === 'disabled' ? [stored] : []
+          return stored === 'enabled' ||
+            stored === 'disabled' ||
+            stored === 'outside_schedule'
+            ? [stored]
+            : []
         },
       },
       { columnId: 'type', searchKey: 'type', type: 'array' },
@@ -310,6 +314,7 @@ export function ChannelsTable() {
       }
     },
     placeholderData: (previousData) => previousData,
+    refetchInterval: 30_000,
   })
 
   // Apply tag aggregation if tag mode is enabled

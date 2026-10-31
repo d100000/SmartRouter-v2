@@ -40,7 +40,20 @@ export const channelSchema = z.object({
   key: z.string(),
   openai_organization: z.string().nullish(),
   test_model: z.string().nullish(),
-  status: z.number(), // 1: enabled, 0: manual disabled, 2: auto disabled
+  status: z.number(), // Persisted administrator/health status: 1 enabled, 2 manual, 3 automatic.
+  effective_status: z.number().optional(),
+  availability: z.string().nullish(),
+  availability_state: z
+    .object({
+      enabled: z.boolean(),
+      open: z.boolean(),
+      timezone: z.string().optional(),
+      invalid: z.boolean().optional(),
+      evaluated_at: z.number(),
+      next_change_at: z.number().optional(),
+      preview_days: z.number(),
+    })
+    .nullish(),
   name: z.string(),
   weight: z.number().nullish(),
   created_time: z.number(),
