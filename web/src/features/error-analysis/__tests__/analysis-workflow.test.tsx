@@ -51,6 +51,7 @@ let config: AnalysisConfig
 let snapshot: Snapshot
 let tasks: AnalysisTask[]
 let writes: { url?: string; data: Record<string, unknown> }[]
+let reads: Record<string, unknown>[]
 
 function Wrapper(props: { children: ReactNode }) {
   return (
@@ -100,6 +101,7 @@ beforeEach(() => {
   }
   tasks = []
   writes = []
+  reads = []
   api.defaults.adapter = (async (request) => {
     let data: unknown = null
     if (request.method === 'put' || request.method === 'post') {
@@ -131,6 +133,7 @@ beforeEach(() => {
     } else if (request.url === '/api/error-analysis/config') {
       data = config
     } else if (request.url === '/api/error-analysis') {
+      reads.push(request.params as Record<string, unknown>)
       data = { snapshot, log_total: snapshot.logs.length, offset: 0 }
     } else if (request.url === '/api/error-analysis/reports') {
       data = { items: tasks, total: tasks.length }
@@ -331,10 +334,158 @@ describe('Error analysis workflow', () => {
     ).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'View details' }))
     const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByText('diagnostic-request')).toBeVisible()
+    expect(await within(dialog).findByText('diagnostic-request')).toBeVisible()
     expect(
       within(dialog).getByRole('button', { name: 'Copy to clipboard' })
     ).toBeEnabled()
-    expect(within(dialog).getByText('eof')).toBeVisible()
+    expect(within(dialog).getByText(/"end_reason": "eof"/)).toBeVisible()
+  })
+  test('exact request search disables unrelated filters and clears the prior category', async () => {
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await screen.findByText('No requests in this time range')
+    await user.selectOptions(
+      screen.getByLabelText('Category'),
+      'settlement_risk'
+    )
+    await user.type(
+      screen.getByLabelText('Request ID'),
+      '  request-across-days  '
+    )
+    expect(screen.getByLabelText('Time range')).toBeDisabled()
+    expect(screen.getByLabelText('Model')).toBeDisabled()
+    expect(screen.getByLabelText('Channel ID')).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    await waitFor(() =>
+      expect(reads.at(-1)).toMatchObject({
+        request_id: 'request-across-days',
+        category: '',
+        offset: 0,
+      })
+    )
+    expect(screen.getByLabelText('Category')).toHaveValue('')
+    await user.clear(screen.getByLabelText('Request ID'))
+    expect(screen.getByLabelText('Time range')).toBeEnabled()
+  })
+
+  test('request details load on demand and show full upstream errors, usage and settlement evidence', async () => {
+    const longMessage = `upstream tool transport failed ${'x'.repeat(2000)} end-of-error`
+    snapshot.settlement_risk = 1
+    snapshot.logs = [
+      {
+        id: 9,
+        request_id: 'billed-failed',
+        upstream_request_id: 'provider-9',
+        created_at: 1000,
+        model: 'test',
+        channel: 7,
+        is_stream: true,
+        prompt_tokens: 118353,
+        completion_tokens: 27,
+        attempts: 1,
+        log_type: 2,
+        quota: 23763,
+        recorded_quota: 23763,
+        categories: ['settlement_risk'],
+        diagnostic: { response_status: 'failed', status_code: 502 },
+        evidence: {
+          version: 1,
+          upstream: [
+            {
+              attempt: 1,
+              channel: 7,
+              request_id: 'provider-9',
+              status_code: 200,
+              error_body: longMessage,
+              usage: {
+                usage: { prompt_tokens: 118353, completion_tokens: 27 },
+              },
+            },
+          ],
+          local: {
+            state: 'confirmed',
+            confirmed_quota: 23763,
+            requested_quota: 23763,
+            pre_consumed_quota: 10000,
+          },
+          downstream: {
+            status_code: 200,
+            completed: false,
+            failed: true,
+            write_failed: false,
+            capture_incomplete: false,
+          },
+        },
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await screen.findByText('billed-failed')
+    expect(reads.every((read) => !read.details)).toBe(true)
+    await user.click(screen.getByRole('button', { name: 'View details' }))
+    const dialog = screen.getByRole('dialog')
+    expect(await within(dialog).findByText(longMessage)).toBeVisible()
+    expect(reads.at(-1)).toMatchObject({
+      request_id: 'billed-failed',
+      details: true,
+    })
+    expect(
+      within(dialog).getAllByText('Funding settlement confirmed')[0]
+    ).toBeVisible()
+    expect(within(dialog).getByText(/"prompt_tokens": 118353/)).toBeVisible()
+    expect(within(dialog).getByText(longMessage)).toHaveAttribute(
+      'tabindex',
+      '0'
+    )
+    expect(within(dialog).getByText(longMessage)).toHaveClass(
+      'overflow-auto',
+      'whitespace-pre-wrap'
+    )
+    expect(
+      within(dialog).getByText(
+        'Provider usage is not a billing receipt. Downstream delivery does not confirm downstream settlement.'
+      )
+    ).toBeVisible()
+  })
+  test('a failed detail fetch shows retry and does not substitute the incomplete list record', async () => {
+    snapshot.logs = [
+      {
+        id: 5,
+        request_id: 'retry-detail',
+        upstream_request_id: '',
+        created_at: 1000,
+        model: 'test',
+        channel: 1,
+        is_stream: false,
+        completion_tokens: 0,
+        attempts: 1,
+        categories: ['error'],
+        diagnostic: {},
+      },
+    ]
+    const adapter = api.defaults.adapter as AxiosAdapter
+    let failDetails = true
+    api.defaults.adapter = async (request) => {
+      if (
+        request.url === '/api/error-analysis' &&
+        request.params?.details &&
+        failDetails
+      ) {
+        throw new Error('detail fetch unavailable')
+      }
+      return adapter(request)
+    }
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await screen.findByText('retry-detail')
+    await user.click(screen.getByRole('button', { name: 'View details' }))
+    const dialog = screen.getByRole('dialog')
+    const retry = await within(dialog).findByRole('button', { name: 'Retry' })
+    expect(
+      within(dialog).queryByText('Recorded consumption quota')
+    ).not.toBeInTheDocument()
+    failDetails = false
+    await user.click(retry)
+    expect(await within(dialog).findByText('retry-detail')).toBeVisible()
   })
 })

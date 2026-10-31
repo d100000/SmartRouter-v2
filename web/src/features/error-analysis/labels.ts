@@ -21,6 +21,11 @@ import { useTranslation } from 'react-i18next'
 export function useAnalysisLabels(): Record<string, string> {
   const { t } = useTranslation()
   return {
+    settlement_risk: t('Settlement risk'),
+    upstream_usage_unbilled: t('Upstream usage without local consumption'),
+    charged_zero_output: t('Charged with zero output'),
+    confirmed: t('Funding settlement confirmed'),
+    unconfirmed: t('Settlement not confirmed'),
     zero_output: t('Zero output'),
     interrupted: t('Interrupted streams'),
     error: t('Request errors'),

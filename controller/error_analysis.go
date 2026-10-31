@@ -48,6 +48,16 @@ func GetErrorAnalysis(c *gin.Context) {
 	total := len(logs)
 	offset = min(offset, total)
 	data.Logs = logs[offset:min(offset+50, total)]
+	if filter.RequestID == "" || c.Query("details") != "true" {
+		for i := range data.Logs {
+			data.Logs[i].Records = nil
+			data.Logs[i].Evidence = nil
+			if len([]rune(data.Logs[i].ErrorMessage)) > 512 {
+				data.Logs[i].ErrorTruncated = true
+			}
+			data.Logs[i].ErrorMessage = model.SafeFailureFact(data.Logs[i].ErrorMessage, 512)
+		}
+	}
 	common.ApiSuccess(c, gin.H{"snapshot": data, "log_total": total, "offset": offset})
 }
 

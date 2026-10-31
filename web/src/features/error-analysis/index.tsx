@@ -44,6 +44,7 @@ export function ErrorAnalysis() {
   const [configure, setConfigure] = useState(false)
   const [selected, setSelected] = useState('')
   const [range, setRange] = useState('1')
+  const [requestId, setRequestId] = useState('')
   const [model, setModel] = useState('')
   const [channel, setChannel] = useState('')
   const [offset, setOffset] = useState(0)
@@ -88,7 +89,10 @@ export function ErrorAnalysis() {
   const applyFilter = () => {
     const end = Math.floor(Date.now() / 1000)
     setOffset(0)
+    setCategory('')
+    setTab('statistics')
     setFilter({
+      request_id: requestId.trim(),
       start: end - Number(range) * 86400,
       end,
       model: model.trim(),
@@ -157,9 +161,20 @@ export function ErrorAnalysis() {
               applyFilter()
             }}
           >
+            <div className='w-full min-w-0 space-y-1.5 sm:w-80'>
+              <Label htmlFor='analysis-request-id'>{t('Request ID')}</Label>
+              <Input
+                id='analysis-request-id'
+                value={requestId}
+                maxLength={64}
+                onChange={(event) => setRequestId(event.target.value)}
+                placeholder={t('Exact request ID')}
+              />
+            </div>
             <div className='w-full space-y-1.5 sm:w-auto'>
               <Label htmlFor='analysis-range'>{t('Time range')}</Label>
               <NativeSelect
+                disabled={!!requestId.trim()}
                 id='analysis-range'
                 value={range}
                 onChange={(event) => setRange(event.target.value)}
@@ -178,6 +193,7 @@ export function ErrorAnalysis() {
             <div className='w-full min-w-0 space-y-1.5 sm:w-auto sm:min-w-40 sm:flex-1'>
               <Label htmlFor='analysis-model'>{t('Model')}</Label>
               <Input
+                disabled={!!requestId.trim()}
                 id='analysis-model'
                 value={model}
                 maxLength={200}
@@ -188,6 +204,7 @@ export function ErrorAnalysis() {
             <div className='w-28 space-y-1.5'>
               <Label htmlFor='analysis-channel'>{t('Channel ID')}</Label>
               <Input
+                disabled={!!requestId.trim()}
                 id='analysis-channel'
                 type='number'
                 min={0}
@@ -208,7 +225,11 @@ export function ErrorAnalysis() {
             </Button>
           </form>
           <p className='text-muted-foreground text-xs'>
-            {t('Filters apply to statistics and new analyses.')}
+            {requestId.trim()
+              ? t(
+                  'Request ID searches all retained logs and overrides time, model and channel filters.'
+                )
+              : t('Filters apply to statistics and new analyses.')}
           </p>
           <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
             <TabsList>
@@ -226,6 +247,7 @@ export function ErrorAnalysis() {
               )}
               {dashboard.data && !dashboard.isError && (
                 <FailureDashboard
+                  key={JSON.stringify(filter)}
                   data={dashboard.data.snapshot}
                   total={dashboard.data.log_total}
                   offset={offset}

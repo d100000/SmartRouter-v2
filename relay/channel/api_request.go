@@ -483,6 +483,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		info.ResponsesRetryEligible = false
 	}
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
+	c.Set(common2.UpstreamRequestIdKey, "")
 	service.MarkOverviewUpstreamSent(info)
 	resp, err := relayClient.Do(req)
 	if err != nil {
@@ -502,16 +503,13 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			resp.Proto)
 	}
 
-	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
-		c.Set(common2.UpstreamRequestIdKey, upID)
-	}
-
 	if req.Body != nil {
 		_ = req.Body.Close()
 	}
 	if c.Request.Body != nil {
 		_ = c.Request.Body.Close()
 	}
+	service.ObserveUpstreamResponse(c, info, resp)
 	return resp, nil
 }
 
