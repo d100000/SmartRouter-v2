@@ -32,12 +32,13 @@ export async function getAnalysis(
   filter: AnalysisFilter,
   offset: number,
   category: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  details = false
 ) {
   const response = await api.get<
     Response<{ snapshot: Snapshot; log_total: number; offset: number }>
   >('/api/error-analysis', {
-    params: { ...filter, offset, category },
+    params: { ...filter, offset, category, details },
     signal,
     disableDuplicate: true,
   })

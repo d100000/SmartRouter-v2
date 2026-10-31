@@ -100,12 +100,20 @@ export function AnalysisReports(props: {
                   </Badge>
                 </span>
                 <span className='text-muted-foreground block text-xs whitespace-normal'>
-                  <span className='block'>
-                    {formatTimestamp(task.payload.start)}
-                  </span>
-                  <span className='block'>
-                    — {formatTimestamp(task.payload.end)}
-                  </span>
+                  {task.payload.request_id ? (
+                    <span className='block break-all'>
+                      {t('Request ID')}: {task.payload.request_id}
+                    </span>
+                  ) : (
+                    <>
+                      <span className='block'>
+                        {formatTimestamp(task.payload.start)}
+                      </span>
+                      <span className='block'>
+                        — {formatTimestamp(task.payload.end)}
+                      </span>
+                    </>
+                  )}
                   <span className='block break-words'>
                     {task.payload.model || t('All models')} · {t('Channel')}{' '}
                     {task.payload.channel || t('All')}
@@ -160,9 +168,10 @@ export function AnalysisReports(props: {
             <div className='flex flex-wrap items-center justify-between gap-3'>
               <div className='space-y-1'>
                 <h2 className='font-semibold'>{t('Analysis report')}</h2>
-                <p className='text-muted-foreground text-xs'>
-                  {formatTimestamp(report.payload.start)} —{' '}
-                  {formatTimestamp(report.payload.end)}
+                <p className='text-muted-foreground text-xs break-all'>
+                  {report.payload.request_id
+                    ? `${t('Request ID')}: ${report.payload.request_id}`
+                    : `${formatTimestamp(report.payload.start)} — ${formatTimestamp(report.payload.end)}`}
                 </p>
                 <p className='text-muted-foreground text-xs break-words'>
                   {t('Model')}: {report.payload.model || t('All models')} ·{' '}

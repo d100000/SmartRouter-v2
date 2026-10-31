@@ -18,12 +18,14 @@ const failureObservationKey = "failure_output_observation"
 // Only the current incomplete frame is buffered, never persisted. This observer
 // does not alter forwarding, token counts, retry decisions or settlement.
 type failureOutputObservation struct {
-	mu       sync.Mutex
-	pending  []byte
-	known    bool
-	output   bool
-	finish   string
-	overflow bool
+	mu          sync.Mutex
+	pending     []byte
+	known       bool
+	output      bool
+	finish      string
+	overflow    bool
+	delivery    responseEvidenceParser
+	writeFailed bool
 }
 
 func observeFailureOutput(c *gin.Context, body []byte) {
@@ -34,6 +36,7 @@ func observeFailureOutput(c *gin.Context, body []byte) {
 	state := value.(*failureOutputObservation)
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	state.delivery.feed(body, strings.Contains(c.Writer.Header().Get("Content-Type"), "text/event-stream") || bytes.HasPrefix(bytes.TrimSpace(body), []byte("data:")) || bytes.HasPrefix(bytes.TrimSpace(body), []byte("event:")))
 	if state.overflow {
 		return
 	}

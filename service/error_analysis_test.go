@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -9,18 +10,22 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -133,7 +138,7 @@ func TestErrorAnalysisDatabaseMatrix(t *testing.T) {
 				{CreatedAt: now - 9, RequestId: "recovered", Type: model.LogTypeConsume, ModelName: "model-a", ChannelId: 2, CompletionTokens: 3},
 				{CreatedAt: now - 8, RequestId: "empty", Type: model.LogTypeConsume, ModelName: "model-a", ChannelId: 1, Other: `{"admin_info":{"failure_diagnostic":{"path":"/v1/chat/completions","has_output":false}},"root_info":{"key":"do-not-send"}}`},
 				{CreatedAt: now - 7, RequestId: "cut", Type: model.LogTypeConsume, ModelName: "model-b", ChannelId: 3, IsStream: true, CompletionTokens: 5, Other: `{"stream_status":{"end_reason":"timeout"}}`},
-				{CreatedAt: now - 6, RequestId: "error", Type: model.LogTypeError, ModelName: "model-b", ChannelId: 3, Content: "secret prompt must not leave", Other: `{"error_code":"sk-secret-value","status_code":500}`},
+				{CreatedAt: now - 6, RequestId: "error", Type: model.LogTypeError, ModelName: "model-b", ChannelId: 3, Content: `{"error":{"message":"upstream failed"},"prompt":"secret prompt must not leave"}`, Other: `{"error_code":"sk-secret-value","status_code":500}`},
 				{CreatedAt: now, RequestId: "boundary", Type: model.LogTypeConsume, ModelName: "excluded"},
 			}
 			require.NoError(t, db.Create(&logs).Error)
@@ -153,6 +158,37 @@ func TestErrorAnalysisDatabaseMatrix(t *testing.T) {
 			assert.NotContains(t, string(encoded), "secret prompt")
 			assert.NotContains(t, string(encoded), "sk-secret-value")
 			assert.NotContains(t, string(encoded), "do-not-send")
+			// Exact IDs search retained history across time and channel filters,
+			// include successful calls, and retain both sides of a retry.
+			exact := model.ErrorAnalysisFilter{RequestID: " recovered ", Start: now - 1, End: now, Channel: 99}
+			require.NoError(t, exact.Normalize(time.Now()))
+			chain, err := model.LoadErrorAnalysis(context.Background(), exact)
+			require.NoError(t, err)
+			require.Len(t, chain.Logs, 1)
+			require.Len(t, chain.Logs[0].Records, 2)
+			assert.Equal(t, 2, chain.Logs[0].Records[0].Channel)
+			assert.Equal(t, 1, chain.Logs[0].Records[1].Channel)
+			successful, err := model.LoadErrorAnalysis(context.Background(), model.ErrorAnalysisFilter{RequestID: "boundary"})
+			require.NoError(t, err)
+			require.Len(t, successful.Logs, 1)
+			assert.Empty(t, successful.Logs[0].Categories)
+			missing, err := model.LoadErrorAnalysis(context.Background(), model.ErrorAnalysisFilter{RequestID: "recovered' OR 1=1 --"})
+			require.NoError(t, err)
+			assert.Empty(t, missing.Logs)
+			finance := []model.Log{
+				{RequestId: "FINANCIAL-RETRY", CreatedAt: now - 3, Type: model.LogTypeConsume, ChannelId: 9, ModelName: "finance"},
+				{RequestId: "financial-retry", CreatedAt: now - 2, Type: model.LogTypeError, ChannelId: 4, ModelName: "finance", Other: `{"admin_info":{"settlement_evidence":{"version":1,"upstream":[{"attempt":1,"channel":4,"usage":{"usage":{"input_tokens":10}}}]}}}`},
+				{RequestId: "financial-retry", CreatedAt: now - 1, Type: model.LogTypeConsume, ChannelId: 6, ModelName: "finance", Quota: 200, CompletionTokens: 2},
+			}
+			require.NoError(t, db.Create(&finance).Error)
+			financial, err := model.LoadErrorAnalysis(context.Background(), model.ErrorAnalysisFilter{RequestID: "financial-retry"})
+			require.NoError(t, err)
+			require.Len(t, financial.Logs, 1)
+			assert.Equal(t, 1, financial.UpstreamUsageUnbilled)
+			assert.Equal(t, 1, financial.Recovered)
+			assert.Equal(t, 1, financial.Affected)
+			assert.EqualValues(t, 200, financial.Logs[0].RecordedQuota)
+			assert.Contains(t, financial.Logs[0].Categories, "upstream_usage_unbilled")
 			// The reader must use LOG_DB, independently of the primary database.
 			model.DB = oldDB
 			separate, err := model.LoadErrorAnalysis(context.Background(), model.ErrorAnalysisFilter{Start: now - 20, End: now, Model: "model-b"})
@@ -416,3 +452,176 @@ func TestErrorAnalysisLiveProvider(t *testing.T) {
 	}
 	t.Log(fmt.Sprintf("Chat Completions SSE succeeded; report length %d bytes", len(report)))
 }
+
+func TestErrorAnalysisRetainsUpstreamEvidenceWithoutChangingResponse(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{StartTime: time.Now(), ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 7}}
+	raw := "data: {\"usage\":{\"prompt_tokens\":118353,\"completion_tokens\":27,\"prompt_tokens_details\":{\"cached_tokens\":100}}}\n\ndata: {\"error\":{\"code\":\"bad_response\",\"message\":\"tool transport correction changed an operation; no tool was executed\",\"api_key\":\"private-provider-key\"},\"prompt\":\"private input\"}\n\n"
+	response := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}, common.RequestIdKey: {"upstream-1"}}, Body: io.NopCloser(strings.NewReader(raw))}
+	ObserveUpstreamResponse(c, info, response)
+	received, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	assert.Equal(t, raw, string(received), "diagnostic capture must not change forwarded bytes")
+	other := model.NewLogOther()
+	AppendRelayLogAdminInfo(c, info, other)
+	row := model.ClassifyFailureLog(model.Log{Type: model.LogTypeError, Other: other.JSONString()})
+	require.NotNil(t, row.Evidence)
+	require.Len(t, row.Evidence.Upstream, 1)
+	attempt := row.Evidence.Upstream[0]
+	assert.Equal(t, "upstream-1", attempt.RequestID)
+	assert.Contains(t, string(attempt.Usage["usage"]), `"prompt_tokens":118353`)
+	assert.Contains(t, attempt.ErrorBody, "tool transport correction changed an operation; no tool was executed")
+	assert.NotContains(t, attempt.ErrorBody, "private-provider-key")
+	assert.NotContains(t, attempt.ErrorBody, "private input")
+	assert.False(t, attempt.CaptureIncomplete)
+	assert.Contains(t, row.Categories, "upstream_usage_unbilled")
+	// A retry without a provider ID must not inherit the preceding attempt's ID.
+	next := &http.Response{StatusCode: 502, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("gateway unavailable"))}
+	ObserveUpstreamResponse(c, info, next)
+	_, err = io.ReadAll(next.Body)
+	require.NoError(t, err)
+	assert.Empty(t, c.GetString(common.UpstreamRequestIdKey))
+	other = model.NewLogOther()
+	AppendRelayLogAdminInfo(c, info, other)
+	row = model.ClassifyFailureLog(model.Log{Type: model.LogTypeError, Other: other.JSONString()})
+	require.Len(t, row.Evidence.Upstream, 2)
+	assert.Equal(t, "gateway unavailable", row.Evidence.Upstream[1].ErrorBody)
+	assert.Equal(t, "upstream-1", row.Evidence.Upstream[0].RequestID)
+}
+
+func TestErrorAnalysisDeliveryAndSettlementClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, body                         string
+		risk, completed, usage, incomplete bool
+	}{
+		{name: "content followed by disconnect", body: "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n", risk: true},
+		{name: "usage permits settlement without terminal", body: "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n", usage: true},
+		{name: "complete terminal permits settlement without usage", body: "data: [DONE]\n\n", completed: true},
+		{name: "partial terminal is unknown", body: "data: [DONE]\n", incomplete: true},
+		{name: "error after usage remains a risk", body: "data: {\"usage\":{\"completion_tokens\":2}}\n\ndata: {\"error\":{\"message\":\"failed\"}}\n\n", risk: true, usage: true},
+		{name: "claude terminal", body: "data: {\"type\":\"message_stop\"}\n\n", completed: true},
+		{name: "responses terminal", body: "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10}}}\n\n", completed: true, usage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			c.Writer.Header().Set("Content-Type", "text/event-stream")
+			ObserveSchedulingResponse(c)
+			// Arbitrary transport boundaries must not turn partial terminal bytes into completion.
+			split := len(tc.body) / 2
+			_, err := c.Writer.WriteString(tc.body[:split])
+			require.NoError(t, err)
+			_, err = c.Writer.WriteString(tc.body[split:])
+			require.NoError(t, err)
+			other := model.NewLogOther()
+			AppendRelayLogAdminInfo(c, &relaycommon.RelayInfo{StartTime: time.Now()}, other)
+			entry := model.ClassifyFailureLog(model.Log{Type: model.LogTypeConsume, Quota: 500, Other: other.JSONString()})
+			require.NotNil(t, entry.Evidence.Downstream)
+			assert.Equal(t, tc.completed, entry.Evidence.Downstream.Completed)
+			assert.Equal(t, tc.usage, len(entry.Evidence.Downstream.Usage) > 0)
+			assert.Equal(t, tc.incomplete, entry.Evidence.Downstream.CaptureIncomplete)
+			assert.Equal(t, tc.risk, slices.Contains(entry.Categories, "settlement_risk"))
+		})
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/realtime", nil)
+	ObserveSchedulingResponse(c)
+	other := model.NewLogOther()
+	AppendRelayLogAdminInfo(c, &relaycommon.RelayInfo{StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAIRealtime}, other)
+	realtime := model.ClassifyFailureLog(model.Log{Type: model.LogTypeConsume, Quota: 500, Other: other.JSONString()})
+	assert.Nil(t, realtime.Evidence.Downstream, "HTTP observation cannot establish WebSocket delivery")
+	assert.NotContains(t, realtime.Categories, "settlement_risk")
+	legacy := model.ClassifyFailureLog(model.Log{Type: model.LogTypeConsume, Quota: 500, Other: `{}`})
+	assert.NotContains(t, legacy.Categories, "settlement_risk", "missing history is not proof of a settlement gap")
+	zero := model.ClassifyFailureLog(model.Log{Type: model.LogTypeConsume, Quota: 500, Other: `{"admin_info":{"failure_diagnostic":{"has_output":false}}}`})
+	assert.Contains(t, zero.Categories, "charged_zero_output")
+}
+
+func TestErrorAnalysisCaptureBoundsAndSplitUsage(t *testing.T) {
+	var parser responseEvidenceParser
+	parser.feed([]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":8}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n"), true)
+	assert.JSONEq(t, `{"input_tokens":10,"cache_read_input_tokens":8}`, string(parser.usage["message.usage"]))
+	assert.JSONEq(t, `{"output_tokens":3}`, string(parser.usage["usage"]))
+	var precise responseEvidenceParser
+	precise.feed([]byte(`{"usage":{"input_tokens":1234567890123456789,"cost":0.1234567890123456789}}`), false)
+	assert.Contains(t, string(precise.usage["usage"]), `1234567890123456789`)
+	assert.Contains(t, string(precise.usage["usage"]), `0.1234567890123456789`)
+	snapshot := cloneEvidenceUsage(parser.usage)
+	parser.feed([]byte("data: {\"usage\":{\"output_tokens\":4}}\n\n"), true)
+	assert.JSONEq(t, `{"output_tokens":3}`, string(snapshot["usage"]), "persisted snapshots must not alias mutable usage")
+	parser.feed([]byte("data: "+strings.Repeat("x", evidenceFrameLimit)+"\n\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: [DONE]\n\n"), true)
+	assert.True(t, parser.incomplete)
+	assert.True(t, parser.completed)
+	assert.JSONEq(t, `{"output_tokens":5}`, string(parser.usage["usage"]), "a large output frame must not hide later usage")
+	safe, truncated := model.SafeFailureDetail(`{"error":{"message":"see https://example.com/private?q=key"},"headers":{"Authorization":"private-key"}}`, 2048)
+	assert.True(t, gjson.Valid(safe), "redaction must preserve JSON structure")
+	assert.False(t, truncated)
+	assert.NotContains(t, safe, "private-key")
+	safe, truncated = model.SafeFailureDetail(strings.Repeat("错", evidenceErrorLimit+1), evidenceErrorLimit)
+	assert.True(t, truncated)
+	assert.True(t, utf8.ValidString(safe))
+	assert.Len(t, []rune(safe), evidenceErrorLimit)
+	assert.False(t, model.HasReportedUsage(map[string]json.RawMessage{"usage": []byte(`{"input_tokens":0,"output_tokens":0,"service_tier":"default","unknown":null}`)}))
+}
+
+func TestErrorAnalysisPartialWriteDoesNotProveDelivery(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	c.Writer = &analysisFailWriter{ResponseWriter: c.Writer}
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	ObserveSchedulingResponse(c)
+	_, err := c.Writer.WriteString("data: [DONE]\n\n")
+	require.Error(t, err)
+	other := model.NewLogOther()
+	AppendRelayLogAdminInfo(c, &relaycommon.RelayInfo{StartTime: time.Now()}, other)
+	row := model.ClassifyFailureLog(model.Log{Type: model.LogTypeConsume, Quota: 100, Other: other.JSONString()})
+	assert.True(t, row.Evidence.Downstream.WriteFailed)
+	assert.Contains(t, row.Categories, "settlement_risk")
+}
+
+type analysisFailWriter struct{ gin.ResponseWriter }
+
+func (w *analysisFailWriter) Write(body []byte) (int, error) { return len(body) - 1, io.ErrClosedPipe }
+
+func TestErrorAnalysisSeparatesRecordedChargeFromConfirmedSettlement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		failed bool
+		state  string
+	}{
+		{name: "pre-consumed amount is finalized", state: "confirmed"},
+		{name: "settlement failed despite consumption log", failed: true, state: "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{StartTime: time.Now(), FinalPreConsumedQuota: 500}
+			if tc.failed {
+				info.Billing = &analysisFailedSettlement{}
+			}
+			err := SettleBilling(c, info, 500)
+			if tc.failed {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			other := model.NewLogOther()
+			AppendRelayLogAdminInfo(c, info, other)
+			entry := model.ClassifyFailureLog(model.Log{Type: model.LogTypeConsume, Quota: 500, Other: other.JSONString()})
+			require.NotNil(t, entry.Evidence.Local)
+			assert.Equal(t, tc.state, entry.Evidence.Local.State)
+			if tc.failed {
+				assert.Zero(t, entry.Evidence.Local.ConfirmedQuota)
+				assert.Contains(t, entry.Categories, "settlement_risk")
+			} else {
+				assert.EqualValues(t, 500, entry.Evidence.Local.ConfirmedQuota)
+			}
+		})
+	}
+}
+
+type analysisFailedSettlement struct{ relaycommon.BillingSettler }
+
+func (*analysisFailedSettlement) Settle(int) error         { return io.ErrClosedPipe }
+func (*analysisFailedSettlement) GetPreConsumedQuota() int { return 500 }

@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 export type AnalysisFilter = {
   start: number
   end: number
+  request_id?: string
   model?: string
   channel?: number
 }
@@ -31,6 +32,9 @@ export type FailureCounts = {
   client_cancelled: number
   unknown_output: number
   recovered: number
+  settlement_risk?: number
+  upstream_usage_unbilled?: number
+  charged_zero_output?: number
 }
 export type Distribution = FailureCounts & { name: string }
 export type FailureLog = {
@@ -45,6 +49,17 @@ export type FailureLog = {
   attempts: number
   categories: string[]
   diagnostic: Record<string, string | number | boolean | null>
+  log_type?: number
+  prompt_tokens?: number
+  quota?: number
+  recorded_quota?: number
+  no_charge?: boolean
+  usage_source?: string
+  error_message?: string
+  error_truncated?: boolean
+  evidence?: SettlementEvidence
+  records?: FailureLog[]
+  records_truncated?: boolean
 }
 export type Snapshot = FailureCounts & {
   filter: AnalysisFilter
@@ -108,4 +123,35 @@ export type AnalysisTask = {
     sample_count: number
     attempts: AnalysisAttempt[]
   } | null
+}
+
+export type UpstreamEvidence = {
+  attempt: number
+  channel: number
+  request_id?: string
+  status_code: number
+  error_body?: string
+  error_truncated?: boolean
+  usage?: Record<string, unknown>
+  capture_incomplete?: boolean
+}
+export type SettlementEvidence = {
+  version: number
+  upstream?: UpstreamEvidence[]
+  attempts_truncated?: boolean
+  downstream?: {
+    status_code: number
+    usage?: Record<string, unknown>
+    completed: boolean
+    failed: boolean
+    write_failed: boolean
+    capture_incomplete: boolean
+  }
+  local?: {
+    state: string
+    requested_quota: number
+    confirmed_quota: number
+    pre_consumed_quota: number
+    error?: string
+  }
 }

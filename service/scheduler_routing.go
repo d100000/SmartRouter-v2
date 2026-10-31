@@ -374,6 +374,12 @@ func (w *schedulingResponseWriter) Unwrap() http.ResponseWriter {
 func (w *schedulingResponseWriter) Write(body []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(body)
 	if err != nil || n < len(body) {
+		if value, ok := w.ctx.Get(failureObservationKey); ok {
+			observation := value.(*failureOutputObservation)
+			observation.mu.Lock()
+			observation.writeFailed = true
+			observation.mu.Unlock()
+		}
 		state := schedulingState(w.ctx)
 		state.mu.Lock()
 		// Once the complete terminal has been written successfully, a failed

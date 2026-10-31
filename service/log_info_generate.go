@@ -72,6 +72,7 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
 		return
 	}
 	appendFailureDiagnostic(ctx, relayInfo, other)
+	appendSettlementEvidence(ctx, relayInfo, other)
 	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
 	if relayInfo != nil {
 		if len(relayInfo.StreamRetryHistory) > 0 {

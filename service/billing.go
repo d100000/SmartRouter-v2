@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -83,7 +84,25 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 
 // SettleBilling 执行计费结算。如果 RelayInfo 上有 BillingSession 则通过 session 结算，
 // 否则回退到旧的 PostConsumeQuota 路径（兼容按次计费等场景）。
-func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) error {
+func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) (settleErr error) {
+	evidence := &model.LocalSettlementEvidence{State: "unconfirmed", RequestedQuota: actualQuota, PreConsumedQuota: relayInfo.FinalPreConsumedQuota}
+	if relayInfo.Billing != nil {
+		evidence.PreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
+	}
+	defer func() {
+		if snapshot := relayInfo.AnalyticsBilling; snapshot != nil && snapshot.RevenueConfirmed {
+			evidence.State, evidence.ConfirmedQuota = "confirmed", snapshot.RevenueQuota
+		}
+		if settleErr != nil {
+			evidence.Error, _ = model.SafeFailureDetail(settleErr.Error(), 1024)
+			if evidence.State != "confirmed" {
+				evidence.State = "failed"
+			}
+		}
+		if ctx != nil {
+			ctx.Set(localSettlementEvidenceKey, evidence)
+		}
+	}()
 	if relayInfo.Billing != nil {
 		preConsumed := relayInfo.Billing.GetPreConsumedQuota()
 		delta := actualQuota - preConsumed

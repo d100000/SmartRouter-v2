@@ -58,13 +58,24 @@ func SafeFailureFact(value string, limit int) string {
 // ErrorAnalysisFilter uses a half-open time range, so adjacent daily reports
 // never count a boundary request twice. Queries deliberately avoid JSON SQL.
 type ErrorAnalysisFilter struct {
-	Start   int64  `json:"start" form:"start"`
-	End     int64  `json:"end" form:"end"`
-	Model   string `json:"model" form:"model"`
-	Channel int    `json:"channel" form:"channel"`
+	RequestID string `json:"request_id,omitempty" form:"request_id"`
+	Start     int64  `json:"start" form:"start"`
+	End       int64  `json:"end" form:"end"`
+	Model     string `json:"model" form:"model"`
+	Channel   int    `json:"channel" form:"channel"`
 }
 
 func (f *ErrorAnalysisFilter) Normalize(now time.Time) error {
+	f.RequestID = strings.TrimSpace(f.RequestID)
+	if f.RequestID != "" {
+		if len(f.RequestID) > 64 || strings.ContainsAny(f.RequestID, "\r\n\x00") {
+			return common.NewMessage("Invalid analysis time range or filters")
+		}
+		// An exact indexed lookup intentionally searches all retained records,
+		// including earlier attempts on other channels and older requests.
+		f.Start, f.End, f.Channel, f.Model = 0, 0, 0, ""
+		return nil
+	}
 	if f.End == 0 {
 		f.End = now.Unix()
 	}
@@ -102,28 +113,42 @@ type FailureDiagnostic struct {
 }
 
 type FailureLog struct {
-	ID                int               `json:"id"`
-	RequestID         string            `json:"request_id"`
-	UpstreamRequestID string            `json:"upstream_request_id"`
-	CreatedAt         int64             `json:"created_at"`
-	Model             string            `json:"model"`
-	Channel           int               `json:"channel"`
-	IsStream          bool              `json:"is_stream"`
-	CompletionTokens  int               `json:"completion_tokens"`
-	Attempts          int               `json:"attempts"`
-	Categories        []string          `json:"categories"`
-	Diagnostic        FailureDiagnostic `json:"diagnostic"`
+	ID                int                      `json:"id"`
+	RequestID         string                   `json:"request_id"`
+	UpstreamRequestID string                   `json:"upstream_request_id"`
+	CreatedAt         int64                    `json:"created_at"`
+	Model             string                   `json:"model"`
+	Channel           int                      `json:"channel"`
+	IsStream          bool                     `json:"is_stream"`
+	CompletionTokens  int                      `json:"completion_tokens"`
+	Attempts          int                      `json:"attempts"`
+	Categories        []string                 `json:"categories"`
+	Diagnostic        FailureDiagnostic        `json:"diagnostic"`
+	LogType           int                      `json:"log_type"`
+	PromptTokens      int                      `json:"prompt_tokens"`
+	Quota             int                      `json:"quota"`
+	RecordedQuota     int64                    `json:"recorded_quota"`
+	UsageSource       string                   `json:"usage_source,omitempty"`
+	NoCharge          *bool                    `json:"no_charge,omitempty"`
+	ErrorMessage      string                   `json:"error_message,omitempty"`
+	ErrorTruncated    bool                     `json:"error_truncated,omitempty"`
+	Evidence          *RelaySettlementEvidence `json:"evidence,omitempty"`
+	Records           []FailureLog             `json:"records,omitempty"`
+	RecordsTruncated  bool                     `json:"records_truncated,omitempty"`
 }
 
 type FailureCounts struct {
-	Requests        int `json:"requests"`
-	Affected        int `json:"affected"`
-	ZeroOutput      int `json:"zero_output"`
-	Interrupted     int `json:"interrupted"`
-	Errors          int `json:"errors"`
-	ClientCancelled int `json:"client_cancelled"`
-	UnknownOutput   int `json:"unknown_output"`
-	Recovered       int `json:"recovered"`
+	Requests              int `json:"requests"`
+	Affected              int `json:"affected"`
+	ZeroOutput            int `json:"zero_output"`
+	Interrupted           int `json:"interrupted"`
+	Errors                int `json:"errors"`
+	ClientCancelled       int `json:"client_cancelled"`
+	UnknownOutput         int `json:"unknown_output"`
+	Recovered             int `json:"recovered"`
+	SettlementRisk        int `json:"settlement_risk"`
+	UpstreamUsageUnbilled int `json:"upstream_usage_unbilled"`
+	ChargedZeroOutput     int `json:"charged_zero_output"`
 }
 
 type FailureDistribution struct {
@@ -150,8 +175,8 @@ func isGenerationPath(path string) bool {
 	return strings.HasSuffix(path, "/chat/completions") || strings.HasSuffix(path, "/completions") || strings.HasSuffix(path, "/responses") || strings.HasSuffix(path, "/messages") || strings.Contains(path, ":generateContent") || strings.Contains(path, ":streamGenerateContent")
 }
 
-// ClassifyFailureLog projects allowlisted facts only. Free-form upstream errors,
-// request bodies, user identities, keys and headers never enter analysis data.
+// ClassifyFailureLog includes bounded, redacted error/usage evidence. It never
+// includes request bodies, account identities, credentials or arbitrary headers.
 func ClassifyFailureLog(log Log) FailureLog {
 	root := gjson.Parse(log.Other)
 	d := FailureDiagnostic{}
@@ -196,6 +221,33 @@ func ClassifyFailureLog(log Log) FailureLog {
 	d.Path, _, _ = strings.Cut(d.Path, "?")
 	d.Path = SafeFailureFact(d.Path, 200)
 	entry := FailureLog{ID: log.Id, RequestID: SafeFailureFact(log.RequestId, 64), UpstreamRequestID: SafeFailureFact(log.UpstreamRequestId, 128), CreatedAt: log.CreatedAt, Model: SafeFailureFact(log.ModelName, 200), Channel: log.ChannelId, IsStream: log.IsStream, CompletionTokens: log.CompletionTokens, Attempts: 1, Categories: []string{}, Diagnostic: d}
+	entry.LogType, entry.PromptTokens, entry.Quota = log.Type, log.PromptTokens, log.Quota
+	if log.Type == LogTypeConsume {
+		entry.RecordedQuota = int64(log.Quota)
+	}
+	entry.UsageSource = SafeFailureFact(root.Get("stream_failure.usage_source").String(), 80)
+	if entry.UsageSource == "" && root.Get("admin_info.local_count_tokens").Bool() {
+		entry.UsageSource = "local_estimate"
+	}
+	if entry.UsageSource == "" {
+		entry.UsageSource = SafeFailureFact(root.Get("admin_info.usage_billing_path").String(), 80)
+	}
+	if raw := root.Get("admin_info.settlement_evidence"); raw.Exists() {
+		_ = common.UnmarshalJsonStr(raw.Raw, &entry.Evidence)
+		if entry.UsageSource == "" && entry.Evidence != nil {
+			entry.UsageSource = entry.Evidence.UsageSource
+		}
+	}
+	if noCharge := root.Get("stream_failure.no_charge"); noCharge.Exists() {
+		value := noCharge.Bool()
+		entry.NoCharge = &value
+	}
+	if log.Type == LogTypeError {
+		entry.ErrorMessage, entry.ErrorTruncated = SafeFailureDetail(log.Content, 32*1024)
+	}
+	if message := root.Get("stream_failure.message").String(); message != "" {
+		entry.ErrorMessage, entry.ErrorTruncated = SafeFailureDetail(message, 32*1024)
+	}
 	cancelled := d.EndReason == "client_gone" || d.ResponseStatus == "cancelled"
 	if cancelled {
 		entry.Categories = append(entry.Categories, "client_cancelled")
@@ -227,6 +279,32 @@ func ClassifyFailureLog(log Log) FailureLog {
 			entry.Categories = append(entry.Categories, "unknown_output")
 		}
 	}
+	if log.Type == LogTypeConsume && log.Quota > 0 && d.HasOutput != nil && !*d.HasOutput {
+		entry.Categories = append(entry.Categories, "charged_zero_output")
+	}
+	if e := entry.Evidence; e != nil {
+		if e.Local != nil && (e.Local.State == "failed" || e.Local.Error != "") {
+			entry.Categories = append(entry.Categories, "settlement_risk")
+		}
+		upstreamUsage := false
+		for _, attempt := range e.Upstream {
+			upstreamUsage = upstreamUsage || HasReportedUsage(attempt.Usage)
+		}
+		if upstreamUsage && (log.Type == LogTypeError || log.Type == LogTypeConsume && log.Quota == 0) {
+			entry.Categories = append(entry.Categories, "upstream_usage_unbilled")
+		}
+		if log.Type == LogTypeConsume && log.Quota > 0 {
+			down := e.Downstream
+			if down != nil && (down.WriteFailed || down.Failed || down.StatusCode >= 400 || !down.CaptureIncomplete && len(down.Usage) == 0 && !down.Completed) || d.ResponseStatus == "failed" || root.Get("stream_failure").Exists() {
+				if !slices.Contains(entry.Categories, "settlement_risk") {
+					entry.Categories = append(entry.Categories, "settlement_risk")
+				}
+			}
+		}
+	}
+	if log.Type == LogTypeConsume && log.Quota > 0 && (d.ResponseStatus == "failed" || root.Get("stream_failure").Exists() || interrupted) && !slices.Contains(entry.Categories, "settlement_risk") {
+		entry.Categories = append(entry.Categories, "settlement_risk")
+	}
 	return entry
 }
 
@@ -250,6 +328,15 @@ func (c *FailureCounts) add(entry FailureLog) {
 			c.UnknownOutput++
 		case "recovered":
 			c.Recovered++
+		case "settlement_risk":
+			c.SettlementRisk++
+			affected = true
+		case "upstream_usage_unbilled":
+			c.UpstreamUsageUnbilled++
+			affected = true
+		case "charged_zero_output":
+			c.ChargedZeroOutput++
+			affected = true
 		}
 	}
 	if affected {
@@ -261,7 +348,12 @@ func (c *FailureCounts) add(entry FailureLog) {
 // warning. Request IDs deduplicate relay retries; legacy rows remain distinct.
 // LOG_DB can be separate (including ClickHouse); no cross-database joins occur.
 func LoadErrorAnalysis(ctx context.Context, filter ErrorAnalysisFilter) (*ErrorAnalysisSnapshot, error) {
-	query := LOG_DB.WithContext(ctx).Model(&Log{}).Where("created_at >= ? AND created_at < ? AND type IN ?", filter.Start, filter.End, []int{LogTypeConsume, LogTypeError})
+	query := LOG_DB.WithContext(ctx).Model(&Log{}).Where("type IN ?", []int{LogTypeConsume, LogTypeError})
+	if filter.RequestID != "" {
+		query = query.Where("request_id = ?", filter.RequestID)
+	} else {
+		query = query.Where("created_at >= ? AND created_at < ?", filter.Start, filter.End)
+	}
 	if filter.Model != "" {
 		query = query.Where("model_name = ?", filter.Model)
 	}
@@ -276,7 +368,7 @@ func LoadErrorAnalysis(ctx context.Context, filter ErrorAnalysisFilter) (*ErrorA
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = "created_at desc, request_id desc"
 	}
-	rows, err := query.Select("id", "created_at", "type", "model_name", "channel_id", "request_id", "upstream_request_id", "completion_tokens", "use_time", "is_stream", "other").Order(order).Limit(50000).Rows()
+	rows, err := query.Select("id", "created_at", "type", "model_name", "channel_id", "request_id", "upstream_request_id", "prompt_tokens", "completion_tokens", "quota", "content", "use_time", "is_stream", "other").Order(order).Limit(50000).Rows()
 	if err != nil {
 		return nil, err
 	}
@@ -291,32 +383,51 @@ func LoadErrorAnalysis(ctx context.Context, filter ErrorAnalysisFilter) (*ErrorA
 		if err := LOG_DB.ScanRows(rows, &log); err != nil {
 			return nil, err
 		}
-		bytesScanned += len(log.Other)
+		bytesScanned += len(log.Other) + len(log.Content)
 		if bytesScanned > 64*1024*1024 {
 			break
 		}
 		result.ScannedLogRows++
+		// MySQL's default collation can equate IDs differing only by case.
+		// Keep the indexed candidate query, then enforce an exact identifier
+		// match consistently across all log database engines.
+		if filter.RequestID != "" && log.RequestId != filter.RequestID {
+			continue
+		}
 		key := log.RequestId
 		if key == "" {
 			key = fmt.Sprintf("legacy:%d:%d", log.CreatedAt, log.Id)
 		}
 		errored[key] = errored[key] || log.Type == LogTypeError
+		classified := ClassifyFailureLog(log)
 		if index, exists := indices[key]; exists {
 			entry := &entries[index]
-			entry.Attempts++
+			attempts, recordedQuota := entry.Attempts+1, entry.RecordedQuota+classified.RecordedQuota
+			records := entry.Records
+			if len(records) < 50 {
+				records = append(records, classified)
+			}
+			categories := entry.Categories
 			// Consumption is the final request outcome even when ClickHouse
 			// returns rows with equal timestamps in an arbitrary order.
 			if log.Type == LogTypeConsume && !consumed[key] {
-				attempts := entry.Attempts
-				*entry = ClassifyFailureLog(log)
-				entry.Attempts = attempts
+				*entry = classified
+			}
+			entry.Attempts, entry.RecordedQuota, entry.Records = attempts, recordedQuota, records
+			entry.RecordsTruncated = attempts > len(records)
+			// A successful retry must not erase financial risk on failed attempts.
+			for _, kind := range append(slices.Clone(categories), classified.Categories...) {
+				if (kind == "settlement_risk" || kind == "upstream_usage_unbilled" || kind == "charged_zero_output") && !slices.Contains(entry.Categories, kind) {
+					entry.Categories = append(entry.Categories, kind)
+				}
 			}
 			consumed[key] = consumed[key] || log.Type == LogTypeConsume
 			continue
 		}
 		indices[key] = len(entries)
 		consumed[key] = log.Type == LogTypeConsume
-		entries = append(entries, ClassifyFailureLog(log))
+		classified.Records = []FailureLog{classified}
+		entries = append(entries, classified)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -349,7 +460,7 @@ func LoadErrorAnalysis(ctx context.Context, filter ErrorAnalysisFilter) (*ErrorA
 			}
 			dimensions[i][key].add(entry)
 		}
-		if len(entry.Categories) > 0 {
+		if len(entry.Categories) > 0 || filter.RequestID != "" {
 			result.Logs = append(result.Logs, entry)
 		}
 	}

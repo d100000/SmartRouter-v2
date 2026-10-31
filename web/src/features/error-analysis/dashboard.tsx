@@ -19,9 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { lazy, Suspense, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
-import { Dialog } from '@/components/dialog'
 import { EmptyState } from '@/components/empty-state'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
@@ -32,6 +30,7 @@ import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber, formatTimestamp } from '@/lib/format'
 
 import { useAnalysisLabels } from './labels'
+import { RequestEvidenceDialog } from './request-evidence-dialog'
 import type { FailureLog, Snapshot } from './types'
 
 const TrendChart = lazy(() => import('./trend-chart'))
@@ -77,6 +76,15 @@ export function FailureDashboard(props: {
       </p>
       <div className='flex flex-wrap gap-x-6 gap-y-2 text-sm'>
         {[
+          { label: t('Settlement risk'), value: data.settlement_risk ?? 0 },
+          {
+            label: t('Upstream usage without local consumption'),
+            value: data.upstream_usage_unbilled ?? 0,
+          },
+          {
+            label: t('Charged with zero output'),
+            value: data.charged_zero_output ?? 0,
+          },
           { label: t('Affected requests'), value: data.affected },
           { label: t('Client cancelled'), value: data.client_cancelled },
           { label: t('Recovered after retry'), value: data.recovered },
@@ -126,7 +134,11 @@ export function FailureDashboard(props: {
       )}
       {data.requests === 0 ? (
         <EmptyState
-          title={t('No requests in this time range')}
+          title={
+            data.filter.request_id
+              ? t('Request ID not found')
+              : t('No requests in this time range')
+          }
           description={t('Check log recording or select another time range.')}
         />
       ) : (
@@ -211,6 +223,9 @@ export function FailureDashboard(props: {
             >
               <NativeSelectOption value=''>{t('All')}</NativeSelectOption>
               {[
+                'settlement_risk',
+                'upstream_usage_unbilled',
+                'charged_zero_output',
                 'zero_output',
                 'interrupted',
                 'error',
@@ -230,6 +245,15 @@ export function FailureDashboard(props: {
           getRowKey={(row) => `${row.request_id}:${row.id}`}
           emptyContent={<EmptyState title={t('No matching diagnostic logs')} />}
           columns={[
+            {
+              id: 'request',
+              header: t('Request ID'),
+              cell: (row) => (
+                <span className='block max-w-56 font-mono text-xs break-all'>
+                  {row.request_id || t('Unknown')}
+                </span>
+              ),
+            },
             {
               id: 'time',
               header: t('Time'),
@@ -300,39 +324,7 @@ export function FailureDashboard(props: {
         </div>
       </section>
       {detail && (
-        <Dialog
-          open
-          onOpenChange={(open) => {
-            if (!open) setDetail(null)
-          }}
-          title={t('Request diagnostics')}
-          description={t(
-            'Diagnostic facts only; request bodies and credentials are not recorded here.'
-          )}
-          footer={
-            <CopyButton
-              value={JSON.stringify(detail, null, 2)}
-              size='sm'
-              variant='outline'
-            >
-              {t('Copy diagnostics')}
-            </CopyButton>
-          }
-        >
-          <div className='space-y-4'>
-            <p className='font-mono text-xs break-all'>{detail.request_id}</p>
-            <dl className='grid grid-cols-1 gap-3 text-sm sm:grid-cols-2'>
-              {Object.entries(detail.diagnostic).map(([key, value]) => (
-                <div key={key} className='min-w-0'>
-                  <dt className='text-muted-foreground font-mono text-xs'>
-                    {key}
-                  </dt>
-                  <dd className='break-all'>{String(value ?? '—')}</dd>
-                </div>
-              ))}
-            </dl>
-          </div>
-        </Dialog>
+        <RequestEvidenceDialog row={detail} onClose={() => setDetail(null)} />
       )}
     </div>
   )
