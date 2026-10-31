@@ -40,7 +40,7 @@ relay.group_upstream_saturated: "当前分组上游负载已饱和，请稍后�
 relay.retry_get_channel_failed: "获取分组 {{.Group}} 下模型 {{.Model}} 的可用渠道失败（retry）: {{.Error}}"
 relay.retry_no_available_channel: "分组 {{.Group}} 下模型 {{.Model}} 的可用渠道不存在（retry）"
 relay.access_token_unsupported: "暂不支持使用 access token"
-relay.stream_empty: "上游流式响应未返回有效用量或有效输出"
+relay.stream_empty: "上游未返回有效输出内容"
 relay.stream_invalid_response: "上游返回了无效的流式响应"
 relay.stream_interrupted: "上游流式响应异常结束（{{.Reason}}）"
 relay.stream_upstream_error: "上游流式响应返回错误"

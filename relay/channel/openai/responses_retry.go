@@ -114,10 +114,28 @@ func responsesStreamError(c *gin.Context, data, event string) *types.NewAPIError
 
 // Output evidence is independent of tool prices: an unpriced function call is
 // still output and must never be replayed. Empty message shells are not output.
-func responsesEventHasOutput(event *dto.ResponsesStreamResponse) bool {
+func responsesEventHasOutput(event *dto.ResponsesStreamResponse, payload []byte) bool {
 	if strings.TrimSpace(event.Delta) != "" || event.Text != nil && strings.TrimSpace(*event.Text) != "" ||
-		event.Arguments != nil && *event.Arguments != "" || event.Input != nil && *event.Input != "" {
+		event.Arguments != nil && strings.TrimSpace(*event.Arguments) != "" || event.Input != nil && strings.TrimSpace(*event.Input) != "" ||
+		event.Part != nil && strings.TrimSpace(event.Part.Text) != "" {
 		return true
+	}
+	// Preserve output carried by native fields not modeled in the conversion DTO.
+	root := gjson.ParseBytes(payload)
+	if strings.TrimSpace(root.Get("partial_image_b64").String()+root.Get("part.refusal").String()) != "" {
+		return true
+	}
+	for _, output := range []gjson.Result{root.Get("output"), root.Get("response.output")} {
+		for _, item := range output.Array() {
+			if strings.TrimSpace(item.Get("encrypted_content").String()) != "" {
+				return true
+			}
+			for _, content := range item.Get("content").Array() {
+				if strings.TrimSpace(content.Get("refusal").String()) != "" {
+					return true
+				}
+			}
+		}
 	}
 	var items []dto.ResponsesOutput
 	if event.Response != nil {
@@ -127,7 +145,7 @@ func responsesEventHasOutput(event *dto.ResponsesStreamResponse) bool {
 		items = append(items[:len(items):len(items)], *event.Item)
 	}
 	for _, item := range items {
-		if item.Name != "" || item.Result != "" || strings.HasSuffix(item.Type, "_call") && item.Status == "completed" {
+		if strings.TrimSpace(item.Name+item.Result) != "" || strings.HasSuffix(item.Type, "_call") && item.Status == "completed" {
 			return true
 		}
 		for _, content := range item.Content {

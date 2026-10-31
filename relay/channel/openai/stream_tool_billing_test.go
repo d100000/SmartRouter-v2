@@ -59,6 +59,7 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 		body        string
 		code        types.ErrorCode
 		message     string
+		actualUsage bool
 	}{
 		{name: "error with done", body: "data: {\"error\":{\"message\":\"context too long\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}\n\ndata: [DONE]\n\n", code: "context_length_exceeded", message: "context too long"},
 		{name: "error without type", body: "data: {\"error\":{\"message\":\"context too long\",\"code\":\"context_length_exceeded\"}}\n\n", code: "context_length_exceeded", message: "context too long"},
@@ -72,6 +73,10 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 		{name: "finish only", body: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "whitespace only", body: "data: {\"choices\":[{\"delta\":{\"content\":\"   \"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "heartbeats only", body: ": ping\n\nevent: heartbeat\ndata: {\"type\":\"heartbeat\"}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
+		{name: "input usage only", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0,\"total_tokens\":17}}\n\ndata: [DONE]\n\n", actualUsage: true, code: types.ErrorCodeEmptyResponse},
+		{name: "canonical cache only", body: "data: {\"usage\":{\"billing_usage\":{\"source\":\"claude_messages\",\"semantic\":\"anthropic\",\"claude_usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":17}}}}\n\ndata: [DONE]\n\n", actualUsage: true, code: types.ErrorCodeEmptyResponse},
+		{name: "actual usage error", body: "data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0}}\n\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\n", actualUsage: true, code: types.ErrorCodeBadResponse},
+		{name: "json actual usage error", contentType: "application/json", body: `{"usage":{"prompt_tokens":17},"error":{"message":"upstream failed"}}`, actualUsage: true, code: types.ErrorCodeBadResponse},
 		{name: "zero usage", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "estimated canonical usage", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1325020,\"billing_usage\":{\"source\":\"oai_chat\",\"semantic\":\"openai\",\"estimated\":true,\"openai_usage\":{\"prompt_tokens\":1325020}}}}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "local usage source", body: "data: {\"usage\":{\"prompt_tokens\":1325020,\"usage_source\":\"local\"}}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
@@ -80,6 +85,7 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 		{name: "invalid event", body: "data: not-json\n\n", code: types.ErrorCodeBadResponseBody},
 		{name: "json error without type", contentType: "application/json", body: `{"error":{"message":"context too long","code":"context_length_exceeded"}}`, code: "context_length_exceeded", message: "context too long"},
 		{name: "json error incidental choices", contentType: "application/json", body: `{"error":{"message":"upstream refused"},"choices":[{"message":{"role":"assistant","content":"not delivered"}}]}`, code: types.ErrorCodeBadResponse, message: "upstream refused"},
+		{name: "JSON tool metadata without payload", contentType: "application/json", body: `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call1","type":"function","function":{}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":17}}`, actualUsage: true, code: types.ErrorCodeEmptyResponse},
 		{name: "invalid json response", contentType: "application/json", body: `{`, code: types.ErrorCodeBadResponseBody},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -97,7 +103,7 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 			}
 			require.NotNil(t, info.StreamFailure)
 			assert.True(t, info.StreamFailure.NoCharge)
-			assert.False(t, info.StreamFailure.HasActualUsage)
+			assert.Equal(t, test.actualUsage, info.StreamFailure.HasActualUsage)
 			assert.False(t, info.StreamFailure.HasEffectiveOutput)
 			assert.True(t, info.StreamStatus.ResponseFailed())
 			assert.True(t, info.StreamStatus.HasErrors())
@@ -107,7 +113,7 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 	}
 }
 
-func TestOaiStreamHandlerKeepsOutputAndRealUsageBillable(t *testing.T) {
+func TestOaiStreamHandlerKeepsEffectiveOutputBillable(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		body        string
@@ -126,14 +132,11 @@ func TestOaiStreamHandlerKeepsOutputAndRealUsageBillable(t *testing.T) {
 		{name: "tool only", body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call1\",\"type\":\"function\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n", prompt: 1325020, completion: -1},
 		{name: "custom tool", body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call1\",\"type\":\"custom\",\"custom\":{\"name\":\"python\",\"input\":\"print(1)\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n", prompt: 1325020, completion: -1},
 		{name: "audio payload", body: "data: {\"choices\":[{\"delta\":{\"audio\":{\"data\":\"aGVsbG8=\"}},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", prompt: 1325020},
-		{name: "input usage only", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0,\"total_tokens\":17}}\n\ndata: [DONE]\n\n", prompt: 17, actualUsage: true},
-		{name: "canonical cache only", body: "data: {\"usage\":{\"billing_usage\":{\"source\":\"claude_messages\",\"semantic\":\"anthropic\",\"claude_usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":17}}}}\n\ndata: [DONE]\n\n", actualUsage: true},
 		{name: "JSON response with output and usage", contentType: "application/json", body: `{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":2}}`, prompt: 17, completion: 2, actualUsage: true, visible: "hello"},
-		{name: "earlier usage retained", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":2}}\n\ndata: {\"choices\":[]}\n\ndata: {\"choices\":[]}\n\ndata: [DONE]\n\n", prompt: 17, completion: 2, actualUsage: true},
-		{name: "actual replaces estimate", body: "data: {\"usage\":{\"prompt_tokens\":1325020,\"billing_usage\":{\"source\":\"oai_chat\",\"semantic\":\"openai\",\"estimated\":true,\"openai_usage\":{\"prompt_tokens\":1325020}}}}\n\ndata: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n", prompt: 17, completion: 2, actualUsage: true},
+		{name: "JSON custom tool output", contentType: "application/json", body: `{"choices":[{"message":{"role":"assistant","tool_calls":[{"type":"custom","custom":{"name":"python","input":"print(1)"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":17,"completion_tokens":2}}`, prompt: 17, completion: 2, actualUsage: true, visible: "print(1)"},
+		{name: "earlier usage retained", body: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":2}}\n\ndata: {\"choices\":[]}\n\ndata: {\"choices\":[]}\n\ndata: [DONE]\n\n", prompt: 17, completion: 2, actualUsage: true},
+		{name: "actual replaces estimate", body: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1325020,\"billing_usage\":{\"source\":\"oai_chat\",\"semantic\":\"openai\",\"estimated\":true,\"openai_usage\":{\"prompt_tokens\":1325020}}}}\n\ndata: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n", prompt: 17, completion: 2, actualUsage: true},
 		{name: "partial output error", body: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"error\":{\"message\":\"upstream failed\",\"code\":\"upstream_failed\"}}\n\n", prompt: 1325020, completion: -1, failure: true},
-		{name: "actual usage error", body: "data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0}}\n\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\n", prompt: 17, actualUsage: true, failure: true},
-		{name: "json actual usage error", contentType: "application/json", body: `{"usage":{"prompt_tokens":17},"error":{"message":"upstream failed"}}`, prompt: 17, actualUsage: true, failure: true},
 		{name: "partial premature eof", body: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n", prompt: 1325020, completion: -1, failure: true},
 		{name: "finish without done", body: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n", prompt: 1325020, completion: -1},
 	} {

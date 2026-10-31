@@ -283,7 +283,7 @@ func TestOaiResponsesHandlerDeclaredToolsWithoutOutputCountZero(t *testing.T) {
 			{"type": "file_search"},
 		},
 		Output: []dto.ResponsesOutput{
-			{Type: "message", Role: "assistant"},
+			{Type: "message", Role: "assistant", Content: []dto.ResponsesOutputContent{{Type: "output_text", Text: "hello"}}},
 		},
 		Usage: &dto.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
 	})
@@ -482,7 +482,7 @@ func TestOaiResponsesHandlersKeepCacheWriteTTLSplit(t *testing.T) {
 	})
 
 	const usage = `"usage":{"input_tokens":12000,"output_tokens":0,"total_tokens":12000,"input_tokens_details":{"cached_tokens":4000,"cache_write_tokens":7000,"cache_write_tokens_details":{"ttl_30m_tokens":3000,"ttl_12h_tokens":4000}}}`
-	const response = `{"id":"resp_1","object":"response","model":"gpt-6-astra","status":"completed","output":[],` + usage + `}`
+	const response = `{"id":"resp_1","object":"response","model":"gpt-6-astra","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],` + usage + `}`
 	for _, tt := range []struct {
 		name, contentType, body string
 	}{
@@ -537,7 +537,7 @@ func TestOaiResponsesHandlerRewritesSGLangCreatedAtToInt(t *testing.T) {
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(`{"id":"resp_1","object":"response","created_at":1786588600.0,"status":"completed","output":[]}`)),
+		Body:       io.NopCloser(strings.NewReader(`{"id":"resp_1","object":"response","created_at":1786588600.0,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}`)),
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 	}
 
@@ -570,7 +570,7 @@ func TestOaiResponsesStreamHandlerRewritesSGLangCreatedAtToInt(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":1.7865886E9,\"status\":\"completed\",\"output\":[]}}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":1.7865886E9,\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}}\n\n" +
 				"data: [DONE]\n\n",
 		)),
 		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -603,7 +603,7 @@ func TestOaiResponsesStreamHandlerKeepsNonSGLangCreatedAt(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":1786588600.0,\"status\":\"completed\",\"output\":[]}}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":1786588600.0,\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}}\n\n" +
 				"data: [DONE]\n\n",
 		)),
 		Header: http.Header{"Content-Type": []string{"text/event-stream"}},

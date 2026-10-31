@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 
@@ -103,6 +104,16 @@ func calcViolationFeeQuota(amount, groupRatio float64) int {
 func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, apiErr *types.NewAPIError) bool {
 	if ctx == nil || relayInfo == nil || apiErr == nil {
 		return false
+	}
+	// A zero-output exemption must survive the post-refund fee path as well.
+	if failure := relayInfo.StreamFailure; failure != nil && failure.NoCharge && !failure.HasEffectiveOutput {
+		return false
+	}
+	if relayInfo.RelayMode == relayconstant.RelayModeChatCompletions || relayInfo.RelayMode == relayconstant.RelayModeCompletions ||
+		relayInfo.RelayMode == relayconstant.RelayModeResponses || relayInfo.RelayMode == relayconstant.RelayModeGemini || relayInfo.RelayFormat == types.RelayFormatClaude {
+		if relayInfo.StreamFailure == nil || !relayInfo.StreamFailure.HasEffectiveOutput {
+			return false
+		}
 	}
 	//if relayInfo.IsPlayground {
 	//	return false

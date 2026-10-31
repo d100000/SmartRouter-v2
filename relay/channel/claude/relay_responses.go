@@ -1,11 +1,13 @@
 package claude
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -38,9 +40,10 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		Usage:        &dto.Usage{},
 	}
 	var streamErr *types.NewAPIError
+	var hasOutput bool
 	// streamFailed means a Responses-native terminal error was sent successfully.
 	// In that case the scanner stops without a transport error and the partial
-	// upstream usage remains billable.
+	// upstream usage remains billable only when output was produced.
 	streamFailed := false
 
 	sendResponsesEvent := func(eventType string, payload dto.ResponsesStreamResponse) bool {
@@ -69,6 +72,7 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		return sendResponsesEvent(event.Type, event.Payload)
 	}
 	failResponsesStream := func(err error) bool {
+		streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		failureResults, handled := state.FailResponsesStream("server_error", err.Error(), "")
 		if !handled {
 			return false
@@ -87,8 +91,6 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		if err := common.UnmarshalJsonStr(data, &claudeResponse); err != nil {
 			logger.LogError(c, common.LogText("failed to unmarshal Claude stream event: %s", err.Error()))
 			if failResponsesStream(err) {
-				// A nil streamErr here is intentional: the protocol-level failure
-				// event was delivered, so only the scanner needs to stop.
 				sr.Stop(streamErr)
 				return
 			}
@@ -106,6 +108,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			return
 		}
 
+		for _, block := range []*dto.ClaudeMediaMessage{claudeResponse.ContentBlock, claudeResponse.Delta} {
+			if block != nil {
+				hasOutput = hasOutput || claudeBlockHasOutput(block)
+			}
+		}
 		if claudeResponse.StopReason != "" {
 			maybeMarkClaudeRefusal(c, info, claudeResponse.StopReason)
 		}
@@ -113,6 +120,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			maybeMarkClaudeRefusal(c, info, *claudeResponse.Delta.StopReason)
 		}
 		if claudeResponse.Type == "message_stop" {
+			if !hasOutput {
+				streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+				sr.Stop(streamErr)
+				return
+			}
 			info.StreamStatus.MarkCompleted()
 		}
 		if claudeResponse.Type == "message_start" && claudeResponse.Message != nil {
@@ -158,8 +170,17 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			}
 		}
 	})
+	if streamErr == nil && !hasOutput {
+		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
 	if streamErr != nil {
-		return nil, streamErr
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: streamErr,
+			HasActualUsage: dto.HasOpenAIUsageTokens(claudeInfo.Usage), HasEffectiveOutput: hasOutput,
+			NoCharge: !hasOutput, ErrorDelivered: streamFailed}
+		info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), streamErr.ToOpenAIError().Type, streamErr.StatusCode)
+		if !hasOutput || !streamFailed {
+			return nil, streamErr
+		}
 	}
 	if streamFailed {
 		return claudeInfo.Usage, nil
