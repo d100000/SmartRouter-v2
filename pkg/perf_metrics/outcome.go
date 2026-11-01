@@ -19,20 +19,24 @@ const (
 
 // ClassifyRelayOutcome decides whether one finished relay counts as a health
 // sample. Business rejections and cancellations during generation are not
-// samples; a stream already completed normally without errors remains eligible
-// after its context is canceled. Classification is independent of retries,
-// channel disabling and billing.
+// samples; a relay already completed normally without errors remains eligible
+// after its context is canceled, and so does an error-free non-stream response,
+// since a proxy may close the connection right after it is written.
+// Classification is independent of retries, channel disabling and billing.
 func ClassifyRelayOutcome(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) Outcome {
 	if info == nil || info.PerformanceBusinessRejection {
 		return OutcomeIgnored
 	}
 	stream := info.StreamStatus.OutcomeSnapshot()
-	completedNormally := info.IsStream && info.StreamStatus != nil && apiErr == nil &&
-		stream.Response == relaycommon.ResponseOutcomeCompleted &&
-		(stream.EndReason == relaycommon.StreamEndReasonEOF || stream.EndReason == relaycommon.StreamEndReasonDone) &&
-		!stream.HasErrors && info.StreamStatus.EndError == nil
+	completedNormally := !info.IsStream && apiErr == nil
+	if info.StreamStatus != nil {
+		completedNormally = apiErr == nil &&
+			stream.Response == relaycommon.ResponseOutcomeCompleted &&
+			(stream.EndReason == relaycommon.StreamEndReasonEOF || stream.EndReason == relaycommon.StreamEndReasonDone) &&
+			!stream.HasErrors && info.StreamStatus.EndError == nil
+	}
 	// A whole-request deadline is not evidence of channel failure. Only a
-	// cancellation after normal stream completion still counts as success;
+	// cancellation after normal relay completion still counts as success;
 	// upstream-only timeouts keep a live caller context and count as failures.
 	if ctx != nil && ctx.Err() != nil && !(ctx.Err() == context.Canceled && completedNormally) {
 		return OutcomeIgnored

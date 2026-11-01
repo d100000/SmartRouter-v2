@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -89,6 +92,36 @@ export function buildSubmitRequest(){return {}} export function parseSubmitRespo
 		"upstream":{"task_id":"upstream_private"}
 	}`, recorder.Body.String())
 	assert.JSONEq(t, `{"seconds":5}`, recorder.Header().Get("X-New-Api-Other-Ratios"))
+}
+
+// The submit presenter may answer with the vendor's status; a native route that
+// already relayed the vendor's event stream gets nothing more.
+func TestPresentTaskSubmissionHonorsReplyWrapperAndRelayedStreams(t *testing.T) {
+	plugin, err := pluginruntime.CompilePlugin(`
+export const meta = {apiVersion:1,key:"accepted-test",name:"Accepted",version:"1.0.0",author:{name:"Test"},models:["model"],fetchMode:"per_task",routes:[{method:"POST",path:"/vendor/jobs",type:"submit",decode:"decode",render:"created"}]};
+export const native = {decode:function(ctx){return {kind:"submit",model:"model",requestBody:ctx.body.value};},created:function(ctx,task){return {__status:202,__body:{id:task.task_id}};}};
+export function buildSubmitRequest(){return {}} export function parseSubmitResponse(){return {taskId:"upstream"}} export function buildQueryRequest(){return {}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+	present := func(recorder *httptest.ResponseRecorder, written bool) {
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/vendor/jobs", strings.NewReader(`{"model":"model"}`))
+		c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Plugin: plugin, Route: plugin.Meta.Routes[0]})
+		c.Set(pluginruntime.ContextKeyRouteRequest, pluginruntime.RouteRequestContext{Path: "/vendor/jobs", Method: http.MethodPost, Body: map[string]any{"kind": "json", "value": map[string]any{"model": "model"}}})
+		if written {
+			_, _ = c.Writer.WriteString("data: {}\n\n")
+		}
+		presentTaskSubmission(c, &taskSubmissionOutcome{Result: &relay.TaskSubmitResult{}, Task: &model.Task{TaskID: "task_public"}, RelayInfo: &relaycommon.RelayInfo{}})
+	}
+
+	accepted := httptest.NewRecorder()
+	present(accepted, false)
+	assert.Equal(t, http.StatusAccepted, accepted.Code)
+	assert.JSONEq(t, `{"id":"task_public"}`, accepted.Body.String())
+
+	streamed := httptest.NewRecorder()
+	present(streamed, true)
+	assert.Equal(t, "data: {}\n\n", streamed.Body.String())
 }
 
 func TestPresentTaskSubmissionFallbackUsesPersistedPublicID(t *testing.T) {
@@ -241,6 +274,11 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 // asynchronous result on the same route is retained because polling and
 // retrieval depend on it.
 func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
+	previousMetrics := perf_metrics_setting.GetSetting()
+	config.UpdateConfigFromMap(config.GlobalConfig.Get("perf_metrics_setting"), map[string]string{"enabled": "true"})
+	t.Cleanup(func() {
+		config.UpdateConfigFromMap(config.GlobalConfig.Get("perf_metrics_setting"), map[string]string{"enabled": strconv.FormatBool(previousMetrics.Enabled)})
+	})
 	retainFalse := false
 	zero := int64(0)
 	for _, tc := range []struct {
@@ -248,13 +286,13 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 		immediate     *relaycommon.TaskInfo
 		wantDiscarded bool
 	}{
-		{"immediate success is discarded", &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%", PerformanceOutputTokens: &zero}, true},
+		{"immediate success is discarded", &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: "100%", TotalTokens: 5000, PerformanceOutputTokens: &zero}, true},
 		{"immediate failure is discarded", &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "rejected"}, true},
 		{"asynchronous result is retained", nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := make([]string, 0, 3)
-			database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.User{}, &model.Channel{}, &model.Ability{})
+			database, _ := openTaskDialectDatabase(t, &model.Task{}, &model.User{}, &model.Channel{}, &model.Ability{}, &model.PerfMetricEvent{})
 			previousDB := model.DB
 			model.DB = database
 			t.Cleanup(func() { model.DB = previousDB })
@@ -294,6 +332,24 @@ func TestExecuteTaskSubmissionHonorsRouteRetainResult(t *testing.T) {
 				assert.Equal(t, tc.immediate.PerformanceOutputTokens, stored.PrivateData.PerformanceOutputTokens)
 				assert.Equal(t, info.StartTime.Unix(), stored.SubmitTime, "immediate latency includes the upstream operation before task insertion")
 			}
+			staged, err := model.StagePerfMetricTaskEvents(context.Background(), database)
+			require.NoError(t, err)
+			var samples []model.PerfMetricEvent
+			require.NoError(t, database.Find(&samples).Error)
+			if tc.immediate == nil {
+				assert.Zero(t, staged)
+				assert.Empty(t, samples)
+			} else {
+				assert.Equal(t, 1, staged)
+				require.Len(t, samples, 1, "immediate tasks must not also create a second relay sample")
+				assert.Equal(t, fmt.Sprintf("task:%d", stored.ID), samples[0].ID)
+				assert.Equal(t, tc.immediate.Status == model.TaskStatusSuccess, samples[0].Success)
+				assert.Equal(t, tc.immediate.PerformanceOutputTokens != nil, samples[0].OutputTokensKnown)
+				assert.Zero(t, samples[0].OutputTokens, "billing total tokens are not output throughput")
+			}
+			staged, err = model.StagePerfMetricTaskEvents(context.Background(), database)
+			require.NoError(t, err)
+			assert.Zero(t, staged, "repeated collection must not duplicate a terminal task")
 			var nullCount int64
 			require.NoError(t, database.Model(&model.Task{}).Where("task_id = ? AND data IS NULL", "task_public").Count(&nullCount).Error)
 			if tc.wantDiscarded {
