@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/smtp"
 	"slices"
 	"strings"
@@ -42,25 +43,26 @@ func smtpTLSConfig() *tls.Config {
 }
 
 func newSMTPClient(addr string) (*smtp.Client, error) {
-	if SMTPSSLEnabled || (SMTPPort == 465 && !SMTPStartTLSEnabled) {
-		conn, err := tls.Dial("tcp", addr, smtpTLSConfig())
-		if err != nil {
-			return nil, err
-		}
-		client, err := smtp.NewClient(conn, SMTPServer)
-		if err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-		return client, nil
-	}
-
-	client, err := smtp.Dial(addr)
+	// Bound the whole SMTP conversation, including greeting, AUTH and DATA.
+	// Durable notification retries must not overlap a permanently hung sender.
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	if err := conn.SetDeadline(time.Now().Add(time.Minute)); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if SMTPSSLEnabled || (SMTPPort == 465 && !SMTPStartTLSEnabled) {
+		conn = tls.Client(conn, smtpTLSConfig())
+	}
+	client, err := smtp.NewClient(conn, SMTPServer)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 
-	if SMTPStartTLSEnabled {
+	if SMTPStartTLSEnabled && !SMTPSSLEnabled {
 		startTLSSupported, _ := client.Extension("STARTTLS")
 		if !startTLSSupported {
 			_ = client.Close()
@@ -144,7 +146,9 @@ func SendEmail(subject string, receiver string, content string) error {
 	}
 	err = client.Quit()
 	if err != nil {
-		SysError(LogText("failed to send email to %s: %v", receiver, err))
+		SysError(LogText("SMTP connection close failed after the message was accepted: %v", err))
 	}
-	return err
+	// A successful final DATA response means the server accepted the mail.
+	// A failed QUIT must not cause the outbox to deliver the same mail again.
+	return nil
 }

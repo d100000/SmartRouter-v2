@@ -90,6 +90,7 @@ import { formatAvailabilityTime } from '../lib/channel-availability'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelCostCell } from './channel-cost-cell'
+import { ChannelFundingBadge, FundingStatusBadge } from './channel-funding'
 import { ChannelRecentStatsCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { TaskPluginChannelBadge } from './channel-type-badge'
@@ -956,6 +957,29 @@ export function useChannelsColumns(
         enableSorting: false,
       },
 
+      {
+        accessorKey: 'funding_status',
+        header: t('Funding status'),
+        enableSorting: false,
+        size: 180,
+        cell: ({ row }) => {
+          if (isTagAggregateRow(row.original)) {
+            const funding = row.original.funding_status
+            return funding ? (
+              <Button
+                variant='ghost'
+                size='sm'
+                onClick={() => row.toggleExpanded()}
+                aria-label={t('Funding status')}
+              >
+                <FundingStatusBadge funding={funding} />
+              </Button>
+            ) : null
+          }
+          return <ChannelFundingBadge channel={row.original as Channel} />
+        },
+      },
+
       // Status column
       {
         accessorKey: 'status',
@@ -1093,6 +1117,14 @@ export function useChannelsColumns(
               }
             } catch {
               /* empty */
+            }
+
+            const fundingEvent =
+              /^Upstream funding restriction \(event #(\d+)\)$/.exec(statusReason)
+            if (fundingEvent) {
+              statusReason = t('Upstream funding restriction (event #{{id}})', {
+                id: fundingEvent[1],
+              })
             }
 
             if (statusReason || statusTime) {

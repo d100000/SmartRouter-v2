@@ -255,6 +255,13 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 		FailReason:  "",
 		ChannelId:   c.GetInt("channel_id"),
 	}
+	if common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey) {
+		midjourneyTask.PollingKey = common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	}
+	if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+		data, _ := common.Marshal(attempt.Identity)
+		midjourneyTask.FundingAttemptData = string(data)
+	}
 	billingPrepared, billingErr := service.PrepareMidjourneyTaskBilling(
 		info,
 		midjourneyTask,
@@ -587,6 +594,13 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		Progress:    "0%",
 		FailReason:  "",
 		ChannelId:   c.GetInt("channel_id"),
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey) {
+		midjourneyTask.PollingKey = common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	}
+	if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+		data, _ := common.Marshal(attempt.Identity)
+		midjourneyTask.FundingAttemptData = string(data)
 	}
 	if midjResponse.Code == 3 {
 		//无实例账号自动禁用渠道（No available account instance）

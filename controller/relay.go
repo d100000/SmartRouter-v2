@@ -235,6 +235,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
+			if service.RequestPolicy(c).Successful && relayInfo.ClientWs == nil && relayInfo.RelayFormat != types.RelayFormatOpenAIRealtime {
+				service.ObserveChannelFundingResponseSuccess(c)
+			}
 			relayInfo.LastError = nil
 			return
 		}
@@ -726,6 +729,10 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+		identity := attempt.Identity
+		task.PrivateData.FundingAttempt = &identity
+	}
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
@@ -758,6 +765,7 @@ func executeTaskSubmissionWith(
 			}
 		}
 		if immediate.Status == model.TaskStatusFailure {
+			service.RecordChannelFundingError(service.ChannelFundingAttempt(c), http.StatusOK, fmt.Sprint(immediate.Code), "", immediate.Reason)
 			task.FailReason = immediate.Reason
 		}
 		if immediate.Url != "" {

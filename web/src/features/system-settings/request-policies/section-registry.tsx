@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createSectionRegistry } from '../utils/section-registry'
+import { ChannelFundingSection } from './channel-funding-section'
 import { ChannelHealthSection } from './channel-health-section'
 import type { RequestPolicySettings } from './defaults'
 import { RequestChecksSection } from './request-checks-section'
@@ -46,6 +47,13 @@ const POLICY_SECTIONS = [
     titleKey: 'Channel health',
     build: (settings: RequestPolicySettings) => (
       <ChannelHealthSection defaultValues={settings} />
+    ),
+  },
+  {
+    id: 'funding',
+    titleKey: 'Channel funding monitoring',
+    build: (settings: RequestPolicySettings) => (
+      <ChannelFundingSection defaultValues={settings} />
     ),
   },
 ] as const

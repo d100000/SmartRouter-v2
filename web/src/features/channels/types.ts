@@ -41,6 +41,14 @@ export const channelSchema = z.object({
   openai_organization: z.string().nullish(),
   test_model: z.string().nullish(),
   status: z.number(), // Persisted administrator/health status: 1 enabled, 2 manual, 3 automatic.
+  funding_status: z
+    .object({
+      status: z.enum(['balance_insufficient', 'quota_limited', 'suspected']),
+      affected_keys: z.number(),
+      total_keys: z.number(),
+      last_seen: z.number(),
+    })
+    .nullish(),
   effective_status: z.number().optional(),
   availability: z.string().nullish(),
   availability_state: z
@@ -215,6 +223,7 @@ export interface GetChannelsResponse {
     total: number
     page: number
     page_size: number
+    funding_tags?: Record<string, NonNullable<Channel['funding_status']>>
     type_counts?: Record<string, number>
   }
 }
@@ -225,6 +234,7 @@ export interface SearchChannelsResponse {
   data?: {
     items: Channel[]
     total: number
+    funding_tags?: Record<string, NonNullable<Channel['funding_status']>>
     type_counts?: Record<string, number>
   }
 }
@@ -333,6 +343,7 @@ export type ChannelSortBy =
 export type ChannelSortOrder = 'asc' | 'desc'
 
 export interface GetChannelsParams {
+  funding_status?: string
   p?: number
   page_size?: number
   status?: string // 'enabled', 'disabled', or empty for all
@@ -345,6 +356,7 @@ export interface GetChannelsParams {
 }
 
 export interface SearchChannelsParams {
+  funding_status?: string
   keyword?: string
   group?: string
   model?: string

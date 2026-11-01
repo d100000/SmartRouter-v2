@@ -28,6 +28,7 @@ type responseEvidenceParser struct {
 	dropping       bool
 	incomplete     bool
 	completed      bool
+	fundingOutput  bool
 	failed         bool
 	usage          map[string]json.RawMessage
 	errorBody      string
@@ -97,6 +98,11 @@ func (p *responseEvidenceParser) payload(body []byte, stream bool) {
 		return
 	}
 	root := gjson.ParseBytes(body)
+	if stream {
+		p.fundingOutput = p.fundingOutput || root.Get("choices.0.delta").IsObject() || root.Get("type").String() == "message_start" || root.Get("type").String() == "response.output_text.delta" || root.Get("candidates.0.finishReason").String() != ""
+	} else {
+		p.fundingOutput = root.Get("choices.0.finish_reason").String() != "" || root.Get("type").String() == "message" && root.Get("stop_reason").String() != "" || root.Get("object").String() == "response" && root.Get("status").String() == "completed" || root.Get("candidates.0.finishReason").String() != ""
+	}
 	for _, path := range []string{"usage", "response.usage", "message.usage", "usageMetadata"} {
 		usage := root.Get(path)
 		if !usage.IsObject() {
@@ -167,13 +173,15 @@ type upstreamEvidenceCapture struct {
 
 type upstreamEvidenceBody struct {
 	io.ReadCloser
-	mu        sync.Mutex
-	parser    responseEvidenceParser
-	evidence  model.UpstreamResponseEvidence
-	stream    bool
-	errorBody []byte
-	finished  bool
-	secrets   []string
+	funding     *FundingAttempt
+	fundingOnce sync.Once
+	mu          sync.Mutex
+	parser      responseEvidenceParser
+	evidence    model.UpstreamResponseEvidence
+	stream      bool
+	errorBody   []byte
+	finished    bool
+	secrets     []string
 }
 
 // ObserveUpstreamResponse wraps the existing body without extra reads, buffering
@@ -204,6 +212,12 @@ func ObserveUpstreamResponse(c *gin.Context, info *relaycommon.RelayInfo, respon
 		channel = info.ChannelId
 	}
 	body := &upstreamEvidenceBody{ReadCloser: response.Body, stream: strings.Contains(response.Header.Get("Content-Type"), "text/event-stream"), evidence: model.UpstreamResponseEvidence{Attempt: capture.count, Channel: channel, RequestID: model.SafeFailureFact(upID, 128), StatusCode: response.StatusCode}}
+	body.funding = ChannelFundingAttempt(c)
+	if body.funding != nil {
+		body.funding.mu.Lock()
+		body.funding.rawStatus = response.StatusCode
+		body.funding.mu.Unlock()
+	}
 	if response.Request != nil {
 		for _, key := range []string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
 			secret := strings.TrimPrefix(response.Request.Header.Get(key), "Bearer ")
@@ -222,7 +236,6 @@ func ObserveUpstreamResponse(c *gin.Context, info *relaycommon.RelayInfo, respon
 func (b *upstreamEvidenceBody) Read(body []byte) (int, error) {
 	n, err := b.ReadCloser.Read(body)
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if n > 0 {
 		if b.evidence.StatusCode >= 300 {
 			remaining := evidenceErrorLimit - len(b.errorBody)
@@ -237,6 +250,11 @@ func (b *upstreamEvidenceBody) Read(body []byte) (int, error) {
 			b.parser.incomplete = true
 		}
 	}
+	errorBody, status := b.parser.errorBody, b.evidence.StatusCode
+	b.mu.Unlock()
+	if errorBody != "" {
+		ObserveChannelFundingJSON(b.funding, status, []byte(errorBody))
+	}
 	return n, err
 }
 
@@ -248,6 +266,12 @@ func (b *upstreamEvidenceBody) Close() error {
 	b.parser.incomplete = b.parser.incomplete || len(b.parser.pending) > 0 || len(b.parser.event) > 0
 	b.parser.pending, b.parser.event = nil, nil
 	b.mu.Unlock()
+	b.fundingOnce.Do(func() {
+		if b.funding != nil {
+			evidence := b.snapshot()
+			ObserveChannelFundingJSON(b.funding, evidence.StatusCode, []byte(evidence.ErrorBody))
+		}
+	})
 	return err
 }
 

@@ -369,6 +369,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "read_response_body_failed", statusCode), nullBytes, err
 	}
 	CloseResponseBodyGracefully(resp)
+	ObserveChannelFundingJSON(ChannelFundingAttempt(c), statusCode, responseBody)
 	logger.LogDebug(c, "midjourney response body: %s", responseBody)
 	if len(responseBody) == 0 {
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "empty_response_body", statusCode), responseBody, nil
@@ -380,6 +381,9 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 				return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "unmarshal_response_body_failed", statusCode), responseBody, err
 			}
 		}
+	}
+	if midjResponse.Code != 1 && midjResponse.Code != 21 && midjResponse.Code != 22 {
+		RecordChannelFundingError(ChannelFundingAttempt(c), statusCode, fmt.Sprint(midjResponse.Code), "", midjResponse.Description)
 	}
 	//for k, v := range resp.Header {
 	//	c.Writer.Header().Set(k, v[0])

@@ -156,6 +156,11 @@ export function ChannelsTable() {
             : []
         },
       },
+      {
+        columnId: 'funding_status',
+        searchKey: 'funding_status',
+        type: 'array',
+      },
       { columnId: 'type', searchKey: 'type', type: 'array' },
       { columnId: 'group', searchKey: 'group', type: 'array' },
       { columnId: 'model', searchKey: 'model', type: 'string' },
@@ -179,6 +184,11 @@ export function ChannelsTable() {
   }
 
   // Extract filters from column filters
+  const fundingFilter = (
+    columnFilters.find((f) => f.id === 'funding_status')?.value as
+      | string[]
+      | undefined
+  )?.[0]
   const statusFilter =
     (columnFilters.find((f) => f.id === 'status')?.value as string[]) || []
   const typeFilter = useMemo(
@@ -244,6 +254,7 @@ export function ChannelsTable() {
   // eslint-disable-next-line @tanstack/query/exhaustive-deps
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: channelsQueryKeys.list({
+      funding_status: fundingFilter,
       keyword: globalFilter,
       model: modelFilter,
       group:
@@ -268,6 +279,7 @@ export function ChannelsTable() {
       if (shouldSearch) {
         return requireServerSuccess(
           await searchChannels({
+            funding_status: fundingFilter,
             keyword: globalFilter,
             model: modelFilter,
             group:
@@ -292,6 +304,7 @@ export function ChannelsTable() {
       } else {
         return requireServerSuccess(
           await getChannels({
+            funding_status: fundingFilter,
             group:
               groupFilter.length > 0 && !groupFilter.includes('all')
                 ? groupFilter[0]
@@ -322,7 +335,7 @@ export function ChannelsTable() {
     const rawChannels = data?.data?.items || []
 
     if (enableTagMode && rawChannels.length > 0) {
-      return aggregateChannelsByTag(rawChannels)
+      return aggregateChannelsByTag(rawChannels, data?.data?.funding_tags)
     }
 
     return rawChannels
@@ -576,6 +589,23 @@ export function ChannelsTable() {
                 />
               ),
               filters: [
+                {
+                  columnId: 'funding_status',
+                  title: t('Funding status'),
+                  options: [
+                    {
+                      value: 'balance_insufficient',
+                      label: t('Insufficient funding'),
+                    },
+                    {
+                      value: 'quota_limited',
+                      label: t('Spending limit reached'),
+                    },
+                    { value: 'suspected', label: t('Funding review needed') },
+                    { value: 'none', label: t('No active funding event') },
+                  ],
+                  singleSelect: true,
+                },
                 {
                   columnId: 'status',
                   title: t('Status'),

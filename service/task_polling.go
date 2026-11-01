@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
@@ -37,6 +39,31 @@ type BatchTaskPollingAdaptor interface {
 	FetchMode() string
 	FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error)
 	ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*BatchTaskResult, error)
+}
+
+// TaskPollingKey retains the submission credential even while it is disabled.
+// Legacy multi-key tasks without a snapshot use one current key, never the
+// newline-joined credential list as an Authorization header.
+func TaskPollingKey(channel *model.Channel, saved string, identity *hosttypes.ChannelFundingAttempt) string {
+	if saved != "" {
+		return saved
+	}
+	if !channel.ChannelInfo.IsMultiKey {
+		return channel.Key
+	}
+	keys := channel.GetKeys()
+	if identity != nil {
+		for index, key := range keys {
+			snapshot := channel.GetUpstreamCredentialSnapshot(index)
+			if snapshot.BindingID == identity.BindingID && snapshot.CredentialVersionID == identity.VersionID && snapshot.BindingActivatedAt == identity.BindingActivatedAt {
+				return key
+			}
+		}
+	}
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
 }
 
 const (
@@ -172,8 +199,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
 			}
-			taskM[upstreamID] = task
-			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], upstreamID)
+			localID := fmt.Sprint(task.ID)
+			taskM[localID] = task
+			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], localID)
 		}
 		if len(nullTaskIds) > 0 {
 			summary.NullTasksFailed += len(nullTaskIds)
@@ -245,7 +273,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
 		common.SysLog(common.LogText("CacheGetChannel: %v", err))
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
+		// Resolve the polling map keys to database IDs before the bulk update.
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
@@ -262,16 +290,40 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 		return err
 	}
+	groups := make(map[string][]*model.Task)
+	order := []string{}
+	for _, upstreamID := range taskIds {
+		if task := taskM[upstreamID]; task != nil && task.ChannelId == channelId {
+			key := TaskPollingKey(ch, task.PrivateData.Key, task.PrivateData.FundingAttempt)
+			if _, exists := groups[key]; !exists {
+				order = append(order, key)
+			}
+			groups[key] = append(groups[key], task)
+		}
+	}
+	var failures []error
+	for _, key := range order {
+		if err := pollCredentialBatch(ctx, adaptor, ch, key, groups[key]); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// A batch request has one credential. Never mix tasks belonging to different
+// keys, or accept results for tasks that were not part of this request.
+func pollCredentialBatch(ctx context.Context, adaptor BatchTaskPollingAdaptor, ch *model.Channel, key string, tasks []*model.Task) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	proxy := ch.GetSetting().Proxy
 	baseURL := ch.GetBaseURL()
 	if baseURL == "" {
 		baseURL = constant.GetChannelBaseURL(ch.Type)
 	}
-	tasks := make([]*model.Task, 0, len(taskIds))
-	for _, upstreamID := range taskIds {
-		if task := taskM[upstreamID]; task != nil {
-			tasks = append(tasks, task)
-		}
+	taskM := make(map[string]*model.Task, len(tasks))
+	for _, task := range tasks {
+		taskM[task.GetUpstreamTaskID()] = task
 	}
 	// The channel type tells plugin adaptors whether the upstream is another
 	// New API gateway, the same signal submission derives from the request.
@@ -283,9 +335,10 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		ChannelSetting:  ch.GetSetting(),
 		HeadersOverride: ch.GetHeaderOverride(),
 	}
-	info.ApiKey = ch.Key
+	info.ApiKey = key
 	adaptor.Init(info)
-	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	fundingAttempt := FundingTaskAttempt(ch, key, tasks[0])
+	resp, err := adaptor.FetchBatchTasks(baseURL, key, tasks, proxy)
 	if err != nil {
 		common.SysLog(common.LogText("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
@@ -296,6 +349,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		common.SysLog(common.LogText("Get Suno Task parse body error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, resp.StatusCode, err.Error())
 	}
+	ObserveChannelFundingJSON(fundingAttempt, resp.StatusCode, responseBody)
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
 		for _, task := range tasks {
@@ -305,13 +359,16 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 		return failTasksFromPoll(ctx, adaptor, tasks, "Upstream task not found")
 	case pollClassAuth:
-		logger.LogWarn(ctx, common.LogText("task poll auth failure channel_id=%d http=%d", channelId, resp.StatusCode))
+		logger.LogWarn(ctx, common.LogText("task poll auth failure channel_id=%d http=%d", ch.Id, resp.StatusCode))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassAuth, resp.StatusCode, "")
 	case pollClassTransient:
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransient, resp.StatusCode, "")
 	}
 	responseItems, err := adaptor.ParseBatchResult(tasks, resp, responseBody)
 	if err != nil {
+		if resp.StatusCode < 400 {
+			ObserveChannelFundingJSON(fundingAttempt, resp.StatusCode, responseBody)
+		}
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassHookError, resp.StatusCode, err.Error())
 	}
 	for upstreamID, responseItem := range responseItems {
@@ -326,6 +383,9 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		snap := task.Snapshot()
 		httpClass := classifyPollHTTP(resp.StatusCode)
 		parsedStatus := model.TaskStatus(responseItem.TaskInfo.Status)
+		if parsedStatus == model.TaskStatusFailure {
+			ObserveTaskFundingFailure(task, responseItem.TaskInfo.Reason, fmt.Sprint(responseItem.TaskInfo.Code))
+		}
 		if parsedStatus == model.TaskStatusUnknown || parsedStatus == "" || !knownPollStatus(parsedStatus) {
 			if err := recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, responseItem.TaskInfo.Reason); err != nil {
 				common.SysLog(common.LogText("UpdateSunoTask task error: %s", err.Error()))
@@ -434,7 +494,7 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
+		// Resolve the polling map keys to database IDs before the bulk update.
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
@@ -455,16 +515,6 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	if adaptor == nil {
 		return fmt.Errorf("video adaptor not found")
 	}
-	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{
-		ChannelType:     cacheGetChannel.Type,
-		ChannelId:       cacheGetChannel.Id,
-		ChannelBaseUrl:  cacheGetChannel.GetBaseURL(),
-		ChannelSetting:  cacheGetChannel.GetSetting(),
-		HeadersOverride: cacheGetChannel.GetHeaderOverride(),
-	}
-	info.ApiKey = cacheGetChannel.Key
-	adaptor.Init(info)
 	disablePollingSleep := cacheGetChannel.GetOtherSettings().DisableTaskPollingSleep
 	for i, taskId := range taskIds {
 		if ctx.Err() != nil {
@@ -502,13 +552,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogError(ctx, common.LogText("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
-	key := ch.Key
-
-	privateData := task.PrivateData
-	if privateData.Key != "" {
-		key = privateData.Key
-	}
+	key := TaskPollingKey(ch, task.PrivateData.Key, task.PrivateData.FundingAttempt)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType: ch.Type, ChannelId: ch.Id, ChannelBaseUrl: baseURL,
+		ChannelSetting: ch.GetSetting(), HeadersOverride: ch.GetHeaderOverride(), ApiKey: key,
+	}})
 	snap := task.Snapshot()
+	fundingAttempt := FundingTaskAttempt(ch, key, task)
 	resp, err := adaptor.FetchTask(baseURL, key, task, proxy)
 	if err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
@@ -520,6 +570,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	ObserveChannelFundingJSON(fundingAttempt, resp.StatusCode, responseBody)
 
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
@@ -545,12 +596,18 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Reason = t.FailReason
 		task.Data = t.Data
 	} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
+		if resp.StatusCode < 400 {
+			ObserveChannelFundingJSON(fundingAttempt, resp.StatusCode, responseBody)
+		}
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
 	}
 
 	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
 
 	parsedStatus := model.TaskStatus(taskResult.Status)
+	if parsedStatus == model.TaskStatusFailure {
+		ObserveTaskFundingFailure(task, taskResult.Reason, fmt.Sprint(taskResult.Code))
+	}
 	if parsedStatus == model.TaskStatusUnknown || parsedStatus == "" || !knownPollStatus(parsedStatus) {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
 	}

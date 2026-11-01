@@ -48,7 +48,7 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 }
 
 func EnableChannel(channelId int, usingKey string, channelName string) {
-	success := model.UpdateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "")
+	success := model.EnableChannelAutomatically(channelId, usingKey)
 	if success {
 		params := map[string]any{"Name": channelName, "Id": channelId}
 		NotifyChannelWatchers(formatNotifyType(channelId, common.ChannelStatusEnabled), func(lang string) (string, string) {
@@ -58,7 +58,8 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 }
 
 func ShouldDisableChannel(err *types.NewAPIError) bool {
-	if !common.AutomaticDisableChannelEnabled {
+	disable, _ := common.ChannelAutomationSwitches()
+	if !disable {
 		return false
 	}
 	if err == nil {
@@ -80,7 +81,8 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 }
 
 func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {
-	if !common.AutomaticEnableChannelEnabled {
+	_, enable := common.ChannelAutomationSwitches()
+	if !enable {
 		return false
 	}
 	if newAPIError != nil {

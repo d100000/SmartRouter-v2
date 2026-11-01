@@ -42,6 +42,7 @@ func requestPolicyDefaultOptions() map[string]string {
 	for prefix, value := range map[string]any{
 		"channel_affinity_setting.": operation_setting.GetChannelAffinitySetting(),
 		"monitor_setting.":          operation_setting.GetMonitorSetting(),
+		"channel_funding_setting.":  operation_setting.GetChannelFundingSetting(),
 	} {
 		fields, err := config.ConfigToMap(value)
 		if err != nil {
@@ -65,6 +66,9 @@ func requestPolicyDefaultOptions() map[string]string {
 }
 
 func IsRequestPolicyOption(key string) bool {
+	if strings.HasPrefix(key, "channel_funding_setting.") {
+		return true
+	}
 	if strings.HasPrefix(key, "channel_affinity_setting.") {
 		return true
 	}
@@ -97,6 +101,11 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 		}
 	}
 	maps.Copy(raw, options)
+	for key, value := range raw {
+		if err := operation_setting.ValidateChannelFundingOption(key, value); err != nil {
+			return nil, err
+		}
+	}
 	snapshot := &RequestPolicySnapshot{Options: raw}
 	affinityFields := map[string]string{}
 	for key, value := range raw {

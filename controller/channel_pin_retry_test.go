@@ -339,6 +339,7 @@ func TestRequestPolicyRoutingDatabaseMatrix(t *testing.T) {
 func TestChannelAvailabilityAdmissionAndManagement(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	db := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, db.AutoMigrate(&model.ChannelFundingIncident{}, &model.ChannelFundingDelivery{}))
 	config := model.ChannelAvailability{Enabled: true, Timezone: "UTC", Mode: "daily", Rules: []model.ChannelAvailabilityRule{{ChannelAvailabilityWindow: model.ChannelAvailabilityWindow{Start: "00:00", End: "24:00"}}}}
 	for _, offset := range []int{-1, 0, 1} {
 		config.Exceptions = append(config.Exceptions, model.ChannelAvailabilityException{Date: time.Now().UTC().AddDate(0, 0, offset).Format("2006-01-02")})

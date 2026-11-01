@@ -26,27 +26,28 @@ import (
 )
 
 type Channel struct {
-	Id                 int      `json:"id"`
-	Type               int      `json:"type" gorm:"default:0"`
-	Key                string   `json:"key" gorm:"not null"`
-	OpenAIOrganization *string  `json:"openai_organization"`
-	TestModel          *string  `json:"test_model"`
-	Status             int      `json:"status" gorm:"default:1"`
-	Name               string   `json:"name" gorm:"index"`
-	Weight             *uint    `json:"weight" gorm:"default:0"`
-	CreatedTime        int64    `json:"created_time" gorm:"bigint"`
-	TestTime           int64    `json:"test_time" gorm:"bigint"`
-	ResponseTime       int      `json:"response_time"` // in milliseconds
-	BaseURL            *string  `json:"base_url" gorm:"column:base_url;default:''"`
-	Other              string   `json:"other"`
-	Balance            float64  `json:"balance"` // in USD
-	BalanceUpdatedTime int64    `json:"balance_updated_time" gorm:"bigint"`
-	Models             string   `json:"models"`
-	Group              string   `json:"group" gorm:"type:varchar(64);default:'default'"`
-	UsedQuota          int64    `json:"used_quota" gorm:"bigint;default:0"`
-	CostRatio          *float64 `json:"cost_ratio"`
-	CostVersionID      string   `json:"cost_version_id" gorm:"type:varchar(36)"`
-	ModelMapping       *string  `json:"model_mapping" gorm:"type:text"`
+	Funding            *ChannelFundingSummary `json:"funding_status,omitempty" gorm:"-"`
+	Id                 int                    `json:"id"`
+	Type               int                    `json:"type" gorm:"default:0"`
+	Key                string                 `json:"key" gorm:"not null"`
+	OpenAIOrganization *string                `json:"openai_organization"`
+	TestModel          *string                `json:"test_model"`
+	Status             int                    `json:"status" gorm:"default:1"`
+	Name               string                 `json:"name" gorm:"index"`
+	Weight             *uint                  `json:"weight" gorm:"default:0"`
+	CreatedTime        int64                  `json:"created_time" gorm:"bigint"`
+	TestTime           int64                  `json:"test_time" gorm:"bigint"`
+	ResponseTime       int                    `json:"response_time"` // in milliseconds
+	BaseURL            *string                `json:"base_url" gorm:"column:base_url;default:''"`
+	Other              string                 `json:"other"`
+	Balance            float64                `json:"balance"` // in USD
+	BalanceUpdatedTime int64                  `json:"balance_updated_time" gorm:"bigint"`
+	Models             string                 `json:"models"`
+	Group              string                 `json:"group" gorm:"type:varchar(64);default:'default'"`
+	UsedQuota          int64                  `json:"used_quota" gorm:"bigint;default:0"`
+	CostRatio          *float64               `json:"cost_ratio"`
+	CostVersionID      string                 `json:"cost_version_id" gorm:"type:varchar(36)"`
+	ModelMapping       *string                `json:"model_mapping" gorm:"type:text"`
 	//MaxInputTokens     *int    `json:"max_input_tokens" gorm:"default:0"`
 	StatusCodeMapping *string `json:"status_code_mapping" gorm:"type:varchar(1024);default:''"`
 	Priority          *int64  `json:"priority" gorm:"bigint;default:0"`
@@ -888,31 +889,43 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.SetOtherInfo(info)
 			return
 		}
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
-			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		updateMultiKeyStatusAtIndex(channel, keyIndex, status, reason)
+	}
+}
+
+// Funding incidents address a binding, not key material: duplicate key slots
+// still have distinct bindings and must not update the first matching slot.
+func updateMultiKeyStatusAtIndex(channel *Channel, keyIndex, status int, reason string) {
+	keys := channel.GetKeys()
+	if keyIndex < 0 || keyIndex >= len(keys) {
+		return
+	}
+	if channel.ChannelInfo.MultiKeyStatusList == nil {
+		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if status == common.ChannelStatusEnabled {
+		delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+		delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+		delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
+	} else {
+		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
+		if channel.ChannelInfo.MultiKeyDisabledReason == nil {
+			channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
 		}
-		if status == common.ChannelStatusEnabled {
-			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
-		} else {
-			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
-			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
-				channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
-			}
-			if channel.ChannelInfo.MultiKeyDisabledTime == nil {
-				channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
-			}
-			channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
-			channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+		if channel.ChannelInfo.MultiKeyDisabledTime == nil {
+			channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		}
-		if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
-			channel.Status = common.ChannelStatusAutoDisabled
-			info := channel.GetOtherInfo()
-			info["status_reason"] = ChannelStatusReasonAllKeysDisabled
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-		} else if status == common.ChannelStatusEnabled {
-			channel.Status = common.ChannelStatusEnabled
-		}
+		channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
+		channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+	}
+	if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
+		channel.Status = common.ChannelStatusAutoDisabled
+		info := channel.GetOtherInfo()
+		info["status_reason"] = ChannelStatusReasonAllKeysDisabled
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+	} else if status == common.ChannelStatusEnabled {
+		channel.Status = common.ChannelStatusEnabled
 	}
 }
 
@@ -930,6 +943,16 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+	return updateChannelStatus(channelId, usingKey, status, reason, false)
+}
+
+// EnableChannelAutomatically checks funding ownership under the same database
+// lock as the status update. A separate read would race a new funding failure.
+func EnableChannelAutomatically(channelId int, usingKey string) bool {
+	return updateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "", true)
+}
+
+func updateChannelStatus(channelId int, usingKey string, status int, reason string, automatic bool) bool {
 	defer invalidateRoutingMetadata()
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
@@ -946,15 +969,34 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	channel := &Channel{}
 	changed := false
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			if err := tx.Model(&Channel{}).Where("id = ?", channelId).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+				return err
+			}
+		}
 		if err := lockForUpdate(tx).First(channel, channelId).Error; err != nil {
 			return err
+		}
+		if automatic {
+			owned, err := fundingOwnedDisable(tx, channel, usingKey)
+			if err != nil || owned || channel.Status == common.ChannelStatusManuallyDisabled {
+				return err
+			}
+			if channel.ChannelInfo.IsMultiKey {
+				for index, key := range channel.GetKeys() {
+					if key == usingKey && channel.ChannelInfo.MultiKeyStatusList[index] == common.ChannelStatusManuallyDisabled {
+						return nil
+					}
+				}
+			}
 		}
 		// A manual channel operation must replace the exhaustion reason even
 		// when the status value is already manually disabled.
 		overridesKeyExhaustion := channel.ChannelInfo.IsMultiKey && usingKey == "" &&
 			status == common.ChannelStatusManuallyDisabled && reason != ChannelStatusReasonAllKeysDisabled &&
 			channel.GetOtherInfo()["status_reason"] == ChannelStatusReasonAllKeysDisabled
-		if channel.Status == status && !overridesKeyExhaustion && (!channel.ChannelInfo.IsMultiKey || usingKey == "") {
+		overridesFunding := status == common.ChannelStatusAutoDisabled && strings.HasPrefix(fmt.Sprint(channel.GetOtherInfo()["status_reason"]), "Upstream funding restriction (event #")
+		if channel.Status == status && !overridesKeyExhaustion && !overridesFunding && (!channel.ChannelInfo.IsMultiKey || usingKey == "") {
 			return nil
 		}
 		beforeStatus := channel.Status

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -55,6 +56,7 @@ type ChannelCredentialBinding struct {
 	CredentialID        string `json:"credential_id" gorm:"type:varchar(36);index"`
 	CredentialVersionID string `json:"credential_version_id" gorm:"type:varchar(36);index"`
 	Active              bool   `json:"active" gorm:"index"`
+	ActivatedAt         int64  `json:"-" gorm:"bigint"`
 	CreatedTime         int64  `json:"created_time" gorm:"bigint"`
 }
 
@@ -69,6 +71,7 @@ type UpstreamCredentialFingerprintSecret struct {
 // UpstreamCredentialSnapshot is copied before an attempt. Its versions and
 // values remain valid after a key is removed, reordered, or reassigned.
 type UpstreamCredentialSnapshot struct {
+	BindingActivatedAt      int64    `json:"binding_activated_at,omitempty"`
 	BindingID               string   `json:"binding_id"`
 	ChannelID               int      `json:"channel_id"`
 	KeyIndex                int      `json:"key_index"`
@@ -251,11 +254,15 @@ func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
 			binding = ChannelCredentialBinding{ID: uuid.NewString(), ChannelID: channel.Id, CredentialID: credential.ID, CredentialVersionID: version.ID, CreatedTime: common.GetTimestamp()}
 		}
 		usedBindings[binding.ID] = true
+		if !binding.Active {
+			binding.ActivatedAt = max(time.Now().UnixMilli(), binding.ActivatedAt+1)
+		}
 		binding.KeyIndex, binding.ActiveSlot, binding.Active = index, &index, true
 		if err := tx.Save(&binding).Error; err != nil {
 			return err
 		}
 		snapshot := UpstreamCredentialSnapshot{BindingID: binding.ID, ChannelID: channel.Id, KeyIndex: index, CredentialID: credential.ID, CredentialVersionID: version.ID, Alias: credential.Alias, SupplierID: credential.SupplierID, Tags: slices.Clone(credential.Tags), CostRatio: credential.CostRatio, OwnershipVersionID: credential.OwnershipVersionID, Active: true, CostSource: "unknown", CostVersionID: channel.CostVersionID}
+		snapshot.BindingActivatedAt = binding.ActivatedAt
 		snapshot.CredentialCostVersionID, snapshot.ChannelCostVersionID = credential.CostVersionID, channel.CostVersionID
 		if credential.SupplierID != "" {
 			var supplier UpstreamSupplier
@@ -270,6 +277,11 @@ func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
 			snapshot.EffectiveCostRatio, snapshot.CostSource = channel.CostRatio, "channel"
 		}
 		snapshots = append(snapshots, snapshot)
+	}
+	if tx.Migrator().HasTable(&ChannelFundingIncident{}) {
+		if err := ArchiveDetachedChannelFunding(tx, channel.Id, snapshots); err != nil {
+			return err
+		}
 	}
 	data, err := common.Marshal(snapshots)
 	if err != nil {

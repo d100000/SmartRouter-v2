@@ -421,6 +421,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		if resp != nil {
 			statusCode = resp.StatusCode
 			if resp.Body != nil {
+				if body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32*1024)); readErr == nil {
+					service.ObserveChannelFundingJSON(service.ChannelFundingAttempt(c), resp.StatusCode, body)
+				}
 				_ = resp.Body.Close()
 			}
 		}

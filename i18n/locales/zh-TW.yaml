@@ -98,3 +98,21 @@ channel.upstream_update_failed_channels: "失敗管道 ID（顯示 {{.Shown}}/{{
 channel.upstream_update_more_omitted: "（其餘 {{.Count}} 個已省略）"
 
 distributor.channel_outside_schedule: "渠道目前不在有效時間內"
+
+# Upstream channel funding notifications
+funding.notice_subject: "渠道 {{.Name}}（#{{.Id}}）欠費提醒：影響 {{.Count}} 個 Key"
+funding.recovery_subject: "渠道 {{.Name}}（#{{.Id}}）資金狀態恢復：{{.Count}} 個 Key"
+funding.notice_entry: "事件 #{{.Event}} · Key {{.Key}}<br/>原因：{{.Reason}}<br/>首次發現：{{.Time}}<br/>本事件執行了停用：{{.Disabled}}<br/>恢復檢查：{{.Probe}}<br/>錯誤依據：{{.Evidence}}"
+funding.manage_link: "<a href=\"{{.Link}}\">管理渠道</a>"
+funding.balance_insufficient: "餘額不足"
+funding.quota_limited: "消費額度受限"
+funding.disabled_yes: "是"
+funding.disabled_no: "否"
+funding.probe_pending: "等待複測"
+funding.probe_running: "複測中"
+funding.probe_failed: "複測失敗"
+funding.probe_paused: "已暫停"
+funding.probe_blocked: "暫時受阻"
+funding.probe_manual_required: "需人工複核"
+funding.probe_recovered: "已恢復"
+funding.probe_cancelled: "已取消"

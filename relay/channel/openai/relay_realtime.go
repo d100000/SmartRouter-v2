@@ -131,6 +131,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					errChan <- fmt.Errorf("error unmarshalling message: %v", err)
 					return
 				}
+				service.ObserveChannelFundingJSON(service.ChannelFundingAttempt(c), 0, message)
 				if realtimeEvent.Error != nil {
 					info.StreamStatus.MarkFailed(fmt.Sprint(realtimeEvent.Error.Code), realtimeEvent.Error.Type, 0)
 				}

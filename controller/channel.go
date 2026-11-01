@@ -211,6 +211,7 @@ func GetAllChannels(c *gin.Context) {
 	var total int64
 	now := time.Now()
 	baseQuery := model.ApplyChannelGroupFilter(model.DB.Model(&model.Channel{}), groupFilter)
+	baseQuery = model.ApplyChannelFundingFilter(baseQuery, c.Query("funding_status"))
 	baseQuery = model.ApplyChannelEffectiveStatusFilter(baseQuery, statusFilter, now)
 	listQuery := baseQuery.Session(&gorm.Session{})
 	if typeFilter >= 0 {
@@ -264,6 +265,10 @@ func GetAllChannels(c *gin.Context) {
 		}
 	}
 
+	if err := model.AttachChannelFunding(channelData); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	for _, datum := range channelData {
 		clearChannelInfo(datum, now)
 	}
@@ -283,11 +288,12 @@ func GetAllChannels(c *gin.Context) {
 		typeCounts[r.Type] = r.Count
 	}
 	common.ApiSuccess(c, gin.H{
-		"items":       channelData,
-		"total":       total,
-		"page":        pageInfo.GetPage(),
-		"page_size":   pageInfo.GetPageSize(),
-		"type_counts": typeCounts,
+		"items":        channelData,
+		"funding_tags": model.ChannelFundingTags(channelData),
+		"total":        total,
+		"page":         pageInfo.GetPage(),
+		"page_size":    pageInfo.GetPageSize(),
+		"type_counts":  typeCounts,
 	})
 	return
 }
@@ -426,6 +432,18 @@ func SearchChannels(c *gin.Context) {
 	}
 
 	// calculate type counts for search results
+	if funding := c.Query("funding_status"); funding != "" && funding != "all" {
+		var ids []int
+		if err := model.ApplyChannelFundingFilter(model.DB.Model(&model.Channel{}), funding).Pluck("id", &ids).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		allowed := make(map[int]bool, len(ids))
+		for _, id := range ids {
+			allowed[id] = true
+		}
+		channelData = slices.DeleteFunc(channelData, func(ch *model.Channel) bool { return !allowed[ch.Id] })
+	}
 	typeCounts := make(map[int64]int64)
 	for _, channel := range channelData {
 		typeCounts[int64(channel.Type)]++
@@ -463,6 +481,28 @@ func SearchChannels(c *gin.Context) {
 	endIdx := min(startIdx+pageSize, total)
 
 	pagedData := channelData[startIdx:endIdx]
+	if enableTagMode {
+		tags := make([]string, 0)
+		byTag := make(map[string][]*model.Channel)
+		for _, channel := range channelData {
+			tag := channel.GetTag()
+			if _, exists := byTag[tag]; !exists {
+				tags = append(tags, tag)
+			}
+			byTag[tag] = append(byTag[tag], channel)
+		}
+		total = len(tags)
+		startIdx = min((page-1)*pageSize, total)
+		endIdx = min(startIdx+pageSize, total)
+		pagedData = make([]*model.Channel, 0)
+		for _, tag := range tags[startIdx:endIdx] {
+			pagedData = append(pagedData, byTag[tag]...)
+		}
+	}
+	if err := model.AttachChannelFunding(pagedData); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 
 	for _, datum := range pagedData {
 		clearChannelInfo(datum, now)
@@ -472,9 +512,10 @@ func SearchChannels(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"items":       pagedData,
-			"total":       total,
-			"type_counts": typeCounts,
+			"items":        pagedData,
+			"funding_tags": model.ChannelFundingTags(pagedData),
+			"total":        total,
+			"type_counts":  typeCounts,
 		},
 	})
 	return
@@ -492,6 +533,10 @@ func GetChannel(c *gin.Context) {
 		return
 	}
 	if channel != nil {
+		if err := model.AttachChannelFunding([]*model.Channel{channel}); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		clearChannelInfo(channel)
 	}
 	c.JSON(http.StatusOK, gin.H{

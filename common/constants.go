@@ -133,6 +133,15 @@ var QuotaForInvitee = 0
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
 var AutomaticEnableChannelEnabled = false
+
+// ChannelAutomationSwitches reads the hot-reloaded flags under the same lock
+// used by the option writer.
+func ChannelAutomationSwitches() (disable, enable bool) {
+	OptionMapRWMutex.RLock()
+	defer OptionMapRWMutex.RUnlock()
+	return AutomaticDisableChannelEnabled, AutomaticEnableChannelEnabled
+}
+
 var QuotaRemindEnabled = true
 var QuotaRemindThreshold = 1000
 

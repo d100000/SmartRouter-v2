@@ -340,6 +340,8 @@ func migrateDB() error {
 	}
 
 	err := DB.AutoMigrate(
+		&ChannelFundingIncident{},
+		&ChannelFundingDelivery{},
 		&Channel{},
 		&UpstreamSupplier{},
 		&UpstreamCredential{},

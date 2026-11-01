@@ -97,3 +97,21 @@ channel.upstream_update_failed_channels: "Failed channel IDs (showing {{.Shown}}
 channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
 
 distributor.channel_outside_schedule: "This channel is outside its availability schedule"
+
+# Upstream channel funding notifications
+funding.notice_subject: "Channel {{.Name}} (#{{.Id}}): funding alert, {{.Count}} affected keys"
+funding.recovery_subject: "Channel {{.Name}} (#{{.Id}}): funding recovered, {{.Count}} keys"
+funding.notice_entry: "Event #{{.Event}} · Key {{.Key}}<br/>Reason: {{.Reason}}<br/>First detected: {{.Time}}<br/>Disabled by this event: {{.Disabled}}<br/>Recovery check: {{.Probe}}<br/>Evidence: {{.Evidence}}"
+funding.manage_link: "<a href=\"{{.Link}}\">Manage channel</a>"
+funding.balance_insufficient: "Insufficient balance"
+funding.quota_limited: "Spending limit reached"
+funding.disabled_yes: "Yes"
+funding.disabled_no: "No"
+funding.probe_pending: "Pending"
+funding.probe_running: "Running"
+funding.probe_failed: "Failed"
+funding.probe_paused: "Paused"
+funding.probe_blocked: "Blocked"
+funding.probe_manual_required: "Manual review required"
+funding.probe_recovered: "Recovered"
+funding.probe_cancelled: "Cancelled"

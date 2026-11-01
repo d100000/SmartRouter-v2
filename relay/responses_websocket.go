@@ -444,6 +444,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 						}
 						continue
 					}
+					service.ObserveChannelFundingJSON(service.ChannelFundingAttempt(c), rejection.Status, incoming.body)
 					if accepted {
 						if rejection.Error != nil {
 							code := ""
@@ -483,6 +484,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 						responseID = event.Response.ID
 					}
 				}
+				service.ObserveChannelFundingJSON(service.ChannelFundingAttempt(c), 0, incoming.body)
 				accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
 			}
 			switch event.Type {
@@ -492,6 +494,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				}
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				state.terminal = &incoming
+				if event.Type == "response.completed" {
+					service.ObserveChannelFundingSuccess(service.ChannelFundingAttempt(c))
+				}
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
 				return nil
 			}
@@ -631,6 +636,7 @@ func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model stri
 	}
 	policy := service.RequestPolicy(c)
 	policy.BeginAttempt(channel, s.lockedGroup)
+	service.BeginChannelFundingAttempt(c, channel, s.lockedKey, s.lockedKeyIndex, model)
 	policy.AddEvent(service.PolicyEvent{ChannelID: channel.Id, Decision: service.PolicyDecision{Action: "select", Reason: "pinned_channel", Source: "channel_constraint"}})
 	return nil
 }
