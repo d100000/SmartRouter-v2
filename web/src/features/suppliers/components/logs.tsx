@@ -42,6 +42,7 @@ export function SupplyLogs() {
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 20 })
   const [filters, setFilters] = useState<SupplyLogFilters>({ days: 7 })
   const query = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'logs', pagination, filters],
     queryFn: ({ signal }) =>
       getSupplyLogs(
@@ -285,34 +286,37 @@ export function SupplyLogs() {
     columnVisibilityStorageKey: false,
     columnSizingStorageKey: false,
   })
-  if (query.isError) return <ErrorState onRetry={() => void query.refetch()} />
   return (
-    <DataTablePage
-      table={table}
-      columns={columns}
-      isLoading={query.isPending}
-      isFetching={query.isFetching}
-      fixedHeight={false}
-      emptyTitle={t('No supply logs')}
-      toolbar={
-        <SupplyFilters
-          logs
-          onChange={(next) => {
-            setFilters(next)
-            setPagination((p) => ({ ...p, pageIndex: 0 }))
-          }}
+    <div className='space-y-4'>
+      <SupplyFilters
+        logs
+        onChange={(next) => {
+          setFilters(next)
+          setPagination((p) => ({ ...p, pageIndex: 0 }))
+        }}
+      >
+        <Button
+          type='button'
+          variant='outline'
+          disabled={exporting.isPending}
+          onClick={() => exporting.mutate()}
         >
-          <Button
-            type='button'
-            variant='outline'
-            disabled={exporting.isPending}
-            onClick={() => exporting.mutate()}
-          >
-            {exporting.isPending ? t('Exporting...') : t('Export CSV')}
-          </Button>
-        </SupplyFilters>
-      }
-    />
+          {exporting.isPending ? t('Exporting...') : t('Export CSV')}
+        </Button>
+      </SupplyFilters>
+      {query.isError ? (
+        <ErrorState onRetry={() => void query.refetch()} />
+      ) : (
+        <DataTablePage
+          table={table}
+          columns={columns}
+          isLoading={query.isPending}
+          isFetching={query.isFetching}
+          fixedHeight={false}
+          emptyTitle={t('No supply logs')}
+        />
+      )}
+    </div>
   )
 }
 

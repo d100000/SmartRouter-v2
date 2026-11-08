@@ -26,6 +26,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { DataTablePage, useDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
+import { Alert, AlertAction, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -61,6 +62,7 @@ export function SupplyChannelList(props: Props) {
   const [pausing, setPausing] = useState<SupplyChannel | null>(null)
   const [discarding, setDiscarding] = useState<SupplyChannel | null>(null)
   const query = useQuery<Awaited<ReturnType<typeof getSupplyChannels>>>({
+    meta: { errorRedirect: false },
     queryKey: [
       ...supplyQueryKey,
       userId,
@@ -261,61 +263,81 @@ export function SupplyChannelList(props: Props) {
     columnVisibilityStorageKey: false,
     columnSizingStorageKey: false,
   })
-  if (query.isError) return <ErrorState onRetry={() => void query.refetch()} />
   return (
     <>
-      <DataTablePage
-        table={table}
-        columns={columns}
-        isLoading={query.isPending}
-        isFetching={query.isFetching}
-        fixedHeight={false}
-        emptyTitle={t('No channels')}
-        emptyDescription={
-          props.mode === 'supplier'
-            ? t('Add a channel to start supplying models.')
-            : undefined
-        }
-        toolbar={
-          <div className='flex flex-wrap items-center justify-between gap-2'>
-            <form
-              className='flex min-w-0 items-center gap-2'
-              onSubmit={(event) => {
-                event.preventDefault()
-                setKeyword(draftSearch)
-                setPagination((p) => ({ ...p, pageIndex: 0 }))
-              }}
+      {query.isError && query.data && (
+        <Alert className='mb-4'>
+          <AlertDescription>
+            {t('Refresh failed. Showing the last successful snapshot.')}
+          </AlertDescription>
+          <AlertAction>
+            <Button
+              variant='outline'
+              size='sm'
+              onClick={() => void query.refetch()}
+              disabled={query.isFetching}
             >
-              <Input
-                aria-label={t('Search channels')}
-                value={draftSearch}
-                onChange={(event) => setDraftSearch(event.target.value)}
-                placeholder={t('Search channels')}
-              />
-              <Button type='submit' variant='outline'>
-                {t('Search')}
-              </Button>
-            </form>
-            <div className='flex gap-2'>
-              <Button
-                variant='outline'
-                onClick={() => void query.refetch()}
-                disabled={query.isFetching}
+              {t('Retry')}
+            </Button>
+          </AlertAction>
+        </Alert>
+      )}
+      {query.isError && !query.data ? (
+        <ErrorState onRetry={() => void query.refetch()} />
+      ) : (
+        <DataTablePage
+          table={table}
+          columns={columns}
+          isLoading={query.isPending}
+          isFetching={query.isFetching}
+          fixedHeight={false}
+          emptyTitle={t('No channels')}
+          emptyDescription={
+            props.mode === 'supplier'
+              ? t('Add a channel to start supplying models.')
+              : undefined
+          }
+          toolbar={
+            <div className='flex flex-wrap items-center justify-between gap-2'>
+              <form
+                className='flex min-w-0 items-center gap-2'
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  setKeyword(draftSearch)
+                  setPagination((p) => ({ ...p, pageIndex: 0 }))
+                }}
               >
-                {t('Refresh')}
-              </Button>
-              {props.mode === 'supplier' && (
-                <Button
-                  onClick={() => setEditing('new')}
-                  disabled={!props.templates?.length}
-                >
-                  {t('Add Channel')}
+                <Input
+                  aria-label={t('Search channels')}
+                  value={draftSearch}
+                  onChange={(event) => setDraftSearch(event.target.value)}
+                  placeholder={t('Search channels')}
+                />
+                <Button type='submit' variant='outline'>
+                  {t('Search')}
                 </Button>
-              )}
+              </form>
+              <div className='flex gap-2'>
+                <Button
+                  variant='outline'
+                  onClick={() => void query.refetch()}
+                  disabled={query.isFetching}
+                >
+                  {t('Refresh')}
+                </Button>
+                {props.mode === 'supplier' && (
+                  <Button
+                    onClick={() => setEditing('new')}
+                    disabled={!props.templates?.length}
+                  >
+                    {t('Add Channel')}
+                  </Button>
+                )}
+              </div>
             </div>
-          </div>
-        }
-      />
+          }
+        />
+      )}
       {copying && (
         <CopySupplyChannelDialog
           channel={copying}

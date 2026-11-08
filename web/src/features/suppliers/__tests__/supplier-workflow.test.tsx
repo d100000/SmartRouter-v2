@@ -17,13 +17,22 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { AxiosError } from 'axios'
+import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { NavGroup } from '@/components/layout/types'
 import { api } from '@/lib/api'
 import { formatFixedUSD } from '@/lib/currency'
+import { createAppQueryClient } from '@/lib/query-client'
 import {
   filterRoleNavigation,
   canReadChannels,
@@ -35,11 +44,14 @@ import {
   useSystemConfigStore,
 } from '@/stores/system-config-store'
 
+import { SuppliersAdmin } from '../admin'
 import { saveSupplier, saveSupplyChannel, copySupplyChannel } from '../api'
+import { ChannelEditor } from '../components/channel-editor'
 import { ChannelLimitsDialog } from '../components/channel-limits-dialog'
 import { SupplyChannelList } from '../components/channel-list'
 import { SupplyLogs } from '../components/logs'
 import { SupplyOverviewPanel } from '../components/overview'
+import { SupplierEditor } from '../components/supplier-editor'
 import { SupplyFilters } from '../components/supply-filters'
 import { SupplierWorkspace } from '../index'
 import { supplierAccountSchema, supplierChannelSchema } from '../lib/forms'
@@ -107,6 +119,339 @@ function withClient(element: React.ReactNode) {
     <QueryClientProvider client={client}>{element}</QueryClientProvider>
   )
 }
+
+it('opens the add supplier form from the admin list with real dialog and template controls', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, role: 100, username: 'root' })
+  vi.spyOn(api, 'get').mockImplementation(async (path) => {
+    if (path === '/api/suppliers/templates') {
+      return {
+        data: {
+          success: true,
+          data: { items: [{ id: '1', name: 'OpenAI', type: 1, models: [] }] },
+        },
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: path === '/api/suppliers/' ? { items: [], total: 0 } : [],
+      },
+    }
+  })
+  const user = userEvent.setup()
+  const router = createRouter({
+    routeTree: createRootRoute({ component: SuppliersAdmin }),
+    history: createMemoryHistory({ initialEntries: ['/'] }),
+  })
+  await router.load()
+  withClient(
+    <StrictMode>
+      <RouterProvider router={router} />
+    </StrictMode>
+  )
+  await screen.findByText('No suppliers')
+  await user.click(await screen.findByRole('button', { name: 'Add supplier' }))
+  expect(
+    await screen.findByRole('dialog', { name: 'Add supplier' })
+  ).toBeVisible()
+  expect(screen.getByLabelText('Supplier name')).toHaveValue('')
+  expect(screen.getByRole('combobox', { name: 'Allowed models' })).toBeVisible()
+  await user.click(screen.getByLabelText('Allowed channel templates'))
+  await user.click(await screen.findByRole('option', { name: 'OpenAI' }))
+  await user.keyboard('{Escape}')
+  await user.click(await screen.findByRole('button', { name: 'Cancel' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+})
+
+it('creates a supplier only after verification and keeps the form when verification is cancelled', async () => {
+  vi.spyOn(api, 'get').mockImplementation(async (path) => {
+    if (path === '/api/suppliers/templates') {
+      return {
+        data: {
+          success: true,
+          data: { items: [{ id: '1', name: 'OpenAI', type: 1, models: [] }] },
+        },
+      }
+    }
+    if (path === '/api/verify/methods') {
+      return {
+        data: {
+          success: true,
+          data: {
+            scope: 'supplier.manage',
+            methods: [{ method: 'password', available: true }],
+            oauth_providers: [],
+            password_encryption_enabled: false,
+          },
+        },
+      }
+    }
+    return { data: { success: true, data: [] } }
+  })
+  const post = vi.spyOn(api, 'post').mockImplementation(async (path) => ({
+    data: {
+      success: true,
+      data:
+        path === '/api/verify'
+          ? {
+              proof_token: 'supplier-proof',
+              method: 'password',
+              scope: 'supplier.manage',
+              expires_at: Math.floor(Date.now() / 1000) + 300,
+            }
+          : {},
+    },
+  }))
+  const onClose = vi.fn()
+  const user = userEvent.setup()
+  withClient(<SupplierEditor onClose={onClose} />)
+  await user.type(await screen.findByLabelText('Supplier name'), 'Supplier A')
+  await user.click(screen.getByLabelText('Allowed channel templates'))
+  await user.click(await screen.findByRole('option', { name: 'OpenAI' }))
+  await user.keyboard('{Escape}')
+  await user.type(screen.getByLabelText('Allowed models'), 'model-a')
+  await user.click(await screen.findByRole('option', { name: 'Add "model-a"' }))
+  await user.click(await screen.findByRole('button', { name: 'Save' }))
+  expect(
+    await screen.findByLabelText('Password', { selector: 'input' })
+  ).toBeVisible()
+  expect(post).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(await screen.findByLabelText('Supplier name')).toHaveValue(
+    'Supplier A'
+  )
+  expect(onClose).not.toHaveBeenCalled()
+  await user.click(await screen.findByRole('button', { name: 'Save' }))
+  await user.type(
+    await screen.findByLabelText('Password', { selector: 'input' }),
+    'test-password'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+  expect(post).toHaveBeenCalledWith(
+    '/api/verify',
+    expect.objectContaining({
+      scope: 'supplier.manage',
+      context: { supplier_id: '', version: 0 },
+    }),
+    expect.anything()
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/suppliers/',
+    expect.objectContaining({
+      name: 'Supplier A',
+      allowed_templates: ['1'],
+      allowed_models: ['model-a'],
+      user_id: 0,
+      cost_ratio: null,
+    }),
+    expect.objectContaining({
+      headers: { 'X-Security-Proof': 'supplier-proof' },
+    })
+  )
+})
+
+it.each(['/api/suppliers/templates', '/api/upstream-supplier'])(
+  'keeps the supplier draft and offers retry when %s returns HTTP 500',
+  async (failedPath) => {
+    const onInternalServerError = vi.fn()
+    client = createAppQueryClient(onInternalServerError)
+    let failRequest!: (reason: Error) => void
+    const pending = new Promise<never>((_, reject) => {
+      failRequest = reject
+    })
+    let fail = true
+    vi.spyOn(api, 'get').mockImplementation(async (path) => {
+      if (path === failedPath && fail) return pending
+      return {
+        data: {
+          success: true,
+          data:
+            path === '/api/suppliers/templates'
+              ? { items: [{ id: '1', name: 'OpenAI', type: 1, models: [] }] }
+              : [],
+        },
+      }
+    })
+    const user = userEvent.setup()
+    withClient(<SupplierEditor onClose={vi.fn()} />)
+    await user.type(screen.getByLabelText('Supplier name'), 'Unsaved supplier')
+    await act(async () => {
+      fail = false
+      failRequest(
+        Object.assign(new AxiosError('Unavailable'), {
+          response: { status: 500 },
+        })
+      )
+    })
+    await screen.findByText('Oops! Something went wrong')
+    expect(screen.getByLabelText('Supplier name')).toHaveValue(
+      'Unsaved supplier'
+    )
+    expect(onInternalServerError).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Oops! Something went wrong')
+      ).not.toBeInTheDocument()
+    )
+    expect(screen.getByLabelText('Supplier name')).toHaveValue(
+      'Unsaved supplier'
+    )
+  }
+)
+
+it('edits an existing supplier channel without reading or resubmitting its credential', async () => {
+  const get = vi.spyOn(api, 'get')
+  const put = vi.spyOn(api, 'put').mockResolvedValue({
+    data: { success: true, data: channel },
+  })
+  const onClose = vi.fn()
+  const user = userEvent.setup()
+  withClient(
+    <ChannelEditor
+      channel={channel}
+      templates={[{ id: '1', name: 'OpenAI', type: 1, models: ['model-a'] }]}
+      onClose={onClose}
+    />
+  )
+  expect(await screen.findByLabelText('Replacement upstream key')).toHaveValue(
+    ''
+  )
+  expect(screen.getByLabelText('Channel template')).toBeDisabled()
+  await user.clear(screen.getByLabelText('Supplier internal priority'))
+  await user.type(screen.getByLabelText('Supplier internal priority'), '5')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+  expect(put).toHaveBeenCalledWith(
+    '/api/supplier/channels/9',
+    expect.objectContaining({ priority: 5, version: 2, key: undefined }),
+    undefined
+  )
+  expect(get).not.toHaveBeenCalled()
+})
+
+it('preserves a new channel draft when the initial channel list request fails', async () => {
+  const onInternalServerError = vi.fn()
+  client = createAppQueryClient(onInternalServerError)
+  let failRequest!: (error: Error) => void
+  vi.spyOn(api, 'get').mockReturnValue(
+    new Promise((_, reject) => {
+      failRequest = reject
+    })
+  )
+  const user = userEvent.setup()
+  withClient(
+    <SupplyChannelList
+      mode='supplier'
+      templates={[{ id: '1', name: 'OpenAI', type: 1, models: ['model-a'] }]}
+    />
+  )
+  await user.click(screen.getByRole('button', { name: 'Add Channel' }))
+  await user.type(screen.getByLabelText('Name'), 'Unsaved channel')
+  await user.type(screen.getByLabelText('Upstream key'), 'test-upstream-key')
+  await act(async () => {
+    failRequest(
+      Object.assign(new AxiosError('Offline'), { response: { status: 500 } })
+    )
+  })
+  await screen.findByText('Oops! Something went wrong')
+  expect(screen.getByLabelText('Name')).toHaveValue('Unsaved channel')
+  expect(screen.getByLabelText('Upstream key')).toHaveValue('test-upstream-key')
+  expect(onInternalServerError).not.toHaveBeenCalled()
+})
+
+it('preserves channel edits when a background refresh fails and allows retry', async () => {
+  const onInternalServerError = vi.fn()
+  client = createAppQueryClient(onInternalServerError)
+  const get = vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { items: [channel], total: 1 } },
+  })
+  const user = userEvent.setup()
+  withClient(
+    <SupplyChannelList
+      mode='supplier'
+      templates={[{ id: '1', name: 'OpenAI', type: 1, models: ['model-a'] }]}
+    />
+  )
+  await user.click((await screen.findAllByRole('button', { name: 'Edit' }))[0])
+  await user.type(screen.getByLabelText('Name'), ' draft')
+  await user.type(
+    screen.getByLabelText('Replacement upstream key'),
+    'test-upstream-key'
+  )
+  get.mockRejectedValueOnce(
+    Object.assign(new AxiosError('Refresh failed'), {
+      response: { status: 500 },
+    })
+  )
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ['supply'] })
+  })
+  await screen.findByText(
+    'Refresh failed. Showing the last successful snapshot.'
+  )
+  expect(screen.getByLabelText('Name')).toHaveValue('Supplier A channel draft')
+  expect(screen.getByLabelText('Replacement upstream key')).toHaveValue(
+    'test-upstream-key'
+  )
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Refresh failed. Showing the last successful snapshot.'
+  )
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  )
+  expect(screen.getAllByText('Supplier A channel').length).toBeGreaterThan(0)
+  expect(onInternalServerError).not.toHaveBeenCalled()
+})
+
+it('retains supply log filters after HTTP 500 and can recover with corrected filters', async () => {
+  const onInternalServerError = vi.fn()
+  client = createAppQueryClient(onInternalServerError)
+  const response = { data: { success: true, data: { items: [], total: 0 } } }
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValueOnce(response)
+    .mockRejectedValueOnce(
+      Object.assign(new AxiosError('Log query failed'), {
+        response: { status: 500 },
+      })
+    )
+    .mockResolvedValue(response)
+  const user = userEvent.setup()
+  withClient(<SupplyLogs />)
+  await screen.findByText('No supply logs')
+  await user.type(screen.getByRole('textbox', { name: 'Channel ID' }), '9')
+  await user.type(screen.getByRole('textbox', { name: 'Model' }), 'model-a')
+  await user.click(screen.getByRole('combobox', { name: 'Time range' }))
+  await user.click(screen.getByRole('option', { name: 'Last 24 hours' }))
+  await user.click(screen.getByRole('button', { name: 'Filter' }))
+  await screen.findByText('Oops! Something went wrong')
+  expect(screen.getByRole('textbox', { name: 'Channel ID' })).toHaveValue('9')
+  expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('model-a')
+  expect(
+    screen.getByRole('combobox', { name: 'Time range' })
+  ).toHaveTextContent('Last 24 hours')
+  await user.clear(screen.getByRole('textbox', { name: 'Model' }))
+  await user.type(screen.getByRole('textbox', { name: 'Model' }), 'model-b')
+  await user.click(screen.getByRole('button', { name: 'Filter' }))
+  await screen.findByText('No supply logs')
+  expect(get).toHaveBeenLastCalledWith(
+    '/api/supplier/logs',
+    expect.objectContaining({
+      params: expect.objectContaining({
+        channel_id: 9,
+        model: 'model-b',
+        days: 1,
+      }),
+    })
+  )
+  expect(onInternalServerError).not.toHaveBeenCalled()
+})
 
 describe('supplier limits contract', () => {
   it('keeps independent unlimited limits and decimal amounts without resetting counters', () => {

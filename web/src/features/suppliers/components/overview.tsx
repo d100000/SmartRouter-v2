@@ -30,24 +30,34 @@ import { formatNumber } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getSupplyOverview, supplyQueryKey } from '../api'
-import type { SupplierMode, SupplyLogFilters } from '../types'
+import type { SupplierMode, SupplyLogFilters, SupplyOverview } from '../types'
 import { SupplyAsyncMetricsPanel } from './async-metrics'
 import { SupplyFilters } from './supply-filters'
 
 const SupplyTrendChart = lazy(() => import('./supply-trend'))
 
 export function SupplyOverviewPanel(props: { mode: SupplierMode }) {
-  const { t, i18n } = useTranslation()
-  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const userId = useAuthStore((s) => s.auth.user?.id)
   const [filters, setFilters] = useState<SupplyLogFilters>({ days: 7 })
   const query = useQuery({
     queryKey: [...supplyQueryKey, userId, props.mode, 'overview', filters],
     queryFn: ({ signal }) => getSupplyOverview(props.mode, filters, signal),
+    meta: { errorRedirect: false },
   })
-  if (query.isPending) return <LoadingState />
-  if (query.isError) return <ErrorState onRetry={() => void query.refetch()} />
-  const overview = query.data
+  return (
+    <div className='space-y-4'>
+      <SupplyFilters onChange={setFilters} />
+      {query.isPending && <LoadingState />}
+      {query.isError && <ErrorState onRetry={() => void query.refetch()} />}
+      {query.isSuccess && <SupplyOverviewData overview={query.data} />}
+    </div>
+  )
+}
+
+function SupplyOverviewData(props: { overview: SupplyOverview }) {
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const overview = props.overview
   const date = new Intl.DateTimeFormat(locale, {
     dateStyle: 'short',
     timeStyle: 'short',
@@ -181,7 +191,6 @@ export function SupplyOverviewPanel(props: { mode: SupplierMode }) {
           · {t('Statistics timezone')}: {overview.coverage?.timezone ?? 'UTC'}
         </p>
       </div>
-      <SupplyFilters onChange={setFilters} />
       <p className='text-muted-foreground text-xs'>
         {t('Usage coverage')}:{' '}
         {overview.usage_known_count == null

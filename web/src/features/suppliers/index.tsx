@@ -42,6 +42,7 @@ export function SupplierWorkspace() {
   const { t } = useTranslation()
   const userId = useAuthStore((s) => s.auth.user?.id)
   const self = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'self'],
     queryFn: ({ signal }) => getSupplierSelf(signal),
   })

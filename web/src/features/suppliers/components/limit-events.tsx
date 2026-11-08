@@ -37,6 +37,7 @@ export function SupplierLimitEvents(props: {
   const userId = useAuthStore((s) => s.auth.user?.id)
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 10 })
   const query = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [
       ...supplyQueryKey,
       userId,

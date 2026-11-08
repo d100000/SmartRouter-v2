@@ -40,14 +40,17 @@ export function AdminSupplierChannelEditor(props: {
   const { t } = useTranslation()
   const userId = useAuthStore((state) => state.auth.user?.id)
   const channel = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'channel', props.channelId],
     queryFn: ({ signal }) => getReadOnlyChannel(props.channelId, signal),
   })
   const suppliers = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'accounts'],
     queryFn: ({ signal }) => getSuppliers(signal),
   })
   const templates = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'templates'],
     queryFn: ({ signal }) => getSupplierTemplates(signal),
   })

@@ -69,6 +69,7 @@ export function SupplierEditor(props: {
   const supplier = props.supplier
   const userId = useAuthStore((state) => state.auth.user?.id)
   const catalog = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'templates'],
     queryFn: ({ signal }) => getSupplierTemplates(signal),
   })
@@ -78,6 +79,7 @@ export function SupplierEditor(props: {
   }))
   const [existingId, setExistingId] = useState('new')
   const upstream = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'procurement-suppliers'],
     queryFn: ({ signal }) => getUpstreamSuppliers(signal),
     enabled: !supplier,
@@ -200,6 +202,12 @@ export function SupplierEditor(props: {
           >
             {!supplier && (
               <div className='space-y-2'>
+                {upstream.isError && (
+                  <ErrorState
+                    className='min-h-0'
+                    onRetry={() => void upstream.refetch()}
+                  />
+                )}
                 <Select
                   value={existingId}
                   items={sourceOptions}
@@ -269,6 +277,7 @@ export function SupplierEditor(props: {
                   <FormLabel>{t('Allowed channel templates')}</FormLabel>
                   <FormControl>
                     <MultiSelect
+                      aria-label={t('Allowed channel templates')}
                       options={templates}
                       selected={field.value}
                       onChange={field.onChange}
@@ -287,6 +296,7 @@ export function SupplierEditor(props: {
                   <FormLabel>{t('Allowed models')}</FormLabel>
                   <FormControl>
                     <MultiSelect
+                      aria-label={t('Allowed models')}
                       options={[]}
                       selected={field.value}
                       onChange={field.onChange}

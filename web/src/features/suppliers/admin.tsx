@@ -71,10 +71,12 @@ export function SuppliersAdmin() {
     useState<SupplierAccount | null>(null)
   const [editing, setEditing] = useState<SupplierAccount | 'new' | null>(null)
   const query = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'accounts'],
     queryFn: ({ signal }) => getSuppliers(signal),
   })
   const templates = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'templates'],
     queryFn: ({ signal }) => getSupplierTemplates(signal),
     enabled: channelSupplier !== null,
@@ -197,12 +199,16 @@ export function SuppliersAdmin() {
     ],
     [t, mutation, canManage]
   )
-  const { table } = useDataTable({
-    data: (query.data?.items ?? []).filter((supplier) =>
+  const filteredSuppliers = useMemo(() => {
+    const keyword = search.trim().toLocaleLowerCase()
+    return (query.data?.items ?? []).filter((supplier) =>
       `${supplier.name} ${supplier.username ?? ''}`
         .toLocaleLowerCase()
-        .includes(search.trim().toLocaleLowerCase())
-    ),
+        .includes(keyword)
+    )
+  }, [query.data?.items, search])
+  const { table } = useDataTable({
+    data: filteredSuppliers,
     columns,
     enableRowSelection: false,
     withPaginationRowModel: true,

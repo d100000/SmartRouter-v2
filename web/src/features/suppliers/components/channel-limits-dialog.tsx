@@ -68,6 +68,7 @@ export function ChannelLimitsDialog(props: Props) {
   const { t } = useTranslation()
   const userId = useAuthStore((s) => s.auth.user?.id)
   const query = useQuery({
+    meta: { errorRedirect: false },
     refetchOnWindowFocus: false,
     queryKey: [
       ...supplyQueryKey,

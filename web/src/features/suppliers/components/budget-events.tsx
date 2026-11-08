@@ -44,6 +44,7 @@ export function SupplierBudgetEvents(props: {
   const [draftDay, setDraftDay] = useState(props.day)
   const [day, setDay] = useState(props.day)
   const query = useQuery({
+    meta: { errorRedirect: false },
     queryKey: [
       ...supplyQueryKey,
       userId,

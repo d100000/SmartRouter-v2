@@ -288,6 +288,7 @@ export function ChannelEditor(props: Props) {
                   <FormLabel>{t('Models')}</FormLabel>
                   <FormControl>
                     <MultiSelect
+                      aria-label={t('Models')}
                       options={(selectedTemplate?.models ?? []).map(
                         (model) => ({ value: model, label: model })
                       )}

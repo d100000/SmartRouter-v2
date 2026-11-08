@@ -22,7 +22,14 @@ import {
   getCoreRowModel,
   useReactTable,
 } from '@tanstack/react-table'
-import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createInstance } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
@@ -126,6 +133,9 @@ beforeEach(async () => {
   )
 })
 afterEach(() => {
+  // Unmount subscribers before clearing their query and currency state. This
+  // hook runs before the shared cleanup because afterEach uses reverse order.
+  cleanup()
   client.clear()
   useSystemConfigStore.getState().setConfig(previousConfig)
 })
