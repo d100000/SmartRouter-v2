@@ -393,6 +393,24 @@ func (e *Engine) call(ctx context.Context, opts callOptions, exportName string, 
 		return nil, nil, err
 	}
 	call := &runtimeCall{engine: e, ctx: ctx, holdsSlot: true}
+	for _, argument := range args {
+		if data, ok := argument.(map[string]any); ok {
+			for _, field := range []string{"apiKey", "authHeader"} {
+				if key, ok := data[field].(string); ok && key != "" {
+					call.logSecrets = append(call.logSecrets, key)
+					if field == "authHeader" {
+						_, token, found := strings.Cut(key, " ")
+						if found && token != "" {
+							call.logSecrets = append(call.logSecrets, token)
+						}
+					}
+					if encoded, err := common.Marshal(key); err == nil && len(encoded) > 2 {
+						call.logSecrets = append(call.logSecrets, string(encoded[1:len(encoded)-1]))
+					}
+				}
+			}
+		}
+	}
 	// utils.fetch may lend the slot out; return what the call holds now.
 	defer call.release()
 
@@ -806,9 +824,15 @@ func (e *Engine) newRuntime(ctx context.Context) (*runtimeInstance, error) {
 	runtime := moejs.NewRuntime(moejs.Options{DisableDynamicCode: true})
 	logContext := &runtimeLogContext{context: ctx}
 	instance := &runtimeInstance{runtime: runtime, logContext: logContext}
-	logOutput := e.log
-	if logOutput == nil {
-		logOutput = func(message string) {
+	logOutput := func(message string) {
+		if call := instance.call; call != nil {
+			for _, secret := range call.logSecrets {
+				message = strings.ReplaceAll(message, secret, "[redacted]")
+			}
+		}
+		if e.log != nil {
+			e.log(message)
+		} else {
 			logger.LogDebug(logContext.context, "task_plugin subsystem=runtime event=console message=%q", message)
 		}
 	}

@@ -70,7 +70,18 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, fundingKeyIndex ...int) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, fundingKeyIndex ...int) (testOutcome testResult) {
+	protectedCredentials := channel.OwnerSupplierID != "" || channel.SecretsWriteOnly
+	defer func() {
+		if protectedCredentials && !errors.Is(testOutcome.localErr, model.ErrChannelOutsideSchedule) && (testOutcome.localErr != nil || testOutcome.newAPIError != nil) {
+			testOutcome.localErr = common.NewMessage("Channel test failed")
+			status := http.StatusBadGateway
+			if testOutcome.newAPIError != nil {
+				status = testOutcome.newAPIError.StatusCode
+			}
+			testOutcome.newAPIError = types.NewOpenAIError(testOutcome.localErr, types.ErrorCodeBadResponse, status)
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -252,7 +263,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
-	if len(fundingKeyIndex) > 0 {
+	if len(fundingKeyIndex) > 0 || channel.OwnerSupplierID != "" {
 		switch req := request.(type) {
 		case *dto.GeneralOpenAIRequest:
 			if req.MaxCompletionTokens != nil {
@@ -282,6 +293,14 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 
 	info.IsChannelTest = true
 	info.InitChannelMeta(c)
+	if err := service.PrepareChannelLimitAttempt(info, selectedChannel); err != nil {
+		return testResult{context: c, localErr: err, newAPIError: service.ChannelLimitRelayError(err, c)}
+	}
+	defer func() {
+		if err := service.FinishChannelLimitAttempt(c, info, testOutcome.newAPIError); err != nil {
+			common.SysError("channel test limit settlement failed: " + err.Error())
+		}
+	}()
 	if len(fundingKeyIndex) > 0 && len(info.ParamOverride) > 0 {
 		return testResult{context: c, localErr: errors.New("Funding recovery checks require manual review for channels with parameter overrides")}
 	}
@@ -336,7 +355,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//// 创建一个用于日志的 info 副本，移除 ApiKey
 	//logInfo := info
 	//logInfo.ApiKey = ""
-	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	if !protectedCredentials {
+		common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	}
 
 	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
 	if err != nil {
@@ -489,6 +510,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
+			if protectedCredentials {
+				service.CloseResponseBodyGracefully(httpResp)
+				return testResult{context: c, localErr: common.NewMessage("Channel test failed"), newAPIError: types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, httpResp.StatusCode)}
+			}
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -542,24 +567,27 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	info.SetEstimatePromptTokens(usage.PromptTokens)
 
 	quota, tieredResult := settleTestQuota(info, priceData, usage)
+	service.CaptureChannelTestLimitUsage(c, info, usage, tieredResult)
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
 	consumedTime := float64(milliseconds) / 1000.0
 	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
-	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
-		ChannelId:        channel.Id,
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		ModelName:        info.OriginModelName,
-		TokenName:        "Model test",
-		Quota:            quota,
-		Content:          []*common.Message{common.NewMessage("Model test")},
-		UseTimeSeconds:   int(consumedTime),
-		IsStream:         info.IsStream,
-		Group:            info.UsingGroup,
-		Other:            other,
-	})
-	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	if !protectedCredentials {
+		model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+			ChannelId:        channel.Id,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ModelName:        info.OriginModelName,
+			TokenName:        "Model test",
+			Quota:            quota,
+			Content:          []*common.Message{common.NewMessage("Model test")},
+			UseTimeSeconds:   int(consumedTime),
+			IsStream:         info.IsStream,
+			Group:            info.UsingGroup,
+			Other:            other,
+		})
+		common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	}
 	if len(fundingKeyIndex) > 0 && !fundingProbeCompleted(respBody, relayFormat) {
 		return testResult{context: c, localErr: errors.New("upstream did not return a completed text response")}
 	}

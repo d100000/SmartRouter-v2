@@ -100,6 +100,7 @@ type responsesWSSession struct {
 	closeOnce      sync.Once
 
 	clientWriteMu sync.Mutex
+	redactKey     string
 	targetWriteMu sync.Mutex
 	connectionMu  sync.Mutex
 	target        *websocket.Conn
@@ -112,14 +113,15 @@ type responsesWSSession struct {
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
-	lastResponseID  string
-	lockedModel     string
-	lockedChannelID int
-	lockedGroup     string
-	lockedKey       string
-	lockedKeyIndex  int
-	lockedContext   map[appconstant.ContextKey]any
-	lockedRoute     dto.AdvancedCustomRoute
+	lastResponseID   string
+	lockedModel      string
+	lockedChannelID  int
+	lockedSupplierID string
+	lockedGroup      string
+	lockedKey        string
+	lockedKeyIndex   int
+	lockedContext    map[appconstant.ContextKey]any
+	lockedRoute      dto.AdvancedCustomRoute
 }
 
 func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner) *types.NewAPIError {
@@ -262,6 +264,11 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
 		service.FinishSchedulingAttempt(c, info, apiErr)
+		service.FinishOverviewAttempt(c, info, apiErr)
+		if err := service.FinishChannelLimitAttempt(c, info, apiErr); err != nil {
+			common.SysError("channel limit settlement failed: " + err.Error())
+		}
+		service.CompleteOverviewRelay(info)
 		perfmetrics.RecordRelayOutcome(c.Request.Context(), info, service.FinalRelayOutcome(c, info, apiErr))
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
@@ -299,7 +306,17 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if apiErr != nil {
 			return apiErr
 		}
-		service.StartSchedulingAttempt(c, info)
+		channel, err := appmodel.GetChannelById(s.lockedChannelID, true)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeGetChannelFailed)
+		}
+		if apiErr = prepareResponsesWSAttempt(c, info, channel); apiErr != nil {
+			return apiErr
+		}
+		if err := service.AdmitResponsesWebSocketEvent(c, info, payload); err != nil {
+			return service.ChannelLimitRelayError(err, c)
+		}
+		service.MarkOverviewUpstreamSent(info)
 		if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
 			state.closeCode = websocket.CloseInternalServerErr
 			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
@@ -336,7 +353,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			}
 			adaptor := GetAdaptor(info.ApiType)
 			adaptor.Init(info)
-			service.StartSchedulingAttempt(c, info)
+			if apiErr = prepareResponsesWSAttempt(c, info, channel); apiErr != nil {
+				return apiErr
+			}
 			target, dialErr := relaychannel.DoWssRequest(adaptor, c, info, nil)
 			if dialErr != nil {
 				apiErr = service.NormalizeViolationFeeError(types.NewError(dialErr, types.ErrorCodeDoRequestFailed))
@@ -354,12 +373,24 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			if !s.setTarget(target) {
 				return types.NewError(context.Canceled, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
+			if err := service.AdmitResponsesWebSocketEvent(c, info, payload); err != nil {
+				_ = target.Close()
+				s.connectionMu.Lock()
+				s.target = nil
+				s.connectionMu.Unlock()
+				return service.ChannelLimitRelayError(err, c)
+			}
+			s.clientWriteMu.Lock()
+			s.redactKey = info.ApiKey
+			s.clientWriteMu.Unlock()
+			service.MarkOverviewUpstreamSent(info)
 			if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
 				state.closeCode = websocket.CloseInternalServerErr
 				return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
 			s.lockedModel, s.lockedChannelID, s.lockedGroup = modelName, channel.Id, info.UsingGroup
 			s.lockedKey, s.lockedKeyIndex = info.ApiKey, info.ChannelMultiKeyIndex
+			s.lockedSupplierID = channel.OwnerSupplierID
 			s.lockedRoute, _ = channel.GetOtherSettings().AdvancedCustom.MatchPathForModel(c.Request.URL.Path, modelName)
 			s.lockedContext = make(map[appconstant.ContextKey]any)
 			for _, key := range []appconstant.ContextKey{
@@ -538,6 +569,19 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 }
 
+func prepareResponsesWSAttempt(c *gin.Context, info *relaycommon.RelayInfo, channel *appmodel.Channel) *types.NewAPIError {
+	if err := service.PrepareChannelEventAttempt(info, channel); err != nil {
+		return service.ChannelLimitRelayError(err, c)
+	}
+	service.PrepareOverviewAttempt(c, info, channel)
+	if info.OverviewAttempt != nil {
+		info.OverviewAttempt.CallStage = "realtime_generation"
+	}
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.RequireTerminal()
+	return nil
+}
+
 // A single generation is active, but a cancel can fail independently. Correlate
 // available IDs first; uncorrelated control/server errors require a bounded
 // connection close because continuing could leave the generation stuck forever.
@@ -569,8 +613,6 @@ func responsesWSErrorEndsRequest(event responsesWSErrorEvent, streamID, response
 }
 
 func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model string) *types.NewAPIError {
-	// The channel type is not rechecked: a locked channel keeps its type, and
-	// the FilterResponsesWebSocket rules were applied when it was selected.
 	channel, err := appmodel.CacheGetChannel(s.lockedChannelID)
 	if err != nil || channel == nil || channel.Status != common.ChannelStatusEnabled || !channel.GetSetting().ResponsesWebSocketEnabled {
 		return types.NewErrorWithStatusCode(errors.New("Responses WebSocket is disabled for this channel"), types.ErrorCode(appdto.FilterResponsesWebSocket), http.StatusForbidden, types.ErrOptionWithSkipRetry())
@@ -589,7 +631,7 @@ func (s *responsesWSSession) restoreConnectionContext(c *gin.Context, model stri
 	}
 	// Changes that alter the physical upstream connection require a new
 	// handshake. Request-level settings can be refreshed without rotating keys.
-	if channel.GetBaseURL() != s.lockedContext[appconstant.ContextKeyChannelBaseUrl] ||
+	if channel.Type != s.lockedContext[appconstant.ContextKeyChannelType] || channel.OwnerSupplierID != s.lockedSupplierID || channel.GetBaseURL() != s.lockedContext[appconstant.ContextKeyChannelBaseUrl] ||
 		!reflect.DeepEqual(channel.GetHeaderOverride(), s.lockedContext[appconstant.ContextKeyChannelHeaderOverride]) {
 		return types.NewErrorWithStatusCode(errors.New("upstream connection settings changed; reconnect required"), types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 	}
@@ -748,6 +790,7 @@ func (s *responsesWSSession) writeTarget(kind int, message []byte) error {
 func (s *responsesWSSession) writeClient(kind int, message []byte) error {
 	s.clientWriteMu.Lock()
 	defer s.clientWriteMu.Unlock()
+	message = service.RedactUpstreamWebSocketCredential(message, s.redactKey)
 	if err := s.client.SetWriteDeadline(s.clientWriteBudget.Deadline(time.Now(), len(message))); err != nil {
 		return err
 	}
@@ -803,6 +846,14 @@ func (s *responsesWSSession) registerChannelClose(channelID int) {
 // closeForPolicy tells both peers why the connection ends, like the realtime
 // relay does.
 func (s *responsesWSSession) closeForPolicy(reason string) {
+	if reason == service.ChannelDisabledCloseReason {
+		s.stateMu.Lock()
+		active := s.current != nil
+		s.stateMu.Unlock()
+		if active {
+			return
+		}
+	}
 	s.shutdown(websocket.ClosePolicyViolation, reason)
 }
 

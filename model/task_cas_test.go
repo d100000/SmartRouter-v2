@@ -53,6 +53,10 @@ func TestMain(m *testing.M) {
 		&TwoFABackupCode{},
 		&Log{},
 		&Channel{},
+		&ChannelLimitConfig{},
+		&ChannelDailyBudget{},
+		&ChannelLimitAttempt{},
+		&ChannelLimitEvent{},
 		&UpstreamSupplier{},
 		&UpstreamCredential{},
 		&UpstreamCredentialVersion{},
@@ -94,6 +98,9 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM users")
 		DB.Exec("DELETE FROM logs")
 		DB.Exec("DELETE FROM channels")
+		for _, table := range []string{"channel_limit_configs", "channel_daily_budgets", "channel_limit_attempts", "channel_limit_events"} {
+			require.NoError(t, DB.Exec("DELETE FROM "+table).Error)
+		}
 		DB.Exec("DELETE FROM channel_credential_bindings")
 		DB.Exec("DELETE FROM upstream_credential_versions")
 		DB.Exec("DELETE FROM upstream_credentials")

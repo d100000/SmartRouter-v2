@@ -21,55 +21,126 @@ import { useTranslation } from 'react-i18next'
 import {
   StaticDataTable,
   staticDataTableClassNames,
+  type StaticDataTableColumn,
 } from '@/components/data-table'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber } from '@/lib/format'
 
 import { getOverviewObjectLabel } from '../lib/object-label'
-import type { OverviewModel } from '../types'
+import type { OverviewChannelModel, OverviewModel } from '../types'
+
+type CacheRow = OverviewModel | OverviewChannelModel
 
 export function OverviewCacheTable(props: {
-  dimension: 'model' | 'channel'
-  rows: OverviewModel[]
+  dimension: 'model' | 'channel' | 'channel_model'
+  rows: CacheRow[]
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  const title =
-    props.dimension === 'model'
-      ? t('Cache Statistics by Model')
-      : t('Cache Statistics by Channel')
+  const titles = {
+    model: t('Cache Statistics by Model'),
+    channel: t('Cache Statistics by Channel'),
+    channel_model: t('Cache Statistics by Channel and Model'),
+  }
+  const channelColumns: StaticDataTableColumn<CacheRow>[] = []
+  if (props.dimension === 'channel_model') {
+    channelColumns.push({
+      id: 'channel',
+      header: t('Channel'),
+      className: 'min-w-48',
+      cell: (row) => {
+        if (!('channel_id' in row)) return '—'
+        return (
+          <div className='max-w-72 break-all whitespace-normal'>
+            <div>
+              {getOverviewObjectLabel(
+                'channel',
+                row.channel_name,
+                String(row.channel_id),
+                t
+              )}
+            </div>
+            <div
+              data-table-text='secondary'
+              className='text-muted-foreground text-xs'
+            >
+              #{row.channel_id}
+            </div>
+          </div>
+        )
+      },
+    })
+  }
 
   return (
     <div className='overflow-x-auto'>
       <StaticDataTable
         className={staticDataTableClassNames.embeddedContainer}
-        tableClassName='min-w-[880px]'
-        tableProps={{ 'aria-label': title }}
+        tableClassName={
+          props.dimension === 'channel_model'
+            ? 'min-w-[1080px]'
+            : 'min-w-[960px]'
+        }
+        tableProps={{ 'aria-label': titles[props.dimension] }}
         headerRowClassName={staticDataTableClassNames.mutedHeaderRow}
         data={props.rows}
         getRowKey={(row) => row.id}
         emptyContent={t('No cache usage samples yet.')}
         columns={[
+          ...channelColumns,
           {
             id: 'name',
-            header: props.dimension === 'model' ? t('Model') : t('Channel'),
+            header: props.dimension === 'channel' ? t('Channel') : t('Model'),
             className: 'min-w-48',
-            cell: (row) => (
-              <span className='block max-w-72 break-all whitespace-normal'>
-                {props.dimension === 'channel'
-                  ? getOverviewObjectLabel('channel', row.name, row.id, t)
-                  : row.name || row.id || t('Unknown')}
-              </span>
-            ),
+            cell: (row) => {
+              let label = row.name || t('Unknown')
+              if (props.dimension === 'model') {
+                label = row.name || row.id || t('Unknown')
+              } else if (props.dimension === 'channel') {
+                label = getOverviewObjectLabel('channel', row.name, row.id, t)
+              }
+              return (
+                <span className='block max-w-72 break-all whitespace-normal'>
+                  {label}
+                </span>
+              )
+            },
           },
           {
             id: 'cache-hit-rate',
-            header: t('Cache Hit Rate'),
+            header: t('Cache Token Hit Rate'),
             cellClassName: staticDataTableClassNames.compactNumericCell,
             cell: (row) =>
               row.cache_usage_attempts > 0 && row.cache_hit_rate != null
                 ? `${formatNumber(row.cache_hit_rate, locale)}%`
                 : '—',
+          },
+          {
+            id: 'cache-request-hit-rate',
+            header: t('Cache Request Hit Rate'),
+            cellClassName: staticDataTableClassNames.compactNumericCell,
+            cell: (row) => {
+              if (
+                !(row.cache_usage_attempts > 0) ||
+                row.cache_attempt_hit_rate == null
+              ) {
+                return '—'
+              }
+              return (
+                <div className='space-y-0.5'>
+                  <div>{formatNumber(row.cache_attempt_hit_rate, locale)}%</div>
+                  <div
+                    data-table-text='secondary'
+                    className='text-muted-foreground text-xs'
+                  >
+                    {t('{{hits}} / {{total}} measured attempts', {
+                      hits: formatNumber(row.cache_hit_attempts, locale),
+                      total: formatNumber(row.cache_usage_attempts, locale),
+                    })}
+                  </div>
+                </div>
+              )
+            },
           },
           {
             id: 'cache-read',
@@ -110,7 +181,10 @@ export function OverviewCacheTable(props: {
                     : `${formatNumber(row.cache_usage_coverage, locale)}%`}
                 </div>
                 {row.cache_usage_attempts != null && (
-                  <div className='text-muted-foreground text-xs'>
+                  <div
+                    data-table-text='secondary'
+                    className='text-muted-foreground text-xs'
+                  >
                     {t('{{known}} / {{total}} attempts', {
                       known: formatNumber(row.cache_usage_attempts, locale),
                       total: formatNumber(row.attempts, locale),

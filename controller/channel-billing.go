@@ -150,6 +150,9 @@ func GetClaudeAuthHeader(token string) http.Header {
 }
 
 func GetResponseBody(method, url string, channel *model.Channel, headers http.Header) ([]byte, error) {
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		return nil, model.ErrSupplierChannelOperation
+	}
 	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
 		return nil, err
@@ -622,6 +625,9 @@ func fetchAdvancedCustomBalance(channel *model.Channel) (channelBalanceResult, e
 }
 
 func updateChannelBalance(channel *model.Channel) (channelBalanceResult, error) {
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		return channelBalanceResult{}, model.ErrSupplierChannelOperation
+	}
 	if channel.Type == constant.ChannelTypeAdvancedCustom {
 		return fetchAdvancedCustomBalance(channel)
 	}

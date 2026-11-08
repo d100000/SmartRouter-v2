@@ -149,13 +149,15 @@ type TaskAdaptor struct {
 	// the relayed events of a submission whose stream stopped before the
 	// upstream finished it, or whose result the plugin could not read: the
 	// task then settles at the reserved quota.
-	keepReservation bool
+	keepReservation         bool
+	submitTerminalConfirmed bool
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo)   { a.info = info }
 
-func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
+func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (failure *dto.TaskError) {
+	defer func() { failure = service.ProtectTaskChannelError(info, failure) }()
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Plugin == a.plugin {
 			if protocolValue, present := c.Get(pluginruntime.ContextKeyProtocolRequest); present {
@@ -624,6 +626,7 @@ func submitReplyLimit(c *gin.Context) int64 {
 }
 
 func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (submitted *channel.TaskSubmitResponse, taskErr *dto.TaskError) {
+	a.submitTerminalConfirmed, a.keepReservation = false, false
 	started := time.Now()
 	var responseBody any
 	var err error
@@ -633,6 +636,31 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	acceptedStream := streaming || eventStream
 	relayed := false
 	defer func() {
+		taskErr = service.ProtectTaskChannelError(info, taskErr)
+		if submitted != nil && service.ProtectedChannelCredentials(info) {
+			submitted.TaskData = service.RedactTaskChannelPayload(info, submitted.TaskData)
+			submitted.PluginState = service.RedactTaskChannelPayload(info, submitted.PluginState)
+			if submitted.ClientResponse != nil {
+				encoded, err := common.Marshal(submitted.ClientResponse)
+				if err == nil {
+					submitted.ClientResponse = json.RawMessage(service.RedactTaskChannelPayload(info, encoded))
+				} else {
+					submitted.ClientResponse = nil
+				}
+			}
+			if submitted.Immediate != nil {
+				a.protectTaskInfo(submitted.Immediate)
+			}
+		}
+		if service.ProtectedChannelCredentials(info) && submitted != nil && submitted.Immediate != nil && submitted.Immediate.Status == model.TaskStatusFailure {
+			submitted.Immediate.Reason = "Task failed"
+			submitted.TaskData, submitted.ClientResponse = nil, nil
+		}
+		defer func() {
+			if submitted != nil && submitted.Immediate != nil && (a.keepReservation || eventStream && !a.submitTerminalConfirmed) {
+				submitted.Immediate.Unconfirmed = true
+			}
+		}()
 		switch {
 		case taskErr == nil:
 		case relayed:
@@ -672,6 +700,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		if err == nil && int64(len(body)) > replyLimit {
 			err = fmt.Errorf("task submit response exceeds size limit")
 		}
+		body = service.RedactTaskChannelPayload(info, body)
 		responseBody = string(body)
 		var decoded any
 		if err == nil && common.Unmarshal(body, &decoded) == nil {
@@ -769,16 +798,16 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	task.PrivateData.PluginState = pluginState
 	ctx, err := a.queryContext(task, info.ApiKey, info.ChannelBaseUrl, info.ChannelSetting.Proxy)
 	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota: %v", a.plugin.Meta.Key, service.TaskChannelSensitiveError(info, err)))
 		return response, nil
 	}
 	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), parsed.TaskData)
 	if err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota: %v", a.plugin.Meta.Key, service.TaskChannelSensitiveError(info, err)))
 		return response, nil
 	}
 	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
-		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, err))
+		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, service.TaskChannelSensitiveError(info, err)))
 	}
 	return response, nil
 }
@@ -829,7 +858,7 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 		if err := pluginruntime.ValidateRequestURL(request.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 			return pluginruntime.FetchResponse{}, err
 		}
-		client, err := service.GetHttpClientWithProxySettings(proxy, a.channelSetting())
+		client, err := a.taskHTTPClient(request.URL, proxy)
 		if err != nil {
 			return pluginruntime.FetchResponse{}, err
 		}
@@ -868,6 +897,21 @@ func (a *TaskAdaptor) hookFetcher(baseURL, proxy string) pluginruntime.Fetcher {
 	}
 }
 
+func (a *TaskAdaptor) protectedSupplier() bool {
+	return service.ProtectedChannelCredentials(a.info)
+}
+
+func (a *TaskAdaptor) taskHTTPClient(raw, proxy string) (*http.Client, error) {
+	if !a.protectedSupplier() {
+		return service.GetHttpClientWithProxySettings(proxy, a.channelSetting())
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Fragment != "" {
+		return nil, fmt.Errorf("supplier upstream requires HTTPS")
+	}
+	return service.GetSupplierHTTPClient(), nil
+}
+
 func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor requestDescriptor) (*http.Response, error) {
 	if err := pluginruntime.ValidateRequestURL(descriptor.URL, baseURL, a.plugin.Meta.AllowedHosts); err != nil {
 		return nil, err
@@ -900,9 +944,19 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor r
 	if err := channel.ApplyHeaderOverride(a.headerOverrideInfo(key), nil, req); err != nil {
 		return nil, err
 	}
-	client, err := service.GetHttpClientWithProxySettings(proxy, a.channelSetting())
+	client, err := a.taskHTTPClient(descriptor.URL, proxy)
 	if err != nil {
 		return nil, err
+	}
+	if a.protectedSupplier() {
+		ctx, release := context.WithTimeout(context.Background(), 2*time.Minute)
+		resp, err := client.Do(req.WithContext(ctx))
+		if err != nil || resp == nil {
+			release()
+			return resp, err
+		}
+		resp.Body = deadlineBody{ReadCloser: resp.Body, release: release}
+		return resp, nil
 	}
 	// Clients are cached across channels. Keep the redirect policy and its
 	// credential state local to this query, while reusing the transport.
@@ -995,6 +1049,7 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, key, proxy string, descriptor r
 
 func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*service.BatchTaskResult, error) {
 	started := time.Now()
+	body = service.RedactTaskChannelPayload(a.info, body)
 	input := any(string(body))
 	var decoded any
 	if common.Unmarshal(body, &decoded) == nil {
@@ -1070,6 +1125,15 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 			}
 		}
 		results[item.TaskID] = &service.BatchTaskResult{TaskInfo: info, Action: item.Action, SubmitTime: item.SubmitTime, StartTime: item.StartTime, FinishTime: item.FinishTime, Data: item.Data}
+		a.protectTaskInfo(&results[item.TaskID].TaskInfo)
+		if a.protectedSupplier() && item.Data != nil {
+			encoded, err := common.Marshal(item.Data)
+			if err == nil {
+				results[item.TaskID].Data = json.RawMessage(service.RedactTaskChannelPayload(a.info, encoded))
+			} else {
+				results[item.TaskID].Data = nil
+			}
+		}
 	}
 	logger.LogDebug(
 		context.Background(),
@@ -1085,6 +1149,7 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 
 func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
 	started := time.Now()
+	body = service.RedactTaskChannelPayload(a.info, body)
 	input := any(string(body))
 	var decoded any
 	if common.Unmarshal(body, &decoded) == nil {
@@ -1140,6 +1205,7 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		}
 	}
 	taskStatus := model.TaskStatus(result.Status)
+	a.protectTaskInfo(result)
 	logger.LogDebug(
 		context.Background(),
 		"task_plugin subsystem=adaptor event=parse_task_complete plugin=%q terminal=%t body_bytes=%d elapsed_ms=%d",
@@ -1149,6 +1215,15 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		time.Since(started).Milliseconds(),
 	)
 	return result, nil
+}
+
+func (a *TaskAdaptor) protectTaskInfo(result *relaycommon.TaskInfo) {
+	if result == nil || !a.protectedSupplier() {
+		return
+	}
+	if encoded, err := common.Marshal(result); err == nil {
+		_ = common.Unmarshal(service.RedactTaskChannelPayload(a.info, encoded), result)
+	}
 }
 
 func (a *TaskAdaptor) applyCompletionUsageFacts(result *relaycommon.TaskInfo, facts any, models ...string) error {

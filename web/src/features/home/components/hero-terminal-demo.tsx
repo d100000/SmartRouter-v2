@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useState, useEffect, useRef, type ReactNode } from 'react'
 
+import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 type AccentTone = 'emerald' | 'amber' | 'blue' | 'violet'
@@ -40,30 +41,35 @@ const ACCENT_CLASSES: Record<
   AccentTone,
   {
     activeText: string
+    activeHover: string
     activeBorder: string
     badge: string
   }
 > = {
   emerald: {
     activeText: 'text-emerald-600 dark:text-emerald-400',
+    activeHover: 'hover:text-emerald-600 dark:hover:text-emerald-400',
     activeBorder: 'border-emerald-500 dark:border-emerald-400',
     badge:
       'bg-emerald-500/10 text-emerald-600 dark:bg-emerald-400/10 dark:text-emerald-400',
   },
   amber: {
     activeText: 'text-amber-600 dark:text-amber-400',
+    activeHover: 'hover:text-amber-600 dark:hover:text-amber-400',
     activeBorder: 'border-amber-500 dark:border-amber-400',
     badge:
       'bg-amber-500/10 text-amber-600 dark:bg-amber-400/10 dark:text-amber-400',
   },
   blue: {
     activeText: 'text-blue-600 dark:text-blue-400',
+    activeHover: 'hover:text-blue-600 dark:hover:text-blue-400',
     activeBorder: 'border-blue-500 dark:border-blue-400',
     badge:
       'bg-blue-500/10 text-blue-600 dark:bg-blue-400/10 dark:text-blue-400',
   },
   violet: {
     activeText: 'text-violet-600 dark:text-violet-400',
+    activeHover: 'hover:text-violet-600 dark:hover:text-violet-400',
     activeBorder: 'border-violet-500 dark:border-violet-400',
     badge:
       'bg-violet-500/10 text-violet-600 dark:bg-violet-400/10 dark:text-violet-400',
@@ -226,18 +232,20 @@ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
             const tone = ACCENT_CLASSES[item.accent]
             const isActive = index === activeIndex
             return (
-              <button
+              <Button
                 key={item.id}
+                type='button'
+                variant='ghost'
                 onClick={() => handleSelect(index)}
                 className={cn(
-                  'relative -mb-px flex items-center gap-1.5 border-b-2 px-2.5 py-2.5 text-[11px] font-medium tracking-wide transition-colors sm:px-3 sm:text-xs',
+                  'relative -mb-px flex h-auto items-center gap-1.5 rounded-none border-x-0 border-t-0 border-b-2 px-2.5 py-2.5 text-[11px] font-medium tracking-wide transition-colors hover:bg-transparent active:not-aria-[haspopup]:translate-y-0 sm:px-3 sm:text-xs dark:hover:bg-transparent',
                   isActive
-                    ? `${tone.activeBorder} ${tone.activeText}`
+                    ? `${tone.activeBorder} ${tone.activeText} ${tone.activeHover}`
                     : 'text-foreground/40 hover:text-foreground/70 border-transparent'
                 )}
               >
                 {item.label}
-              </button>
+              </Button>
             )
           })}
           <div className='ml-auto flex items-center gap-2 pr-2 sm:pr-3'>
@@ -342,8 +350,8 @@ function RequestBlock(props: { demo: ApiDemoConfig; transitioning: boolean }) {
         <CodeLine indent={2}>
           <Flag>-d</Flag> <StringText>&apos;{'{'}</StringText>
         </CodeLine>
-        {demo.request.map((line, i) => (
-          <CodeLine key={i} indent={4}>
+        {demo.request.map((line) => (
+          <CodeLine key={`${demo.id}-request-${line}`} indent={4}>
             {renderJsonLine(line)}
           </CodeLine>
         ))}
@@ -372,8 +380,10 @@ function ResponseBlock(props: { demo: ApiDemoConfig; transitioning: boolean }) {
           transitioning ? 'opacity-0' : 'opacity-100'
         )}
       >
-        {demo.response.map((line, i) => (
-          <CodeLine key={i}>{renderResponseLine(line, demo)}</CodeLine>
+        {demo.response.map((line) => (
+          <CodeLine key={`${demo.id}-response-${line}`}>
+            {renderResponseLine(line, demo)}
+          </CodeLine>
         ))}
       </div>
     </div>
@@ -405,36 +415,36 @@ function renderResponseLine(line: string, demo: ApiDemoConfig): ReactNode {
 
   if (matches.length === 0) return tokenize(line)
 
-  matches.forEach((match, idx) => {
+  matches.forEach((match) => {
     const start = match.index ?? 0
     if (start > cursor) {
       segments.push(
-        <span key={`pre-${idx}`}>{tokenize(line.slice(cursor, start))}</span>
+        <span key={`pre-${start}`}>{tokenize(line.slice(cursor, start))}</span>
       )
     }
     const placeholder = match[0]
     if (placeholder === '<text>') {
       segments.push(
-        <Accent key={`ph-${idx}`} accent={demo.accent}>
+        <Accent key={`ph-${start}`} accent={demo.accent}>
           {`"${truncateResponse(demo)}"`}
         </Accent>
       )
     } else if (placeholder === '<tokens>') {
-      segments.push(<NumberText key={`ph-${idx}`}>{demo.tokens}</NumberText>)
+      segments.push(<NumberText key={`ph-${start}`}>{demo.tokens}</NumberText>)
     } else if (placeholder === '<in>') {
       segments.push(
-        <NumberText key={`ph-${idx}`}>
+        <NumberText key={`ph-${start}`}>
           {Math.floor(demo.tokens * 0.4)}
         </NumberText>
       )
     } else if (placeholder === '<out>') {
       segments.push(
-        <NumberText key={`ph-${idx}`}>
+        <NumberText key={`ph-${start}`}>
           {Math.ceil(demo.tokens * 0.6)}
         </NumberText>
       )
     } else {
-      segments.push(<Muted key={`ph-${idx}`}>{placeholder}</Muted>)
+      segments.push(<Muted key={`ph-${start}`}>{placeholder}</Muted>)
     }
     cursor = start + placeholder.length
   })
@@ -462,20 +472,20 @@ function tokenize(input: string): ReactNode {
   let cursor = 0
   const matches = [...input.matchAll(STRING_RE)]
 
-  matches.forEach((match, idx) => {
+  matches.forEach((match) => {
     const start = match.index ?? 0
     if (start > cursor) {
       segments.push(
-        <Muted key={`m-${idx}`}>{input.slice(cursor, start)}</Muted>
+        <Muted key={`m-${start}`}>{input.slice(cursor, start)}</Muted>
       )
     }
     const text = match[0]
     const after = input.slice(start + text.length).trimStart()
     const isKey = after.startsWith(':')
     if (isKey) {
-      segments.push(<Key key={`k-${idx}`}>{text}</Key>)
+      segments.push(<Key key={`k-${start}`}>{text}</Key>)
     } else {
-      segments.push(<StringText key={`s-${idx}`}>{text}</StringText>)
+      segments.push(<StringText key={`s-${start}`}>{text}</StringText>)
     }
     cursor = start + text.length
   })

@@ -45,6 +45,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { getSuppliers, supplyQueryKey } from '@/features/suppliers/api'
 import { useMediaQuery } from '@/hooks'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
 import { hasPermission } from '@/lib/admin-permissions'
@@ -156,6 +157,7 @@ export function ChannelsTable() {
             : []
         },
       },
+      { columnId: 'supplier_name', searchKey: 'supplier', type: 'array' },
       {
         columnId: 'funding_status',
         searchKey: 'funding_status',
@@ -182,6 +184,17 @@ export function ChannelsTable() {
       return next
     })
   }
+
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  const supplierDirectory = useQuery({
+    queryKey: [...supplyQueryKey, userId, 'admin', 'accounts'],
+    queryFn: ({ signal }) => getSuppliers(signal),
+  })
+  const supplierFilter = (
+    columnFilters.find((filter) => filter.id === 'supplier_name')?.value as
+      | string[]
+      | undefined
+  )?.[0]
 
   // Extract filters from column filters
   const fundingFilter = (
@@ -255,6 +268,7 @@ export function ChannelsTable() {
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: channelsQueryKeys.list({
       funding_status: fundingFilter,
+      owner_supplier_id: supplierFilter,
       keyword: globalFilter,
       model: modelFilter,
       group:
@@ -280,6 +294,7 @@ export function ChannelsTable() {
         return requireServerSuccess(
           await searchChannels({
             funding_status: fundingFilter,
+            owner_supplier_id: supplierFilter,
             keyword: globalFilter,
             model: modelFilter,
             group:
@@ -305,6 +320,7 @@ export function ChannelsTable() {
         return requireServerSuccess(
           await getChannels({
             funding_status: fundingFilter,
+            owner_supplier_id: supplierFilter,
             group:
               groupFilter.length > 0 && !groupFilter.includes('all')
                 ? groupFilter[0]
@@ -589,6 +605,20 @@ export function ChannelsTable() {
                 />
               ),
               filters: [
+                {
+                  columnId: 'supplier_name',
+                  title: t('Channel Supplier'),
+                  options: [
+                    { value: 'unassigned', label: t('Unassigned') },
+                    ...(supplierDirectory.data?.items ?? []).map(
+                      (supplier) => ({
+                        value: supplier.id,
+                        label: supplier.name,
+                      })
+                    ),
+                  ],
+                  singleSelect: true,
+                },
                 {
                   columnId: 'funding_status',
                   title: t('Funding status'),

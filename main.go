@@ -328,6 +328,9 @@ func InitResources() error {
 		return err
 	}
 	model.StartOverviewProjector()
+	service.StartChannelLimitLeaseWorker()
+	service.StartTaskChannelLimitWorker()
+	controller.StartSupplierValidationWorker()
 	if common.PasswordLoginEncryptionEnabled {
 		if err = model.InitPasswordEncryption(); err != nil {
 			common.FatalLog(common.LogText("failed to initialize password encryption: %s", err.Error()))

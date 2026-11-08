@@ -73,6 +73,10 @@ func fetchCodexChannelWhamData(
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "channel not found"})
 		return
 	}
+	if ch.OwnerSupplierID != "" || ch.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if ch.Type != constant.ChannelTypeCodex {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "channel type is not Codex"})
 		return

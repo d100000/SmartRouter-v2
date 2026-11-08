@@ -823,3 +823,38 @@ it('shows complete translated 2FA step descriptions and updates every step on la
     if (next) await user.click(next)
   }
 })
+
+it('rejects a supplier password shorter than 15 characters before requesting verification', async () => {
+  useAuthStore.getState().auth.setUser({
+    id: 7,
+    username: 'supplier',
+    role: 2,
+    must_change_password: true,
+  })
+  const post = vi.spyOn(api, 'post')
+  const put = vi.spyOn(api, 'put')
+  const user = userEvent.setup()
+  render(
+    <ChangePasswordDialog open username='supplier' onOpenChange={vi.fn()} />
+  )
+  await user.type(
+    screen.getByLabelText('Current Password', { selector: 'input' }),
+    'initial-password'
+  )
+  await user.type(
+    screen.getByLabelText('New Password', { selector: 'input' }),
+    'only-14-chars!'
+  )
+  await user.type(
+    screen.getByLabelText('Confirm New Password', { selector: 'input' }),
+    'only-14-chars!'
+  )
+  await user.click(screen.getByRole('button', { name: 'Change Password' }))
+  expect(
+    await screen.findByText(
+      'Supplier account passwords must contain at least 15 characters'
+    )
+  ).toBeVisible()
+  expect(post).not.toHaveBeenCalled()
+  expect(put).not.toHaveBeenCalled()
+})

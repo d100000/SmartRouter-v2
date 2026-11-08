@@ -68,6 +68,7 @@ func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {
 
 	require.NotPanics(t, func() {
 		registerChannelRoutes(api)
+		registerSupplierRoutes(api)
 	})
 }
 

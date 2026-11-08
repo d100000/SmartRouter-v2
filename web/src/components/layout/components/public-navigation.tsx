@@ -22,6 +22,7 @@ import { useTopNavLinks } from '@/hooks/use-top-nav-links'
 import { cn } from '@/lib/utils'
 
 import { defaultTopNavLinks } from '../config/top-nav.config'
+import { getKeyedTopNavLinks } from '../lib/url-utils'
 import type { TopNavLink } from '../types'
 
 interface PublicNavigationProps {
@@ -51,12 +52,12 @@ export function PublicNavigation({
 
   return (
     <nav className={cn('hidden items-center gap-1 md:flex', className)}>
-      {links.map((link, index) => {
+      {getKeyedTopNavLinks(links).map(({ link, key }) => {
         // Handle external links
         if (link.external) {
           return (
             <a
-              key={index}
+              key={key}
               href={link.href}
               target='_blank'
               rel='noopener noreferrer'
@@ -72,7 +73,7 @@ export function PublicNavigation({
         // Handle internal links
         return (
           <Link
-            key={index}
+            key={key}
             to={link.href}
             className={cn(
               'text-muted-foreground hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground inline-flex h-9 w-max items-center justify-center rounded-md bg-transparent px-4 py-2 text-sm font-medium transition-colors focus:outline-none',

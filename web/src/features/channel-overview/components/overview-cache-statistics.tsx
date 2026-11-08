@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Database, DatabaseZap, Gauge, Percent } from 'lucide-react'
+import { Database, DatabaseZap, Gauge, Percent, Repeat } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -38,12 +38,20 @@ export function OverviewCacheStatistics(props: { snapshot: OverviewSnapshot }) {
   const hasSamples = metrics.cache_usage_attempts > 0
   const cards = [
     {
-      title: t('Cache Hit Rate'),
+      title: t('Cache Token Hit Rate'),
       value:
         hasSamples && metrics.cache_hit_rate != null
           ? `${formatNumber(metrics.cache_hit_rate, locale)}%`
           : '—',
       icon: Percent,
+    },
+    {
+      title: t('Cache Request Hit Rate'),
+      value:
+        hasSamples && metrics.cache_attempt_hit_rate != null
+          ? `${formatNumber(metrics.cache_attempt_hit_rate, locale)}%`
+          : '—',
+      icon: Repeat,
     },
     {
       title: t('Cache Read Tokens'),
@@ -87,6 +95,16 @@ export function OverviewCacheStatistics(props: { snapshot: OverviewSnapshot }) {
                 )}
               </p>
               <p>
+                {t(
+                  'Request hit rate is attempts with cache reads divided by attempts with measured cache usage. Retries are counted separately.'
+                )}
+              </p>
+              <p>
+                {t(
+                  'Models use the requested model name. Cache writes are not cache hits.'
+                )}
+              </p>
+              <p>
                 {t('Cache statistics are limited to {{count}} rows per view.', {
                   count: formatNumber(props.snapshot.limits.max_rows, locale),
                 })}
@@ -98,7 +116,7 @@ export function OverviewCacheStatistics(props: { snapshot: OverviewSnapshot }) {
       >
         <section
           aria-label={t('Cache Usage Samples')}
-          className='grid min-w-0 grid-cols-2 gap-4 border-b p-4 sm:px-5 lg:grid-cols-4'
+          className='grid min-w-0 grid-cols-2 gap-4 border-b p-4 sm:px-5 lg:grid-cols-5'
         >
           {cards.map((card) => (
             <StatCard key={card.title} {...card} density='compact' />
@@ -121,12 +139,34 @@ export function OverviewCacheStatistics(props: { snapshot: OverviewSnapshot }) {
             <TabsList aria-label={t('Cache Statistics')}>
               <TabsTrigger value='model'>{t('By Model')}</TabsTrigger>
               <TabsTrigger value='channel'>{t('By Channel')}</TabsTrigger>
+              <TabsTrigger value='channel_model'>
+                {t('By Channel and Model')}
+              </TabsTrigger>
             </TabsList>
           </div>
           <TabsContent value='model' className='min-w-0'>
             <OverviewCacheTable
               dimension='model'
               rows={props.snapshot.models ?? []}
+            />
+          </TabsContent>
+          <TabsContent value='channel_model' className='min-w-0'>
+            {props.snapshot.channel_models_truncated && (
+              <p
+                role='status'
+                className='text-muted-foreground px-4 py-2 text-xs sm:px-5'
+              >
+                {t(
+                  'Showing the {{count}} busiest channel/model combinations. Select a channel to narrow the results. Summary metrics include all combinations.',
+                  {
+                    count: formatNumber(props.snapshot.limits.max_rows, locale),
+                  }
+                )}
+              </p>
+            )}
+            <OverviewCacheTable
+              dimension='channel_model'
+              rows={props.snapshot.channel_models ?? []}
             />
           </TabsContent>
           <TabsContent value='channel' className='min-w-0'>

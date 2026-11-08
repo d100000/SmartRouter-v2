@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import {
   ArrowRight,
   ArrowLeft,
@@ -429,7 +430,12 @@ export function ChannelMutateDrawer({
     ADMIN_PERMISSION_RESOURCES.TASK_PLUGIN,
     ADMIN_PERMISSION_ACTIONS.BIND
   )
-  const canRevealChannelKey = currentUser?.role === ROLE.SUPER_ADMIN
+  const canRevealChannelKey =
+    currentUser?.role === ROLE.SUPER_ADMIN &&
+    !currentRow?.owner_supplier_id &&
+    !currentRow?.secrets_write_only &&
+    !currentRow?.supplier_id &&
+    !currentRow?.key_write_only
   const [isCodexCredentialRefreshing, setIsCodexCredentialRefreshing] =
     useState(false)
   const initialModelsRef = useRef<string[]>([])
@@ -2206,49 +2212,67 @@ export function ChannelMutateDrawer({
         icon={<Route className='h-3.5 w-3.5' />}
         iconTone='info'
       />
-      <div className='grid gap-4 sm:grid-cols-2'>
-        <FormField
-          control={form.control}
-          name='priority'
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('Priority')}</FormLabel>
-              <FormControl>
-                <Input
-                  type='number'
-                  placeholder='0'
-                  {...field}
-                  onChange={(e) => field.onChange(Number(e.target.value))}
-                />
-              </FormControl>
-              <FormDescription>
-                {t(FIELD_DESCRIPTIONS.PRIORITY)}
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+      {currentRow?.owner_supplier_id ? (
+        <div className='space-y-1'>
+          <p className='text-muted-foreground text-sm'>
+            {t('Platform pool priority')} · {t('Platform pool weight')}
+          </p>
+          <Button
+            variant='link'
+            role='link'
+            className='px-0'
+            render={<Link to='/suppliers' />}
+          >
+            {t('Channel Suppliers')}
+          </Button>
+        </div>
+      ) : (
+        <div className='grid gap-4 sm:grid-cols-2'>
+          <FormField
+            control={form.control}
+            name='priority'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Priority')}</FormLabel>
+                <FormControl>
+                  <Input
+                    type='number'
+                    placeholder='0'
+                    {...field}
+                    onChange={(e) => field.onChange(Number(e.target.value))}
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t(FIELD_DESCRIPTIONS.PRIORITY)}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
 
-        <FormField
-          control={form.control}
-          name='weight'
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('Weight')}</FormLabel>
-              <FormControl>
-                <Input
-                  type='number'
-                  placeholder='0'
-                  {...field}
-                  onChange={(e) => field.onChange(Number(e.target.value))}
-                />
-              </FormControl>
-              <FormDescription>{t(FIELD_DESCRIPTIONS.WEIGHT)}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-      </div>
+          <FormField
+            control={form.control}
+            name='weight'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Weight')}</FormLabel>
+                <FormControl>
+                  <Input
+                    type='number'
+                    placeholder='0'
+                    {...field}
+                    onChange={(e) => field.onChange(Number(e.target.value))}
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t(FIELD_DESCRIPTIONS.WEIGHT)}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+      )}
 
       <FormField
         control={form.control}

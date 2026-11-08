@@ -3,6 +3,7 @@ package controller
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	"github.com/QuantumNous/new-api/relay/channel/xunfei"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -37,6 +39,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 )
 
@@ -76,6 +79,7 @@ func TestXunfeiHTTPRelayHonorsCancelledRequestBudget(t *testing.T) {
 
 func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Helper()
+	require.NoError(t, i18n.Init())
 	previousDB := model.DB
 	previousLogDB := model.LOG_DB
 	previousType := common.MainDatabaseType()
@@ -125,6 +129,7 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 		require.NoError(t, sqlDB.Close())
 	})
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(db))
 	// The shared in-memory limiter outlives each database fixture. Give every
 	// user a separate quota bucket, including when the tests run with -count.
 	user := &model.User{Id: 5062000 + int(responsesWSTestUserSequence.Add(1)), Username: "responses-ws-user", Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
@@ -370,6 +375,10 @@ func waitPerfCounters(t *testing.T, wantRequests int64) (requests, successes int
 }
 
 func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*websocket.Conn, *http.Request), httpEvents ...string) *responsesWSBillingTest {
+	return newMeteredWSBillingTest(t, false, expression, handle, httpEvents...)
+}
+
+func newMeteredWSBillingTest(t *testing.T, realtime bool, expression string, handle func(*websocket.Conn, *http.Request), httpEvents ...string) *responsesWSBillingTest {
 	t.Helper()
 	require.NoError(t, i18n.Init())
 	user, token := setupResponsesWSRequestTest(t)
@@ -400,7 +409,7 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		"perf_metrics_setting.bucket_time":    "hour",
 		"perf_metrics_setting.retention_days": "0",
 	}))
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.PerfMetric{}, &model.PerfMetricEvent{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.PerfMetric{}, &model.PerfMetricEvent{}, &model.OverviewAttemptEvent{}))
 	for _, schema := range []any{&model.PerfMetric{}, &model.PerfMetricEvent{}} {
 		var existing int64
 		require.NoError(t, model.DB.Model(schema).Where("model_name = ?", "ws-billing").Count(&existing).Error)
@@ -448,6 +457,7 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	channel.SetOtherSettings(dto.ChannelOtherSettings{AllowServiceTier: true})
 	require.NoError(t, model.DB.Create(channel).Error)
 	fixture.channel = channel
+	require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
 	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: channel.Id, Model: "ws-billing", Group: "default", Enabled: true}).Error)
 	t.Cleanup(func() {
 		require.NoError(t, model.DB.Where("model_name = ?", "ws-billing").Delete(&model.PerfMetricEvent{}).Error)
@@ -457,6 +467,11 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		require.NoError(t, model.DB.Delete(channel).Error)
 	})
 	engine := gin.New()
+	engine.GET("/v1/realtime", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) {
+		defer close(fixture.done)
+		c.Set(common.RequestIdKey, "realtime-billing")
+		Relay(c, types.RelayFormatOpenAIRealtime)
+	})
 	engine.GET("/v1/responses", middleware.TokenAuth(), func(c *gin.Context) {
 		defer close(fixture.done)
 		c.Set(common.RequestIdKey, "responses-ws-billing")
@@ -470,7 +485,11 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	gateway := httptest.NewServer(engine)
 	fixture.gatewayURL = gateway.URL
 	t.Cleanup(gateway.Close)
-	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+"/v1/responses", http.Header{"Authorization": []string{"Bearer sk-" + token.Key}})
+	path := "/v1/responses"
+	if realtime {
+		path = "/v1/realtime?model=ws-billing"
+	}
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(gateway.URL, "http")+path, http.Header{"Authorization": []string{"Bearer sk-" + token.Key}})
 	require.NoError(t, err)
 	fixture.client = client
 	t.Cleanup(func() { fixture.closeAndWait(t) })
@@ -1780,6 +1799,492 @@ func TestResponsesSchedulingTerminalFraming(t *testing.T) {
 			}
 			assert.Zero(t, snapshot.Summary.InFlight)
 			assert.Nil(t, snapshot.Summary.AvgTTFTMS5m, "terminal metadata is not first output")
+		})
+	}
+}
+
+// Real upstream frames exercise the handshake/generation distinction, fresh
+// per-message admission, audio/cache expression pricing and idempotent done.
+func TestRealtimeUsageRequiresReliableModalityQuantities(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage   string
+		input, output int
+		valid         bool
+	}{
+		{"mixed image/audio", `{"input_tokens":10,"output_tokens":3,"total_tokens":13,"input_token_details":{"text_tokens":2,"audio_tokens":5,"image_tokens":3},"output_token_details":{"audio_tokens":2,"text_tokens":1}}`, 2, 1, true},
+		{"ASR text output", `{"type":"tokens","input_tokens":10,"output_tokens":3,"total_tokens":13,"input_token_details":{"text_tokens":2,"audio_tokens":8}}`, 2, 3, true},
+		{"missing modalities", `{"input_tokens":10,"output_tokens":0,"total_tokens":10}`, 0, 0, false},
+		{"partial modalities", `{"input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"text_tokens":3,"audio_tokens":2}}`, 0, 0, false},
+		{"invalid cached modality", `{"input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"text_tokens":3,"audio_tokens":7,"cached_tokens":2,"cached_tokens_details":{"text_tokens":4}}}`, 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := openai.ParseRealtimeUsage(gjson.Parse(tc.usage))
+			if !tc.valid {
+				assert.Nil(t, usage)
+				return
+			}
+			require.NotNil(t, usage)
+			assert.Equal(t, tc.input, usage.InputTokenDetails.TextTokens)
+			assert.Equal(t, tc.output, usage.OutputTokenDetails.TextTokens)
+		})
+	}
+	payload := []byte(`{"type":"error","error":{"message":"bad sk-\u0073ecret credential"},"count":9007199254740993}`)
+	redacted := service.RedactUpstreamWebSocketCredential(payload, "sk-secret")
+	assert.Equal(t, `{"type":"error","error":{"message":"bad [REDACTED] credential"},"count":9007199254740993}`, string(redacted))
+}
+
+func TestRealtimeRejectsUncontrolledSessionBeforeAudio(t *testing.T) {
+	for _, session := range []string{
+		`{"turn_detection":{"create_response":true,"interrupt_response":false},"input_audio_transcription":null}`,
+		`{"turn_detection":null,"input_audio_transcription":{"model":"whisper-1"}}`,
+		`{}`,
+	} {
+		t.Run(session, func(t *testing.T) {
+			var forwarded atomic.Int32
+			fixture := newMeteredWSBillingTest(t, true, `tier("base",p*2)`, func(ws *websocket.Conn, _ *http.Request) {
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":{"type":"server_vad"}}}`)))
+				_, _, err := ws.ReadMessage()
+				require.NoError(t, err)
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":`+session+`}`)))
+				if _, _, err := ws.ReadMessage(); err == nil {
+					forwarded.Add(1)
+				}
+			})
+			_ = fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.append","audio":"AAAA"}`))
+			_, _, _ = fixture.client.ReadMessage()
+			fixture.closeAndWait(t)
+			assert.Zero(t, forwarded.Load(), "no billable audio is sent until effective controls are confirmed")
+			assertResponsesWSAccounting(t, fixture, nil)
+		})
+	}
+}
+
+func TestRealtimeRejectedManualCommitAndClearDoNotSuppressVAD(t *testing.T) {
+	fixture := newMeteredWSBillingTest(t, true, `tier("base",p*2)`, func(ws *websocket.Conn, _ *http.Request) {
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":{"type":"server_vad","create_response":true}}}`)))
+		_, _, err := ws.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false},"input_audio_transcription":null}}`)))
+		_, raw, err := ws.ReadMessage()
+		require.NoError(t, err)
+		require.Equal(t, "input_audio_buffer.commit", gjson.GetBytes(raw, "type").String())
+		failure, _ := common.Marshal(map[string]any{"type": "error", "error": map[string]any{"event_id": gjson.GetBytes(raw, "event_id").String(), "message": "empty audio"}})
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, failure))
+		_, raw, err = ws.ReadMessage()
+		require.NoError(t, err)
+		require.Equal(t, "input_audio_buffer.clear", gjson.GetBytes(raw, "type").String())
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.cleared"}`)))
+		_, raw, err = ws.ReadMessage()
+		require.NoError(t, err)
+		require.Equal(t, "input_audio_buffer.append", gjson.GetBytes(raw, "type").String())
+		for _, event := range []string{`{"type":"input_audio_buffer.speech_started","item_id":"turn","audio_start_ms":0}`, `{"type":"input_audio_buffer.speech_stopped","item_id":"turn","audio_end_ms":100}`, `{"type":"input_audio_buffer.committed","item_id":"turn"}`} {
+			require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(event)))
+		}
+		_, raw, err = ws.ReadMessage()
+		require.NoError(t, err)
+		require.Equal(t, "response.create", gjson.GetBytes(raw, "type").String())
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"vad"}}`)))
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"vad","status":"completed","usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"text_tokens":10}}}}`)))
+		_, _, _ = ws.ReadMessage()
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.commit","event_id":"client-commit"}`)))
+	rejection := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "error", rejection["type"])
+	assert.Equal(t, "client-commit", rejection["error"].(map[string]any)["event_id"])
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.clear"}`)))
+	require.Equal(t, "input_audio_buffer.cleared", readResponsesWSTestEvent(t, fixture.client)["type"])
+	payload, _ := common.Marshal(map[string]any{"type": "input_audio_buffer.append", "audio": base64.StdEncoding.EncodeToString(make([]byte, 4800))})
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, payload))
+	for _, kind := range []string{"input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "input_audio_buffer.committed", "response.created", "response.done"} {
+		require.Equal(t, kind, readResponsesWSTestEvent(t, fixture.client)["type"])
+	}
+	fixture.closeAndWait(t)
+	assertResponsesWSAccounting(t, fixture, []int{10})
+}
+
+func TestRealtimeDisconnectKeepsUnknownGeneration(t *testing.T) {
+	fixture := newMeteredWSBillingTest(t, true, `tier("base",p*2)`, func(ws *websocket.Conn, _ *http.Request) {
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`)))
+		_, _, err := ws.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null,"input_audio_transcription":null}}`)))
+		_, _, err = ws.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"interrupted"}}`)))
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
+	event := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "response.created", event["type"], "%+v", event)
+	fixture.closeAndWait(t)
+	var attempts []model.ChannelLimitAttempt
+	require.NoError(t, model.DB.Where("channel_id = ?", fixture.channel.Id).Find(&attempts).Error)
+	require.Len(t, attempts, 1)
+	assert.False(t, attempts[0].Completed)
+	assert.False(t, attempts[0].Released)
+	assert.Positive(t, attempts[0].ReconcileUntilMS)
+	assertResponsesWSAccounting(t, fixture, nil)
+}
+
+func TestRealtimeMissingUsageRetainsFrozenReservation(t *testing.T) {
+	fixture := newMeteredWSBillingTest(t, true, `tier("base", p * 2 + 20)`, func(ws *websocket.Conn, _ *http.Request) {
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`)))
+		_, _, err := ws.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null,"input_audio_transcription":null}}`)))
+		_, _, err = ws.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"missing"}}`)))
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"missing","status":"completed"}}`)))
+		_, _, _ = ws.ReadMessage()
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
+	event := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "response.created", event["type"], "%+v", event)
+	require.Equal(t, "response.done", readResponsesWSTestEvent(t, fixture.client)["type"])
+	fixture.closeAndWait(t)
+	assertResponsesWSAccounting(t, fixture, []int{10})
+	var attempt model.ChannelLimitAttempt
+	require.NoError(t, model.DB.Where("channel_id = ?", fixture.channel.Id).First(&attempt).Error)
+	assert.False(t, attempt.TokenActualKnown, "customer reservation is not fabricated supplier text usage")
+	assert.False(t, attempt.CostActualKnown, "missing upstream usage preserves unknown procurement cost")
+}
+
+func TestRealtimeSemanticVADDoesNotInheritServerIdleTimeout(t *testing.T) {
+	fixture := newMeteredWSBillingTest(t, true, `tier("base", p*2)`, func(ws *websocket.Conn, _ *http.Request) {
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":{"type":"server_vad","idle_timeout_ms":5000}}}`)))
+		for turn := range 2 {
+			_, raw, err := ws.ReadMessage()
+			require.NoError(t, err)
+			if turn == 1 {
+				assert.Equal(t, "semantic_vad", gjson.GetBytes(raw, "session.turn_detection.type").String())
+				assert.False(t, gjson.GetBytes(raw, "session.turn_detection.idle_timeout_ms").Exists())
+			}
+			var update map[string]any
+			require.NoError(t, common.Unmarshal(raw, &update))
+			update["type"] = "session.updated"
+			ack, err := common.Marshal(update)
+			require.NoError(t, err)
+			require.NoError(t, ws.WriteMessage(websocket.TextMessage, ack))
+		}
+		_, _, _ = ws.ReadMessage()
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.update","session":{"turn_detection":{"type":"semantic_vad"}}}`)))
+	event := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "session.updated", event["type"])
+	assert.NotContains(t, event["session"].(map[string]any)["turn_detection"].(map[string]any), "idle_timeout_ms")
+	fixture.closeAndWait(t)
+	assertResponsesWSAccounting(t, fixture, nil)
+}
+
+func TestRealtimeGenerationsShareChannelLimitsAndSettleIndependently(t *testing.T) {
+	var creates atomic.Int32
+	fixture := newMeteredWSBillingTest(t, true, `tier("base",p * 2 + cr + ao * 4)`, func(ws *websocket.Conn, _ *http.Request) {
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":{"type":"server_vad","create_response":true,"interrupt_response":true},"max_response_output_tokens":"inf"}}`)))
+		for {
+			_, raw, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			var event map[string]any
+			require.NoError(t, common.Unmarshal(raw, &event))
+			if event["type"] == "session.update" {
+				session := event["session"].(map[string]any)
+				vad := session["turn_detection"].(map[string]any)
+				assert.Equal(t, false, vad["create_response"])
+				assert.Equal(t, false, vad["interrupt_response"])
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false},"input_audio_transcription":null}}`)))
+				continue
+			}
+			require.Equal(t, "response.create", event["type"])
+			count := creates.Add(1)
+			created := fmt.Sprintf(`{"type":"response.created","response":{"id":"r%d","status":"in_progress"}}`, count)
+			done := fmt.Sprintf(`{"type":"response.done","response":{"id":"r%d","status":"completed","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"input_token_details":{"text_tokens":10,"audio_tokens":0,"cached_tokens":2},"output_token_details":{"text_tokens":0,"audio_tokens":4}}}}`, count)
+			require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(created)))
+			require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(done)))
+			require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(done)))
+		}
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	config, err := model.GetChannelLimitState(fixture.channel.Id, time.Now())
+	require.NoError(t, err)
+	_, err = model.UpdateChannelLimits(fixture.channel.Id, config.Config.Revision, model.ChannelLimitSettings{RPM: 2, ReconcileSeconds: 300}, false, time.Now())
+	require.NoError(t, err)
+	for range 2 {
+		require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"max_output_tokens":16}}`)))
+		require.Equal(t, "response.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+		require.Equal(t, "response.done", readResponsesWSTestEvent(t, fixture.client)["type"])
+	}
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
+	rejection := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "error", rejection["type"])
+	assert.Equal(t, int32(2), creates.Load())
+	fixture.closeAndWait(t)
+	var attempts []model.ChannelLimitAttempt
+	require.NoError(t, model.DB.Where("channel_id = ?", fixture.channel.Id).Find(&attempts).Error)
+	require.Len(t, attempts, 2)
+	for _, attempt := range attempts {
+		assert.True(t, attempt.Completed)
+		assert.EqualValues(t, 10, attempt.ActualTokens)
+	}
+	assertResponsesWSAccounting(t, fixture, []int{17, 17})
+}
+
+func TestRealtimeVADAdmissionAndPausedSupplyFinishInflight(t *testing.T) {
+	creates := make(chan struct{}, 2)
+	complete := make(chan struct{})
+	fixture := newMeteredWSBillingTest(t, true, `tier("base", p * 2)`, func(ws *websocket.Conn, _ *http.Request) {
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":{"type":"server_vad","create_response":true,"interrupt_response":true}}}`)))
+		_, _, err := ws.ReadMessage()
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false},"input_audio_transcription":null}}`)))
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"audio1"}`)))
+		_, raw, err := ws.ReadMessage()
+		require.NoError(t, err)
+		var request map[string]any
+		require.NoError(t, common.Unmarshal(raw, &request))
+		assert.Equal(t, "response.create", request["type"])
+		creates <- struct{}{}
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"vad1","status":"in_progress"}}`)))
+		<-complete
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"vad1","status":"completed","usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"text_tokens":10}}}}`)))
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"audio2"}`)))
+		_, _, _ = ws.ReadMessage()
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	event := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "input_audio_buffer.committed", event["type"], "%+v", event)
+	require.Equal(t, "response.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	<-creates
+	require.NoError(t, model.DB.Model(fixture.channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	service.CloseActiveWebSocketsForChannel(fixture.channel.Id, service.ChannelDisabledCloseReason)
+	close(complete)
+	require.Equal(t, "response.done", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.Equal(t, "error", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.Equal(t, "input_audio_buffer.committed", readResponsesWSTestEvent(t, fixture.client)["type"])
+	fixture.closeAndWait(t)
+	assertResponsesWSAccounting(t, fixture, []int{10})
+}
+
+func TestRealtimeVADTranscriptionUsesIndependentlyAdmittedTurns(t *testing.T) {
+	var transcriptionCalls atomic.Int32
+	var mainAppends atomic.Int32
+	fixture := newMeteredWSBillingTest(t, true, `tier("base", p * 2)`, func(ws *websocket.Conn, request *http.Request) {
+		if request.URL.Query().Get("intent") == "transcription" {
+			if ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"type":"transcription"}}`)) != nil {
+				return
+			}
+			_, raw, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			var update map[string]any
+			require.NoError(t, common.Unmarshal(raw, &update))
+			input := update["session"].(map[string]any)["audio"].(map[string]any)["input"].(map[string]any)
+			assert.Nil(t, input["turn_detection"])
+			assert.Equal(t, "gpt-4o", input["transcription"].(map[string]any)["model"], "ASR aliases use the frozen channel mapping")
+			update["type"] = "session.updated"
+			ack, _ := common.Marshal(update)
+			if ws.WriteMessage(websocket.TextMessage, ack) != nil {
+				return
+			}
+			for {
+				_, raw, err = ws.ReadMessage()
+				if err != nil {
+					return
+				} // Budget refusal closes before billed audio.
+				var appendEvent struct {
+					Type  string `json:"type"`
+					Audio string `json:"audio"`
+				}
+				require.NoError(t, common.Unmarshal(raw, &appendEvent))
+				require.Equal(t, "input_audio_buffer.append", appendEvent.Type)
+				audio, err := base64.StdEncoding.DecodeString(appendEvent.Audio)
+				require.NoError(t, err)
+				assert.Len(t, audio, 24000)
+				transcriptionCalls.Add(1)
+				_, raw, err = ws.ReadMessage()
+				if err != nil {
+					return
+				}
+				assert.Contains(t, string(raw), "input_audio_buffer.commit")
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"sidecar-item"}`)))
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"sidecar-item","content_index":0,"transcript":"hello","usage":{"type":"tokens","input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"audio_tokens":10,"text_tokens":0}}}`)))
+			}
+		}
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false},"input_audio_transcription":{"model":"ws-billing"}}}`)))
+		_, raw, err := ws.ReadMessage()
+		require.NoError(t, err)
+		var update map[string]any
+		require.NoError(t, common.Unmarshal(raw, &update))
+		assert.Nil(t, update["session"].(map[string]any)["input_audio_transcription"])
+		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":{"type":"server_vad","create_response":false,"interrupt_response":false},"input_audio_transcription":null}}`)))
+		for {
+			_, _, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			count := mainAppends.Add(1)
+			segments := []struct {
+				id         string
+				start, end int
+			}{{"main-a", 0, 500}, {"main-b", 500, 1000}}
+			if count > 1 {
+				segments = []struct {
+					id         string
+					start, end int
+				}{{"main-c", 1000, 1500}}
+			}
+			for _, segment := range segments {
+				for _, event := range []string{fmt.Sprintf(`{"type":"input_audio_buffer.speech_started","item_id":%q,"audio_start_ms":%d}`, segment.id, segment.start), fmt.Sprintf(`{"type":"input_audio_buffer.speech_stopped","item_id":%q,"audio_end_ms":%d}`, segment.id, segment.end), fmt.Sprintf(`{"type":"input_audio_buffer.committed","item_id":%q}`, segment.id)} {
+					if ws.WriteMessage(websocket.TextMessage, []byte(event)) != nil {
+						return
+					}
+				}
+			}
+		}
+	})
+	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	config, err := model.GetChannelLimitState(fixture.channel.Id, time.Now())
+	require.NoError(t, err)
+	_, err = model.UpdateChannelLimits(fixture.channel.Id, config.Config.Revision, model.ChannelLimitSettings{RPM: 2, ReconcileSeconds: 300}, false, time.Now())
+	require.NoError(t, err)
+	audio, _ := common.Marshal(map[string]any{"type": "input_audio_buffer.append", "audio": base64.StdEncoding.EncodeToString(make([]byte, 48000))})
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, audio))
+	ids := map[string]bool{}
+	for len(ids) < 2 {
+		event := readResponsesWSTestEvent(t, fixture.client)
+		require.NotEqual(t, "error", event["type"], "%+v", event)
+		if event["type"] == "conversation.item.input_audio_transcription.completed" {
+			ids[event["item_id"].(string)] = true
+		}
+	}
+	assert.Equal(t, map[string]bool{"main-a": true, "main-b": true}, ids)
+	audio, _ = common.Marshal(map[string]any{"type": "input_audio_buffer.append", "audio": base64.StdEncoding.EncodeToString(make([]byte, 24000))})
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, audio))
+	for {
+		event := readResponsesWSTestEvent(t, fixture.client)
+		if event["type"] == "error" {
+			break
+		}
+	}
+	assert.Equal(t, int32(2), transcriptionCalls.Load(), "an audio frame containing two utterances creates two separately admitted ASR jobs")
+	fixture.closeAndWait(t)
+	assertResponsesWSAccounting(t, fixture, []int{10, 10})
+	var count int64
+	require.NoError(t, model.DB.Model(&model.ChannelLimitAttempt{}).Where("channel_id = ?", fixture.channel.Id).Count(&count).Error)
+	assert.EqualValues(t, 2, count)
+	var attempts []model.ChannelLimitAttempt
+	require.NoError(t, model.DB.Where("channel_id = ?", fixture.channel.Id).Find(&attempts).Error)
+	for _, attempt := range attempts {
+		assert.Zero(t, attempt.ActualTokens, "audio tokens do not consume the text TPM budget")
+	}
+	assert.Equal(t, int32(2), fixture.connections.Load(), "one main and one persistent ASR connection preserve transcription context")
+}
+
+func TestSupplierTranscriptionProbeRequiresTerminalAndPreservesWallet(t *testing.T) {
+	for _, scenario := range []string{"completed", "failed", "handshake_only", "wrong_terminal"} {
+		t.Run(scenario, func(t *testing.T) {
+			fixture := newMeteredWSBillingTest(t, true, `tier("base", p * 2)`, func(ws *websocket.Conn, request *http.Request) {
+				transcription := request.URL.Query().Get("intent") == "transcription"
+				created := `{"type":"session.created","session":{"turn_detection":null,"input_audio_transcription":null}}`
+				if transcription {
+					created = `{"type":"session.created","session":{"type":"transcription"}}`
+				}
+				if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(created))) {
+					return
+				}
+				if transcription && scenario == "handshake_only" {
+					return
+				}
+				_, raw, err := ws.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				var update map[string]any
+				if !assert.NoError(t, common.Unmarshal(raw, &update)) {
+					return
+				}
+				if transcription {
+					assert.Equal(t, "gpt-4o", gjson.GetBytes(raw, "session.audio.input.transcription.model").String())
+					assert.Equal(t, gjson.Null, gjson.GetBytes(raw, "session.audio.input.turn_detection").Type)
+				}
+				update["type"] = "session.updated"
+				ack, err := common.Marshal(update)
+				if !assert.NoError(t, err) || !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, ack)) {
+					return
+				}
+				if !transcription {
+					for {
+						if _, _, err := ws.ReadMessage(); err != nil {
+							return
+						}
+					}
+				}
+				_, raw, err = ws.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "input_audio_buffer.append", gjson.GetBytes(raw, "type").String())
+				audio, err := base64.StdEncoding.DecodeString(gjson.GetBytes(raw, "audio").String())
+				assert.NoError(t, err)
+				assert.Len(t, audio, 24000)
+				_, raw, err = ws.ReadMessage()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, "input_audio_buffer.commit", gjson.GetBytes(raw, "type").String())
+				if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"probe-item"}`))) {
+					return
+				}
+				terminal := `{"type":"conversation.item.input_audio_transcription.completed","item_id":"probe-item","content_index":0,"transcript":"hello","usage":{"type":"tokens","input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"audio_tokens":10,"text_tokens":0}}}`
+				switch scenario {
+				case "failed":
+					terminal = `{"type":"conversation.item.input_audio_transcription.failed","item_id":"probe-item","content_index":0,"error":{"message":"failure"}}`
+				case "wrong_terminal":
+					terminal = `{"type":"response.done","response":{"id":"generation","status":"completed"}}`
+				}
+				assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(terminal)))
+			})
+			require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+			fixture.channel.CostRatio = common.GetPointer(0.5)
+			require.NoError(t, fixture.channel.Update())
+			config, err := model.GetChannelLimitState(fixture.channel.Id, time.Now())
+			require.NoError(t, err)
+			_, err = model.UpdateChannelLimits(fixture.channel.Id, config.Config.Revision, model.ChannelLimitSettings{RPM: 1, ReconcileSeconds: 300}, false, time.Now())
+			require.NoError(t, err)
+			var before model.User
+			require.NoError(t, model.DB.First(&before, fixture.user.Id).Error)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err = testSupplierTranscriptionChannel(ctx, fixture.channel, fixture.user.Id, "ws-billing")
+			if scenario == "completed" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			fixture.closeAndWait(t)
+			var after model.User
+			require.NoError(t, model.DB.First(&after, fixture.user.Id).Error)
+			assert.Equal(t, before.Quota, after.Quota)
+			assert.Equal(t, before.UsedQuota, after.UsedQuota)
+			var consumeLogs int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", fixture.user.Id, model.LogTypeConsume).Count(&consumeLogs).Error)
+			assert.Zero(t, consumeLogs)
+			state, err := model.GetChannelLimitState(fixture.channel.Id, time.Now())
+			require.NoError(t, err)
+			if scenario == "handshake_only" {
+				assert.Zero(t, state.RPMUsed, "opening a socket does not count as a business inference")
+			} else {
+				assert.EqualValues(t, 1, state.RPMUsed)
+			}
+			if scenario == "completed" {
+				assert.EqualValues(t, 10000, state.DailyUsedNano)
+				assert.Zero(t, state.TPMUsed, "ASR audio tokens are distinct from text TPM")
+			}
 		})
 	}
 }

@@ -85,6 +85,17 @@ func TestAdminUserRiskOperationsRequireProofBeforeMutation(t *testing.T) {
 			},
 		},
 		{
+			name: "grant viewer", method: http.MethodPost, path: "/api/user/manage", handler: ManageUser,
+			body: func(target *model.User) string {
+				return fmt.Sprintf(`{"id":%d,"action":"grant_channel_viewer"}`, target.Id)
+			},
+			unchanged: func(t *testing.T, target *model.User) {
+				stored, err := model.GetUserById(target.Id, false)
+				require.NoError(t, err)
+				assert.False(t, stored.ChannelViewer)
+			},
+		},
+		{
 			name: "manage delete", method: http.MethodPost, path: "/api/user/manage", handler: ManageUser,
 			body: func(target *model.User) string { return fmt.Sprintf(`{"id":%d,"action":"delete"}`, target.Id) },
 			unchanged: func(t *testing.T, target *model.User) {
@@ -186,6 +197,27 @@ func TestAdminUserRiskOperationsRequireProofBeforeMutation(t *testing.T) {
 			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Count(&flows).Error)
 			assert.Zero(t, flows)
 		})
+	}
+}
+
+func TestAdminChannelViewerGrantIsScopedAndKeepsConsumerIdentity(t *testing.T) {
+	_, identity, target := setupAdminUserTest(t)
+	require.NoError(t, model.DB.Model(target).Update("quota", 123).Error)
+	for _, action := range []string{"grant_channel_viewer", "revoke_channel_viewer"} {
+		operation := service.VerificationOperation{Scope: service.VerificationScopeAdminUserManage, Context: []byte(fmt.Sprintf(`{"user_id":%d,"action":%q}`, target.Id, action))}
+		proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
+		body := fmt.Sprintf(`{"id":%d,"action":%q}`, target.Id, action)
+		response := adminUserRequest(http.MethodPost, "/api/user/manage", body, proof, identity, common.RoleRootUser, nil, ManageUser)
+		var result securityEnrollmentResponse
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		require.True(t, result.Success, response.Body.String())
+		stored, err := model.GetUserById(target.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, action == "grant_channel_viewer", stored.ChannelViewer)
+		assert.Equal(t, common.RoleCommonUser, stored.Role)
+		assert.Equal(t, 123, stored.Quota)
+		response = adminUserRequest(http.MethodPost, "/api/user/manage", body, proof, identity, common.RoleRootUser, nil, ManageUser)
+		assert.Equal(t, http.StatusForbidden, response.Code)
 	}
 }
 

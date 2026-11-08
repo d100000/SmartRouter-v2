@@ -2092,13 +2092,14 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "endpoint_" + common.GetUUID()[:12] + "_"}
 			require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}))
 			require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(database))
+			require.NoError(t, model.AutoMigrateChannelLimitSchema(database))
 			t.Cleanup(func() {
 				for _, table := range []any{&model.Ability{}, &model.Channel{}, &model.Task{}} {
 					require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
 				}
 				common.MemoryCacheEnabled = true
 				model.InitChannelCache()
-				require.NoError(t, database.Migrator().DropTable(&model.Ability{}, &model.Channel{}, &model.Task{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialVersion{}, &model.UpstreamCredential{}, &model.UpstreamSupplier{}, &model.UpstreamCredentialFingerprintSecret{}))
+				require.NoError(t, database.Migrator().DropTable(&model.ChannelLimitEvent{}, &model.ChannelLimitAttempt{}, &model.ChannelDailyBudget{}, &model.ChannelLimitConfig{}, &model.Ability{}, &model.Channel{}, &model.Task{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialVersion{}, &model.UpstreamCredential{}, &model.UpstreamSupplier{}, &model.UpstreamCredentialFingerprintSecret{}))
 				model.DB = previousDB
 				common.SetDatabaseTypes(previousMain, previousLog)
 				common.SQLitePath, common.IsMasterNode = previousPath, previousMaster

@@ -64,6 +64,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 			}
 		}
 		a.imageCounter.Commit(a.info)
+		a.info.ObserveImageCount(int64(a.imageCounter.Count()))
 		a.imageCommitted = true
 	case "response.output_text.delta", "response.function_call_arguments.delta",
 		"response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta":

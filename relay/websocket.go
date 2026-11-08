@@ -38,6 +38,11 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.
 		defer info.TargetWs.Close()
 		var closeOnce sync.Once
 		unregister := wsmanager.Register(info.ChannelId, wsmanager.KindRealtime, func(reason string) {
+			// Ordinary supply changes gate the next generation. Already admitted
+			// work may finish; explicit emergency close reasons still terminate.
+			if reason == service.ChannelDisabledCloseReason {
+				return
+			}
 			closeOnce.Do(func() {
 				deadline := time.Now().Add(time.Second)
 				closeMessage := websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason)
@@ -56,6 +61,8 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
-	service.PostWssConsumeQuota(c, info, info.UpstreamModelName, usage.(*dto.RealtimeUsage), nil)
+	if !info.RealtimeMetered {
+		service.PostWssConsumeQuota(c, info, info.UpstreamModelName, usage.(*dto.RealtimeUsage), nil)
+	}
 	return nil
 }

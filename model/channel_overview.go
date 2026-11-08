@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,29 @@ import (
 // Accounting observations live in the primary database, even when relay logs
 // use a separate database or are disabled. Pending rows retain crash evidence.
 type OverviewAttemptEvent struct {
+	AuthorizedSupplierID    string `gorm:"type:varchar(36);index:idx_overview_owner"`
+	SupplierReference       string `gorm:"type:varchar(36)"`
+	InputTokens             int64
+	OutputTokens            int64
+	UsageSource             string `gorm:"type:varchar(32)"`
+	ImageCount              *int64
+	AudioSeconds            *float64
+	ImageUsageSource        string `gorm:"type:varchar(32)"`
+	AudioUsageSource        string `gorm:"type:varchar(32)"`
+	UpstreamStatusCode      int
+	UpstreamRequestID       string `gorm:"type:varchar(128)"`
+	TaskStatus              string `gorm:"type:varchar(16)"`
+	TaskObservedAt          *int64
+	TaskCompletedAt         *int64
+	TaskDurationMS          *int64
+	TaskObservationVersion  int64
+	VideoSeconds            *float64
+	Credits                 *string `gorm:"type:varchar(64)"`
+	VideoUsageSource        string  `gorm:"type:varchar(32)"`
+	CreditUsageSource       string  `gorm:"type:varchar(32)"`
+	CallStage               string  `gorm:"type:varchar(24)"`
+	IsStream                bool
+	FirstTokenMS            *int64
 	ID                      string `gorm:"type:varchar(96);primaryKey"`
 	RequestID               string `gorm:"type:varchar(64);index"`
 	Day                     string `gorm:"type:varchar(10);index"`
@@ -175,6 +199,11 @@ func ProjectOverviewEvents(ctx context.Context, db *gorm.DB) (int, error) {
 		if claim.RowsAffected != int64(len(events)) {
 			return errOverviewClaimChanged
 		}
+		// Task completion can correct procurement between the initial scan and
+		// the claim. Read the locked observations, never that stale scan.
+		if err := tx.Where("id IN ?", ids).Find(&events).Error; err != nil {
+			return err
+		}
 		rows := make(map[string]*OverviewDaily, len(events))
 		for _, event := range events {
 			identity, err := common.Marshal([]any{event.Day, event.ChannelID, event.GroupName, event.ModelName, event.CredentialID, event.SupplierID, event.OwnershipVersionID, event.CostVersionID, event.QuotaPerUnit})
@@ -286,6 +315,9 @@ func StartOverviewProjector() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
+				if err := ReconcileChannelAttempts(time.Now()); err != nil {
+					common.SysError("channel limit reconciliation failed")
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				var err error
 				for range 10 {
@@ -331,6 +363,7 @@ type OverviewMetrics struct {
 	CacheUsageAttempts         int64    `json:"cache_usage_attempts"`
 	CacheHitAttempts           int64    `json:"cache_hit_attempts"`
 	CacheHitRate               *float64 `json:"cache_hit_rate"`
+	CacheAttemptHitRate        *float64 `json:"cache_attempt_hit_rate"`
 	CacheUsageCoverage         *float64 `json:"cache_usage_coverage"`
 }
 
@@ -345,23 +378,34 @@ type OverviewOption struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
+
+// Name is the requested model name, consistent with OverviewResult.Models.
+// ChannelID keeps identically named channels distinct in cross-channel reports.
+type OverviewChannelModelRow struct {
+	OverviewRow
+	ChannelID   int    `json:"channel_id"`
+	ChannelName string `json:"channel_name"`
+}
+
 type OverviewResult struct {
-	Dimension      string           `json:"dimension"`
-	Days           int              `json:"days"`
-	Currency       string           `json:"currency"`
-	RefreshedAt    int64            `json:"refreshed_at"`
-	CollectedSince *int64           `json:"collected_since"`
-	Partial        bool             `json:"partial"`
-	Scope          string           `json:"scope"`
-	Summary        OverviewMetrics  `json:"summary"`
-	Daily          []OverviewRow    `json:"daily"`
-	Ranking        []OverviewRow    `json:"ranking"`
-	Distribution   []OverviewRow    `json:"distribution"`
-	Models         []OverviewRow    `json:"models"`
-	Channels       []OverviewRow    `json:"channels"`
-	Options        []OverviewOption `json:"options"`
-	Limits         map[string]int   `json:"limits"`
-	Warnings       []string         `json:"warnings"`
+	Dimension              string                    `json:"dimension"`
+	Days                   int                       `json:"days"`
+	Currency               string                    `json:"currency"`
+	RefreshedAt            int64                     `json:"refreshed_at"`
+	CollectedSince         *int64                    `json:"collected_since"`
+	Partial                bool                      `json:"partial"`
+	Scope                  string                    `json:"scope"`
+	Summary                OverviewMetrics           `json:"summary"`
+	Daily                  []OverviewRow             `json:"daily"`
+	Ranking                []OverviewRow             `json:"ranking"`
+	Distribution           []OverviewRow             `json:"distribution"`
+	Models                 []OverviewRow             `json:"models"`
+	Channels               []OverviewRow             `json:"channels"`
+	ChannelModels          []OverviewChannelModelRow `json:"channel_models"`
+	ChannelModelsTruncated bool                      `json:"channel_models_truncated"`
+	Options                []OverviewOption          `json:"options"`
+	Limits                 map[string]int            `json:"limits"`
+	Warnings               []string                  `json:"warnings"`
 }
 
 // Complete-set margin must never subtract a partially known cost from total
@@ -381,6 +425,10 @@ func (m *OverviewMetrics) Finalize() {
 	if m.CacheUsageAttempts > 0 && m.CacheInputTokens > 0 {
 		value := float64(m.CacheReadTokens) / float64(m.CacheInputTokens) * 100
 		m.CacheHitRate = &value
+	}
+	if m.CacheUsageAttempts > 0 {
+		value := float64(m.CacheHitAttempts) / float64(m.CacheUsageAttempts) * 100
+		m.CacheAttemptHitRate = &value
 	}
 	if ended := m.Successes + m.Failures; ended > 0 {
 		value := float64(m.Successes) / float64(ended) * 100
@@ -415,8 +463,8 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 	now := time.Now().UTC()
 	start := now.AddDate(0, 0, -days+1).Format("2006-01-02")
 	end := now.Format("2006-01-02")
-	result := &OverviewResult{Dimension: dimension, Days: days, Currency: "USD", RefreshedAt: now.Unix(), Scope: "synchronous_relay", Daily: []OverviewRow{}, Ranking: []OverviewRow{}, Distribution: []OverviewRow{}, Models: []OverviewRow{}, Channels: []OverviewRow{}, Options: []OverviewOption{}, Warnings: []string{}, Limits: map[string]int{"max_days": 90, "max_rows": 100}}
-	// Main DB transaction gives one snapshot to all seven business queries.
+	result := &OverviewResult{Dimension: dimension, Days: days, Currency: "USD", RefreshedAt: now.Unix(), Scope: "synchronous_relay", Daily: []OverviewRow{}, Ranking: []OverviewRow{}, Distribution: []OverviewRow{}, Models: []OverviewRow{}, Channels: []OverviewRow{}, ChannelModels: []OverviewChannelModelRow{}, Options: []OverviewOption{}, Warnings: []string{}, Limits: map[string]int{"max_days": 90, "max_rows": 100}}
+	// Main DB transaction gives one snapshot to all eight business queries.
 	options := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		// The SQLite driver uses BEGIN IMMEDIATE for ordinary transactions.
@@ -465,6 +513,9 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 		if err := filtered.Session(&gorm.Session{}).Select("channel_id AS id, MAX(channel_name) AS name, " + sums).Group("channel_id").Order("SUM(attempts) DESC, channel_id ASC").Limit(100).Scan(&result.Channels).Error; err != nil {
 			return err
 		}
+		if err := filtered.Session(&gorm.Session{}).Select("channel_id, MAX(channel_name) AS channel_name, model_name AS name, " + sums).Group("channel_id, model_name").Order("SUM(attempts) DESC, channel_id ASC, model_name ASC").Limit(101).Scan(&result.ChannelModels).Error; err != nil {
+			return err
+		}
 		if err := base.Session(&gorm.Session{}).Select(column + " AS id, MAX(" + nameColumn + ") AS name").Group(column).Order(column + " ASC").Limit(101).Scan(&result.Options).Error; err != nil {
 			return err
 		}
@@ -480,6 +531,15 @@ func GetChannelOverview(ctx context.Context, dimension string, days int, objectI
 	if len(result.Options) > 100 {
 		result.Options = result.Options[:100]
 		result.Warnings = append(result.Warnings, "Object options are limited to 100; use a specific object ID for additional objects")
+	}
+	if len(result.ChannelModels) > 100 {
+		result.ChannelModels = result.ChannelModels[:100]
+		result.ChannelModelsTruncated = true
+	}
+	for i := range result.ChannelModels {
+		row := &result.ChannelModels[i]
+		row.ID = strconv.Itoa(row.ChannelID) + ":" + row.Name
+		row.Finalize()
 	}
 	for _, row := range result.Daily {
 		result.Summary.Revenue += row.Revenue

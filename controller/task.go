@@ -216,7 +216,7 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 	if task == nil || !taskHasPluginExecution(task) {
 		return nil, errTaskArtifactPluginUnavailable
 	}
-	channelModel, err := model.CacheGetChannel(task.ChannelId)
+	channelModel, err := service.ResolveTaskChannelConnection(task)
 	if err != nil {
 		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
 	}
@@ -233,6 +233,7 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 		baseURL = constant.GetChannelBaseURL(channelModel.Type)
 	}
 	adaptor.Init(&relaycommon.RelayInfo{
+		TaskChannelSnapshot: task.PrivateData.ChannelAttempt,
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelType:     channelModel.Type,
 			ChannelBaseUrl:  baseURL,

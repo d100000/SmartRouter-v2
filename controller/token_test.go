@@ -608,6 +608,8 @@ func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			db := setupTokenControllerTestDB(t)
 			body := map[string]any{"name": "quota-query", "expired_time": -1, "unlimited_quota": true, "status": common.TokenStatusEnabled}
+			require.NoError(t, db.AutoMigrate(&model.User{}))
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "quota-query-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}).Error)
 			if tc.field != nil {
 				body["allow_user_quota_query"] = tc.field
 			}

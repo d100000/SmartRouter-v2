@@ -56,6 +56,15 @@ func TestStartupUpgradePreservesData(t *testing.T) {
 		require.NoError(t, InitDB())
 		common.SQLitePath = os.Getenv("TEST_STARTUP_SQLITE_LOG")
 		require.NoError(t, InitLogDB())
+		if restart == 0 {
+			versionQuery := "SELECT VERSION()"
+			if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			var databaseVersion string
+			require.NoError(t, DB.Raw(versionQuery).Scan(&databaseVersion).Error)
+			t.Logf("startup phase=%s main=%s version=%s separate_log=%s", phase, common.MainDatabaseType(), databaseVersion, common.LogDatabaseType())
+		}
 		mainSQL, err := DB.DB()
 		require.NoError(t, err)
 		logSQL, err := LOG_DB.DB()
@@ -70,6 +79,7 @@ func TestStartupUpgradePreservesData(t *testing.T) {
 				{"channels", map[string]any{"id": 87003, "type": 1, "name": "startup-upgrade-channel", "key": "startup-upgrade-fixture-key", "status": 1, "models": "upgrade-model", "group": "default", "used_quota": 654321}},
 				{"options", map[string]any{"key": "billing_setting.billing_expr", "value": `{"upgrade-model":"tier(\"base\", p * 2 + cc * 2.5)"}`}},
 				{"tasks", map[string]any{"id": 87004, "task_id": "startup-upgrade-task", "user_id": 87001, "channel_id": 87003, "quota": 123000, "status": "SUCCESS", "data": `{"result":"preserved"}`}},
+				{"midjourneys", map[string]any{"id": 87008, "mj_id": "startup-legacy-task", "user_id": 87001, "channel_id": 87003, "status": "SUCCESS", "quota": 321}},
 				{"quota_data", map[string]any{"id": 87005, "user_id": 87001, "username": "startup-upgrade-user", "model_name": "upgrade-model", "created_at": 1790000000, "token_used": 500, "quota": 600, "count": 1}},
 				{"overview_attempt_events", map[string]any{"id": "startup-upgrade-attempt", "request_id": "startup-upgrade-request", "status": "completed", "day": "2026-10-20", "channel_id": 87003, "base_quota": 1000.25, "quota_per_unit": 500000, "revenue_quota": 600, "cost_quota": 250.0625, "cost_known": true, "revenue_confirmed": true}},
 				{"overview_dailies", map[string]any{"id": "startup-upgrade-daily", "day": "2026-10-20", "channel_id": 87003, "quota_per_unit": 500000, "revenue": 600, "cost": 250.0625, "complete_revenue": 600, "complete_cost": 250.0625, "requests": 1, "attempts": 1}},
@@ -85,7 +95,7 @@ func TestStartupUpgradePreservesData(t *testing.T) {
 			require.NoError(t, migrateDB())
 		}
 		actual := map[string]tableSnapshot{}
-		for _, table := range []string{"users", "tokens", "channels", "options", "tasks", "quota_data", "overview_attempt_events", "overview_dailies", "overview_collection_states", "upstream_suppliers", "upstream_credentials", "upstream_credential_versions", "channel_credential_bindings", "upstream_credential_fingerprint_secrets", "logs", "audit_logs"} {
+		for _, table := range []string{"users", "tokens", "channels", "options", "tasks", "midjourneys", "quota_data", "overview_attempt_events", "overview_dailies", "overview_collection_states", "upstream_suppliers", "upstream_credentials", "upstream_credential_versions", "channel_credential_bindings", "upstream_credential_fingerprint_secrets", "logs", "audit_logs"} {
 			db := DB
 			if table == "logs" || table == "audit_logs" {
 				db = LOG_DB
@@ -139,6 +149,47 @@ func TestStartupUpgradePreservesData(t *testing.T) {
 				require.NoError(t, err)
 				require.NoError(t, os.WriteFile(snapshotPath, data, 0600))
 			} else {
+				for table, columns := range map[string][]string{
+					"users":                   {"supplier_id", "channel_viewer", "must_change_password"},
+					"channels":                {"owner_supplier_id", "created_by", "supplier_priority", "supplier_version", "supplier_paused", "supplier_validated", "secrets_write_only"},
+					"upstream_credentials":    {"owner_supplier_id", "secrets_write_only", "created_by"},
+					"supplier_accounts":       {"supplier_id", "supply_enabled", "pool_priority", "pool_weight", "pool_capacity", "max_input_tokens", "max_output_tokens", "allowed_templates", "revision"},
+					"supplier_channel_drafts": {"channel_id", "supplier_id", "version", "secret", "lease_until", "template_id", "probe_task_ids"},
+					"overview_attempt_events": {"call_stage", "is_stream", "first_token_ms", "image_count", "audio_seconds", "image_usage_source", "audio_usage_source", "upstream_request_id", "task_status", "task_observed_at", "task_completed_at", "task_duration_ms", "task_observation_version", "video_seconds", "credits", "video_usage_source", "credit_usage_source"},
+					"channel_limit_configs":   {"channel_id", "rpm", "tpm", "daily_usd_nano", "revision", "budget_day"},
+					"channel_daily_budgets":   {"id", "channel_id", "budget_day", "used_usd_nano", "held_usd_nano"},
+					"channel_limit_attempts":  {"id", "channel_id", "budget_day", "reserved_tokens", "actual_usd_nano", "reconcile_until_ms", "observed_cost_nano", "cost_ratio", "quota_per_unit", "pricing_snapshot"},
+					"tasks":                   {"procurement_pending", "procurement_version", "procurement_unknown", "procurement_next_poll"},
+					"midjourneys":             {"channel_attempt_data", "procurement_pending", "procurement_version", "procurement_reconcile"},
+					"channel_limit_events":    {"id", "channel_id", "kind", "budget_day", "config_revision", "occurred_at_ms"},
+				} {
+					assert.True(t, DB.Migrator().HasTable(table), table)
+					for _, column := range columns {
+						assert.True(t, DB.Migrator().HasColumn(table, column), table+"."+column)
+					}
+				}
+				// NULL permits ordinary users to coexist; a concrete supplier
+				// identity must remain unique. Rollback keeps upgrade snapshots
+				// reusable for another destination build.
+				var duplicateErr, fixtureErr error
+				err := DB.Transaction(func(tx *gorm.DB) error {
+					for _, row := range []map[string]any{
+						{"id": 87991, "username": "supplier-migration-null-a"},
+						{"id": 87992, "username": "supplier-migration-null-b"},
+						{"id": 87993, "username": "supplier-migration-one", "supplier_id": "00000000-0000-0000-0000-000000087993"},
+					} {
+						row["password"] = "unusable-supplier-migration-fixture"
+						if err := tx.Table("users").Create(row).Error; err != nil {
+							fixtureErr = err
+							return err
+						}
+					}
+					duplicateErr = tx.Table("users").Create(map[string]any{"id": 87994, "username": "supplier-migration-duplicate", "password": "unusable-supplier-migration-fixture", "supplier_id": "00000000-0000-0000-0000-000000087993"}).Error
+					return fmt.Errorf("rollback supplier uniqueness fixture")
+				})
+				require.Error(t, err)
+				require.NoError(t, fixtureErr)
+				require.Error(t, duplicateErr, "supplier binding must be unique after both startups")
 				assert.True(t, DB.Migrator().HasColumn("quota_data", "cache_read_tokens"))
 				assert.True(t, DB.Migrator().HasColumn("quota_data", "cache_creation_tokens"))
 				assert.True(t, LOG_DB.Migrator().HasIndex("audit_logs", "idx_audit_time_event"))
@@ -147,6 +198,13 @@ func TestStartupUpgradePreservesData(t *testing.T) {
 					require.NoError(t, DB.Table("quota_data").Select(field).Where("id = ?", 87005).Scan(&quantity).Error)
 					assert.Zero(t, quantity, "historical cache usage is not backfilled")
 				}
+				var historicalQuantities struct {
+					ImageCount   *int64
+					AudioSeconds *float64
+				}
+				require.NoError(t, DB.Table("overview_attempt_events").Select("image_count", "audio_seconds").Where("id = ?", "startup-upgrade-attempt").Scan(&historicalQuantities).Error)
+				assert.Nil(t, historicalQuantities.ImageCount, "unknown historical image usage must not become zero")
+				assert.Nil(t, historicalQuantities.AudioSeconds, "unknown historical audio duration must not become zero")
 				recorder := &migrationSQLRecorder{}
 				DB, LOG_DB = DB.Session(&gorm.Session{Logger: recorder}), LOG_DB.Session(&gorm.Session{Logger: recorder})
 				require.NoError(t, migrateDB())

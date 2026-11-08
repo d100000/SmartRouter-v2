@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type ManageUserAction } from '../types'
+import type { ManageUserAction } from '../types'
 
 // ============================================================================
 // User Action Messages
@@ -29,6 +29,8 @@ const ACTION_MESSAGES: Record<ManageUserAction, string> = {
   demote: 'User demoted to regular user successfully',
   delete: 'User deleted successfully',
   add_quota: 'Quota adjusted successfully',
+  grant_channel_viewer: 'Channel viewing access granted',
+  revoke_channel_viewer: 'Channel viewing access revoked',
 }
 
 /**

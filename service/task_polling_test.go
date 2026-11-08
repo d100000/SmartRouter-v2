@@ -3,8 +3,12 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,9 +21,17 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 type taskPollingFetchAdaptor struct {
@@ -1087,6 +1099,245 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			} else {
 				assert.Equal(t, initialQuota, getUserQuota(t, userID))
 			}
+		})
+	}
+}
+
+func TestAsyncTaskChannelProcurementDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(":memory:")
+			case "mysql":
+				if os.Getenv("TEST_MYSQL_DSN") == "" {
+					t.Skip("TEST_MYSQL_DSN not configured")
+				}
+				driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+			case "postgres":
+				if os.Getenv("TEST_POSTGRES_DSN") == "" {
+					t.Skip("TEST_POSTGRES_DSN not configured")
+				}
+				driver = postgres.New(postgres.Config{DSN: os.Getenv("TEST_POSTGRES_DSN"), PreferSimpleProtocol: true})
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "async_procurement_test_"}, Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			oldDB, oldType, oldCache, oldQuota := model.DB, common.MainDatabaseType(), common.MemoryCacheEnabled, common.QuotaPerUnit
+			model.DB, common.MemoryCacheEnabled, common.QuotaPerUnit = db, false, 500000
+			common.SetMainDatabaseType(common.DatabaseType(dialect))
+			schemas := []any{&model.Channel{}, &model.SupplierAccount{}, &model.Task{}, &model.ChannelLimitConfig{}, &model.ChannelLimitAttempt{}, &model.ChannelDailyBudget{}, &model.ChannelLimitEvent{}, &model.OverviewAttemptEvent{}, &model.OverviewDaily{}, &model.OverviewCollectionState{}}
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(schemas...))
+				model.DB, common.MemoryCacheEnabled, common.QuotaPerUnit = oldDB, oldCache, oldQuota
+				common.SetMainDatabaseType(oldType)
+				require.NoError(t, sqlDB.Close())
+			})
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(schemas...))
+			}
+			t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "test")
+			t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"test":"`+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))+`"}`)
+			baseURL := "https://api.example.com"
+			costRatio := 1.0
+			channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "frozen-task", Key: "secret-before-rotation", BaseURL: &baseURL, Models: "video-model", Status: common.ChannelStatusEnabled, SecretsWriteOnly: true, CostRatio: &costRatio}
+			require.NoError(t, db.Create(channel).Error)
+			pricingSnapshot, err := common.Marshal([]model.UpstreamCredentialSnapshot{{ChannelID: channel.Id, KeyIndex: 0, Active: true, EffectiveCostRatio: &costRatio, CostVersionID: "cost-v1", CredentialID: "original-credential", CredentialVersionID: "credential-v1"}})
+			require.NoError(t, err)
+			channel.UpstreamCredentialSnapshotData = string(pricingSnapshot)
+			require.NoError(t, db.Model(channel).Update("upstream_credential_snapshot_data", channel.UpstreamCredentialSnapshotData).Error)
+			require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
+			state, err := model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			_, err = model.UpdateChannelLimits(channel.Id, state.Config.Revision, model.ChannelLimitSettings{RPM: 10, TPM: 20, DailyUSDNano: 10 * model.ChannelLimitUSDScale, ReconcileSeconds: 300}, true, time.Now())
+			require.NoError(t, err)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"video-model","seconds":6}`))
+			info := &relaycommon.RelayInfo{OriginModelName: "video-model", TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: constant.TaskActionTextToVideo}, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id, ChannelType: channel.Type, ChannelBaseUrl: baseURL, ApiKey: channel.Key}, PriceData: hosttypes.PriceData{UsePrice: true, ModelPrice: 1}, TaskUsageUnits: map[string]string{"seconds": "second", "units": "credit"}}
+			require.NoError(t, PrepareTaskChannelAttempt(info, channel))
+			PrepareOverviewAttempt(c, info, channel)
+			require.NoError(t, BeforeTaskChannelUpstream(c, info, c.Request))
+			MarkOverviewUpstreamSent(info)
+			c.Set("task_submit_http_status", http.StatusAccepted)
+			FinishTaskChannelSubmission(c, info, true, nil, nil)
+			require.NotNil(t, info.TaskChannelSnapshot)
+			assert.True(t, info.TaskChannelSnapshot.Encrypted, "write-only protection survives platform ownership")
+			assert.NotContains(t, info.TaskChannelSnapshot.Connection, "secret-before-rotation")
+			task := model.InitTask(constant.TaskPlatform("video"), info)
+			task.PrivateData.UpstreamTaskID = "vendor-task"
+			task.Status = model.TaskStatusSubmitted
+			task.Quota = 0
+			require.NoError(t, task.Insert())
+			require.NoError(t, FlushTaskChannelObservation(context.Background(), task))
+			var event model.OverviewAttemptEvent
+			require.NoError(t, db.First(&event, "id = ?", info.OverviewAttempt.EventID).Error)
+			assert.True(t, event.Success, "accepted submission is recorded independently")
+			assert.Equal(t, "accepted", event.TaskStatus)
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.EqualValues(t, 1, state.RPMUsed)
+			assert.Zero(t, state.TPMReserved, "media seconds never occupy TPM")
+			assert.EqualValues(t, model.ChannelLimitUSDScale, state.DailyHeldNano)
+			channel.Key = "new-key"
+			channel.Status = common.ChannelStatusManuallyDisabled
+			replacementURL := "https://new.example.com"
+			channel.BaseURL = &replacementURL
+			require.NoError(t, db.Save(channel).Error)
+			frozen, err := ResolveTaskChannelConnection(task)
+			require.NoError(t, err)
+			assert.Equal(t, "secret-before-rotation", frozen.Key)
+			assert.Equal(t, baseURL, frozen.GetBaseURL())
+			oldStatus := task.Status
+			task.Status = model.TaskStatusFailure
+			ObserveTaskChannelResult(task, nil, false)
+			won, err := task.UpdateWithStatus(oldStatus)
+			require.NoError(t, err)
+			require.True(t, won)
+			require.NoError(t, FlushTaskChannelObservation(context.Background(), task))
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.EqualValues(t, model.ChannelLimitUSDScale, state.DailyHeldNano, "local failure/refund cannot release upstream procurement")
+			var stale model.Task
+			require.NoError(t, db.First(&stale, task.ID).Error)
+			result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{"seconds": 6.0, "units": 1.25}}
+			ObserveTaskChannelResult(task, result, true)
+			task.Status = model.TaskStatusSuccess
+			won, err = task.UpdateWithStatus(model.TaskStatusFailure)
+			require.NoError(t, err)
+			require.True(t, won)
+			require.NoError(t, FlushTaskChannelObservation(context.Background(), task))
+			require.NoError(t, SettleTaskChannelSnapshot(context.Background(), task.PrivateData.ChannelAttempt, task.ProcurementVersion, time.Now()))
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.EqualValues(t, model.ChannelLimitUSDScale, state.DailyUsedNano)
+			assert.Zero(t, state.DailyHeldNano)
+			ObserveTaskChannelResult(&stale, nil, false)
+			stale.Status = model.TaskStatusFailure
+			won, err = stale.UpdateWithStatus(model.TaskStatusFailure)
+			require.NoError(t, err)
+			assert.False(t, won, "stale poll cannot overwrite confirmed completion")
+			require.NoError(t, db.First(&event, "id = ?", info.OverviewAttempt.EventID).Error)
+			assert.Equal(t, "succeeded", event.TaskStatus)
+			require.NotNil(t, event.VideoSeconds)
+			assert.Equal(t, 6.0, *event.VideoSeconds)
+			require.NotNil(t, event.Credits)
+			assert.Equal(t, "1.25", *event.Credits)
+			assert.EqualValues(t, 1, state.RPMUsed, "polling and terminal corrections never create another generation")
+			adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{"vendor-task": {TaskInfo: relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{"seconds": 9.0}}}}}
+			version := task.ProcurementVersion
+			require.NoError(t, pollCredentialBatch(context.Background(), adaptor, frozen, frozen.Key, []*model.Task{task}))
+			assert.Greater(t, task.ProcurementVersion, version, "usage-only terminal correction persists a new outbox version")
+			require.NoError(t, db.First(&event, "id = ?", info.OverviewAttempt.EventID).Error)
+			require.NotNil(t, event.VideoSeconds)
+			assert.Equal(t, 9.0, *event.VideoSeconds)
+			adaptor.results["vendor-task"].TaskInfo.Status = model.TaskStatusInProgress
+			require.NoError(t, pollCredentialBatch(context.Background(), adaptor, frozen, frozen.Key, []*model.Task{task}))
+			require.NoError(t, failTaskFromPoll(context.Background(), adaptor, task, task.Status, "Upstream task not found"))
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status, "late stale status or query expiry cannot revoke terminal success")
+		})
+	}
+}
+
+func TestTaskProcurementEstimateAndUnknownCompletion(t *testing.T) {
+	protected := &relaycommon.RelayInfo{ChannelLimitAttempt: &relaycommon.ChannelLimitRuntime{WriteOnlyCredentials: true}, ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "secret"}}
+	redacted := RedactTaskChannelPayload(protected, []byte(`{"echo":"\u0073ecret","exact":9007199254740993,"other":"unchanged"}`))
+	assert.Equal(t, `{"echo":"[REDACTED]","exact":9007199254740993,"other":"unchanged"}`, string(redacted), "JSON string redaction preserves numbers exactly")
+	failure := ProtectTaskChannelError(protected, &taskdto.TaskError{Code: "rejected", StatusCode: 429, NoRetry: true, Message: "secret", Error: errors.New("secret"), Data: map[string]any{"key": "secret"}})
+	assert.Equal(t, "Upstream request failed", failure.Message)
+	assert.Equal(t, "rejected", failure.Code)
+	assert.Equal(t, 429, failure.StatusCode)
+	assert.True(t, failure.NoRetry)
+	assert.Nil(t, failure.Data)
+	costRatio := 0.5
+	info := &relaycommon.RelayInfo{ChannelLimitAttempt: &relaycommon.ChannelLimitRuntime{CostRatio: &costRatio}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, TieredBillingSnapshot: &billingexpr.BillingSnapshot{TaskUsageBilling: true, EstimatedQuotaBeforeGroup: 2.4 * 500000, EstimatedQuotaAfterGroup: 0, GroupRatio: 0, QuotaPerUnit: 500000}}
+	budget, err := channelLimitProcurementBudget(info, nil, nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1200000000, budget, "free customer group must retain procurement estimate")
+	snapshot := &relaycommon.TaskChannelSnapshot{CostRatio: &costRatio, QuotaPerUnit: 500000, ModelPrice: 2.4, UsePrice: true}
+	ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Unconfirmed: true}, true)
+	assert.Equal(t, "unknown", snapshot.Observation.Status)
+	assert.Nil(t, snapshot.Observation.CostUSDNano)
+	ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "10%"}, true)
+	first := snapshot.Observation.ObservedAt
+	ObserveTaskChannelSnapshot(snapshot, nil, false)
+	ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "10%"}, true)
+	assert.Equal(t, "unknown", snapshot.Observation.Status, "repeated old progress must not restart reconciliation")
+	ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "20%"}, true)
+	assert.Equal(t, "running", snapshot.Observation.Status)
+	assert.GreaterOrEqual(t, snapshot.Observation.ObservedAt, first)
+	text := &relaycommon.TaskChannelSnapshot{TPMApplicable: true, UsageUnits: map[string]string{"input_tokens": "credit", "prompt_tokens": "token", "output_tokens": "token"}}
+	ObserveTaskChannelSnapshot(text, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{"input_tokens": 1000, "prompt_tokens": 2, "output_tokens": 3}}, true)
+	require.NotNil(t, text.Observation.Tokens)
+	assert.EqualValues(t, 5, *text.Observation.Tokens, "named aliases still require declared token units")
+	for _, expression := range []string{`tier("flat", 3)`, `tier("duration", u("seconds") * 3)`} {
+		t.Run(expression, func(t *testing.T) {
+			price := &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), QuotaPerUnit: 500000, GroupRatio: 0, UsageFacts: map[string]any{"seconds": 10.0}}
+			snapshot := &relaycommon.TaskChannelSnapshot{Expression: price, CostRatio: &costRatio, QuotaPerUnit: 500000}
+			ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, true)
+			ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}, true)
+			assert.Equal(t, "succeeded", snapshot.Observation.Status, "late stale running status must not revoke terminal evidence")
+			if strings.Contains(expression, `u(`) {
+				assert.Nil(t, snapshot.Observation.CostUSDNano, "a request estimate is not actual completion usage")
+				assert.True(t, snapshot.NeedsReconciliation(), "terminal status alone cannot stop late cost reconciliation")
+			} else {
+				require.NotNil(t, snapshot.Observation.CostUSDNano)
+				assert.EqualValues(t, 1500000000, *snapshot.Observation.CostUSDNano)
+				assert.False(t, snapshot.NeedsReconciliation())
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, path, body string
+		output           *int64
+	}{
+		{"responses final output", "/v1/responses", `{"model":"gpt-4o-mini","input":"Hello","max_output_tokens":5}`, common.GetPointer(int64(5))},
+		{"explicit zero", "/v1/responses", `{"model":"gpt-4o-mini","input":"Hello","max_output_tokens":0}`, common.GetPointer(int64(0))},
+		{"chat final output", "/v1/chat/completions", `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":9}`, common.GetPointer(int64(9))},
+		{"unseen conversation", "/v1/responses", `{"model":"gpt-4o-mini","input":"Hello","previous_response_id":"old-response","max_output_tokens":5}`, nil},
+		{"native lookalike", "/native/submit", `{"model":"gpt-4o-mini","input":"Hello","max_output_tokens":5}`, nil},
+		{"missing output bound", "/v1/responses", `{"model":"gpt-4o-mini","input":"Hello"}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/client/submit", strings.NewReader(`{"max_tokens":1}`))
+			request := httptest.NewRequest(http.MethodPost, "https://provider.example"+tc.path, strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
+			info := &relaycommon.RelayInfo{OriginModelName: "gpt-4o-mini", ChannelMeta: &relaycommon.ChannelMeta{}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, ChannelLimitAttempt: &relaycommon.ChannelLimitRuntime{TPMApplicable: true}}
+			input, output, total, err := taskChannelTokenBudget(c, info, request)
+			require.NoError(t, err)
+			if tc.output == nil {
+				assert.Nil(t, total)
+			} else {
+				require.NotNil(t, input)
+				require.NotNil(t, output)
+				require.NotNil(t, total)
+				assert.Positive(t, *input)
+				assert.Equal(t, *tc.output, *output)
+				assert.Equal(t, *input+*tc.output, *total)
+			}
+			remaining, err := io.ReadAll(request.Body)
+			require.NoError(t, err)
+			assert.Equal(t, tc.body, string(remaining), "counting must preserve the actual upstream request")
+		})
+	}
+	for _, tc := range []struct {
+		name, media, key string
+		video, audio     bool
+	}{
+		{"untyped duration", "", "seconds", false, false},
+		{"video duration", "video", "seconds", true, false},
+		{"audio duration", "audio", "seconds", false, true},
+		{"explicit audio", "", "audio_seconds", false, true},
+		{"explicit video", "", "video_seconds", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := &relaycommon.TaskChannelSnapshot{MediaKind: tc.media, UsageUnits: map[string]string{tc.key: "second"}}
+			ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{tc.key: 6.0}}, true)
+			assert.Equal(t, tc.video, snapshot.Observation.VideoSeconds != nil)
+			assert.Equal(t, tc.audio, snapshot.Observation.AudioSeconds != nil)
 		})
 	}
 }

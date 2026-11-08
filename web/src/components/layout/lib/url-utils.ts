@@ -18,7 +18,17 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { LinkProps } from '@tanstack/react-router'
 
-import type { NavItem, NavCollapsible } from '../types'
+import type { NavItem, NavCollapsible, TopNavLink } from '../types'
+
+export function getKeyedTopNavLinks(links: TopNavLink[]) {
+  const occurrences = new Map<string, number>()
+  return links.map((link) => {
+    const identity = JSON.stringify([link.href, link.title])
+    const occurrence = occurrences.get(identity) ?? 0
+    occurrences.set(identity, occurrence + 1)
+    return { link, key: JSON.stringify([identity, occurrence]) }
+  })
+}
 
 /**
  * Convert LinkProps['to'] to string
@@ -87,8 +97,9 @@ export function checkIsActive(
         }
         return false
       })
-    )
+    ) {
       return true
+    }
   }
 
   // For regular link items, check the item's URL

@@ -147,6 +147,7 @@ func countGeminiBillableFunctionCalls(info *relaycommon.RelayInfo, response *dto
 }
 
 func buildUsageFromGeminiResponse(c *gin.Context, info *relaycommon.RelayInfo, response *dto.GeminiChatResponse) dto.Usage {
+	info.ObserveImageCount(int64(geminiResponseInlineImageCount(response)))
 	metadata := response.GetUsageMetadata()
 	if dto.HasGeminiUsageMetadataTokens(metadata) {
 		usage := buildUsageFromGeminiMetadata(metadata, info.GetEstimatePromptTokens())
@@ -165,7 +166,7 @@ func geminiResponseInlineImageCount(response *dto.GeminiChatResponse) int {
 	count := 0
 	for _, candidate := range response.Candidates {
 		for _, part := range candidate.Content.Parts {
-			if part.InlineData != nil && part.InlineData.MimeType != "" {
+			if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MimeType), "image/") && strings.TrimSpace(part.InlineData.Data) != "" {
 				count++
 			}
 		}
@@ -262,13 +263,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 		hasEffectiveOutput = hasEffectiveOutput || geminiResponseHasOutput(&geminiResponse)
 		// 统计图片数量
-		for _, candidate := range geminiResponse.Candidates {
-			for _, part := range candidate.Content.Parts {
-				if part.InlineData != nil && part.InlineData.MimeType != "" {
-					imageCount++
-				}
-			}
-		}
+		imageCount += geminiResponseInlineImageCount(&geminiResponse)
 		responseText.WriteString(geminiResponseUsageText(&geminiResponse))
 
 		// 更新使用量统计
@@ -311,6 +306,9 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 	if failure == nil && !hasEffectiveOutput {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	if failure == nil {
+		info.ObserveImageCount(int64(imageCount))
 	}
 	if failure != nil {
 		types.ErrOptionWithSkipRetry()(failure)
@@ -635,6 +633,14 @@ func GeminiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			B64Json: prediction.BytesBase64Encoded,
 		})
 	}
+
+	var observedImages int64
+	for _, item := range openAIResponse.Data {
+		if strings.TrimSpace(item.B64Json) != "" {
+			observedImages++
+		}
+	}
+	info.ObserveImageCount(observedImages)
 
 	jsonResponse, jsonErr := common.Marshal(openAIResponse)
 	if jsonErr != nil {

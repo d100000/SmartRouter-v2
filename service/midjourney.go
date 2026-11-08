@@ -18,6 +18,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -296,7 +297,34 @@ func RecordMidjourneyPolicyResponse(c *gin.Context, response *dto.MidjourneyResp
 	return false
 }
 
-func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestURL string) (*dto.MidjourneyResponseWithStatusCode, []byte, error) {
+func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestURL string, infos ...*relaycommon.RelayInfo) (outcome *dto.MidjourneyResponseWithStatusCode, responseBody []byte, resultErr error) {
+	var info *relaycommon.RelayInfo
+	protected := false
+	if len(infos) > 0 {
+		info = infos[0]
+	}
+	if info != nil && info.TaskRelayInfo == nil {
+		info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+	}
+	defer func() {
+		if protected && resultErr != nil {
+			resultErr = errors.New("upstream request failed")
+		}
+		if info == nil || info.ChannelLimitAttempt == nil || !info.ChannelLimitAttempt.Sent {
+			return
+		}
+		accepted := resultErr == nil && outcome != nil && outcome.StatusCode >= 200 && outcome.StatusCode < 300 && (outcome.Response.Code == 1 || outcome.Response.Code == 21 || outcome.Response.Code == 22)
+		var result *relaycommon.TaskInfo
+		if accepted {
+			result = &relaycommon.TaskInfo{Status: "NOT_START"}
+			if properties, ok := outcome.Response.Properties.(map[string]any); ok {
+				if status, ok := properties["status"].(string); ok {
+					result.Status = status
+				}
+			}
+		}
+		FinishTaskChannelSubmission(c, info, accepted, result, resultErr)
+	}()
 	var nullBytes []byte
 	//var requestBody io.Reader
 	//requestBody = c.Request.Body
@@ -334,7 +362,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 	if err != nil {
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "create_request_failed", http.StatusInternalServerError), nullBytes, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 	// 使用带有超时的 context 创建新的请求
 	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
@@ -345,12 +373,74 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		req.Header.Set("mj-api-secret", auth)
 	}
 	defer cancel()
-	resp, err := GetHttpClient().Do(req)
+	var selected *model.Channel
+	if info != nil {
+		if info.LockedChannel != nil {
+			selected, _ = info.LockedChannel.(*model.Channel)
+		} else {
+			selected, err = model.GetChannelById(info.ChannelId, true)
+			if err != nil {
+				return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_unavailable", http.StatusServiceUnavailable), nil, err
+			}
+		}
+		if info.TaskRelayInfo == nil {
+			info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+		}
+		if err = PrepareTaskChannelAttempt(info, selected); err != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_limit_unavailable", http.StatusServiceUnavailable), nil, err
+		}
+		if selected == nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_unavailable", http.StatusServiceUnavailable), nil, model.ErrChannelAttemptState
+		}
+		PrepareOverviewAttempt(c, info, selected)
+	} else if value, ok := c.Get("midjourney_query_channel"); ok {
+		selected, _ = value.(*model.Channel)
+		if selected == nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_unavailable", http.StatusServiceUnavailable), nil, model.ErrChannelAttemptState
+		}
+	} else {
+		// A legacy caller without the durable submit runtime cannot bypass
+		// supplier isolation or configured admission. Existing-task queries
+		// supply their frozen connection through the explicit branch above.
+		selected, err = model.GetChannelById(c.GetInt("channel_id"), true)
+		if err != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_unavailable", http.StatusServiceUnavailable), nil, err
+		}
+		state, stateErr := model.GetChannelLimitState(selected.Id, time.Now())
+		if stateErr != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_limit_unavailable", http.StatusServiceUnavailable), nil, stateErr
+		}
+		if selected.OwnerSupplierID != "" || selected.SecretsWriteOnly || state.Config.RPM > 0 || state.Config.TPM > 0 || state.Config.DailyUSDNano > 0 {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "protocol_limit_unsupported", http.StatusServiceUnavailable), nil, &model.ChannelLimitError{Reason: "protocol_limit_unsupported"}
+		}
+	}
+	client := GetHttpClient()
+	protected = selected != nil && (selected.OwnerSupplierID != "" || selected.SecretsWriteOnly)
+	if protected {
+		if err = ValidateSupplierURL(fullRequestURL); err != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "upstream_target_unavailable", http.StatusServiceUnavailable), nil, err
+		}
+		client = GetSupplierHTTPClient()
+	}
+	if info != nil {
+		if err = BeforeTaskChannelUpstream(c, info, req); err != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_limit_unavailable", http.StatusServiceUnavailable), nil, err
+		}
+	}
+	if info != nil {
+		MarkOverviewUpstreamSent(info)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
+		if protected {
+			err = errors.New("upstream request failed")
+		}
 		common.SysLog(common.LogText("do request failed: %s", err.Error()))
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "do_request_failed", http.StatusInternalServerError), nullBytes, err
 	}
+	defer CloseResponseBodyGracefully(resp)
 	statusCode := resp.StatusCode
+	c.Set("task_submit_http_status", statusCode)
 	//if statusCode != 200  {
 	//	return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "bad_response_status_code", statusCode), nullBytes, nil
 	//}
@@ -364,13 +454,21 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 	}
 	var midjResponse dto.MidjourneyResponse
 	var midjourneyUploadsResponse dto.MidjourneyUploadResponse
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err = io.ReadAll(io.LimitReader(resp.Body, 8<<20+1))
+	if len(responseBody) > 8<<20 {
+		err = errors.New("upstream response exceeds limit")
+	}
 	if err != nil {
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "read_response_body_failed", statusCode), nullBytes, err
 	}
-	CloseResponseBodyGracefully(resp)
 	ObserveChannelFundingJSON(ChannelFundingAttempt(c), statusCode, responseBody)
-	logger.LogDebug(c, "midjourney response body: %s", responseBody)
+	// Upstream payloads can echo credentials and are never written to diagnostics.
+	if protected && len(responseBody) > 0 {
+		responseBody, err = redactMidjourneySupplierPayload(responseBody, auth)
+		if err != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "unmarshal_response_body_failed", statusCode), nil, errors.New("upstream response invalid")
+		}
+	}
 	if len(responseBody) == 0 {
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "empty_response_body", statusCode), responseBody, nil
 	} else {
@@ -383,6 +481,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		}
 	}
 	if midjResponse.Code != 1 && midjResponse.Code != 21 && midjResponse.Code != 22 {
+		c.Set("task_submit_rejected", true)
 		RecordChannelFundingError(ChannelFundingAttempt(c), statusCode, fmt.Sprint(midjResponse.Code), "", midjResponse.Description)
 	}
 	//for k, v := range resp.Header {
@@ -392,4 +491,281 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		StatusCode: statusCode,
 		Response:   midjResponse,
 	}, responseBody, nil
+}
+
+// Redact JSON strings before they enter task storage, client responses or
+// error logs. RawMessage preserves numeric IDs and quantities exactly, while
+// decoding strings also catches credentials echoed with JSON escape sequences.
+func redactMidjourneySupplierPayload(data []byte, secret string) ([]byte, error) {
+	switch common.GetJsonType(data) {
+	case "object":
+		var values map[string]common.RawMessage
+		if err := common.Unmarshal(data, &values); err != nil {
+			return nil, err
+		}
+		clean := make(map[string]common.RawMessage, len(values))
+		for key, value := range values {
+			redacted, err := redactMidjourneySupplierPayload(value, secret)
+			if err != nil {
+				return nil, err
+			}
+			if secret != "" {
+				key = strings.ReplaceAll(key, secret, "[redacted]")
+			}
+			clean[key] = redacted
+		}
+		return common.Marshal(clean)
+	case "array":
+		var values []common.RawMessage
+		if err := common.Unmarshal(data, &values); err != nil {
+			return nil, err
+		}
+		for i, value := range values {
+			redacted, err := redactMidjourneySupplierPayload(value, secret)
+			if err != nil {
+				return nil, err
+			}
+			values[i] = redacted
+		}
+		return common.Marshal(values)
+	case "string":
+		var value string
+		if err := common.Unmarshal(data, &value); err != nil {
+			return nil, err
+		}
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[redacted]")
+		}
+		return common.Marshal(value)
+	default:
+		var scalar common.RawMessage
+		if err := common.Unmarshal(data, &scalar); err != nil {
+			return nil, err
+		}
+		return scalar, nil
+	}
+}
+
+// AttachMidjourneyChannelAttempt freezes the submit-time procurement identity.
+// Legacy task consumers never receive this encrypted connection snapshot.
+func AttachMidjourneyChannelAttempt(info *relaycommon.RelayInfo, task *model.Midjourney) error {
+	if info == nil || info.TaskChannelSnapshot == nil {
+		return nil
+	}
+	snapshot := info.TaskChannelSnapshot
+	if task.Status == "SUCCESS" || task.Status == "FAILURE" {
+		result := &relaycommon.TaskInfo{Status: task.Status, Progress: task.Progress}
+		if task.ImageUrl != "" && task.Action != constant.MjActionVideo {
+			snapshot.UsageUnits = map[string]string{"image_count": "count"}
+			result.UsageFacts = map[string]any{"image_count": 1}
+		}
+		ObserveTaskChannelSnapshot(snapshot, result, true)
+	}
+	if err := task.SetChannelAttempt(snapshot); err != nil {
+		return err
+	}
+	task.ProcurementVersion, task.ProcurementPending = 1, true
+	task.ProcurementReconcile = snapshot.NeedsReconciliation() && task.MjId != ""
+	return nil
+}
+
+func FlushMidjourneyChannelObservation(ctx context.Context, task *model.Midjourney) error {
+	if !task.ProcurementPending {
+		return nil
+	}
+	snapshot, err := task.ChannelAttempt()
+	if err != nil || snapshot == nil {
+		return err
+	}
+	if err := SettleTaskChannelSnapshot(ctx, snapshot, task.ProcurementVersion, time.Now()); err != nil {
+		return err
+	}
+	result := model.DB.WithContext(ctx).Model(&model.Midjourney{}).Where("id = ? AND procurement_version = ?", task.Id, task.ProcurementVersion).Update("procurement_pending", false)
+	if result.Error == nil && result.RowsAffected > 0 {
+		task.ProcurementPending = false
+	}
+	return result.Error
+}
+
+func ResolveMidjourneyTaskChannel(task *model.Midjourney) (*model.Channel, error) {
+	snapshot, err := task.ChannelAttempt()
+	if err != nil {
+		return nil, err
+	}
+	if snapshot != nil {
+		return ResolveTaskChannelSnapshot(snapshot)
+	}
+	channel, err := model.CacheGetChannel(task.ChannelId)
+	if err != nil {
+		return nil, err
+	}
+	var identity hosttypes.ChannelFundingAttempt
+	_ = common.UnmarshalJsonStr(task.FundingAttemptData, &identity)
+	copy := *channel
+	copy.Key = TaskPollingKey(channel, task.PollingKey, &identity)
+	copy.Keys, copy.ChannelInfo = nil, model.ChannelInfo{}
+	return &copy, nil
+}
+
+// RefreshMidjourneyTask accepts terminal evidence only from the frozen
+// upstream. Pauses and today's exhausted budget affect new submissions only.
+func RefreshMidjourneyTask(ctx context.Context, task *model.Midjourney) error {
+	if err := FlushMidjourneyChannelObservation(ctx, task); err != nil {
+		return err
+	}
+	if (task.Status == "SUCCESS" || task.Status == "FAILURE") && task.Progress == "100%" && !task.ProcurementReconcile {
+		return nil
+	}
+	snapshot, err := task.ChannelAttempt()
+	if err != nil {
+		return err
+	}
+	channel, err := ResolveMidjourneyTaskChannel(task)
+	if err != nil {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, err)
+	}
+	body, err := common.Marshal(map[string]any{"ids": []string{task.MjId}})
+	if err != nil {
+		return err
+	}
+	requestURL := strings.TrimRight(channel.GetBaseURL(), "/") + "/mj/task/list-by-condition"
+	client := GetHttpClient()
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		if err := ValidateSupplierURL(requestURL); err != nil {
+			return markMidjourneyResultUnknown(ctx, task, snapshot, err)
+		}
+		client = GetSupplierHTTPClient()
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(queryCtx, http.MethodPost, requestURL, strings.NewReader(string(body)))
+	if err != nil {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("mj-api-secret", channel.Key)
+	response, err := client.Do(req)
+	if err != nil {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task query failed"))
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20+1))
+	if err != nil || len(data) > 8<<20 {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task response unavailable"))
+	}
+	var identity hosttypes.ChannelFundingAttempt
+	_ = common.UnmarshalJsonStr(task.FundingAttemptData, &identity)
+	funding := FundingTaskAttempt(channel, channel.Key, &model.Task{PrivateData: model.TaskPrivateData{FundingAttempt: &identity}})
+	ObserveChannelFundingJSON(funding, response.StatusCode, data)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task result unconfirmed"))
+	}
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		data, err = redactMidjourneySupplierPayload(data, channel.Key)
+		if err != nil {
+			return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task response invalid"))
+		}
+	}
+	var items []dto.MidjourneyDto
+	if common.Unmarshal(data, &items) != nil {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task response invalid"))
+	}
+	var result *dto.MidjourneyDto
+	for i := range items {
+		if items[i].MjId == task.MjId {
+			if result != nil {
+				return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task response ambiguous"))
+			}
+			result = &items[i]
+		}
+	}
+	if result == nil {
+		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task result unconfirmed"))
+	}
+	switch result.Status {
+	case "SUCCESS", "FAILURE", "IN_PROGRESS", "NOT_START", "SUBMITTED", "QUEUED":
+	default:
+		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task result unrecognized"))
+	}
+	previous := task.Status
+	observed := &relaycommon.TaskInfo{Status: result.Status, Progress: result.Progress}
+	if snapshot != nil {
+		if result.Status == "SUCCESS" && result.ImageUrl != "" && task.Action != constant.MjActionVideo {
+			snapshot.UsageUnits = map[string]string{"image_count": "count"}
+			observed.UsageFacts = map[string]any{"image_count": 1}
+		}
+		ObserveTaskChannelSnapshot(snapshot, observed, true)
+		if err := task.SetChannelAttempt(snapshot); err != nil {
+			return err
+		}
+	}
+	task.Code, task.Status, task.Progress = 1, result.Status, result.Progress
+	task.PromptEn, task.State, task.StartTime, task.FinishTime = result.PromptEn, result.State, result.StartTime, result.FinishTime
+	task.ImageUrl, task.VideoUrl, task.FailReason = result.ImageUrl, result.VideoUrl, result.FailReason
+	if result.Properties != nil {
+		raw, err := common.Marshal(result.Properties)
+		if err != nil {
+			return err
+		}
+		task.Properties = string(raw)
+	}
+	if result.Buttons != nil {
+		raw, err := common.Marshal(result.Buttons)
+		if err != nil {
+			return err
+		}
+		task.Buttons = string(raw)
+	}
+	if result.VideoUrls != nil {
+		raw, err := common.Marshal(result.VideoUrls)
+		if err != nil {
+			return err
+		}
+		task.VideoUrls = string(raw)
+	}
+	task.ProcurementReconcile = snapshot != nil && snapshot.NeedsReconciliation()
+	if result.Status == "SUCCESS" || result.Status == "FAILURE" {
+		task.Progress = "100%"
+	}
+	// A customer timeout does not establish upstream failure or a purchase refund.
+	localTimeout := task.Status != "SUCCESS" && task.Status != "FAILURE" && task.SubmitTime > 0 && time.Now().UnixMilli()-task.SubmitTime > int64(time.Hour/time.Millisecond)
+	if localTimeout {
+		task.Status, task.Progress, task.FailReason = "FAILURE", "100%", "Upstream task timed out (over 1 hour)"
+		task.ProcurementReconcile = snapshot != nil
+		if snapshot != nil {
+			ObserveTaskChannelSnapshot(snapshot, nil, false)
+			if err := task.SetChannelAttempt(snapshot); err != nil {
+				return err
+			}
+		}
+	}
+	won, err := task.UpdateWithStatus(previous)
+	if err != nil || !won {
+		return err
+	}
+	if task.Status == "FAILURE" && previous != "FAILURE" {
+		RefundMidjourneyQuota(ctx, task, "Composition failed")
+	}
+	return FlushMidjourneyChannelObservation(ctx, task)
+}
+
+func markMidjourneyResultUnknown(ctx context.Context, task *model.Midjourney, snapshot *relaycommon.TaskChannelSnapshot, cause error) error {
+	if snapshot == nil {
+		return cause
+	}
+	ObserveTaskChannelSnapshot(snapshot, nil, false)
+	if err := task.SetChannelAttempt(snapshot); err != nil {
+		return err
+	}
+	task.ProcurementReconcile = task.MjId != ""
+	won, err := task.UpdateWithStatus(task.Status)
+	if err != nil {
+		return err
+	}
+	if won {
+		if err := FlushMidjourneyChannelObservation(ctx, task); err != nil {
+			return err
+		}
+	}
+	return cause
 }

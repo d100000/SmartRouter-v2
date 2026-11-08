@@ -234,6 +234,29 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	// router/channel-router.go: the key route is RootAuth, not Casbin-guarded.
 	"POST /api/channel/:id/key": accessTokenScopeRule(service.AccessTokenScopeOf(authz.ChannelSecretView)),
 
+	// Supplier identities use interactive sessions only. The viewer is an
+	// ordinary user whose explicitly scoped PAT may read the safe projection.
+	"GET /api/supplier/self":                       accessTokenSessionRule,
+	"GET /api/supplier/channels":                   accessTokenSessionRule,
+	"GET /api/supplier/channels/:id":               accessTokenSessionRule,
+	"POST /api/supplier/channels":                  accessTokenSessionRule,
+	"PUT /api/supplier/channels/:id":               accessTokenSessionRule,
+	"DELETE /api/supplier/channels/:id":            accessTokenSessionRule,
+	"POST /api/supplier/channels/:id/status":       accessTokenSessionRule,
+	"POST /api/supplier/channels/:id/copy":         accessTokenSessionRule,
+	"POST /api/supplier/channels/:id/test":         accessTokenSessionRule,
+	"GET /api/supplier/channels/:id/limits":        accessTokenSessionRule,
+	"GET /api/supplier/channels/:id/budget-events": accessTokenSessionRule,
+	"GET /api/supplier/channels/:id/limit-events":  accessTokenSessionRule,
+	"PUT /api/supplier/channels/:id/limits":        accessTokenSessionRule,
+	"GET /api/supplier/overview":                   accessTokenSessionRule,
+	"GET /api/supplier/logs":                       accessTokenSessionRule,
+	"GET /api/supplier/logs/export":                accessTokenSessionRule,
+	"GET /api/channel/read-only/":                  accessTokenScopeRule("channel:read"),
+	"GET /api/channel/read-only/overview":          accessTokenScopeRule("channel:read"),
+	"GET /api/channel/read-only/:id":               accessTokenScopeRule("channel:read"),
+	"GET /api/channel/read-only/:id/limits":        accessTokenScopeRule("channel:read"),
+
 	// router/authz-router.go
 	"GET /api/authz/catalog": accessTokenScopeRule("user:read"),
 

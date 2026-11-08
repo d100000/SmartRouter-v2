@@ -68,6 +68,8 @@ const MANAGE_ACTION_TITLES: Record<AdminUserManageAction, string> = {
   enable: 'Verify to enable user',
   promote: 'Verify to promote user',
   demote: 'Verify to demote user',
+  grant_channel_viewer: 'Grant channel viewing access',
+  revoke_channel_viewer: 'Revoke channel viewing access',
 }
 
 interface DataTableRowActionsProps {
@@ -242,12 +244,29 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>
         )}
 
-        {!isAdmin && (
+        {user.role === USER_ROLE.USER && (
           <DropdownMenuItem onClick={() => handleManage('promote')}>
             {t('Promote')}
             <DropdownMenuShortcut>
               <ArrowUp size={16} />
             </DropdownMenuShortcut>
+          </DropdownMenuItem>
+        )}
+
+        {user.role === USER_ROLE.USER && (
+          <DropdownMenuItem
+            disabled={verificationActive}
+            onClick={() =>
+              handleManage(
+                user.channel_viewer
+                  ? 'revoke_channel_viewer'
+                  : 'grant_channel_viewer'
+              )
+            }
+          >
+            {user.channel_viewer
+              ? t('Revoke channel viewing access')
+              : t('Grant channel viewing access')}
           </DropdownMenuItem>
         )}
 

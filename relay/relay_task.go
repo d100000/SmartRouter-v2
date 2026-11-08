@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -197,8 +198,24 @@ func ApplyOriginTaskAffinity(c *gin.Context, info *relaycommon.RelayInfo) *dto.T
 // 估算计费(EstimateBilling) → 计算价格 → 预扣费（重试时补足差额）→
 // 构建/发送/解析上游请求 → 提交后计费调整(AdjustBillingOnSubmit)。
 // 共享控制器编排负责未落库退款、最终额度预留、落库和结算。
-func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitResult, *dto.TaskError) {
+func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (outcome *TaskSubmitResult, taskFailure *dto.TaskError) {
+	defer func() {
+		taskFailure = service.ProtectTaskChannelError(info, taskFailure)
+		var submitErr error
+		if taskFailure != nil {
+			submitErr = taskFailure.Error
+			if submitErr == nil {
+				submitErr = errors.New(taskFailure.Message)
+			}
+		}
+		var result *relaycommon.TaskInfo
+		if outcome != nil {
+			result = outcome.Immediate
+		}
+		service.FinishTaskChannelSubmission(c, info, outcome != nil && taskFailure == nil, result, submitErr)
+	}()
 	info.InitChannelMeta(c)
+	c.Set("task_submit_http_status", 0)
 
 	// 1. 确定 platform → 创建适配器 → 验证请求
 	platform := constant.TaskPlatform(c.GetString("platform"))
@@ -259,6 +276,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if pinnedPlugin.Plugin != nil {
 		pluginKey = pinnedPlugin.Plugin.Meta.Key
 	}
+	info.TaskUsageUnits = service.FrozenTaskUsageUnits(pinnedPlugin.Plugin, info.UpstreamModelName, modelName)
 	exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, info.UpstreamModelName)
 	useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
 	if useTiered {
@@ -335,7 +353,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 7. 预扣费：首次尝试创建计费会话；重试时会话已存在，换到更贵的渠道要在
 	//    发起上游请求前补足预扣，余额不足就不发请求。
-	if info.Billing != nil || !info.PriceData.FreeModel {
+	if !info.IsChannelTest && (info.Billing != nil || !info.PriceData.FreeModel) {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
@@ -356,6 +374,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if resp == nil {
 		return nil, service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
 	}
+	c.Set("task_submit_http_status", resp.StatusCode)
 	defer resp.Body.Close()
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
@@ -529,12 +548,23 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 // 仅当渠道类型为 Gemini 或 Vertex 时触发；其他渠道或出错时返回 nil。
 // 当非 OpenAI Video API 时，还会构建自定义格式的响应体。
 func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
-	channelModel, err := model.GetChannelById(task.ChannelId, true)
+	channelModel, err := service.ResolveTaskChannelConnection(task)
 	if err != nil {
 		return nil
 	}
 	if channelModel.Type != constant.ChannelTypeVertexAi && channelModel.Type != constant.ChannelTypeGemini {
 		return nil
+	}
+	if task.PrivateData.ChannelAttempt != nil {
+		// The shared poller owns CAS, procurement corrections and customer
+		// settlement. A result fetch must use exactly that path even when the
+		// visible task status was already terminal before this late result.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := service.PollTaskChannelOnce(ctx, task); err != nil {
+			return nil
+		}
+		return taskVideoFetchResponse(task, task.Data, isOpenAIVideoAPI)
 	}
 
 	baseURL := constant.GetChannelBaseURL(channelModel.Type)
@@ -546,7 +576,7 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	if adaptor == nil {
 		return nil
 	}
-	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	adaptor.Init(&relaycommon.RelayInfo{TaskChannelSnapshot: task.PrivateData.ChannelAttempt, ChannelMeta: &relaycommon.ChannelMeta{
 		ChannelType:     channelModel.Type,
 		ChannelId:       channelModel.Id,
 		ChannelBaseUrl:  baseURL,
@@ -601,6 +631,10 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		}
 	}
 
+	return taskVideoFetchResponse(task, body, isOpenAIVideoAPI)
+}
+
+func taskVideoFetchResponse(task *model.Task, body []byte, isOpenAIVideoAPI bool) []byte {
 	// OpenAI Video API 由调用者的 ConvertToOpenAIVideo 分支处理
 	if isOpenAIVideoAPI {
 		return nil

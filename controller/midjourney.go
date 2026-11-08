@@ -49,6 +49,16 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 	taskM := make(map[string]*model.Midjourney)
 	nullTaskIds := make([]int, 0)
 	for _, task := range tasks {
+		if task.ChannelAttemptData != "" {
+			if task.MjId == "" {
+				_ = service.FlushMidjourneyChannelObservation(ctx, task)
+				continue
+			}
+			if err := service.RefreshMidjourneyTask(ctx, task); err != nil {
+				logger.LogWarn(ctx, "Midjourney procurement result remains unconfirmed")
+			}
+			continue
+		}
 		if task.MjId == "" {
 			// 统计失败的未完成任务
 			nullTaskIds = append(nullTaskIds, task.Id)

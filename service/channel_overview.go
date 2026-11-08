@@ -3,6 +3,7 @@ package service
 import (
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -10,9 +11,11 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
@@ -37,7 +40,39 @@ func PrepareOverviewAttempt(c *gin.Context, info *relaycommon.RelayInfo, channel
 		value := *snapshot.EffectiveCostRatio
 		attempt.CostRatio = &value
 	}
+	if channel.OwnerSupplierID != "" {
+		if limit := info.ChannelLimitAttempt; limit != nil && limit.ChannelID == channel.Id {
+			attempt.CostRatio, attempt.CostSource, attempt.CostVersionID = limit.CostRatio, limit.CostSource, limit.CostVersionID
+			attempt.CredentialCostVersionID, attempt.ChannelCostVersionID = limit.CredentialCostVersionID, limit.ChannelCostVersionID
+		} else if account, err := model.GetSupplierAccount(channel.OwnerSupplierID); err == nil {
+			if cost, err := model.GetChannelProcurementSnapshot(channel, index, account); err == nil {
+				attempt.CostRatio, attempt.CostSource, attempt.CostVersionID = cost.EffectiveCostRatio, cost.CostSource, cost.CostVersionID
+				attempt.CredentialCostVersionID, attempt.ChannelCostVersionID = cost.CredentialCostVersionID, cost.ChannelCostVersionID
+			} else {
+				attempt.CostRatio = nil
+			}
+		} else {
+			attempt.CostRatio = nil
+		}
+	}
+	attempt.AuthorizedSupplierID = channel.OwnerSupplierID
+	attempt.SupplierReference = uuid.NewString()
+	attempt.IsStream, attempt.CallStage = info.IsStream, "inference"
+	switch info.RelayMode {
+	case relayconstant.RelayModeEmbeddings:
+		attempt.CallStage = "embedding"
+	case relayconstant.RelayModeRerank:
+		attempt.CallStage = "rerank"
+	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
+		attempt.CallStage = "image"
+	case relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription, relayconstant.RelayModeAudioTranslation:
+		attempt.CallStage = "audio"
+	}
+	if info.TaskRelayInfo != nil {
+		attempt.CallStage = "task_submit"
+	}
 	info.AnalyticsBilling = nil
+	info.AnalyticsMediaUsage = relaycommon.OverviewMediaUsage{}
 	info.AnalyticsRealtimeRevenueQuota = 0
 	info.AnalyticsRevenueUnitAmbiguous = false
 	info.OverviewAttempt = attempt
@@ -53,6 +88,9 @@ func MarkOverviewUpstreamSent(info *relaycommon.RelayInfo) {
 	}
 	attempt := info.OverviewAttempt
 	attempt.Sent, attempt.StartedAt = true, time.Now().UTC()
+	if upstream := info.GetUpstreamModelName(); upstream != "" {
+		attempt.ModelName = upstream
+	}
 	event := overviewEvent(attempt)
 	event.Status = "pending"
 	if err := model.BeginOverviewAttempt(&event); err != nil {
@@ -71,6 +109,10 @@ func FinishOverviewAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr *
 	}
 	attempt.Finished = true
 	attempt.LatencyMS = max(0, time.Since(attempt.DispatchedAt).Milliseconds())
+	if info.IsStream && info.FirstResponseTime.After(attempt.DispatchedAt) {
+		value := info.FirstResponseTime.Sub(attempt.DispatchedAt).Milliseconds()
+		attempt.FirstTokenMS = &value
+	}
 	state := schedulingState(c)
 	state.mu.Lock()
 	classification := state.lastOutcome
@@ -80,11 +122,61 @@ func FinishOverviewAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr *
 	}
 	attempt.Success = classification == perfmetrics.OutcomeSuccess
 	attempt.Failure = classification == perfmetrics.OutcomeFailure
+	if apiErr != nil {
+		attempt.UpstreamStatusCode = apiErr.StatusCode
+	}
+	attempt.UpstreamRequestID = safeOverviewUpstreamRequestID(c, info)
 	if info.AnalyticsBilling != nil {
 		copy := *info.AnalyticsBilling
 		copy.RevenueUnitAmbiguous = info.AnalyticsRevenueUnitAmbiguous
 		attempt.Billing = &copy
 	}
+	if info.AnalyticsMediaUsage.ImageCount != nil || info.AnalyticsMediaUsage.AudioSeconds != nil {
+		if attempt.Billing == nil {
+			attempt.Billing = &relaycommon.OverviewBillingSnapshot{}
+		}
+		attempt.Billing.OverviewMediaUsage = info.AnalyticsMediaUsage
+	}
+}
+
+// Vendor correlation identifiers are untrusted response data. Keep only a
+// bounded identifier, excluding credentials and the platform's global request
+// identity; an omitted value is safer than storing a modified secret or body.
+func safeOverviewUpstreamRequestID(c *gin.Context, info *relaycommon.RelayInfo) string {
+	if c == nil || info == nil {
+		return ""
+	}
+	value := c.GetString(common.UpstreamRequestIdKey)
+	if len(value) == 0 || len(value) > 128 {
+		return ""
+	}
+	for index := range len(value) {
+		ch := value[index]
+		alphaNumeric := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
+		if !alphaNumeric && (index == 0 || ch != '_' && ch != '-' && ch != '.' && ch != ':') {
+			return ""
+		}
+	}
+	forbidden := []string{info.TokenKey, common.GetContextKeyString(c, constant.ContextKeyTokenKey), common.GetContextKeyString(c, constant.ContextKeyChannelKey), info.RequestId, c.GetString(common.RequestIdKey)}
+	if info.ChannelMeta != nil {
+		forbidden = append(forbidden, info.ApiKey)
+	}
+	if info.OverviewAttempt != nil {
+		forbidden = append(forbidden, info.OverviewAttempt.RequestID)
+	}
+	if c.Request != nil {
+		authorization := strings.TrimSpace(c.Request.Header.Get("Authorization"))
+		if scheme, credential, ok := strings.Cut(authorization, " "); ok && strings.EqualFold(scheme, "Bearer") {
+			authorization = strings.TrimSpace(credential)
+		}
+		forbidden = append(forbidden, authorization, c.Request.Header.Get("X-Api-Key"), c.Request.Header.Get("X-Goog-Api-Key"), c.Query("key"))
+	}
+	for _, secret := range forbidden {
+		if secret != "" && strings.Contains(value, secret) {
+			return ""
+		}
+	}
+	return value
 }
 
 // Costs are attributed to every real attempt; income belongs only to the
@@ -102,6 +194,8 @@ func CompleteOverviewRelay(info *relaycommon.RelayInfo) {
 			continue
 		}
 		event := overviewEvent(attempt)
+		event.UpstreamRequestID = attempt.UpstreamRequestID
+		event.UpstreamStatusCode = attempt.UpstreamStatusCode
 		event.Status = "ready"
 		event.FinishedAt = time.Now().Unix()
 		event.Success, event.Failure, event.LatencyMS = attempt.Success, attempt.Failure, attempt.LatencyMS
@@ -110,6 +204,9 @@ func CompleteOverviewRelay(info *relaycommon.RelayInfo) {
 		}
 		if attempt.Billing != nil {
 			billing := attempt.Billing
+			event.ImageCount, event.AudioSeconds = billing.ImageCount, billing.AudioSeconds
+			event.ImageUsageSource, event.AudioUsageSource = billing.ImageUsageSource, billing.AudioUsageSource
+			event.InputTokens, event.OutputTokens, event.UsageSource = billing.InputTokens, billing.OutputTokens, billing.UsageSource
 			event.CacheUsageKnown = billing.CacheUsageKnown
 			event.CacheInputTokens = billing.CacheInputTokens
 			event.CacheReadTokens = billing.CacheReadTokens
@@ -220,5 +317,5 @@ func captureOverviewCacheUsage(snapshot *relaycommon.OverviewBillingSnapshot, in
 
 func overviewEvent(attempt *relaycommon.OverviewAttempt) model.OverviewAttemptEvent {
 	tags, _ := common.Marshal(attempt.Tags)
-	return model.OverviewAttemptEvent{ID: attempt.EventID, RequestID: attempt.RequestID, Day: attempt.StartedAt.UTC().Format("2006-01-02"), StartedAt: attempt.StartedAt.Unix(), ChannelID: attempt.ChannelID, ChannelName: attempt.ChannelName, GroupName: attempt.GroupName, ModelName: attempt.ModelName, CredentialID: attempt.CredentialID, CredentialName: attempt.CredentialName, CredentialVersionID: attempt.CredentialVersionID, BindingID: attempt.BindingID, SupplierID: attempt.SupplierID, SupplierName: attempt.SupplierName, OwnershipVersionID: attempt.OwnershipVersionID, CostVersionID: attempt.CostVersionID, CostSource: attempt.CostSource, CostRatio: attempt.CostRatio, CredentialCostVersionID: attempt.CredentialCostVersionID, ChannelCostVersionID: attempt.ChannelCostVersionID, TagsJSON: string(tags), BillingSource: attempt.BillingSource, QuotaPerUnit: attempt.QuotaPerUnit}
+	return model.OverviewAttemptEvent{CallStage: attempt.CallStage, IsStream: attempt.IsStream, FirstTokenMS: attempt.FirstTokenMS, AuthorizedSupplierID: attempt.AuthorizedSupplierID, SupplierReference: attempt.SupplierReference, ID: attempt.EventID, RequestID: attempt.RequestID, Day: attempt.StartedAt.UTC().Format("2006-01-02"), StartedAt: attempt.StartedAt.Unix(), ChannelID: attempt.ChannelID, ChannelName: attempt.ChannelName, GroupName: attempt.GroupName, ModelName: attempt.ModelName, CredentialID: attempt.CredentialID, CredentialName: attempt.CredentialName, CredentialVersionID: attempt.CredentialVersionID, BindingID: attempt.BindingID, SupplierID: attempt.SupplierID, SupplierName: attempt.SupplierName, OwnershipVersionID: attempt.OwnershipVersionID, CostVersionID: attempt.CostVersionID, CostSource: attempt.CostSource, CostRatio: attempt.CostRatio, CredentialCostVersionID: attempt.CredentialCostVersionID, ChannelCostVersionID: attempt.ChannelCostVersionID, TagsJSON: string(tags), BillingSource: attempt.BillingSource, QuotaPerUnit: attempt.QuotaPerUnit}
 }

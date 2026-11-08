@@ -78,6 +78,7 @@ beforeEach(() => {
     cache_usage_attempts: 4,
     cache_hit_attempts: 2,
     cache_hit_rate: 9.9,
+    cache_attempt_hit_rate: 50,
     cache_usage_coverage: 80,
   }
   snapshot = {
@@ -94,6 +95,8 @@ beforeEach(() => {
     distribution: [],
     models: [],
     channels: [{ id: '42', name: 'Primary', ...metrics }],
+    channel_models: [],
+    channel_models_truncated: false,
     options: [{ id: '42', name: 'Primary' }],
     limits: { max_days: 90, max_rows: 100 },
     warnings: [],
@@ -154,6 +157,7 @@ describe('channel overview contracts', () => {
       name: 'Cache Usage Samples',
     })
     expect(within(summary).getByText('9.9%')).toBeVisible()
+    expect(within(summary).getByText('50%')).toBeVisible()
     expect(within(summary).queryByText('49.5%')).not.toBeInTheDocument()
     expect(within(summary).getByText('990')).toBeVisible()
     expect(within(summary).getByText('400')).toBeVisible()
@@ -204,6 +208,7 @@ describe('channel overview contracts', () => {
       cache_usage_attempts: 0,
       cache_hit_attempts: 0,
       cache_hit_rate: null,
+      cache_attempt_hit_rate: null,
       cache_usage_coverage: 0,
     }
     snapshot.models = [
@@ -216,6 +221,7 @@ describe('channel overview contracts', () => {
         cache_input_tokens: 100,
         cache_usage_attempts: 1,
         cache_hit_rate: 0,
+        cache_attempt_hit_rate: 0,
         cache_usage_coverage: 100,
       },
     ]
@@ -230,13 +236,15 @@ describe('channel overview contracts', () => {
     expect(unknownCells[2]).toHaveTextContent('—')
     expect(unknownCells[3]).toHaveTextContent('—')
     expect(unknownCells[4]).toHaveTextContent('—')
+    expect(unknownCells[5]).toHaveTextContent('—')
     const missCells = within(
       within(models).getByRole('row', { name: /measured-miss/ })
     ).getAllByRole('cell')
     expect(missCells[1]).toHaveTextContent('0%')
-    expect(missCells[2]).toHaveTextContent('0')
+    expect(missCells[2]).toHaveTextContent('0%')
     expect(missCells[3]).toHaveTextContent('0')
-    expect(missCells[4]).toHaveTextContent('100')
+    expect(missCells[4]).toHaveTextContent('0')
+    expect(missCells[5]).toHaveTextContent('100')
     expect(screen.getByText('No cache usage samples yet.')).toBeVisible()
   })
 
@@ -248,18 +256,106 @@ describe('channel overview contracts', () => {
       }
     }
     Reflect.deleteProperty(snapshot, 'channels')
+    Reflect.deleteProperty(snapshot, 'channel_models')
     render(<ChannelOverview />, { wrapper: Wrapper })
     const summary = await screen.findByRole('region', {
       name: 'Cache Usage Samples',
     })
-    expect(within(summary).getAllByText('—')).toHaveLength(4)
+    expect(within(summary).getAllByText('—')).toHaveLength(5)
     const ranking = screen.getByRole('table', { name: 'Channel Ranking' })
     expect(within(ranking).getAllByRole('cell')[3]).toHaveTextContent('$12')
     await user.click(screen.getByRole('tab', { name: 'By Channel' }))
     expect(
       screen.getByRole('table', { name: 'Cache Statistics by Channel' })
     ).toHaveTextContent('No cache usage samples yet.')
+    await user.click(screen.getByRole('tab', { name: 'By Channel and Model' }))
+    expect(
+      screen.getByRole('table', {
+        name: 'Cache Statistics by Channel and Model',
+      })
+    ).toHaveTextContent('No cache usage samples yet.')
     expect(screen.queryByText('NaN')).not.toBeInTheDocument()
+  })
+
+  test('channel/model comparisons keep same-named channels distinct and show both hit-rate denominators', async () => {
+    const user = userEvent.setup()
+    const modelName = 'vendor/shared-model-with-a-long-context-window-name'
+    snapshot.channel_models = [
+      {
+        ...snapshot.summary,
+        id: `42:${modelName}`,
+        name: modelName,
+        channel_id: 42,
+        channel_name: 'Same channel name',
+        attempts: 2,
+        cache_usage_attempts: 2,
+        cache_hit_attempts: 1,
+        cache_input_tokens: 1_000,
+        cache_read_tokens: 900,
+        cache_hit_rate: 90,
+        cache_attempt_hit_rate: 50,
+        cache_usage_coverage: 100,
+      },
+      {
+        ...snapshot.summary,
+        id: `43:${modelName}`,
+        name: modelName,
+        channel_id: 43,
+        channel_name: 'Same channel name',
+        attempts: 3,
+        cache_usage_attempts: 2,
+        cache_hit_attempts: 1,
+        cache_input_tokens: 9_000,
+        cache_read_tokens: 90,
+        cache_hit_rate: 1,
+        cache_attempt_hit_rate: 50,
+        cache_usage_coverage: 66.67,
+      },
+    ]
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    await user.click(
+      await screen.findByRole('tab', { name: 'By Channel and Model' })
+    )
+    const table = screen.getByRole('table', {
+      name: 'Cache Statistics by Channel and Model',
+    })
+    expect(table.closest('[data-slot="table-container"]')).toHaveClass(
+      'overflow-x-auto'
+    )
+    expect(table).toHaveClass('min-w-[1080px]')
+    expect(within(table).getAllByText(modelName)).toHaveLength(2)
+    const primary = within(table).getByRole('row', { name: /#42/ })
+    const backup = within(table).getByRole('row', { name: /#43/ })
+    expect(within(primary).getByText('90%')).toBeVisible()
+    expect(within(backup).getByText('1%')).toBeVisible()
+    expect(within(primary).getByText('50%')).toBeVisible()
+    expect(within(primary).getByText('1 / 2 measured attempts')).toBeVisible()
+    expect(within(backup).getByText('2 / 3 attempts')).toBeVisible()
+    expect(
+      screen.queryByText(/Showing the 100 busiest/)
+    ).not.toBeInTheDocument()
+    expect(api.get).toHaveBeenCalledTimes(1)
+    await user.click(
+      screen.getByRole('button', { name: 'Details for Cache Statistics' })
+    )
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      'Retries are counted separately.'
+    )
+  })
+
+  test('truncated channel/model detail warns that the summary includes omitted combinations', async () => {
+    const user = userEvent.setup()
+    snapshot.channel_models_truncated = true
+    render(<ChannelOverview />, { wrapper: Wrapper })
+    await user.click(
+      await screen.findByRole('tab', { name: 'By Channel and Model' })
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Showing the 100 busiest channel/model combinations.'
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Summary metrics include all combinations.'
+    )
   })
 
   test('cache statistics refresh with the current period and selected analysis object', async () => {
@@ -281,6 +377,15 @@ describe('channel overview contracts', () => {
             summary: cache,
             models: [{ ...cache, id: 'model-a', name: 'model-a' }],
             channels: [{ ...cache, id: '42', name: 'Primary' }],
+            channel_models: [
+              {
+                ...cache,
+                id: '42:model-a',
+                name: 'model-a',
+                channel_id: 42,
+                channel_name: 'Primary',
+              },
+            ],
           },
         },
       }
@@ -300,6 +405,14 @@ describe('channel overview contracts', () => {
     expect(
       within(
         screen.getByRole('table', { name: 'Cache Statistics by Channel' })
+      ).getByText('37.5%')
+    ).toBeVisible()
+    await user.click(screen.getByRole('tab', { name: 'By Channel and Model' }))
+    expect(
+      within(
+        screen.getByRole('table', {
+          name: 'Cache Statistics by Channel and Model',
+        })
       ).getByText('37.5%')
     ).toBeVisible()
     expect(api.get).toHaveBeenLastCalledWith(

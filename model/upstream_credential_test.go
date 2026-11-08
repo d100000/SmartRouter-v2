@@ -1,9 +1,11 @@
 package model
 
 import (
+	"encoding/base64"
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -16,11 +18,81 @@ import (
 	"gorm.io/gorm/schema"
 )
 
+func TestSupplierCredentialsRemainEncryptedAndTenantOwned(t *testing.T) {
+	truncateTables(t)
+	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+	t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+	secret := "supplier-only-secret"
+	require.NoError(t, DB.Create(&UpstreamSupplier{ID: "supplier-a", Name: "A"}).Error)
+	require.NoError(t, DB.Create(&UpstreamSupplier{ID: "supplier-b", Name: "B"}).Error)
+	a := Channel{Name: "owned-a", Type: constant.ChannelTypeOpenAI, OwnerSupplierID: "supplier-a", Key: secret, Models: "test-model", Group: "default", SupplierValidated: true}
+	b := Channel{Name: "owned-b", Type: a.Type, OwnerSupplierID: "supplier-b", Key: secret, Models: a.Models, Group: a.Group, SupplierValidated: true}
+	require.NoError(t, a.Insert())
+	require.NoError(t, b.Insert())
+	assert.NotEqual(t, a.GetUpstreamCredentialSnapshot(0).CredentialID, b.GetUpstreamCredentialSnapshot(0).CredentialID)
+	var stored string
+	require.NoError(t, DB.Model(&Channel{}).Select(commonKeyCol).Where("id = ?", a.Id).Scan(&stored).Error)
+	assert.NotContains(t, stored, secret)
+	plain, err := DecryptSupplierSecret("supplier-a", stored)
+	require.NoError(t, err)
+	assert.Equal(t, secret, plain)
+	_, err = DecryptSupplierSecret("supplier-b", stored)
+	assert.Error(t, err)
+	var version UpstreamCredentialVersion
+	require.NoError(t, DB.First(&version, "id = ?", a.GetUpstreamCredentialSnapshot(0).CredentialVersionID).Error)
+	assert.NotEmpty(t, version.SecretCiphertext)
+	assert.NotContains(t, version.SecretCiphertext, secret)
+	copy := a
+	copy.Id = 0
+	copy.Name = "owned-copy"
+	copy.SecretsWriteOnly = false
+	require.NoError(t, copy.Insert())
+	assert.True(t, copy.SecretsWriteOnly)
+	assert.Equal(t, a.GetUpstreamCredentialSnapshot(0).CredentialID, copy.GetUpstreamCredentialSnapshot(0).CredentialID)
+	_, err = UpdateUpstreamCredentialMetadata(a.GetUpstreamCredentialSnapshot(0).CredentialID, UpstreamCredentialMetadata{SupplierID: "supplier-b"})
+	assert.Error(t, err)
+	a.OwnerSupplierID = "supplier-b"
+	assert.Error(t, a.Update())
+	a.OwnerSupplierID = "supplier-a"
+	a.SecretsWriteOnly = false
+	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", a.Id).Updates(map[string]any{"supplier_version": 5, "supplier_priority": 7, "supplier_paused": true, "supplier_validated": false}).Error)
+	require.NoError(t, a.Update())
+	assert.True(t, a.SecretsWriteOnly)
+	assert.EqualValues(t, 5, a.SupplierVersion)
+	assert.EqualValues(t, 7, a.SupplierPriority)
+	assert.True(t, a.SupplierPaused)
+	assert.False(t, a.SupplierValidated)
+	require.NoError(t, a.sealSupplierCredential())
+	assert.NotContains(t, a.Key, secret)
+	key, _, apiErr := a.GetNextEnabledKey()
+	require.Nil(t, apiErr)
+	assert.Equal(t, secret, key)
+	assert.NotContains(t, a.Key, secret, "shared cache value must remain encrypted")
+	a.Key = secret + "\nsecond-secret"
+	a.ChannelInfo = ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
+	require.NoError(t, a.Update())
+	previousCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousCache })
+	CacheUpdateChannel(&a)
+	cached, err := CacheGetChannel(a.Id)
+	require.NoError(t, err)
+	first, _, apiErr := cached.GetNextEnabledKey()
+	require.Nil(t, apiErr)
+	second, _, apiErr := cached.GetNextEnabledKey()
+	require.Nil(t, apiErr)
+	assert.Equal(t, secret, first)
+	assert.Equal(t, "second-secret", second)
+	assert.NotContains(t, cached.Key, secret)
+}
+
 func TestUpstreamCredentialIdentityAndCostSnapshots(t *testing.T) {
 	truncateTables(t)
 	channelRatio := 0.6
 	channel := Channel{Name: "procurement", Type: constant.ChannelTypeOpenAI, Key: "test-credential-a\ntest-credential-b\ntest-credential-c", Models: "test-model", Group: "default", CostRatio: &channelRatio, ChannelInfo: ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}}
 	require.NoError(t, channel.Insert())
+	_, limitErr := UpdateChannelLimits(channel.Id, 1, ChannelLimitSettings{RPM: 10, TPM: 1000, DailyUSDNano: ChannelLimitUSDScale, ReconcileSeconds: 300}, true, time.Now())
+	require.NoError(t, limitErr, "a new channel can enable its complete daily budget immediately")
 	original := []UpstreamCredentialSnapshot{channel.GetUpstreamCredentialSnapshot(0), channel.GetUpstreamCredentialSnapshot(1), channel.GetUpstreamCredentialSnapshot(2)}
 	for _, snapshot := range original {
 		assert.NotEmpty(t, snapshot.CredentialID)
@@ -453,7 +525,7 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			common.MemoryCacheEnabled = false
 			initCol()
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&Ability{}, &Channel{}, &ChannelCredentialBinding{}, &UpstreamCredentialVersion{}, &UpstreamCredential{}, &UpstreamSupplier{}, &UpstreamCredentialFingerprintSecret{}))
+				require.NoError(t, db.Migrator().DropTable(&ChannelLimitEvent{}, &ChannelLimitAttempt{}, &ChannelDailyBudget{}, &ChannelLimitConfig{}, &Ability{}, &Channel{}, &ChannelCredentialBinding{}, &UpstreamCredentialVersion{}, &UpstreamCredential{}, &UpstreamSupplier{}, &UpstreamCredentialFingerprintSecret{}))
 				DB = previousDB
 				common.SetMainDatabaseType(previousType)
 				common.MemoryCacheEnabled = previousMemoryCache
@@ -473,6 +545,7 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			for range 2 {
 				require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
 				require.NoError(t, AutoMigrateUpstreamCredentialSchema(db))
+				require.NoError(t, AutoMigrateChannelLimitSchema(db))
 				require.NoError(t, BackfillUpstreamCredentials())
 			}
 			stored, err := GetChannelById(legacy.Id, true)

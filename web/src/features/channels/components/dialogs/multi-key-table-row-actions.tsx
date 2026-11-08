@@ -26,6 +26,7 @@ type MultiKeyTableRowActionsProps = {
   keyIndex: number
   status: number
   canDelete: boolean
+  hideDelete?: boolean
   onAction: (action: MultiKeyConfirmAction) => void
 }
 
@@ -33,6 +34,7 @@ export function MultiKeyTableRowActions({
   keyIndex,
   status,
   canDelete,
+  hideDelete,
   onAction,
 }: MultiKeyTableRowActionsProps) {
   const { t } = useTranslation()
@@ -57,20 +59,22 @@ export function MultiKeyTableRowActions({
           {t('Enable')}
         </Button>
       )}
-      <Button
-        variant='destructive'
-        size='sm'
-        onClick={() => {
-          if (!canDelete) return
-          onAction({ type: 'delete', keyIndex })
-        }}
-        disabled={!canDelete}
-        title={
-          canDelete ? undefined : t('No permission to perform this action')
-        }
-      >
-        {t('Delete')}
-      </Button>
+      {!hideDelete && (
+        <Button
+          variant='destructive'
+          size='sm'
+          onClick={() => {
+            if (!canDelete) return
+            onAction({ type: 'delete', keyIndex })
+          }}
+          disabled={!canDelete}
+          title={
+            canDelete ? undefined : t('No permission to perform this action')
+          }
+        >
+          {t('Delete')}
+        </Button>
+      )}
     </div>
   )
 }

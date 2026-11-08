@@ -635,3 +635,17 @@ export function formatLocalCurrencyAmount(
 
   return formatCurrencyValue(amount, merged, meta)
 }
+
+/** Fixed USD for budgets whose contractual currency must not follow display settings. */
+export function formatFixedUSD(
+  amount: number | string | null | undefined,
+  options?: CurrencyFormatOptions
+): string {
+  if (amount == null || !Number.isFinite(Number(amount))) return '-'
+  return formatCurrencyValue(Number(amount), mergeOptions(options), {
+    kind: 'currency',
+    symbol: '$',
+    currencyCode: 'USD',
+    exchangeRate: 1,
+  })
+}

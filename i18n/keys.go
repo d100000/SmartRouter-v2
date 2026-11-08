@@ -6,12 +6,14 @@ package i18n
 
 // Errors returned to AI clients
 const (
-	MsgDatabaseError          = "common.database_error"
-	MsgAuthUserBanned         = "auth.user_banned"
-	MsgTokenGetInfoFailed     = "token.get_info_failed"
-	MsgTokenInvalid           = "token.invalid"
-	MsgTokenNotProvided       = "token.not_provided"
-	MsgTokenStatusUnavailable = "token.status_unavailable"
+	MsgDatabaseError                 = "common.database_error"
+	MsgAuthUserBanned                = "auth.user_banned"
+	MsgAuthSupplierConsumerForbidden = "auth.supplier_consumer_forbidden"
+	MsgRelayChannelLimitUnavailable  = "relay.channel_limit_unavailable"
+	MsgTokenGetInfoFailed            = "token.get_info_failed"
+	MsgTokenInvalid                  = "token.invalid"
+	MsgTokenNotProvided              = "token.not_provided"
+	MsgTokenStatusUnavailable        = "token.status_unavailable"
 
 	MsgAuthClientIPUnresolved     = "auth.client_ip_unresolved"
 	MsgAuthTokenIPNotAllowed      = "auth.token_ip_not_allowed"
@@ -25,6 +27,7 @@ const (
 	MsgDistributorInvalidRequest               = "distributor.invalid_request"
 	MsgDistributorInvalidChannelId             = "distributor.invalid_channel_id"
 	MsgDistributorOutsideSchedule              = "distributor.channel_outside_schedule"
+	MsgDistributorSupplierUnavailable          = "distributor.supplier_unavailable"
 	MsgDistributorChannelDisabled              = "distributor.channel_disabled"
 	MsgDistributorTokenNoModelAccess           = "distributor.token_no_model_access"
 	MsgDistributorTokenModelForbidden          = "distributor.token_model_forbidden"
@@ -119,4 +122,23 @@ const (
 	MsgChannelUpstreamUpdateRemovedModels   = "channel.upstream_update_removed_models"
 	MsgChannelUpstreamUpdateFailedChannels  = "channel.upstream_update_failed_channels"
 	MsgChannelUpstreamUpdateMoreOmitted     = "channel.upstream_update_more_omitted"
+)
+
+const (
+	MsgFundingNoticeSubject       = "funding.notice_subject"
+	MsgFundingRecoverySubject     = "funding.recovery_subject"
+	MsgFundingNoticeEntry         = "funding.notice_entry"
+	MsgFundingManageLink          = "funding.manage_link"
+	MsgFundingBalanceInsufficient = "funding.balance_insufficient"
+	MsgFundingQuotaLimited        = "funding.quota_limited"
+	MsgFundingDisabledYes         = "funding.disabled_yes"
+	MsgFundingDisabledNo          = "funding.disabled_no"
+	MsgFundingProbePending        = "funding.probe_pending"
+	MsgFundingProbeRunning        = "funding.probe_running"
+	MsgFundingProbeFailed         = "funding.probe_failed"
+	MsgFundingProbePaused         = "funding.probe_paused"
+	MsgFundingProbeBlocked        = "funding.probe_blocked"
+	MsgFundingProbeManualRequired = "funding.probe_manual_required"
+	MsgFundingProbeRecovered      = "funding.probe_recovered"
+	MsgFundingProbeCancelled      = "funding.probe_cancelled"
 )

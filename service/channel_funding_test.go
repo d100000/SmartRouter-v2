@@ -111,6 +111,7 @@ func fundingSchema(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Task{}, &model.Midjourney{}, &model.ChannelFundingIncident{}, &model.ChannelFundingDelivery{}, &model.SystemTask{}, &model.SystemTaskLock{}))
 	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(db))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(db))
 }
 
 func fundingIdentity(channel *model.Channel, index int) hosttypes.ChannelFundingAttempt {
@@ -268,7 +269,7 @@ func TestChannelFundingDatabaseMatrix(t *testing.T) {
 			// The supplied DSNs must point to dedicated disposable databases.
 			for _, mode := range []string{"fresh", "released_rc47"} {
 				t.Run(mode, func(t *testing.T) {
-					require.NoError(t, db.Migrator().DropTable(&model.ChannelFundingDelivery{}, &model.ChannelFundingIncident{}, &model.Task{}, &model.Midjourney{}, &model.Ability{}, &model.Channel{}, &model.User{}, &model.SystemTask{}, &model.SystemTaskLock{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialVersion{}, &model.UpstreamCredential{}, &model.UpstreamSupplier{}, &model.UpstreamCredentialFingerprintSecret{}))
+					require.NoError(t, db.Migrator().DropTable(&model.ChannelLimitEvent{}, &model.ChannelLimitAttempt{}, &model.ChannelDailyBudget{}, &model.ChannelLimitConfig{}, &model.ChannelFundingDelivery{}, &model.ChannelFundingIncident{}, &model.Task{}, &model.Midjourney{}, &model.Ability{}, &model.Channel{}, &model.User{}, &model.SystemTask{}, &model.SystemTaskLock{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialVersion{}, &model.UpstreamCredential{}, &model.UpstreamSupplier{}, &model.UpstreamCredentialFingerprintSecret{}))
 					if mode == "released_rc47" {
 						require.NoError(t, db.AutoMigrate(&fundingReleasedChannel{}, &fundingReleasedMidjourney{}))
 						require.NoError(t, db.Create(&fundingReleasedChannel{Id: 900, Name: "preserved release channel", Type: 1, Key: "released-key", Models: "test-model", Group: "default", UsedQuota: 1234, Status: 1}).Error)

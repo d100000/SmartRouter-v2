@@ -21,7 +21,13 @@ import (
 // ChannelAvailabilityError is a local admission rejection, never an upstream
 // failure. Existing streams and task-result polling do not re-enter admission.
 func ChannelAvailabilityError(c *gin.Context, channel *model.Channel) *types.NewAPIError {
-	if channel == nil || channel.ScheduleAllowsAt(time.Now()) {
+	if channel == nil {
+		return nil
+	}
+	if !supplierChannelEligible(c, channel) {
+		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgDistributorSupplierUnavailable)), "supplier_unavailable", http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+	}
+	if channel.ScheduleAllowsAt(time.Now()) {
 		return nil
 	}
 	return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgDistributorOutsideSchedule)), types.ErrorCode(dto.FilterAvailability), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
@@ -317,7 +323,7 @@ type ChannelSelectError struct {
 // filters. The group the channel was chosen from is returned for auto-group
 // callers. The caller still applies SetupContextForSelectedChannel.
 func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Channel, string, *ChannelSelectError) {
-	if len(c.GetStringSlice("use_channel")) > common.RetryTimes || !SchedulingRetryAllowed(c) {
+	if len(c.GetStringSlice("use_channel"))-c.GetInt("channel_local_refusals") > common.RetryTimes || !SchedulingRetryAllowed(c) {
 		return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: "request retry budget exhausted or response already started"}
 	}
 	if err := SyncSchedulingConfig(); err != nil {
@@ -339,6 +345,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			return nil, "", pinnedChannelUnavailable(pin, http.StatusForbidden, i18n.MsgDistributorChannelDisabled)
 		}
 		if apiErr := ChannelAvailabilityError(c, channel); apiErr != nil {
+			if apiErr.GetErrorCode() == "supplier_unavailable" {
+				return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Code: "supplier_unavailable", MessageID: i18n.MsgDistributorSupplierUnavailable, FilterKind: dto.FilterAvailability, Channel: channel}
+			}
 			return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCode(dto.FilterAvailability), MessageID: i18n.MsgDistributorOutsideSchedule, FilterKind: dto.FilterAvailability, Channel: channel}
 		}
 		if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
@@ -362,7 +371,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			affinityUsable := false
 			preferred, err := model.CacheGetChannel(preferredChannelID)
 			affinitySatisfied := false
-			if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled {
+			if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled && supplierChannelEligible(c, preferred) {
 				affinitySatisfied, _ = model.ChannelSatisfiesFilters(preferred, modelName, constraints.Filters)
 			}
 			if affinitySatisfied {

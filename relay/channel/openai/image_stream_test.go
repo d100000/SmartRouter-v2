@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -78,6 +79,13 @@ func TestImageExpressionUsesCompletedCountAndProtectsAbortedStreams(t *testing.T
 				count = *info.BillingImageCount
 			}
 			assert.Equal(t, tc.want, count)
+			if tc.abort || tc.name == "empty response retains request" {
+				assert.Nil(t, info.AnalyticsMediaUsage.ImageCount, "a reservation or interrupted result is not measured output")
+			} else {
+				require.NotNil(t, info.AnalyticsMediaUsage.ImageCount)
+				assert.EqualValues(t, tc.want, *info.AnalyticsMediaUsage.ImageCount)
+				assert.Equal(t, "upstream_payload", info.AnalyticsMediaUsage.ImageUsageSource)
+			}
 			assert.Empty(t, info.PriceData.OtherRatios(), "expression quantities must not add a legacy multiplier")
 		})
 	}
@@ -485,8 +493,61 @@ func TestOpenaiImageHandlerUsesPositiveActualCountForFixedPrice(t *testing.T) {
 			require.Nil(t, err)
 			require.Equal(t, tt.wantCount, info.PriceData.OtherRatios()["n"])
 			require.Equal(t, tt.body, recorder.Body.String())
+			if strings.Contains(tt.name, "keep") {
+				assert.Nil(t, info.AnalyticsMediaUsage.ImageCount)
+			} else {
+				require.NotNil(t, info.AnalyticsMediaUsage.ImageCount)
+				want := int64(tt.wantCount)
+				if !tt.usePrice {
+					want = 2
+				}
+				assert.Equal(t, want, *info.AnalyticsMediaUsage.ImageCount, "observed images do not depend on the pricing mode")
+			}
 		})
 	}
+}
+
+func TestAudioResponseMeasuredDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       *float64
+	}{
+		{"verbose duration", `{"duration":12.5,"text":"hello"}`, common.GetPointer(12.5)},
+		{"duration usage", `{"usage":{"type":"duration","seconds":9.25},"text":"hello"}`, common.GetPointer(9.25)},
+		{"explicit zero", `{"duration":0,"text":""}`, common.GetPointer(0.0)},
+		{"tokens do not imply seconds", `{"usage":{"prompt_tokens":25,"total_tokens":25},"text":"hello"}`, nil},
+		{"malformed duration preserves token usage", `{"duration":"invalid","usage":{"prompt_tokens":25,"total_tokens":25},"text":"hello"}`, nil},
+		{"negative duration", `{"duration":-1,"text":"hello"}`, nil},
+		{"unbounded duration", `{"duration":1e30,"text":"hello"}`, nil},
+		{"missing duration", `{"text":"hello"}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, resp, info := newImageTestContext(t, tc.body, "application/json", false)
+			apiErr, usage := OpenaiSTTHandler(ctx, resp, info, "verbose_json")
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			if strings.Contains(tc.body, `"total_tokens":25`) {
+				assert.Equal(t, 25, usage.PromptTokens)
+				assert.Equal(t, 25, usage.TotalTokens)
+			}
+			if tc.want == nil {
+				assert.Nil(t, info.AnalyticsMediaUsage.AudioSeconds)
+				assert.Empty(t, info.AnalyticsMediaUsage.AudioUsageSource)
+			} else {
+				require.NotNil(t, info.AnalyticsMediaUsage.AudioSeconds)
+				assert.Equal(t, *tc.want, *info.AnalyticsMediaUsage.AudioSeconds)
+				assert.Equal(t, "upstream_usage", info.AnalyticsMediaUsage.AudioUsageSource)
+			}
+		})
+	}
+	t.Run("complete PCM output", func(t *testing.T) {
+		ctx, _, resp, info := newImageTestContext(t, strings.Repeat("\x00", 60000), "audio/pcm", false)
+		info.Request = &dto.AudioRequest{ResponseFormat: "pcm"}
+		require.NotNil(t, OpenaiTTSHandler(ctx, resp, info))
+		require.NotNil(t, info.AnalyticsMediaUsage.AudioSeconds)
+		assert.Equal(t, 1.25, *info.AnalyticsMediaUsage.AudioSeconds)
+		assert.Equal(t, "media_metadata", info.AnalyticsMediaUsage.AudioUsageSource)
+	})
 }
 
 // TestOpenaiImageStreamHandlerWrapsNonStandardDataShapes covers the JSON-to-SSE

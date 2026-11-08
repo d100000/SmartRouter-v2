@@ -3,6 +3,7 @@
 # Errors returned to AI clients
 common.database_error: "Database error, please contact the administrator"
 auth.user_banned: "User has been banned"
+auth.supplier_consumer_forbidden: "Supplier accounts cannot use consumer API credentials or model calls"
 token.get_info_failed: "Failed to get token info, please try again later"
 token.invalid: "Invalid token"
 token.not_provided: "Token not provided"
@@ -97,6 +98,7 @@ channel.upstream_update_failed_channels: "Failed channel IDs (showing {{.Shown}}
 channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
 
 distributor.channel_outside_schedule: "This channel is outside its availability schedule"
+distributor.supplier_unavailable: "This upstream supplier is temporarily unavailable"
 
 # Upstream channel funding notifications
 funding.notice_subject: "Channel {{.Name}} (#{{.Id}}): funding alert, {{.Count}} affected keys"
@@ -115,3 +117,4 @@ funding.probe_blocked: "Blocked"
 funding.probe_manual_required: "Manual review required"
 funding.probe_recovered: "Recovered"
 funding.probe_cancelled: "Cancelled"
+relay.channel_limit_unavailable: "Upstream channel capacity is currently unavailable"

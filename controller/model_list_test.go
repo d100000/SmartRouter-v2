@@ -50,6 +50,7 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	model.LOG_DB = db
 
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(db))
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()

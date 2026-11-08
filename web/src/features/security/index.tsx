@@ -31,6 +31,8 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { TitledCard } from '@/components/ui/titled-card'
 import { useProfile } from '@/features/profile/hooks/use-profile'
+import { isSupplier } from '@/lib/supplier-access'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { AccessTokensCard } from './components/access-tokens-card'
 import { AccountActionCard } from './components/account-action-card'
@@ -42,6 +44,10 @@ import { TwoFACard } from './components/two-fa-card'
 
 export function Security() {
   const { t } = useTranslation()
+  const supplier = useAuthStore((state) => isSupplier(state.auth.user))
+  const mustChangePassword = useAuthStore(
+    (state) => state.auth.user?.must_change_password
+  )
   const { profile, loading, refreshProfile, fetchProfile } = useProfile()
 
   let content: ReactNode
@@ -105,7 +111,7 @@ export function Security() {
               {t('Sessions & Access')}
             </h3>
             <LoginSessionsCard />
-            <AccessTokensCard />
+            {!supplier && <AccessTokensCard />}
           </section>
           <section aria-labelledby='security-account' className='space-y-4'>
             <h3 id='security-account' className='text-sm font-semibold'>
@@ -142,7 +148,16 @@ export function Security() {
         {t('Security & Access')}
       </SectionPageLayout.Title>
       <SectionPageLayout.Content>
-        <div className='mx-auto w-full max-w-7xl'>{content}</div>
+        <div className='mx-auto w-full max-w-7xl'>
+          {supplier && mustChangePassword && (
+            <p role='status' className='bg-muted mb-4 rounded-lg p-4 text-sm'>
+              {t(
+                'Change your initial password before opening the supplier workspace. Use at least 15 characters.'
+              )}
+            </p>
+          )}
+          {content}
+        </div>
       </SectionPageLayout.Content>
     </SectionPageLayout>
   )

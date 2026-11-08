@@ -85,6 +85,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
 		var err error
+		// Gorilla writes the handshake after hijacking the writer. Retain 101
+		// in Gin so the scheduler does not mistake it for inference output.
+		c.Status(http.StatusSwitchingProtocols)
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()).ToOpenAIError())
@@ -144,6 +147,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	if relayFormat == types.RelayFormatOpenAIRealtime {
 		relayInfo.IsStream = true
+		relayInfo.RealtimeRequestRunner = newResponsesWSRequestRunner(c)
 	}
 
 	defer func() {
@@ -154,6 +158,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, resultErr)
 		service.FinishOverviewAttempt(c, relayInfo, resultErr)
+		if err := service.FinishChannelLimitAttempt(c, relayInfo, resultErr); err != nil {
+			common.SysError("channel limit settlement failed: " + err.Error())
+		}
 		service.CompleteOverviewRelay(relayInfo)
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayOutcome(c.Request.Context(), relayInfo, service.FinalRelayOutcome(c, relayInfo, resultErr))
@@ -167,8 +174,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	// Keep HTTP errors and channel retries available; accepted streams own
 	// their heartbeat lifecycle in StreamScannerHandler.
 
-	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
-		return
+	if relayFormat != types.RelayFormatOpenAIRealtime {
+		if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
+			return
+		}
 	}
 	defer func() {
 		newAPIError = relay.RefundFailedRequestBilling(c, relayInfo, newAPIError)
@@ -184,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for retryParam.GetRetry() <= common.RetryTimes {
 		relayInfo.StreamStatus = nil
 		relayInfo.StreamFailure = nil
 		relayInfo.PerformanceBusinessRejection = false
@@ -194,6 +203,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			if relayInfo.LastError != nil && relayInfo.LastError.GetErrorCode() == types.ErrorCode("channel_limit_unavailable") {
+				newAPIError = relayInfo.LastError
+			}
 			if relayInfo.StreamRetryCount > 0 && relayInfo.LastError != nil {
 				// No fallback route must not hide the original upstream failure.
 				newAPIError = relayInfo.LastError
@@ -217,8 +229,24 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
-		service.StartSchedulingAttempt(c, relayInfo)
-		service.PrepareOverviewAttempt(c, relayInfo, channel)
+		relayInfo.InitChannelMeta(c)
+		if err := service.PrepareChannelLimitAttempt(relayInfo, channel); err != nil {
+			newAPIError = service.ChannelLimitRelayError(err)
+			service.FinishSchedulingAttempt(c, relayInfo, newAPIError)
+			relayInfo.LastError = newAPIError
+			c.Set("channel_local_refusals", c.GetInt("channel_local_refusals")+1)
+			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned || service.RequestPolicy(c).SessionMode == "strict" {
+				break
+			}
+			if c.GetInt("channel_local_refusals") >= 512 {
+				break
+			}
+			continue
+		}
+		if relayFormat != types.RelayFormatOpenAIRealtime {
+			service.StartSchedulingAttempt(c, relayInfo)
+			service.PrepareOverviewAttempt(c, relayInfo, channel)
+		}
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -232,6 +260,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, newAPIError)
 		service.FinishOverviewAttempt(c, relayInfo, newAPIError)
+		if err := service.FinishChannelLimitAttempt(c, relayInfo, newAPIError); err != nil {
+			common.SysError("channel limit settlement failed: " + err.Error())
+		}
 
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
@@ -240,6 +271,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			relayInfo.LastError = nil
 			return
+		}
+		if relayInfo.ChannelLimitAttempt != nil && !relayInfo.ChannelLimitAttempt.Sent && newAPIError.GetErrorCode() == types.ErrorCode("channel_limit_unavailable") {
+			relayInfo.LastError = newAPIError
+			c.Set("channel_local_refusals", c.GetInt("channel_local_refusals")+1)
+			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned || service.RequestPolicy(c).SessionMode == "strict" {
+				break
+			}
+			if c.GetInt("channel_local_refusals") >= 512 {
+				break
+			}
+			continue
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
@@ -263,6 +305,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.BeginStreamRetry()
 			c.Set(common.UpstreamRequestIdKey, "")
 		}
+		retryParam.IncreaseRetry()
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
@@ -329,7 +372,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
-	if len(c.GetStringSlice("use_channel")) > common.RetryTimes || !service.SchedulingRetryAllowed(c) {
+	if len(c.GetStringSlice("use_channel"))-c.GetInt("channel_local_refusals") > common.RetryTimes || !service.SchedulingRetryAllowed(c) {
 		return nil, types.NewError(errors.New("request retry budget exhausted or response already started"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if retryParam.GetRetry() == 0 && len(c.GetStringSlice("use_channel")) == 0 {
@@ -648,6 +691,12 @@ func executeTaskSubmissionWith(
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		stage = "submit"
+		relayInfo.InitChannelMeta(c)
+		if err := service.PrepareChannelLimitAttempt(relayInfo, channel); err != nil {
+			taskErr = service.TaskErrorWrapperLocal(err, "channel_limit_unavailable", http.StatusServiceUnavailable)
+			break
+		}
+		service.PrepareOverviewAttempt(c, relayInfo, channel)
 		service.StartSchedulingAttempt(c, relayInfo)
 		result, taskErr = submit(c, relayInfo)
 		service.FinishSchedulingAttempt(c, relayInfo, taskSubmissionAPIError(taskErr))

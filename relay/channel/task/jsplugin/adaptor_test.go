@@ -2294,6 +2294,7 @@ func TestTaskSubmitStreamRelaysToNativeClients(t *testing.T) {
 			assert.Equal(t, tc.body, recorder.Body.String(), "the client receives the events as the vendor framed them")
 			require.NotNil(t, parsed.Immediate)
 			assert.Equal(t, "SUCCESS", parsed.Immediate.Status)
+			assert.Equal(t, tc.name != "completed", parsed.Immediate.Unconfirmed, "only an explicit vendor terminal event confirms procurement")
 			assert.Equal(t, tc.wantTask, parsed.UpstreamTaskID)
 			assert.Equal(t, tc.wantFacts, parsed.Immediate.UsageFacts)
 			ratios := adaptor.AdjustBillingOnSubmit(info, parsed.TaskData)
@@ -2351,6 +2352,50 @@ func TestTaskSubmitStreamRelaysToNativeClients(t *testing.T) {
 				assert.ErrorIs(t, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestTaskProtectedErrorsAndTransport(t *testing.T) {
+	const source = `export const meta = {apiVersion:1,key:"protected-error",name:"Protected Error",version:"1.0.0",author:{name:"Test"},models:["test"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx) { console.log(ctx.apiKey); if (ctx.request.fail) throw new Error(ctx.apiKey); return {url:ctx.baseUrl+"/submit",method:"POST",body:{}}; }
+export function parseSubmitResponse(ctx, response) { if (response.body.ok) return {taskId:"safe-job",taskData:{upstream:response.body.echo,hook:ctx.apiKey},immediate:{status:"SUCCESS",url:"https://example.com/"+ctx.apiKey},state:{key:ctx.apiKey}}; throw new Error(ctx.apiKey); }
+export function buildQueryRequest(ctx) { return {url:ctx.baseUrl+"/query"}; }
+export function parseTaskResult() { return {status:"SUCCESS"}; }`
+	var logs []string
+	plugin, err := pluginruntime.CompilePlugin(source, pluginruntime.Options{Log: func(message string) { logs = append(logs, message) }})
+	require.NoError(t, err)
+	for _, snapshot := range []bool{false, true} {
+		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "never-echo-this-secret", ChannelBaseUrl: "https://provider.example", UpstreamModelName: "test"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: "test"}
+		if snapshot {
+			info.TaskChannelSnapshot = &relaycommon.TaskChannelSnapshot{Encrypted: true}
+		} else {
+			info.ChannelLimitAttempt = &relaycommon.ChannelLimitRuntime{WriteOnlyCredentials: true}
+		}
+		adaptor := New(plugin)
+		adaptor.Init(info)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/submit", nil)
+		c.Set("task_request", map[string]any{"fail": true})
+		failure := adaptor.ValidateRequestAndSetAction(c, info)
+		require.NotNil(t, failure)
+		assert.Equal(t, "Upstream request failed", failure.Message)
+		assert.NotContains(t, failure.Error.Error(), info.ApiKey)
+		_, failure = adaptor.ParseResponse(c, &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, info)
+		require.NotNil(t, failure)
+		assert.Equal(t, "Upstream request failed", failure.Message)
+		assert.NotContains(t, failure.Error.Error(), info.ApiKey)
+		responseBody, err := common.Marshal(map[string]any{"ok": true, "echo": info.ApiKey})
+		require.NoError(t, err)
+		submitted, failure := adaptor.ParseResponse(c, &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(responseBody))}, info)
+		require.Nil(t, failure)
+		require.NotNil(t, submitted)
+		assert.NotContains(t, string(submitted.TaskData), info.ApiKey)
+		assert.NotContains(t, string(submitted.PluginState), info.ApiKey)
+		require.NotNil(t, submitted.Immediate)
+		assert.NotContains(t, submitted.Immediate.Url, info.ApiKey)
+		_, err = adaptor.taskHTTPClient("http://127.0.0.1/query", "")
+		require.Error(t, err, "copying a protected credential into platform ownership cannot disable secure transport")
+		assert.NotContains(t, strings.Join(logs, "\n"), info.ApiKey)
 	}
 }
 

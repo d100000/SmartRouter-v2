@@ -37,7 +37,10 @@ import {
 } from '@/components/ui/form'
 import { SecureVerificationDialog } from '@/features/auth/secure-verification'
 import { changeAccountPassword } from '@/features/profile/api'
+import { refreshAuthentication } from '@/lib/auth-session'
 import { accountPasswordSchema } from '@/lib/password-policy'
+import { isSupplier } from '@/lib/supplier-access'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { useAccountSecurity } from '../../hooks/use-account-security'
 
@@ -69,6 +72,7 @@ interface ChangePasswordDialogProps {
 export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
   const { t } = useTranslation()
   const security = useAccountSecurity()
+  const supplier = useAuthStore((state) => isSupplier(state.auth.user))
   const hasPassword = props.hasPassword !== false
   const form = useForm<PasswordChangeValues>({
     resolver: zodResolver(passwordChangeSchema),
@@ -95,6 +99,17 @@ export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
     props.onOpenChange(open)
   }
   const submit = async (values: PasswordChangeValues) => {
+    if (supplier && [...values.newPassword].length < 15) {
+      form.setError(
+        'newPassword',
+        {
+          message:
+            'Supplier account passwords must contain at least 15 characters',
+        },
+        { shouldFocus: true }
+      )
+      return
+    }
     if (hasPassword && !values.originalPassword) {
       form.setError(
         'originalPassword',
@@ -133,6 +148,7 @@ export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
       )
     })
     if (!result) return
+    if (supplier) await refreshAuthentication()
     form.reset(emptyPasswordForm)
     toast.success(
       t(

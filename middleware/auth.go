@@ -49,7 +49,7 @@ func validUserInfo(username string, role int) bool {
 	return true
 }
 
-func authHelper(c *gin.Context, minRole int) {
+func authHelper(c *gin.Context, minRole int, permissions ...authz.Permission) {
 	if _, started := c.Get(accessTokenAuditContextKey); !started {
 		defer finishAccessTokenAudit(c)
 	}
@@ -65,6 +65,26 @@ func authHelper(c *gin.Context, minRole int) {
 	if user.Role < minRole {
 		abortWithWebMessage(c, http.StatusForbidden, "AUTH_INSUFFICIENT_PRIVILEGE", common.NewMessage("Unauthorized, insufficient privileges"))
 		return
+	}
+	if minRole == common.RoleSupplierUser && (user.Role != common.RoleSupplierUser || user.SupplierID == "") {
+		abortWithWebMessage(c, http.StatusForbidden, "AUTH_INSUFFICIENT_PRIVILEGE", common.NewMessage("Unauthorized, insufficient privileges"))
+		return
+	}
+	if user.Role == common.RoleSupplierUser {
+		if useAccessToken || !supplierDashboardRouteAllowed(c.Request.Method, c.FullPath()) {
+			abortWithWebMessage(c, http.StatusForbidden, "AUTH_SUPPLIER_SCOPE_DENIED", common.NewMessage("Unauthorized, insufficient privileges"))
+			return
+		}
+		if user.MustChangePassword && strings.HasPrefix(c.FullPath(), "/api/supplier/") {
+			abortWithWebMessage(c, http.StatusForbidden, "AUTH_PASSWORD_CHANGE_REQUIRED", common.NewMessage("Unauthorized, insufficient privileges"))
+			return
+		}
+	}
+	for _, permission := range permissions {
+		if !authz.Can(user.Id, user.Role, permission) {
+			abortWithWebMessage(c, http.StatusForbidden, "AUTH_INSUFFICIENT_PRIVILEGE", common.NewMessage("Unauthorized, insufficient privileges"))
+			return
+		}
 	}
 	var lookup *accessTokenLookup
 	if useAccessToken {
@@ -115,7 +135,7 @@ func TryUserAuth() func(c *gin.Context) {
 		var lookup *accessTokenLookup
 		if credentialKind == dashboardCredentialPAT {
 			lookup = requestAccessTokenLookup(c)
-			if user.Status != common.UserStatusEnabled || !enforceAccessTokenRoute(c, lookup, false) {
+			if user.Status != common.UserStatusEnabled || user.Role == common.RoleSupplierUser || !enforceAccessTokenRoute(c, lookup, false) {
 				credentialKind = dashboardCredentialUnmatched
 			}
 		}
@@ -138,6 +158,22 @@ func UserAuth() func(c *gin.Context) {
 func AdminAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		authHelper(c, common.RoleAdminUser)
+	}
+}
+
+// SupplierAuth authenticates the dedicated supplier identity. Ownership checks
+// still belong to each supplier resource query, using supplier_id from context.
+func SupplierAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHelper(c, common.RoleSupplierUser)
+	}
+}
+
+// ChannelReadAuth is only for side-effect-free, explicitly redacted channel
+// handlers. It does not grant access to existing mutating GET handlers.
+func ChannelReadAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHelper(c, common.RoleCommonUser, authz.ChannelRead)
 	}
 }
 
@@ -443,6 +479,10 @@ func TokenOrUserAuth() func(c *gin.Context) {
 				writeDashboardAuthError(c, err)
 				return
 			}
+			if user.Role == common.RoleSupplierUser {
+				abortWithWebMessage(c, http.StatusForbidden, "AUTH_SUPPLIER_SCOPE_DENIED", common.NewMessage("Unauthorized, insufficient privileges"))
+				return
+			}
 			setDashboardAuthContext(c, user, identity, false)
 			c.Next()
 			return
@@ -514,6 +554,11 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		}
 		if userCache.Status != common.UserStatusEnabled {
 			common.ApiErrorStatus(c, http.StatusForbidden, errors.New(common.TranslateMessage(c, i18n.MsgAuthUserBanned)))
+			c.Abort()
+			return
+		}
+		if userCache.Role == common.RoleSupplierUser {
+			common.ApiErrorStatus(c, http.StatusForbidden, errors.New(common.TranslateMessage(c, i18n.MsgAuthSupplierConsumerForbidden)))
 			c.Abort()
 			return
 		}
@@ -614,6 +659,10 @@ func TokenAuth() func(c *gin.Context) {
 		userEnabled := userCache.Status == common.UserStatusEnabled
 		if !userEnabled {
 			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
+			return
+		}
+		if userCache.Role == common.RoleSupplierUser {
+			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthSupplierConsumerForbidden), types.ErrorCodeAccessDenied)
 			return
 		}
 

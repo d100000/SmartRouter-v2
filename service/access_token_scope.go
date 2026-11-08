@@ -123,6 +123,9 @@ func AccessTokenScopeOf(permission authz.Permission) string {
 // for display. Resources without a grantable action and empty groups are
 // omitted.
 func AccessTokenCatalog(userID, role int) []AccessTokenCatalogGroup {
+	if role == common.RoleSupplierUser {
+		return nil
+	}
 	resources := map[string][]AccessTokenResource{}
 	for _, resource := range accessTokenStaticResources {
 		if role < resource.minRole {
@@ -131,7 +134,7 @@ func AccessTokenCatalog(userID, role int) []AccessTokenCatalogGroup {
 		resource.Actions = slices.Clone(resource.Actions)
 		resources[resource.group] = append(resources[resource.group], resource)
 	}
-	if role >= common.RoleAdminUser {
+	if role >= common.RoleAdminUser || authz.Can(userID, role, authz.ChannelRead) {
 		for _, definition := range authz.Catalog() {
 			resource := AccessTokenResource{Resource: definition.Resource, LabelKey: definition.LabelKey}
 			for _, action := range definition.Actions {
@@ -217,28 +220,30 @@ func AccessTokenScopeGranted(scopes []string, scope string) bool {
 // scope a PAT needs to obtain its proof. An empty value means PATs can never
 // obtain it; scopes missing from this table are denied too.
 var accessTokenVerificationScopes = map[string]string{
-	VerificationScopeChannelKeyRead:        AccessTokenScopeOf(authz.ChannelSecretView),
-	VerificationScopeAdminUserCreate:       "user:write",
-	VerificationScopeAdminUserUpdate:       "user:write",
-	VerificationScopeAdminUserDelete:       "user:write",
-	VerificationScopeAdminUserManage:       "user:write",
-	VerificationScopeAdminUserPasskeyReset: "user:write",
-	VerificationScopeAdminUserTwoFADisable: "user:write",
-	VerificationScopeAdminUserBindingClear: "user:write",
-	VerificationScopePasskeyRegister:       "account_security:write",
-	VerificationScopePasskeyDelete:         "account_security:write",
-	VerificationScopeTwoFASetup:            "account_security:write",
-	VerificationScopeTwoFADisable:          "account_security:write",
-	VerificationScopeTwoFABackupCodes:      "account_security:write",
-	VerificationScopePasswordSet:           "account_security:write",
-	VerificationScopePasswordChange:        "account_security:write",
-	VerificationScopeAccountBind:           "account_security:write",
-	VerificationScopeAccountUnbind:         "account_security:write",
-	VerificationScopeAccountDelete:         "account_security:write",
-	VerificationScopeAccessTokenGenerate:   "",
-	VerificationScopeAccessTokenUpdate:     "",
-	VerificationScopeAccessTokenRevoke:     "",
-	VerificationScopeLogin:                 "",
+	VerificationScopeSupplierChannelCredentials: AccessTokenScopeOf(authz.ChannelSensitiveWrite),
+	VerificationScopeSupplierManage:             "user:write",
+	VerificationScopeChannelKeyRead:             AccessTokenScopeOf(authz.ChannelSecretView),
+	VerificationScopeAdminUserCreate:            "user:write",
+	VerificationScopeAdminUserUpdate:            "user:write",
+	VerificationScopeAdminUserDelete:            "user:write",
+	VerificationScopeAdminUserManage:            "user:write",
+	VerificationScopeAdminUserPasskeyReset:      "user:write",
+	VerificationScopeAdminUserTwoFADisable:      "user:write",
+	VerificationScopeAdminUserBindingClear:      "user:write",
+	VerificationScopePasskeyRegister:            "account_security:write",
+	VerificationScopePasskeyDelete:              "account_security:write",
+	VerificationScopeTwoFASetup:                 "account_security:write",
+	VerificationScopeTwoFADisable:               "account_security:write",
+	VerificationScopeTwoFABackupCodes:           "account_security:write",
+	VerificationScopePasswordSet:                "account_security:write",
+	VerificationScopePasswordChange:             "account_security:write",
+	VerificationScopeAccountBind:                "account_security:write",
+	VerificationScopeAccountUnbind:              "account_security:write",
+	VerificationScopeAccountDelete:              "account_security:write",
+	VerificationScopeAccessTokenGenerate:        "",
+	VerificationScopeAccessTokenUpdate:          "",
+	VerificationScopeAccessTokenRevoke:          "",
+	VerificationScopeLogin:                      "",
 }
 
 // AccessTokenVerificationScope returns the token scope a PAT needs for a

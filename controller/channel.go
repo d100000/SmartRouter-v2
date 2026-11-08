@@ -211,6 +211,7 @@ func GetAllChannels(c *gin.Context) {
 	var total int64
 	now := time.Now()
 	baseQuery := model.ApplyChannelGroupFilter(model.DB.Model(&model.Channel{}), groupFilter)
+	baseQuery = model.ApplyChannelSupplierFilter(baseQuery, c.Query("owner_supplier_id"))
 	baseQuery = model.ApplyChannelFundingFilter(baseQuery, c.Query("funding_status"))
 	baseQuery = model.ApplyChannelEffectiveStatusFilter(baseQuery, statusFilter, now)
 	listQuery := baseQuery.Session(&gorm.Session{})
@@ -385,7 +386,7 @@ func SearchChannels(c *gin.Context) {
 	enableTagMode, _ := strconv.ParseBool(c.Query("tag_mode"))
 	channelData := make([]*model.Channel, 0)
 	if enableTagMode {
-		tags, err := model.SearchTags(keyword, group, modelKeyword, idSort)
+		tags, err := model.SearchTags(keyword, group, modelKeyword, idSort, c.Query("owner_supplier_id"))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -393,7 +394,7 @@ func SearchChannels(c *gin.Context) {
 		for _, tag := range tags {
 			if tag != nil && *tag != "" {
 				var tagChannels []*model.Channel
-				err := sortOptions.Apply(buildChannelListQuery(group, -1, -1).Where("tag = ?", *tag)).
+				err := sortOptions.Apply(model.ApplyChannelSupplierFilter(buildChannelListQuery(group, -1, -1), c.Query("owner_supplier_id")).Where("tag = ?", *tag)).
 					Omit("key", "upstream_credential_snapshot_data").
 					Find(&tagChannels).Error
 				if err != nil {
@@ -404,7 +405,7 @@ func SearchChannels(c *gin.Context) {
 			}
 		}
 	} else {
-		channels, err := model.SearchChannels(keyword, group, modelKeyword, idSort, sortOptions)
+		channels, err := model.SearchChannelsBySupplier(keyword, group, modelKeyword, idSort, c.Query("owner_supplier_id"), sortOptions)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -564,6 +565,10 @@ func GetChannelKey(c *gin.Context) {
 	}
 	if err != nil {
 		writeSecurityOperationError(c, err)
+		return
+	}
+	if channel.SecretsWriteOnly || channel.OwnerSupplierID != "" {
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 
@@ -1178,6 +1183,22 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	originProxy := originChannel.GetSetting().Proxy
+	if originChannel.OwnerSupplierID != "" {
+		connectionChanged := channel.Key != "" || channelHasSensitiveChanges(&channel, originChannel, requestData)
+		if _, supplied := requestData["models"]; supplied && channel.Models != originChannel.Models {
+			connectionChanged = true
+		}
+		if _, supplied := requestData["model_mapping"]; supplied && !equalStringPtr(channel.ModelMapping, originChannel.ModelMapping) {
+			connectionChanged = true
+		}
+		if _, supplied := requestData["status_code_mapping"]; supplied && !equalStringPtr(channel.StatusCodeMapping, originChannel.StatusCodeMapping) {
+			connectionChanged = true
+		}
+		if connectionChanged {
+			common.ApiErrorT(c, "Use the supplier channel editor to change validated connection settings")
+			return
+		}
+	}
 	proxyChanged := false
 	_, settingProvided := requestData["setting"]
 	if settingProvided {
@@ -1732,6 +1753,10 @@ func ManageMultiKeys(c *gin.Context) {
 		common.ApiErrorT(c, "This channel is not in multi-key mode")
 		return
 	}
+	if channel.OwnerSupplierID != "" && (request.Action == "delete_key" || request.Action == "delete_disabled_keys") {
+		common.ApiErrorT(c, "Use the supplier channel editor to change validated connection settings")
+		return
+	}
 	if multiKeyActionRequiresSensitiveWrite(request.Action) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
@@ -1805,6 +1830,9 @@ func ManageMultiKeys(c *gin.Context) {
 			keyPreview := key
 			if len(key) > 10 {
 				keyPreview = key[:10] + "..."
+			}
+			if channel.SecretsWriteOnly || channel.OwnerSupplierID != "" {
+				keyPreview, reason = "configured", ""
 			}
 
 			allKeyStatusList = append(allKeyStatusList, KeyStatus{
@@ -2181,6 +2209,10 @@ func OllamaPullModel(c *gin.Context) {
 	}
 
 	// 检查是否是 Ollama 渠道
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -2244,6 +2276,10 @@ func OllamaPullModelStream(c *gin.Context) {
 	}
 
 	// 检查是否是 Ollama 渠道
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -2326,6 +2362,10 @@ func OllamaDeleteModel(c *gin.Context) {
 	}
 
 	// 检查是否是 Ollama 渠道
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -2375,6 +2415,10 @@ func OllamaVersion(c *gin.Context) {
 		return
 	}
 
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,

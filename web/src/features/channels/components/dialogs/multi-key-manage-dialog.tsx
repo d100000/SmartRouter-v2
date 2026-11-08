@@ -86,6 +86,8 @@ export function MultiKeyManageDialog({
     ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
   )
 
+  const canDelete = canEditSensitive && !currentRow?.owner_supplier_id
+
   // Data state
   const [isLoading, setIsLoading] = useState(false)
   const [keys, setKeys] = useState<KeyStatus[]>([])
@@ -163,7 +165,7 @@ export function MultiKeyManageDialog({
   const performAction = async () => {
     if (!confirmAction || !currentRow) return
     if (
-      !canEditSensitive &&
+      !canDelete &&
       (confirmAction.type === 'delete' ||
         confirmAction.type === 'delete-disabled')
     ) {
@@ -345,7 +347,7 @@ export function MultiKeyManageDialog({
                 </Button>
               )}
 
-              {autoDisabledCount > 0 && (
+              {autoDisabledCount > 0 && !currentRow?.owner_supplier_id && (
                 <Button
                   variant='destructive'
                   size='sm'
@@ -426,7 +428,8 @@ export function MultiKeyManageDialog({
                       <MultiKeyTableRowActions
                         keyIndex={key.index}
                         status={key.status}
-                        canDelete={canEditSensitive}
+                        canDelete={canDelete}
+                        hideDelete={Boolean(currentRow?.owner_supplier_id)}
                         onAction={setConfirmAction}
                       />
                     ),

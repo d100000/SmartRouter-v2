@@ -29,6 +29,9 @@ type UpstreamSupplier struct {
 }
 
 type UpstreamCredential struct {
+	OwnerSupplierID    string   `json:"-" gorm:"type:varchar(36);index"`
+	SecretsWriteOnly   bool     `json:"-"`
+	CreatedBy          int      `json:"-"`
 	ID                 string   `json:"id" gorm:"type:varchar(36);primaryKey"`
 	Alias              string   `json:"alias" gorm:"type:varchar(100)"`
 	SupplierID         string   `json:"supplier_id" gorm:"type:varchar(36);index"`
@@ -42,10 +45,11 @@ type UpstreamCredential struct {
 }
 
 type UpstreamCredentialVersion struct {
-	ID           string `json:"id" gorm:"type:varchar(36);primaryKey"`
-	CredentialID string `json:"credential_id" gorm:"type:varchar(36);index"`
-	Fingerprint  string `json:"-" gorm:"type:varchar(64);uniqueIndex"`
-	CreatedTime  int64  `json:"created_time" gorm:"bigint"`
+	SecretCiphertext string `json:"-" gorm:"type:text"`
+	ID               string `json:"id" gorm:"type:varchar(36);primaryKey"`
+	CredentialID     string `json:"credential_id" gorm:"type:varchar(36);index"`
+	Fingerprint      string `json:"-" gorm:"type:varchar(64);uniqueIndex"`
+	CreatedTime      int64  `json:"created_time" gorm:"bigint"`
 }
 
 type ChannelCredentialBinding struct {
@@ -124,6 +128,9 @@ func (credential *UpstreamCredential) AfterFind(_ *gorm.DB) error {
 }
 
 func (channel *Channel) AfterFind(_ *gorm.DB) error {
+	if err := channel.openSupplierCredential(); err != nil {
+		return err
+	}
 	var snapshots []UpstreamCredentialSnapshot
 	if channel.UpstreamCredentialSnapshotData != "" {
 		// Reporting metadata must never make an otherwise usable channel fail
@@ -199,7 +206,11 @@ func upstreamCredentialNamespace(channel *Channel) (string, error) {
 	if baseURL == "" {
 		baseURL = constant.GetChannelBaseURL(channel.Type)
 	}
-	namespace, err := common.Marshal([]any{channel.Type, strings.TrimRight(baseURL, "/"), organization})
+	parts := []any{channel.Type, strings.TrimRight(baseURL, "/"), organization}
+	if channel.OwnerSupplierID != "" {
+		parts = append(parts, channel.OwnerSupplierID)
+	}
+	namespace, err := common.Marshal(parts)
 	return string(namespace), err
 }
 
@@ -229,11 +240,17 @@ func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
 		var credential UpstreamCredential
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			now := common.GetTimestamp()
-			credential = UpstreamCredential{ID: uuid.NewString(), TagsJSON: "[]", Tags: []string{}, CostVersionID: uuid.NewString(), OwnershipVersionID: uuid.NewString(), CreatedTime: now, UpdatedTime: now}
+			credential = UpstreamCredential{ID: uuid.NewString(), TagsJSON: "[]", Tags: []string{}, CostVersionID: uuid.NewString(), OwnershipVersionID: uuid.NewString(), CreatedTime: now, UpdatedTime: now, OwnerSupplierID: channel.OwnerSupplierID, SupplierID: channel.OwnerSupplierID, SecretsWriteOnly: channel.SecretsWriteOnly, CreatedBy: channel.CreatedBy}
 			if err := tx.Create(&credential).Error; err != nil {
 				return err
 			}
 			version = UpstreamCredentialVersion{ID: uuid.NewString(), CredentialID: credential.ID, Fingerprint: fingerprint, CreatedTime: now}
+			if channel.SecretsWriteOnly {
+				version.SecretCiphertext, err = EncryptSupplierSecret(channel.OwnerSupplierID, key)
+				if err != nil {
+					return err
+				}
+			}
 			// Fingerprints are also private metadata, so do not log their SQL values.
 			if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Create(&version).Error; err != nil {
 				return errors.New("failed to register upstream credential")
@@ -242,6 +259,15 @@ func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
 			return err
 		} else if err := tx.First(&credential, "id = ?", version.CredentialID).Error; err != nil {
 			return err
+		}
+		if credential.OwnerSupplierID != channel.OwnerSupplierID {
+			return errors.New("credential ownership mismatch")
+		}
+		if credential.SecretsWriteOnly && !channel.SecretsWriteOnly {
+			channel.SecretsWriteOnly = true
+			if err := tx.Model(channel).Select("key", "secrets_write_only").Updates(channel).Error; err != nil {
+				return err
+			}
 		}
 		binding := ChannelCredentialBinding{}
 		for _, candidate := range bindings {
@@ -289,7 +315,117 @@ func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
 	}
 	channel.UpstreamCredentialSnapshotData = string(data)
 	channel.cacheUpstreamCredentialSnapshots(snapshots)
-	return tx.Model(&Channel{}).Where("id = ?", channel.Id).Update("upstream_credential_snapshot_data", channel.UpstreamCredentialSnapshotData).Error
+	if err := tx.Model(&Channel{}).Where("id = ?", channel.Id).Update("upstream_credential_snapshot_data", channel.UpstreamCredentialSnapshotData).Error; err != nil {
+		return err
+	}
+	return tx.Model(&ChannelLimitConfig{}).Where("channel_id = ?", channel.Id).Update("budget_ready", channel.ProcurementCostReady()).Error
+}
+
+// refreshProcurementCostSnapshots updates only non-secret pricing metadata.
+// Supplier defaults can therefore change without loading or decrypting Keys.
+func (channel *Channel) refreshProcurementCostSnapshots() error {
+	var snapshots []UpstreamCredentialSnapshot
+	if channel.UpstreamCredentialSnapshotData != "" {
+		if err := common.UnmarshalJsonStr(channel.UpstreamCredentialSnapshotData, &snapshots); err != nil {
+			return err
+		}
+	}
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		snapshot.ChannelCostVersionID = channel.CostVersionID
+		snapshot.EffectiveCostRatio, snapshot.CostVersionID, snapshot.CostSource = channel.CostRatio, channel.CostVersionID, "unknown"
+		if snapshot.CostRatio != nil {
+			snapshot.EffectiveCostRatio, snapshot.CostVersionID, snapshot.CostSource = snapshot.CostRatio, snapshot.CredentialCostVersionID, "credential"
+		} else if channel.CostRatio != nil {
+			snapshot.CostSource = "channel"
+		}
+	}
+	data, err := common.Marshal(snapshots)
+	if err != nil {
+		return err
+	}
+	channel.UpstreamCredentialSnapshotData = string(data)
+	channel.cacheUpstreamCredentialSnapshots(snapshots)
+	return nil
+}
+
+// ProcurementCostReady describes whether every active credential has a cost
+// rule. The per-attempt gate still requires a computable request-cost estimate.
+func (channel *Channel) ProcurementCostReady() bool {
+	if channel.CostRatio != nil {
+		return true
+	}
+	var snapshots []UpstreamCredentialSnapshot
+	if common.UnmarshalJsonStr(channel.UpstreamCredentialSnapshotData, &snapshots) != nil {
+		return false
+	}
+	active := false
+	for _, snapshot := range snapshots {
+		if !snapshot.Active {
+			continue
+		}
+		active = true
+		if snapshot.EffectiveCostRatio == nil {
+			return false
+		}
+	}
+	return active
+}
+
+// GetChannelProcurementSnapshot preserves credential > channel > supplier
+// precedence. Supplier attempts read current non-secret metadata, avoiding a
+// stale shared routing snapshot after an administrator changes a cost rule.
+func GetChannelProcurementSnapshot(channel *Channel, index int, account *SupplierAccount) (UpstreamCredentialSnapshot, error) {
+	if channel.OwnerSupplierID == "" {
+		return channel.GetUpstreamCredentialSnapshot(index), nil
+	}
+	var current Channel
+	if err := DB.Select("id", "owner_supplier_id", "cost_ratio", "cost_version_id", "upstream_credential_snapshot_data").First(&current, "id = ? AND owner_supplier_id = ?", channel.Id, channel.OwnerSupplierID).Error; err != nil {
+		return UpstreamCredentialSnapshot{}, err
+	}
+	snapshot := current.GetUpstreamCredentialSnapshot(index)
+	var snapshots []UpstreamCredentialSnapshot
+	if current.UpstreamCredentialSnapshotData != "" {
+		if err := common.UnmarshalJsonStr(current.UpstreamCredentialSnapshotData, &snapshots); err != nil {
+			return UpstreamCredentialSnapshot{}, err
+		}
+		if channel.ProcurementCredentialID == nil && len(snapshots) > 0 && !snapshot.Active {
+			return UpstreamCredentialSnapshot{}, ErrChannelLimitAccounting
+		}
+	}
+	if candidateID := channel.ProcurementCredentialID; candidateID != nil {
+		snapshot = UpstreamCredentialSnapshot{ChannelID: current.Id, KeyIndex: index, CostSource: "unknown"}
+		if *candidateID != "" {
+			for _, candidate := range snapshots {
+				if candidate.Active && candidate.CredentialID == *candidateID {
+					snapshot = candidate
+					break
+				}
+			}
+			if !snapshot.Active {
+				return UpstreamCredentialSnapshot{}, ErrChannelLimitAccounting
+			}
+		}
+	}
+	if snapshot.Active && snapshot.CostRatio != nil {
+		snapshot.EffectiveCostRatio, snapshot.CostVersionID, snapshot.CostSource = snapshot.CostRatio, snapshot.CredentialCostVersionID, "credential"
+	} else if current.CostVersionID != "" {
+		snapshot.EffectiveCostRatio, snapshot.CostVersionID, snapshot.CostSource = current.CostRatio, current.CostVersionID, "unknown"
+		if current.CostRatio != nil {
+			snapshot.CostSource = "channel"
+		}
+	} else if account != nil {
+		snapshot.EffectiveCostRatio, snapshot.CostVersionID, snapshot.CostSource = account.CostRatio, account.DefaultCostVersionID(), "unknown"
+		if account.CostRatio != nil {
+			snapshot.CostSource = "channel"
+		}
+	}
+	snapshot.ChannelCostVersionID = current.CostVersionID
+	if snapshot.EffectiveCostRatio != nil {
+		value := *snapshot.EffectiveCostRatio
+		snapshot.EffectiveCostRatio = &value
+	}
+	return snapshot, nil
 }
 
 // Rotation is an explicit trusted operation, separate from replacing an
@@ -346,7 +482,19 @@ func RotateChannelUpstreamCredential(channelID int, expectedKey, newKey string) 
 		if err := tx.Model(&binding).Update("credential_version_id", version.ID).Error; err != nil {
 			return err
 		}
-		if err := privateDB.Model(&Channel{}).Where("id = ?", channelID).Update("key", newKey).Error; err != nil {
+		storedKey := newKey
+		if channel.SecretsWriteOnly {
+			storedKey, err = EncryptSupplierSecret(channel.OwnerSupplierID, newKey)
+			if err != nil {
+				return err
+			}
+			if version.SecretCiphertext == "" {
+				if err := privateDB.Model(&version).Update("secret_ciphertext", storedKey).Error; err != nil {
+					return err
+				}
+			}
+		}
+		if err := privateDB.Model(&Channel{}).Where("id = ?", channelID).Update("key", storedKey).Error; err != nil {
 			return errors.New("failed to persist rotated upstream credential")
 		}
 		channel.Key = newKey
@@ -489,6 +637,9 @@ func UpdateUpstreamCredentialMetadata(id string, metadata UpstreamCredentialMeta
 		}
 		if err := lockForUpdate(tx).First(&credential, "id = ?", id).Error; err != nil {
 			return err
+		}
+		if credential.OwnerSupplierID != "" && metadata.SupplierID != credential.OwnerSupplierID {
+			return errors.New("supplier credential ownership cannot be transferred")
 		}
 		if metadata.SupplierID != "" {
 			var count int64

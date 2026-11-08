@@ -210,7 +210,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 
-	channel, err := model.CacheGetChannel(task.ChannelId)
+	channel, err := service.ResolveTaskChannelConnection(task)
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
@@ -262,7 +262,14 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		req.Header.Set(name, value)
 	}
 
-	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
+	if task.PrivateData.ChannelAttempt != nil && task.PrivateData.ChannelAttempt.SupplierID != "" {
+		if parsedURL.Scheme != "https" {
+			return &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_request_rejected", message: "Artifact request was rejected", err: errTaskMediaRequestRejected}
+		}
+		client = service.GetSupplierHTTPClient()
+	} else {
+		client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
+	}
 	clientWithoutBodyTimeout := *client
 	clientWithoutBodyTimeout.Timeout = 0
 	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)

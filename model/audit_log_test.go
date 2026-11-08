@@ -17,6 +17,45 @@ import (
 	"gorm.io/gorm/schema"
 )
 
+func TestSupplierAuditIdentityAndSelfVisibility(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	previousDB, previousType := LOG_DB, common.LogDatabaseType()
+	LOG_DB = db
+	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		LOG_DB = previousDB
+		common.SetLogDatabaseType(previousType)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&AuditLog{}))
+	for i, role := range []int{common.RoleSupplierUser, common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		RecordAuditLog(nil, AuditLog{EventId: fmt.Sprintf("supplier-audit-%d", i), UserId: i + 1, Username: fmt.Sprintf("actor-%d", i), ActorRole: role, Category: AuditCategorySecurity, Action: "password.change", Success: true, Other: AuditOther{AdminInfo: &AuditAdminInfo{AdminID: 99}, RootInfo: AuditFields{"internal": "hidden"}}})
+	}
+	var stored AuditLog
+	require.NoError(t, db.First(&stored, "user_id = ?", 1).Error)
+	assert.Equal(t, common.RoleSupplierUser, stored.ActorRole)
+	for _, user := range []struct{ id, role int }{{1, common.RoleSupplierUser}, {2, common.RoleCommonUser}} {
+		logs, total, err := GetAuditLogs(AuditLogFilter{SelfView: true, UserId: user.id}, 0, 10, user.role)
+		require.NoError(t, err)
+		require.Len(t, logs, 1)
+		assert.EqualValues(t, 1, total)
+		assert.Equal(t, user.id, logs[0].UserId)
+		assert.Nil(t, logs[0].Other.AdminInfo)
+		assert.Nil(t, logs[0].Other.RootInfo)
+	}
+	logs, total, err := GetAuditLogs(AuditLogFilter{}, 0, 10, common.RoleAdminUser)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, total)
+	assert.Len(t, logs, 3)
+	for _, log := range logs {
+		assert.NotEqual(t, common.RoleRootUser, log.ActorRole)
+		assert.Nil(t, log.Other.RootInfo)
+	}
+}
+
 // TestAuditLogSortIndexDatabaseMatrix verifies audit ordering and index migrations across supported databases.
 func TestAuditLogSortIndexDatabaseMatrix(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {

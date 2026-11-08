@@ -55,6 +55,18 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
   return {
     navGroups: [
       {
+        id: 'supply',
+        title: t('Supply'),
+        items: [
+          { title: t('Supplier Workspace'), url: '/supplier', icon: Radio },
+        ],
+      },
+      {
+        id: 'channel-viewer',
+        title: t('Channels'),
+        items: [{ title: t('Channel Viewer'), url: '/channels', icon: Radio }],
+      },
+      {
         id: 'chat',
         title: t('Chat'),
         items: [
@@ -133,6 +145,12 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
         id: 'admin',
         title: t('Admin'),
         items: [
+          {
+            title: t('Channel Suppliers'),
+            url: '/suppliers',
+            icon: Users,
+            requiredRole: ROLE.ADMIN,
+          },
           {
             title: t('Error analysis'),
             url: '/error-analysis',

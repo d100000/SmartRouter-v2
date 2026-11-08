@@ -4,6 +4,7 @@
 # Errors returned to AI clients
 common.database_error: "数据库出错，请联系管理员"
 auth.user_banned: "用户已被封禁"
+auth.supplier_consumer_forbidden: "供应商账号不能使用消费 API 密钥或调用模型"
 token.get_info_failed: "获取令牌信息失败，请稍后重试"
 token.invalid: "无效的令牌"
 token.not_provided: "未提供令牌"
@@ -98,6 +99,7 @@ channel.upstream_update_failed_channels: "失败渠道 ID（展示 {{.Shown}}/{{
 channel.upstream_update_more_omitted: "（其余 {{.Count}} 个已省略）"
 
 distributor.channel_outside_schedule: "渠道当前不在有效时间内"
+distributor.supplier_unavailable: "上游供应商暂时不可用"
 
 # Upstream channel funding notifications
 funding.notice_subject: "渠道 {{.Name}}（#{{.Id}}）欠费提醒：影响 {{.Count}} 个 Key"
@@ -116,3 +118,4 @@ funding.probe_blocked: "暂时受阻"
 funding.probe_manual_required: "需人工复核"
 funding.probe_recovered: "已恢复"
 funding.probe_cancelled: "已取消"
+relay.channel_limit_unavailable: "上游渠道当前无可用容量"

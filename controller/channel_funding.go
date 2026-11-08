@@ -80,6 +80,8 @@ func runFundingProbes(ctx context.Context, incidentID int64) (int, error) {
 		keyDisabledManually := channel.ChannelInfo.IsMultiKey && channel.ChannelInfo.MultiKeyStatusList[binding.KeyIndex] == common.ChannelStatusManuallyDisabled
 		success := false
 		switch {
+		case channel.OwnerSupplierID != "" || channel.SecretsWriteOnly:
+			probeStatus, detail = "manual_required", "No reliable automatic recovery check is available"
 		case incidentID == 0 && (channel.Status == common.ChannelStatusManuallyDisabled || keyDisabledManually):
 			probeStatus, detail = "paused", "Channel or key was disabled manually"
 		case !channel.ScheduleAllowsAt(time.Now()):
@@ -236,6 +238,15 @@ func OperateChannelFunding(c *gin.Context) {
 		return
 	}
 	if strings.HasSuffix(c.FullPath(), "/probe") {
+		channel, err := model.GetChannelById(id, false)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+			common.ApiError(c, model.ErrSupplierChannelOperation)
+			return
+		}
 		if !operation_setting.GetChannelFundingSetting().Enabled {
 			common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Channel funding monitoring is disabled"))
 			return

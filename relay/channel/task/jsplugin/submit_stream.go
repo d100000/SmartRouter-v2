@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -73,6 +74,13 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 		}
 		timer.Reset(idleTimeout)
 		line := scanner.Text()
+		if a.protectedSupplier() {
+			if field, value, hasSeparator := strings.Cut(line, ":"); hasSeparator {
+				line = field + ":" + string(service.RedactTaskChannelPayload(a.info, []byte(value)))
+			} else {
+				line = string(service.RedactTaskChannelPayload(a.info, []byte(line)))
+			}
+		}
 		if firstLine {
 			line = strings.TrimPrefix(line, "\ufeff")
 			firstLine = false
@@ -192,6 +200,7 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 	}
 	switch {
 	case readErr == nil && completed:
+		a.submitTerminalConfirmed = true
 		return result, false, nil
 	case !relayed:
 		if readErr == nil {

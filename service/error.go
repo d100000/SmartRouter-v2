@@ -203,7 +203,8 @@ func TaskErrorWrapper(err error, code string, statusCode int, upstreamURLs ...st
 	text := err.Error()
 	lowerText := strings.ToLower(text)
 	if strings.Contains(lowerText, "post") || strings.Contains(lowerText, "dial") || strings.Contains(lowerText, "http") {
-		common.SysLog(common.LogText("error: %s", text))
+		// An upstream body, hook exception or URL error may contain a channel
+		// credential. Callers can add safe context; never log this raw error.
 		//text = "请求上游地址失败"
 		text = common.MaskSensitiveInfo(text, upstreamURLs...)
 	}

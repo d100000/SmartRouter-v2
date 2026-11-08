@@ -35,6 +35,11 @@ export const channelInfoSchema = z.object({
 export type ChannelInfo = z.infer<typeof channelInfoSchema>
 
 export const channelSchema = z.object({
+  owner_supplier_id: z.string().optional(),
+  secrets_write_only: z.boolean().optional(),
+  supplier_id: z.string().nullish(),
+  supplier_name: z.string().optional(),
+  key_write_only: z.boolean().optional(),
   id: z.number(),
   type: z.number(),
   key: z.string(),
@@ -343,6 +348,7 @@ export type ChannelSortBy =
 export type ChannelSortOrder = 'asc' | 'desc'
 
 export interface GetChannelsParams {
+  owner_supplier_id?: string
   funding_status?: string
   p?: number
   page_size?: number
@@ -356,6 +362,7 @@ export interface GetChannelsParams {
 }
 
 export interface SearchChannelsParams {
+  owner_supplier_id?: string
   funding_status?: string
   keyword?: string
   group?: string

@@ -21,6 +21,7 @@ import { Loader2, MessageCircleWarning } from 'lucide-react'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ChatFrame } from '@/components/chat-frame'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { useActiveChatKey } from '@/features/chat/hooks/use-active-chat-key'
@@ -153,13 +154,5 @@ function ChatRouteComponent() {
     )
   }
 
-  return (
-    <iframe
-      src={iframeSrc}
-      key={iframeSrc}
-      className='h-full w-full border-0'
-      allow='camera; microphone'
-      title={`Chat preset: ${preset.name}`}
-    />
-  )
+  return <ChatFrame src={iframeSrc} title={`Chat preset: ${preset.name}`} />
 }

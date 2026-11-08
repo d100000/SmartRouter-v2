@@ -25,6 +25,7 @@ export interface OverviewCacheMetrics {
   cache_usage_attempts: number
   cache_hit_attempts: number
   cache_hit_rate: number | null
+  cache_attempt_hit_rate: number | null
   cache_usage_coverage: number | null
 }
 
@@ -69,6 +70,8 @@ export interface OverviewSnapshot {
   distribution: OverviewDistribution[]
   models: OverviewModel[]
   channels: OverviewRow[]
+  channel_models: OverviewChannelModel[]
+  channel_models_truncated: boolean
   options: Array<{ id: string; name: string }>
   refreshed_at: number
   collected_since: number | null
@@ -87,4 +90,9 @@ export interface OverviewModel extends OverviewCacheMetrics {
 
 export interface OverviewDistribution extends OverviewModel {
   day: string
+}
+
+export interface OverviewChannelModel extends OverviewModel {
+  channel_id: number
+  channel_name: string
 }

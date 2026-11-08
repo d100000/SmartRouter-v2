@@ -19,16 +19,19 @@ For commercial licensing, please contact support@quantumnous.com
 'use client'
 
 import { ChevronDownIcon } from 'lucide-react'
+import { nanoid } from 'nanoid'
 import {
   type ComponentProps,
   createContext,
   type ReactNode,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { SandboxedFrame } from '@/components/sandboxed-frame'
 import { Button } from '@/components/ui/button'
 import {
   Collapsible,
@@ -195,7 +198,7 @@ export const WebPreviewUrl = ({
   )
 }
 
-export type WebPreviewBodyProps = ComponentProps<'iframe'> & {
+export type WebPreviewBodyProps = ComponentProps<typeof SandboxedFrame> & {
   loading?: ReactNode
 }
 
@@ -210,9 +213,8 @@ export const WebPreviewBody = ({
 
   return (
     <div className='flex-1'>
-      <iframe
+      <SandboxedFrame
         className={cn('size-full', className)}
-        sandbox='allow-scripts allow-same-origin allow-forms allow-popups allow-presentation'
         src={(src ?? url) || undefined}
         title={t('Preview')}
         {...props}
@@ -224,6 +226,7 @@ export const WebPreviewBody = ({
 
 export type WebPreviewConsoleProps = ComponentProps<'div'> & {
   logs?: Array<{
+    id?: string
     level: 'log' | 'warn' | 'error'
     message: string
     timestamp: Date
@@ -238,6 +241,8 @@ export const WebPreviewConsole = ({
 }: WebPreviewConsoleProps) => {
   const { t } = useTranslation()
   const { consoleOpen, setConsoleOpen } = useWebPreview()
+  const logIds = useRef(new WeakMap<object, string>())
+  const occurrences = new Map<string, number>()
 
   return (
     <Collapsible
@@ -272,22 +277,31 @@ export const WebPreviewConsole = ({
           {logs.length === 0 ? (
             <p className='text-muted-foreground'>{t('No console output')}</p>
           ) : (
-            logs.map((log, index) => (
-              <div
-                className={cn(
-                  'text-xs',
-                  log.level === 'error' && 'text-destructive',
-                  log.level === 'warn' && 'text-warning',
-                  log.level === 'log' && 'text-foreground'
-                )}
-                key={`${log.timestamp.getTime()}-${index}`}
-              >
-                <span className='text-muted-foreground'>
-                  {dayjs(log.timestamp).format('HH:mm:ss')}
-                </span>{' '}
-                {log.message}
-              </div>
-            ))
+            logs.map((log) => {
+              let key = log.id ?? logIds.current.get(log)
+              if (!key) {
+                key = nanoid()
+                logIds.current.set(log, key)
+              }
+              const occurrence = occurrences.get(key) ?? 0
+              occurrences.set(key, occurrence + 1)
+              return (
+                <div
+                  className={cn(
+                    'text-xs',
+                    log.level === 'error' && 'text-destructive',
+                    log.level === 'warn' && 'text-warning',
+                    log.level === 'log' && 'text-foreground'
+                  )}
+                  key={JSON.stringify([key, occurrence])}
+                >
+                  <span className='text-muted-foreground'>
+                    {dayjs(log.timestamp).format('HH:mm:ss')}
+                  </span>{' '}
+                  {log.message}
+                </div>
+              )
+            })
           )}
           {children}
         </div>
