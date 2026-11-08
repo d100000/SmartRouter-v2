@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="117" height="20" viewBox="0 0 117 20" role="img" aria-label="TypeScript: Web">
+  <title>TypeScript: Web</title>
+  <defs>
+    <clipPath id="badge-clip"><rect width="117" height="20" rx="3"/></clipPath>
+  </defs>
+  <g clip-path="url(#badge-clip)">
+    <rect width="78" height="20" fill="#334155"/>
+    <rect x="78" width="39" height="20" fill="#3178C6"/>
+  </g>
+  <g fill="#FFFFFF" text-anchor="middle" font-family="Arial, Helvetica, 'Noto Sans CJK SC', sans-serif" font-size="11" font-weight="500">
+    <text x="39" y="14">TypeScript</text>
+    <text x="97.5" y="14">Web</text>
+  </g>
+</svg>

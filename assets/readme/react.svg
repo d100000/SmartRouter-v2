@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="74" height="20" viewBox="0 0 74 20" role="img" aria-label="React: 19">
+  <title>React: 19</title>
+  <defs>
+    <clipPath id="badge-clip"><rect width="74" height="20" rx="3"/></clipPath>
+  </defs>
+  <g clip-path="url(#badge-clip)">
+    <rect width="45" height="20" fill="#334155"/>
+    <rect x="45" width="29" height="20" fill="#087EA4"/>
+  </g>
+  <g fill="#FFFFFF" text-anchor="middle" font-family="Arial, Helvetica, 'Noto Sans CJK SC', sans-serif" font-size="11" font-weight="500">
+    <text x="22.5" y="14">React</text>
+    <text x="59.5" y="14">19</text>
+  </g>
+</svg>

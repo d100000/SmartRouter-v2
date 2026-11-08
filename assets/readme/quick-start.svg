@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="168" height="36" viewBox="0 0 168 36" role="img" aria-label="快速开始: DOCKER">
+  <title>快速开始: DOCKER</title>
+  <defs>
+    <clipPath id="badge-clip"><rect width="168" height="36" rx="5"/></clipPath>
+  </defs>
+  <g clip-path="url(#badge-clip)">
+    <rect width="94" height="36" fill="#334155"/>
+    <rect x="94" width="74" height="36" fill="#2563EB"/>
+  </g>
+  <g fill="#FFFFFF" text-anchor="middle" font-family="Arial, Helvetica, 'Noto Sans CJK SC', sans-serif" font-size="12" font-weight="600">
+    <text x="47" y="22">快速开始</text>
+    <text x="131" y="22">DOCKER</text>
+  </g>
+</svg>

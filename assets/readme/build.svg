@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="126" height="20" viewBox="0 0 126 20" role="img" aria-label="build: c6befee16">
+  <title>build: c6befee16</title>
+  <defs>
+    <clipPath id="badge-clip"><rect width="126" height="20" rx="3"/></clipPath>
+  </defs>
+  <g clip-path="url(#badge-clip)">
+    <rect width="43" height="20" fill="#334155"/>
+    <rect x="43" width="83" height="20" fill="#2563EB"/>
+  </g>
+  <g fill="#FFFFFF" text-anchor="middle" font-family="Arial, Helvetica, 'Noto Sans CJK SC', sans-serif" font-size="11" font-weight="500">
+    <text x="21.5" y="14">build</text>
+    <text x="84.5" y="14">c6befee16</text>
+  </g>
+</svg>

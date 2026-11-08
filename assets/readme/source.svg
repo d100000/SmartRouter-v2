@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="152" height="36" viewBox="0 0 152 36" role="img" aria-label="下载源码: MAIN">
+  <title>下载源码: MAIN</title>
+  <defs>
+    <clipPath id="badge-clip"><rect width="152" height="36" rx="5"/></clipPath>
+  </defs>
+  <g clip-path="url(#badge-clip)">
+    <rect width="94" height="36" fill="#334155"/>
+    <rect x="94" width="58" height="36" fill="#181717"/>
+  </g>
+  <g fill="#FFFFFF" text-anchor="middle" font-family="Arial, Helvetica, 'Noto Sans CJK SC', sans-serif" font-size="12" font-weight="600">
+    <text x="47" y="22">下载源码</text>
+    <text x="123" y="22">MAIN</text>
+  </g>
+</svg>
