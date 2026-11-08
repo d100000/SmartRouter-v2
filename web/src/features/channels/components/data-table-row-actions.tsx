@@ -52,6 +52,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { AdminSupplierChannelEditor } from '@/features/suppliers/components/admin-channel-editor'
+import { ChannelLimitsDialog } from '@/features/suppliers/components/channel-limits-dialog'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -83,10 +85,15 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { setOpen, setCurrentRow, upstream } = useChannels()
   const queryClient = useQueryClient()
   const currentUser = useAuthStore((s) => s.auth.user)
+  const [supplierEditorOpen, setSupplierEditorOpen] = useState(false)
+  const [limitsOpen, setLimitsOpen] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [isTesting, setIsTesting] = useState(false)
   const [isTogglingStatus, setIsTogglingStatus] = useState(false)
 
+  const protectedConnection = Boolean(
+    channel.owner_supplier_id || channel.secrets_write_only
+  )
   const isEnabled = isChannelEnabled(channel)
   const isMultiKey = isMultiKeyChannel(channel)
   const canEditSensitive = hasPermission(
@@ -96,6 +103,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   )
 
   const handleEdit = () => {
+    if (channel.owner_supplier_id) {
+      setSupplierEditorOpen(true)
+      return
+    }
     setCurrentRow(channel)
     setOpen('update-channel')
   }
@@ -174,6 +185,9 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
                   e.stopPropagation()
                   handleEdit()
                 }}
+                disabled={
+                  Boolean(channel.owner_supplier_id) && !canEditSensitive
+                }
                 aria-label={t('Edit')}
               />
             }
@@ -264,7 +278,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         </DropdownMenuTrigger>
         <DropdownMenuContent align='end' className='w-48'>
           {layout === 'card' && (
-            <DropdownMenuItem onClick={handleEdit}>
+            <DropdownMenuItem
+              disabled={Boolean(channel.owner_supplier_id) && !canEditSensitive}
+              onClick={handleEdit}
+            >
               {t('Edit')}
               <DropdownMenuShortcut>
                 <Pencil size={16} />
@@ -281,7 +298,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>
 
           {/* Query Balance */}
-          <DropdownMenuItem onClick={handleQueryBalance}>
+          <DropdownMenuItem
+            disabled={protectedConnection}
+            onClick={handleQueryBalance}
+          >
             {t('Query Balance')}
             <DropdownMenuShortcut>
               <DollarSign size={16} />
@@ -289,7 +309,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>
 
           {/* Fetch Models */}
-          <DropdownMenuItem onClick={handleFetchModels}>
+          <DropdownMenuItem
+            disabled={protectedConnection}
+            onClick={handleFetchModels}
+          >
             {t('Fetch Models')}
             <DropdownMenuShortcut>
               <Download size={16} />
@@ -299,6 +322,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           {/* Detect Upstream Updates (only for fetchable channel types) */}
           {MODEL_FETCHABLE_TYPES.has(channel.type) && (
             <DropdownMenuItem
+              disabled={protectedConnection}
               onClick={() => upstream.detectChannelUpdates(channel)}
             >
               {t('Upstream Updates')}
@@ -332,6 +356,20 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             </DropdownMenuShortcut>
           </DropdownMenuItem>
 
+          {channel.owner_supplier_id && (
+            <DropdownMenuItem
+              onClick={() => {
+                setCurrentRow(channel)
+                setOpen('update-channel')
+              }}
+            >
+              {t('Platform settings')}
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onClick={() => setLimitsOpen(true)}>
+            {t('Channel limits')}
+          </DropdownMenuItem>
+
           {/* Copy Channel */}
           <DropdownMenuItem
             disabled={!canEditSensitive}
@@ -362,10 +400,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
           {/* Delete */}
           <DropdownMenuItem
-            disabled={!canEditSensitive}
+            disabled={!canEditSensitive || Boolean(channel.owner_supplier_id)}
             onSelect={(e) => {
               e.preventDefault()
-              if (!canEditSensitive) return
+              if (!canEditSensitive || channel.owner_supplier_id) return
               setDeleteConfirmOpen(true)
             }}
             className='text-destructive focus:text-destructive'
@@ -378,6 +416,20 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         </DropdownMenuContent>
       </DropdownMenu>
 
+      {supplierEditorOpen && (
+        <AdminSupplierChannelEditor
+          channelId={channel.id}
+          onClose={() => setSupplierEditorOpen(false)}
+        />
+      )}
+      {limitsOpen && (
+        <ChannelLimitsDialog
+          channelId={channel.id}
+          channelName={channel.name}
+          audience='admin'
+          onClose={() => setLimitsOpen(false)}
+        />
+      )}
       <ConfirmDialog
         open={deleteConfirmOpen}
         onOpenChange={setDeleteConfirmOpen}

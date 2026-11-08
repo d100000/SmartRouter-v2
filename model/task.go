@@ -18,6 +18,7 @@ import (
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"gorm.io/gorm"
 )
 
@@ -81,6 +82,10 @@ type Task struct {
 	// task settlement depend on the metrics table being writable.
 	PerformanceSamplePending bool   `json:"-" gorm:"index"`
 	PerformanceSampleError   string `json:"-" gorm:"size:128"`
+	ProcurementUnknown       bool   `json:"-" gorm:"index"`
+	ProcurementNextPoll      int64  `json:"-" gorm:"bigint"`
+	ProcurementPending       bool   `json:"-" gorm:"index"`
+	ProcurementVersion       int64  `json:"-"`
 }
 
 func (t *Task) SetData(data any) {
@@ -121,9 +126,11 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Key            string `json:"key,omitempty"`
-	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	ChannelAttempt *commonRelay.TaskChannelSnapshot `json:"channel_attempt,omitempty"`
+	FundingAttempt *hosttypes.ChannelFundingAttempt `json:"funding_attempt,omitempty"`
+	Key            string                           `json:"key,omitempty"`
+	UpstreamTaskID string                           `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	ResultURL      string                           `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
@@ -229,7 +236,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded && p.PerformanceOutputTokens == nil {
+		!p.ResultDiscarded && p.PerformanceOutputTokens == nil && p.FundingAttempt == nil && p.ChannelAttempt == nil {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -257,12 +264,16 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 	properties := Properties{}
 	privateData := TaskPrivateData{}
 	if relayInfo != nil && relayInfo.ChannelMeta != nil {
+		privateData.ChannelAttempt = relayInfo.TaskChannelSnapshot
 		// A New API channel may rotate between several gateway tokens, so the
 		// task keeps the key that submitted it and polls with the same identity.
-		if relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeGemini ||
+		if relayInfo.ChannelMeta.ChannelIsMultiKey || relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeGemini ||
 			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeVertexAi ||
 			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeNewAPI {
 			privateData.Key = relayInfo.ChannelMeta.ApiKey
+		}
+		if privateData.ChannelAttempt != nil && privateData.ChannelAttempt.Encrypted {
+			privateData.Key = ""
 		}
 		if relayInfo.UpstreamModelName != "" {
 			properties.UpstreamModelName = relayInfo.UpstreamModelName
@@ -506,6 +517,11 @@ func (Task *Task) Insert() error {
 // while the in-memory task keeps its values for presentation.
 func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) error {
 	Task.preparePerformanceSample(TaskStatusUnknown)
+	if Task.PrivateData.ChannelAttempt != nil {
+		Task.ProcurementPending, Task.ProcurementVersion = true, 1
+		Task.ProcurementUnknown = Task.PrivateData.ChannelAttempt.NeedsReconciliation()
+		Task.ProcurementNextPoll = time.Now().Add(time.Minute).Unix()
+	}
 	tx := DB.WithContext(ctx)
 	if len(omitColumns) > 0 {
 		tx = tx.Omit(omitColumns...)
@@ -572,6 +588,9 @@ func (t *Task) UpdateQuota() error {
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 	t.preparePerformanceSample(fromStatus)
+	if t.PrivateData.ChannelAttempt != nil {
+		return t.updateChannelTaskWithStatus(fromStatus)
+	}
 	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
 	if result.Error != nil {
 		return false, result.Error

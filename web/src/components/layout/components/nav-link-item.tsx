@@ -20,6 +20,7 @@ import { Link } from '@tanstack/react-router'
 
 import { cn } from '@/lib/utils'
 
+import { getKeyedTopNavLinks } from '../lib/url-utils'
 import type { TopNavLink } from '../types'
 
 interface NavLinkItemProps {
@@ -76,9 +77,9 @@ export function NavLinkList({
 }: NavLinkListProps) {
   return (
     <>
-      {links.map((link, index) => (
+      {getKeyedTopNavLinks(links).map(({ link, key }) => (
         <NavLinkItem
-          key={index}
+          key={key}
           link={link}
           className={cn(className, itemClassName)}
         />

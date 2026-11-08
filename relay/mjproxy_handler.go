@@ -2,10 +2,14 @@ package relay
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -37,35 +41,49 @@ func RelayMidjourneyImage(c *gin.Context) {
 	}
 	var httpClient *http.Client
 	var proxy string
-	if channel, err := model.CacheGetChannel(midjourneyTask.ChannelId); err == nil {
-		channelSetting := channel.GetSetting()
-		proxy = channelSetting.Proxy
-		if proxy != "" {
-			if httpClient, err = service.GetHttpClientWithProxySettings(proxy, channelSetting); err != nil {
-				c.JSON(400, gin.H{
-					"error": "proxy_url_invalid",
-				})
-				return
+	channel, channelErr := service.ResolveMidjourneyTaskChannel(midjourneyTask)
+	protected := channelErr == nil && (channel.OwnerSupplierID != "" || channel.SecretsWriteOnly)
+	if midjourneyTask.ChannelAttemptData != "" && channelErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "task_connection_unavailable"})
+		return
+	}
+	if protected {
+		artifactURL, parseErr := url.Parse(midjourneyTask.ImageUrl)
+		if parseErr == nil {
+			artifactURL.RawQuery = ""
+		}
+		if parseErr != nil || service.ValidateSupplierURL(artifactURL.String()) != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "artifact_target_unavailable"})
+			return
+		}
+		httpClient = service.GetSupplierHTTPClient()
+	} else {
+		if channelErr == nil {
+			channelSetting := channel.GetSetting()
+			proxy = channelSetting.Proxy
+			if proxy != "" {
+				var err error
+				httpClient, err = service.GetHttpClientWithProxySettings(proxy, channelSetting)
+				if err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "proxy_url_invalid"})
+					return
+				}
 			}
 		}
-	}
-	if httpClient == nil {
-		httpClient = service.GetSSRFProtectedHTTPClient()
-	}
-	var validateErr error
-	if proxy == "" {
-		validateErr = service.ValidateSSRFProtectedFetchURL(midjourneyTask.ImageUrl)
-	} else {
-		// 渠道代理路径的连接由代理侧建立，无法做拨号时逐 IP 校验，
-		// 因此保留请求前的一次性 SSRF 校验。
-		fetchSetting := system_setting.GetFetchSetting()
-		validateErr = common.ValidateURLWithFetchSetting(midjourneyTask.ImageUrl, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain)
-	}
-	if validateErr != nil {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": fmt.Sprintf("request blocked: %v", validateErr),
-		})
-		return
+		if httpClient == nil {
+			httpClient = service.GetSSRFProtectedHTTPClient()
+		}
+		var err error
+		if proxy == "" {
+			err = service.ValidateSSRFProtectedFetchURL(midjourneyTask.ImageUrl)
+		} else {
+			fetchSetting := system_setting.GetFetchSetting()
+			err = common.ValidateURLWithFetchSetting(midjourneyTask.ImageUrl, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain)
+		}
+		if err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "artifact_target_unavailable"})
+			return
+		}
 	}
 	resp, err := httpClient.Get(midjourneyTask.ImageUrl)
 	if err != nil {
@@ -76,6 +94,10 @@ func RelayMidjourneyImage(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if protected {
+			c.JSON(resp.StatusCode, gin.H{"error": "upstream_image_request_failed"})
+			return
+		}
 		responseBody, _ := io.ReadAll(resp.Body)
 		c.JSON(resp.StatusCode, gin.H{
 			"error": string(responseBody),
@@ -84,6 +106,10 @@ func RelayMidjourneyImage(c *gin.Context) {
 	}
 	// 从Content-Type头获取MIME类型
 	contentType := resp.Header.Get("Content-Type")
+	if protected && !strings.HasPrefix(strings.ToLower(contentType), "image/") {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream_image_response_invalid"})
+		return
+	}
 	if contentType == "" {
 		// 如果无法确定内容类型，则默认为jpeg
 		contentType = "image/jpeg"
@@ -93,7 +119,11 @@ func RelayMidjourneyImage(c *gin.Context) {
 	// 将图片流式传输到响应体
 	_, err = io.Copy(c.Writer, resp.Body)
 	if err != nil {
-		log.Println(common.LogText("Failed to stream image: %v", err))
+		if protected {
+			log.Println(common.LogText("Failed to stream protected upstream image"))
+		} else {
+			log.Println(common.LogText("Failed to stream image: %v", err))
+		}
 	}
 	return
 }
@@ -109,33 +139,15 @@ func RelayMidjourneyNotify(c *gin.Context) *dto.MidjourneyResponse {
 			Result:      "",
 		}
 	}
-	midjourneyTask := model.GetByOnlyMJId(midjRequest.MjId)
+	// The legacy callback protocol has no signed completion proof. Treat it
+	// only as a refresh hint from the authenticated owner and query the frozen
+	// upstream connection; never accept status, usage or artifact URLs here.
+	midjourneyTask := model.GetByMJId(c.GetInt("id"), midjRequest.MjId)
 	if midjourneyTask == nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: "midjourney_task_not_found",
-			Properties:  nil,
-			Result:      "",
-		}
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, "midjourney_task_not_found")
 	}
-	midjourneyTask.Progress = midjRequest.Progress
-	midjourneyTask.PromptEn = midjRequest.PromptEn
-	midjourneyTask.State = midjRequest.State
-	midjourneyTask.SubmitTime = midjRequest.SubmitTime
-	midjourneyTask.StartTime = midjRequest.StartTime
-	midjourneyTask.FinishTime = midjRequest.FinishTime
-	midjourneyTask.ImageUrl = midjRequest.ImageUrl
-	midjourneyTask.VideoUrl = midjRequest.VideoUrl
-	videoUrlsStr, _ := common.Marshal(midjRequest.VideoUrls)
-	midjourneyTask.VideoUrls = string(videoUrlsStr)
-	midjourneyTask.Status = midjRequest.Status
-	midjourneyTask.FailReason = midjRequest.FailReason
-	err = midjourneyTask.Update()
-	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: "update_midjourney_task_failed",
-		}
+	if err := service.RefreshMidjourneyTask(c.Request.Context(), midjourneyTask); err != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, "task_refresh_failed")
 	}
 
 	return nil
@@ -204,6 +216,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	}
 	modelName := service.CovertMjpActionToModelName(constant.MjActionSwapFace)
 
+	info.OriginModelName = modelName
 	priceData, err := helper.ModelPriceHelperPerCall(c, info)
 	if err != nil {
 		return &dto.MidjourneyResponse{
@@ -212,6 +225,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 		}
 	}
 
+	info.PriceData = priceData
 	userQuota, err := model.GetUserQuota(info.UserId, false)
 	if err != nil {
 		return &dto.MidjourneyResponse{
@@ -230,8 +244,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	baseURL := c.GetString("base_url")
 	fullRequestURL := fmt.Sprintf("%s%s", baseURL, requestURL)
 	service.RequestPolicy(c).BeginAttempt(&model.Channel{Id: c.GetInt("channel_id")}, info.UsingGroup)
-	service.StartSchedulingAttempt(c, info)
-	mjResp, _, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
+	mjResp, _, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL, info)
 	accepted := service.RecordMidjourneyPolicyResponse(c, mjResp, err)
 	if err != nil {
 		return &mjResp.Response
@@ -255,6 +268,16 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 		FailReason:  "",
 		ChannelId:   c.GetInt("channel_id"),
 	}
+	if common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey) {
+		midjourneyTask.PollingKey = common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	}
+	if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+		data, _ := common.Marshal(attempt.Identity)
+		midjourneyTask.FundingAttemptData = string(data)
+	}
+	if err := service.AttachMidjourneyChannelAttempt(info, midjourneyTask); err != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, "persist_task_failed")
+	}
 	billingPrepared, billingErr := service.PrepareMidjourneyTaskBilling(
 		info,
 		midjourneyTask,
@@ -268,6 +291,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	if err != nil {
 		return service.MidjourneyErrorWrapper(constant.MjRequestError, "insert_midjourney_task_failed")
 	}
+	_ = service.FlushMidjourneyChannelObservation(c.Request.Context(), midjourneyTask)
 	billingApplied, billingErr := service.SettleMidjourneyTaskBilling(info, midjourneyTask, billingPrepared)
 	if billingErr != nil {
 		common.SysLog(common.LogText("error settling Midjourney quota: %s", billingErr.Error()))
@@ -317,15 +341,13 @@ func RelayMidjourneyTaskImageSeed(c *gin.Context) *dto.MidjourneyResponse {
 	if originTask == nil {
 		return service.MidjourneyErrorWrapper(constant.MjRequestError, "task_no_found")
 	}
-	channel, err := model.GetChannelById(originTask.ChannelId, true)
+	channel, err := service.ResolveMidjourneyTaskChannel(originTask)
 	if err != nil {
 		return service.MidjourneyErrorWrapper(constant.MjRequestError, "get_channel_info_failed")
 	}
-	if channel.Status != common.ChannelStatusEnabled {
-		return service.MidjourneyErrorWrapper(constant.MjRequestError, i18n.T(c, i18n.MsgRelayTaskChannelDisabled))
-	}
 	c.Set("channel_id", originTask.ChannelId)
-	c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))
+	common.SetContextKey(c, constant.ContextKeyChannelKey, channel.Key)
+	c.Set("midjourney_query_channel", channel)
 
 	requestURL := getMjRequestPath(c.Request.URL.String())
 	fullRequestURL := fmt.Sprintf("%s%s", channel.GetBaseURL(), requestURL)
@@ -491,20 +513,29 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 					return service.MidjourneyErrorWrapper(constant.MjRequestError, "task_status_not_success")
 				}
 			}
-			channel, err := model.GetChannelById(originTask.ChannelId, true)
+			channel, err := service.ResolveMidjourneyTaskChannel(originTask)
 			if err != nil {
 				return service.MidjourneyErrorWrapper(constant.MjRequestError, "get_channel_info_failed")
 			}
-			if channel.Status != common.ChannelStatusEnabled {
+			current, err := model.GetChannelById(originTask.ChannelId, false)
+			if err != nil || current.Status != common.ChannelStatusEnabled {
 				return service.MidjourneyErrorWrapper(constant.MjRequestError, i18n.T(c, i18n.MsgRelayTaskChannelDisabled))
 			}
-			if apiErr := service.ChannelAvailabilityError(c, channel); apiErr != nil {
+			if apiErr := service.ChannelAvailabilityError(c, current); apiErr != nil {
 				return service.MidjourneyErrorWrapper(constant.MjRequestError, apiErr.Error())
 			}
-			c.Set("base_url", channel.GetBaseURL())
-			c.Set("channel_id", originTask.ChannelId)
-			c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))
-			logger.LogDebug(c, "Midjourney action uses origin channel: id=%s, base_url=%s", strconv.Itoa(originTask.ChannelId), channel.GetBaseURL())
+			if relayInfo.TaskRelayInfo == nil {
+				relayInfo.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+			}
+			relayInfo.LockedChannel = channel
+			common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
+			common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
+			common.SetContextKey(c, constant.ContextKeyChannelKey, channel.Key)
+			common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+			service.BeginChannelFundingAttempt(c, channel, channel.Key, 0, service.CovertMjpActionToModelName(midjRequest.Action))
+
+			logger.LogDebug(c, "Midjourney action uses origin channel: id=%s", strconv.Itoa(originTask.ChannelId))
 		}
 		midjRequest.Prompt = originTask.Prompt
 
@@ -531,6 +562,8 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 
 	modelName := service.CovertMjpActionToModelName(midjRequest.Action)
 
+	relayInfo.InitChannelMeta(c)
+	relayInfo.OriginModelName = modelName
 	priceData, err := helper.ModelPriceHelperPerCall(c, relayInfo)
 	if err != nil {
 		return &dto.MidjourneyResponse{
@@ -539,6 +572,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		}
 	}
 
+	relayInfo.PriceData = priceData
 	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
 	if err != nil {
 		return &dto.MidjourneyResponse{
@@ -555,8 +589,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 	}
 
 	service.RequestPolicy(c).BeginAttempt(&model.Channel{Id: c.GetInt("channel_id")}, relayInfo.UsingGroup)
-	service.StartSchedulingAttempt(c, relayInfo)
-	midjResponseWithStatus, responseBody, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
+	midjResponseWithStatus, responseBody, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL, relayInfo)
 	accepted := service.RecordMidjourneyPolicyResponse(c, midjResponseWithStatus, err)
 	if err != nil {
 		return &midjResponseWithStatus.Response
@@ -587,6 +620,13 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		Progress:    "0%",
 		FailReason:  "",
 		ChannelId:   c.GetInt("channel_id"),
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey) {
+		midjourneyTask.PollingKey = common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+	}
+	if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+		data, _ := common.Marshal(attempt.Identity)
+		midjourneyTask.FundingAttemptData = string(data)
 	}
 	if midjResponse.Code == 3 {
 		//无实例账号自动禁用渠道（No available account instance）
@@ -634,6 +674,9 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		midjourneyTask.Progress = "100%"
 		midjourneyTask.Status = "SUCCESS"
 	}
+	if err := service.AttachMidjourneyChannelAttempt(relayInfo, midjourneyTask); err != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, "persist_task_failed")
+	}
 	billingPrepared, billingErr := service.PrepareMidjourneyTaskBilling(
 		relayInfo,
 		midjourneyTask,
@@ -650,6 +693,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			Description: "insert_midjourney_task_failed",
 		}
 	}
+	_ = service.FlushMidjourneyChannelObservation(c.Request.Context(), midjourneyTask)
 	billingApplied, billingErr := service.SettleMidjourneyTaskBilling(relayInfo, midjourneyTask, billingPrepared)
 	if billingErr != nil {
 		common.SysLog(common.LogText("error settling Midjourney quota: %s", billingErr.Error()))
@@ -728,4 +772,66 @@ func getMjRequestPath(path string) string {
 		requestURL = "/mj/" + urls[1]
 	}
 	return requestURL
+}
+
+// SubmitMidjourneyChannelProbe uses the same actual dispatch and procurement
+// limits as production, without requiring a consumer Key or charging a wallet.
+// Actions that depend on an existing artifact require a real prior task and
+// are not declared verified by a generic imagine request.
+func SubmitMidjourneyChannelProbe(ctx context.Context, channel *model.Channel, userID int, modelName string) (*model.Midjourney, error) {
+	action, path := "", ""
+	switch modelName {
+	case "mj_imagine":
+		action, path = constant.MjActionImagine, "/mj/submit/imagine"
+	case "mj_shorten":
+		action, path = constant.MjActionShorten, "/mj/submit/shorten"
+	default:
+		return nil, errors.New("channel probe requires a completed source task")
+	}
+	body, err := common.Marshal(map[string]any{"prompt": "A simple blue square on a plain white background", "action": action})
+	if err != nil {
+		return nil, err
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("id", userID)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, channel.Key)
+	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, channel.Group)
+	info := &relaycommon.RelayInfo{UserId: userID, UserGroup: channel.Group, UsingGroup: channel.Group, OriginModelName: modelName, StartTime: time.Now(), IsChannelTest: true, TaskRelayInfo: &relaycommon.TaskRelayInfo{LockedChannel: channel}}
+	info.InitChannelMeta(c)
+	info.ChannelSetting = channel.GetSetting()
+	info.ChannelOtherSettings = channel.GetOtherSettings()
+	price, err := helper.ModelPriceHelperPerCall(c, info)
+	if err != nil {
+		return nil, err
+	}
+	info.PriceData = price
+	response, _, err := service.DoMidjourneyHttpRequest(c, 60*time.Second, strings.TrimRight(channel.GetBaseURL(), "/")+path, info)
+	if err != nil {
+		return nil, errors.New("channel probe result unknown")
+	}
+	if response == nil || response.StatusCode < 200 || response.StatusCode >= 300 || response.Response.Result == "" || (response.Response.Code != 1 && response.Response.Code != 21 && response.Response.Code != 22) {
+		return nil, errors.New("channel probe submission rejected")
+	}
+	task := &model.Midjourney{UserId: userID, ChannelId: channel.Id, MjId: response.Response.Result, Action: action, Code: response.Response.Code, SubmitTime: time.Now().UnixMilli(), Status: "SUBMITTED", Progress: "0%"}
+	if properties, ok := response.Response.Properties.(map[string]any); ok {
+		if status, ok := properties["status"].(string); ok && (status == "SUCCESS" || status == "FAILURE") {
+			task.Status, task.Progress = status, "100%"
+			task.ImageUrl, _ = properties["imageUrl"].(string)
+		}
+	}
+	if err := service.AttachMidjourneyChannelAttempt(info, task); err != nil {
+		return nil, err
+	}
+	if err := task.Insert(); err != nil {
+		return nil, err
+	}
+	if err := service.FlushMidjourneyChannelObservation(context.WithoutCancel(ctx), task); err != nil {
+		return task, err
+	}
+	return task, nil
 }

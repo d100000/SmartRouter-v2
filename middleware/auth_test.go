@@ -567,3 +567,122 @@ func TestApplyWebSocketSubprotocolAuthorizationReadsRepeatedHeaders(t *testing.T
 	assert.True(t, applyWebSocketSubprotocolAuthorization(header))
 	assert.Equal(t, "Bearer sk-later-field", header.Get("Authorization"))
 }
+
+func createDashboardIdentityTestSession(t *testing.T, user *model.User, sid string) (string, service.AuthIdentity) {
+	t.Helper()
+	session := &model.UserSession{
+		SID: sid, UserID: user.Id, Version: 1, UserAuthVersion: user.AuthVersion,
+		Status: model.UserSessionStatusActive, RefreshHash: "hash-" + sid,
+		LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600,
+	}
+	require.NoError(t, model.CreateUserSession(session))
+	identity := service.AuthIdentity{UserID: user.Id, SessionID: sid, UserAuthVersion: user.AuthVersion, SessionVersion: 1}
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	return token, identity
+}
+
+func TestSupplierDashboardAccessIsDenyByDefault(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	gin.SetMode(gin.TestMode)
+	supplierID := "supplier-a"
+	user := createMiddlewarePATUser(t, "supplier-auth", "supplier-legacy-pat")
+	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"role": common.RoleSupplierUser, "supplier_id": supplierID}).Error)
+	user.Role, user.SupplierID = common.RoleSupplierUser, &supplierID
+	jwtToken, _ := createDashboardIdentityTestSession(t, user, "supplier-auth-session")
+
+	for _, tc := range []struct {
+		method     string
+		path       string
+		middleware gin.HandlerFunc
+		status     int
+	}{
+		{http.MethodGet, "/api/supplier/channels", SupplierAuth(), http.StatusNoContent},
+		{http.MethodGet, "/api/user/self", UserAuth(), http.StatusNoContent},
+		{http.MethodPut, "/api/user/self", UserAuth(), http.StatusNoContent},
+		{http.MethodPost, "/api/user/2fa/setup", UserAuth(), http.StatusNoContent},
+		{http.MethodPost, "/api/token/", UserAuth(), http.StatusForbidden},
+		{http.MethodGet, "/api/user/access_tokens", UserAuth(), http.StatusForbidden},
+		{http.MethodPost, "/api/user/access_tokens", UserAuth(), http.StatusForbidden},
+		{http.MethodPost, "/api/user/topup", UserAuth(), http.StatusForbidden},
+		{http.MethodGet, "/api/log/self", UserAuth(), http.StatusForbidden},
+		{http.MethodGet, "/api/new-consumer-feature", UserAuth(), http.StatusForbidden},
+		{http.MethodGet, "/api/channel/", AdminAuth(), http.StatusForbidden},
+		{http.MethodPost, "/pg/chat/completions", TokenOrUserAuth(), http.StatusForbidden},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			router := gin.New()
+			router.Handle(tc.method, tc.path, tc.middleware, func(c *gin.Context) { c.Status(http.StatusNoContent) })
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+jwtToken)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, req)
+			assert.Equal(t, tc.status, response.Code, response.Body.String())
+		})
+	}
+
+	router := gin.New()
+	router.GET("/api/supplier/channels", SupplierAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	for _, tc := range []struct {
+		name, token   string
+		forcePassword bool
+		code          string
+	}{
+		{"initial password", jwtToken, true, "AUTH_PASSWORD_CHANGE_REQUIRED"},
+		{"legacy PAT", "supplier-legacy-pat", false, "AUTH_SUPPLIER_SCOPE_DENIED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("must_change_password", tc.forcePassword).Error)
+			req := httptest.NewRequest(http.MethodGet, "/api/supplier/channels", nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, req)
+			assert.Equal(t, http.StatusForbidden, response.Code)
+			assert.Contains(t, response.Body.String(), tc.code)
+		})
+	}
+}
+
+func TestChannelViewerPreservesConsumerAccessAndRevokesChannelGrant(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.AuthzRole{}, &model.CasbinRule{}))
+	wasMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = wasMaster })
+	require.NoError(t, authz.Init(model.DB))
+	user := createMiddlewarePATUser(t, "channel-viewer", "viewer-legacy-pat")
+	require.NoError(t, model.DB.Model(user).Update("quota", 123).Error)
+	require.NoError(t, model.SetChannelViewer(user.Id, true))
+	require.NoError(t, model.DB.First(user, user.Id).Error)
+	jwtToken, identity := createDashboardIdentityTestSession(t, user, "viewer-auth-session")
+	router := gin.New()
+	router.GET("/api/viewer/channels", ChannelReadAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.POST("/api/token/", UserAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.POST("/api/channel/", AdminAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	for _, tc := range []struct {
+		method, path string
+		status       int
+	}{
+		{http.MethodGet, "/api/viewer/channels", http.StatusNoContent},
+		{http.MethodPost, "/api/token/", http.StatusNoContent},
+		{http.MethodPost, "/api/channel/", http.StatusForbidden},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req.Header.Set("Authorization", "Bearer "+jwtToken)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		assert.Equal(t, tc.status, response.Code, response.Body.String())
+	}
+	for _, permission := range []authz.Permission{authz.ChannelOperate, authz.ChannelWrite, authz.ChannelSensitiveWrite, authz.ChannelSecretView} {
+		assert.False(t, authz.Can(user.Id, user.Role, permission))
+	}
+	require.NoError(t, model.SetChannelViewer(user.Id, false))
+	assert.False(t, authz.Can(user.Id, common.RoleCommonUser, authz.ChannelRead))
+	_, _, err := service.ValidateLoginSession(identity)
+	require.Error(t, err)
+	require.NoError(t, model.DB.First(user, user.Id).Error)
+	assert.Equal(t, common.RoleCommonUser, user.Role)
+	assert.Equal(t, 123, user.Quota)
+	assert.Equal(t, "viewer-legacy-pat", user.GetAccessToken())
+	assert.False(t, user.ChannelViewer)
+}

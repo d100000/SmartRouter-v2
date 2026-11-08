@@ -20,6 +20,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 
 import { AuthenticatedLayout } from '@/components/layout'
 import { resolveAuthentication } from '@/lib/auth-session'
+import { isSupplier, isSupplierRoute } from '@/lib/supplier-access'
 import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/_authenticated')({
@@ -37,6 +38,16 @@ export const Route = createFileRoute('/_authenticated')({
         to: '/sign-in',
         search: { redirect: location.href },
       })
+    }
+    if (
+      isSupplier(auth.user) &&
+      auth.user?.must_change_password &&
+      location.pathname !== '/security'
+    ) {
+      throw redirect({ to: '/security' })
+    }
+    if (isSupplier(auth.user) && !isSupplierRoute(location.pathname)) {
+      throw redirect({ to: '/supplier' })
     }
   },
   component: AuthenticatedLayout,

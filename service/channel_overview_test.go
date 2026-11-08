@@ -3,16 +3,25 @@ package service
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +29,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 type overviewQueryRecorder struct {
@@ -33,6 +43,71 @@ func (r *overviewQueryRecorder) Trace(ctx context.Context, began time.Time, sql 
 	r.Interface.Trace(ctx, began, sql, err)
 	if r.queries == 1 && r.onFirstQuery != nil {
 		r.onFirstQuery()
+	}
+}
+
+func TestChannelOverviewMediaRemainsIndependentOfTokenEstimates(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/audio/speech", nil)
+	attempt := &relaycommon.OverviewAttempt{Sent: true, DispatchedAt: time.Now()}
+	info := &relaycommon.RelayInfo{
+		OverviewAttempt:  attempt,
+		AnalyticsBilling: &relaycommon.OverviewBillingSnapshot{UsageSource: "local_estimate", InputTokens: 1000},
+	}
+	info.ObserveAudioSeconds(1.25, "media_metadata")
+	FinishOverviewAttempt(ctx, info, nil)
+	require.NotNil(t, attempt.Billing)
+	require.NotNil(t, attempt.Billing.AudioSeconds)
+	assert.Equal(t, 1.25, *attempt.Billing.AudioSeconds)
+	assert.Equal(t, "media_metadata", attempt.Billing.AudioUsageSource)
+	assert.Equal(t, "local_estimate", attempt.Billing.UsageSource)
+	assert.Nil(t, attempt.Billing.ImageCount)
+	assert.Nil(t, attempt.Billing.BaseQuota, "measured media duration does not manufacture procurement cost")
+	info.ObserveAudioSeconds(9, "upstream_usage")
+	assert.Equal(t, 1.25, *attempt.Billing.AudioSeconds, "finished attempts retain their own observations")
+
+	mediaOnly := &relaycommon.RelayInfo{OverviewAttempt: &relaycommon.OverviewAttempt{Sent: true, DispatchedAt: time.Now()}}
+	mediaOnly.ObserveImageCount(2)
+	FinishOverviewAttempt(ctx, mediaOnly, nil)
+	require.NotNil(t, mediaOnly.OverviewAttempt.Billing)
+	assert.EqualValues(t, 2, *mediaOnly.OverviewAttempt.Billing.ImageCount)
+	assert.Empty(t, mediaOnly.OverviewAttempt.Billing.UsageSource)
+}
+
+func TestChannelOverviewVendorRequestIDIsSafeAndAttemptLocal(t *testing.T) {
+	for _, tc := range []struct{ name, value, want string }{
+		{"vendor identifier", "req_01AZ-2.b:3", "req_01AZ-2.b:3"},
+		{"maximum length", strings.Repeat("a", 128), strings.Repeat("a", 128)},
+		{"missing", "", ""},
+		{"too long", strings.Repeat("a", 129), ""},
+		{"header injection", "vendor\r\nsecret", ""},
+		{"non ASCII", "vendor-编号", ""},
+		{"raw JSON", `{"id":"vendor"}`, ""},
+		{"URL", "https://example.com/id", ""},
+		{"CSV formula", "=vendor", ""},
+		{"upstream secret", "req-upstream-secret-suffix", ""},
+		{"consumer secret", "req-consumer-secret-suffix", ""},
+		{"request authorization", "req-header-secret-suffix", ""},
+		{"alternate authorization", "req-alternate-secret-suffix", ""},
+		{"global platform ID", "platform-request-id", ""},
+		{"wrapped platform ID", "req-platform-request-id-suffix", ""},
+		{"relay request ID", "relay-request-id", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			ctx.Request.Header.Set("Authorization", "Bearer header-secret")
+			ctx.Request.Header.Set("X-Api-Key", "alternate-secret")
+			ctx.Set(common.UpstreamRequestIdKey, tc.value)
+			ctx.Set(common.RequestIdKey, "platform-request-id")
+			attempt := &relaycommon.OverviewAttempt{Sent: true, DispatchedAt: time.Now()}
+			info := &relaycommon.RelayInfo{OverviewAttempt: attempt, ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "upstream-secret"}, TokenKey: "consumer-secret", RequestId: "relay-request-id"}
+			FinishOverviewAttempt(ctx, info, nil)
+			assert.Equal(t, tc.want, attempt.UpstreamRequestID)
+			ctx.Set(common.UpstreamRequestIdKey, "another-attempt-id")
+			FinishOverviewAttempt(ctx, info, nil)
+			assert.Equal(t, tc.want, attempt.UpstreamRequestID, "finished observations cannot be replaced by a later attempt")
+		})
 	}
 }
 
@@ -54,7 +129,9 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 				if dsn == "" {
 					t.Skip("TEST_POSTGRES_DSN is not configured")
 				}
-				driver = postgres.Open(dsn)
+				// Match the primary database configuration: this matrix recreates
+				// released tables on one connection before testing startup upgrades.
+				driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
 			}
 			db, err := gorm.Open(driver, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 			require.NoError(t, err)
@@ -87,6 +164,8 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 			assert.Nil(t, empty.Summary.Health)
 			assert.Nil(t, empty.Summary.CostCoverage)
 			assert.Nil(t, empty.Summary.CacheHitRate)
+			assert.Nil(t, empty.Summary.CacheAttemptHitRate)
+			assert.Empty(t, empty.ChannelModels)
 			assert.Nil(t, empty.Summary.CacheUsageCoverage)
 			now := time.Now().UTC()
 			base, ratio, zero := 100.0, 0.5, 0.0
@@ -103,8 +182,31 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 				{OverviewAttempts: []*relaycommon.OverviewAttempt{{EventID: "unconfirmed:0", RequestID: "unconfirmed", StartedAt: now, QuotaPerUnit: common.QuotaPerUnit, ChannelID: 3, ChannelName: "free supplier", GroupName: "paid", ModelName: "model-a", CredentialID: "key-c", CostRatio: &zero, Sent: true, Finished: true, Failure: true, LatencyMS: 500, Billing: &relaycommon.OverviewBillingSnapshot{UsageSource: "local_estimate", CacheInputTokens: 1000000, CacheReadTokens: 900000}}}},
 			}
 			for _, info := range requests {
+				if info.OverviewAttempts[0].EventID == "paid:0" {
+					info.OverviewAttempts[0].Billing.OverviewMediaUsage = relaycommon.OverviewMediaUsage{ImageCount: common.GetPointer(int64(2)), ImageUsageSource: "upstream_payload"}
+					info.OverviewAttempts[0].UpstreamRequestID = "req_vendor-01"
+				}
+				if info.OverviewAttempts[0].EventID == "free:0" {
+					info.OverviewAttempts[0].Billing.OverviewMediaUsage = relaycommon.OverviewMediaUsage{AudioSeconds: common.GetPointer(1.25), AudioUsageSource: "media_metadata"}
+				}
 				CompleteOverviewRelay(info)
 			}
+			var imageEvent, audioEvent, unknownEvent model.OverviewAttemptEvent
+			require.NoError(t, db.First(&imageEvent, "id = ?", "paid:0").Error)
+			require.NoError(t, db.First(&audioEvent, "id = ?", "free:0").Error)
+			require.NoError(t, db.First(&unknownEvent, "id = ?", "retry:0").Error)
+			require.NotNil(t, imageEvent.ImageCount)
+			assert.EqualValues(t, 2, *imageEvent.ImageCount)
+			assert.Equal(t, "upstream_payload", imageEvent.ImageUsageSource)
+			assert.Equal(t, "req_vendor-01", imageEvent.UpstreamRequestID)
+			require.NotNil(t, audioEvent.AudioSeconds)
+			assert.Equal(t, 1.25, *audioEvent.AudioSeconds)
+			assert.Equal(t, "media_metadata", audioEvent.AudioUsageSource)
+			assert.Nil(t, imageEvent.AudioSeconds)
+			assert.Nil(t, audioEvent.ImageCount)
+			assert.Nil(t, unknownEvent.ImageCount)
+			assert.Nil(t, unknownEvent.AudioSeconds)
+			assert.Empty(t, unknownEvent.UpstreamRequestID)
 			pending, err := model.GetChannelOverview(context.Background(), "channel", 7, "")
 			require.NoError(t, err)
 			assert.True(t, pending.Partial, "durable unprojected events are visible as incomplete")
@@ -144,6 +246,8 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 			assert.EqualValues(t, 300, report.Summary.CacheWriteTokens)
 			assert.EqualValues(t, 3, report.Summary.CacheUsageAttempts)
 			assert.EqualValues(t, 2, report.Summary.CacheHitAttempts)
+			require.NotNil(t, report.Summary.CacheAttemptHitRate)
+			assert.InDelta(t, 2.0/3*100, *report.Summary.CacheAttemptHitRate, 1e-9, "unknown usage must not count as a cache miss")
 			require.NotNil(t, report.Summary.CacheHitRate)
 			assert.InDelta(t, 1700.0/12000*100, *report.Summary.CacheHitRate, 1e-9, "cache rate is token weighted, never an average of per-request percentages")
 			require.NotNil(t, report.Summary.CacheUsageCoverage)
@@ -181,7 +285,7 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 				model.DB = db.Session(&gorm.Session{Logger: recorder})
 				value, err := model.GetChannelOverview(context.Background(), dimension, 7, "")
 				require.NoError(t, err)
-				assert.Equal(t, 7, recorder.queries, "one report has seven bounded business queries")
+				assert.Equal(t, 8, recorder.queries, "cross-channel model comparisons use one bounded query, not one query per channel")
 				assert.InDelta(t, report.Summary.Revenue, value.Summary.Revenue, 1e-12)
 				assert.InDelta(t, report.Summary.Margin, value.Summary.Margin, 1e-12)
 			}
@@ -195,6 +299,11 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 			assert.Len(t, selected.Options, 3)
 			require.Len(t, selected.Channels, 1)
 			assert.Equal(t, "1", selected.Channels[0].ID)
+			require.Len(t, selected.ChannelModels, 2)
+			for _, row := range selected.ChannelModels {
+				assert.Equal(t, 1, row.ChannelID)
+				assert.Equal(t, "primary", row.ChannelName)
+			}
 			assert.Equal(t, report.Summary.CacheReadTokens, selected.Summary.CacheReadTokens)
 			paid, err := model.GetChannelOverview(context.Background(), "group", 7, "paid")
 			require.NoError(t, err)
@@ -215,6 +324,7 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 			assert.Nil(t, absent.Summary.Health)
 			assert.Nil(t, absent.Summary.CacheHitRate)
 			assert.Empty(t, absent.Channels)
+			assert.Empty(t, absent.ChannelModels)
 			_, err = model.GetChannelOverview(context.Background(), "channel", 365, "")
 			assert.Error(t, err)
 			_, err = model.GetChannelOverview(context.Background(), "injected", 7, "")
@@ -223,6 +333,75 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 			cancel()
 			_, err = model.GetChannelOverview(cancelled, "channel", 7, "")
 			assert.Error(t, err)
+			t.Run("channel_model_cache_comparison", func(t *testing.T) {
+				rows := []model.OverviewDaily{
+					{ID: "cache-a-today", Day: now.Format("2006-01-02"), ChannelID: 21, ChannelName: "same name", ModelName: "shared-model", Attempts: 2, CacheUsageAttempts: 1, CacheHitAttempts: 1, CacheInputTokens: 1000, CacheReadTokens: 900},
+					{ID: "cache-a-yesterday", Day: now.AddDate(0, 0, -1).Format("2006-01-02"), ChannelID: 21, ChannelName: "same name", ModelName: "shared-model", Attempts: 1, CacheUsageAttempts: 1, CacheHitAttempts: 1, CacheInputTokens: 9000, CacheReadTokens: 100},
+					{ID: "cache-b-miss", Day: now.Format("2006-01-02"), ChannelID: 22, ChannelName: "same name", ModelName: "shared-model", Attempts: 2, CacheUsageAttempts: 2, CacheInputTokens: 1000},
+					{ID: "cache-a-other", Day: now.Format("2006-01-02"), ChannelID: 21, ChannelName: "same name", ModelName: "other-model", Attempts: 1, CacheUsageAttempts: 1, CacheHitAttempts: 1, CacheInputTokens: 1000, CacheReadTokens: 1000},
+					{ID: "cache-b-unknown", Day: now.Format("2006-01-02"), ChannelID: 22, ChannelName: "same name", ModelName: "other-model", Attempts: 1},
+					{ID: "cache-old", Day: now.AddDate(0, 0, -8).Format("2006-01-02"), ChannelID: 21, ChannelName: "same name", ModelName: "shared-model", Attempts: 1, CacheUsageAttempts: 1, CacheInputTokens: 10000},
+				}
+				for i := range rows {
+					rows[i].GroupName, rows[i].QuotaPerUnit = "cache-comparison", unit
+				}
+				require.NoError(t, db.Create(&rows).Error)
+				comparison, err := model.GetChannelOverview(context.Background(), "group", 7, "cache-comparison")
+				require.NoError(t, err)
+				require.Len(t, comparison.ChannelModels, 4)
+				assert.False(t, comparison.ChannelModelsTruncated)
+				byID := make(map[string]model.OverviewChannelModelRow)
+				for _, row := range comparison.ChannelModels {
+					byID[row.ID] = row
+				}
+				require.Len(t, byID, 4, "same model and same channel names must keep distinct channel/model identities")
+				a := byID["21:shared-model"]
+				assert.Equal(t, "shared-model", a.Name)
+				assert.EqualValues(t, 10000, a.CacheInputTokens)
+				require.NotNil(t, a.CacheHitRate)
+				assert.Equal(t, 10.0, *a.CacheHitRate, "daily ratios must be weighted by measured input tokens")
+				require.NotNil(t, a.CacheAttemptHitRate)
+				assert.Equal(t, 100.0, *a.CacheAttemptHitRate)
+				require.NotNil(t, a.CacheUsageCoverage)
+				assert.InDelta(t, 200.0/3, *a.CacheUsageCoverage, 1e-9)
+				miss := byID["22:shared-model"]
+				require.NotNil(t, miss.CacheHitRate)
+				assert.Zero(t, *miss.CacheHitRate)
+				require.NotNil(t, miss.CacheAttemptHitRate)
+				assert.Zero(t, *miss.CacheAttemptHitRate)
+				unknown := byID["22:other-model"]
+				assert.Nil(t, unknown.CacheHitRate)
+				assert.Nil(t, unknown.CacheAttemptHitRate)
+				month, err := model.GetChannelOverview(context.Background(), "group", 30, "cache-comparison")
+				require.NoError(t, err)
+				require.NotEmpty(t, month.ChannelModels)
+				assert.Equal(t, "21:shared-model", month.ChannelModels[0].ID)
+				require.NotNil(t, month.ChannelModels[0].CacheHitRate)
+				assert.Equal(t, 5.0, *month.ChannelModels[0].CacheHitRate)
+			})
+			t.Run("bounded_channel_model_results", func(t *testing.T) {
+				rows := make([]model.OverviewDaily, 101)
+				for i := range rows {
+					rows[i] = model.OverviewDaily{ID: fmt.Sprintf("bounded-cache-%03d", i), Day: now.Format("2006-01-02"), ChannelID: 99, ModelName: fmt.Sprintf("model-%03d", i), GroupName: "cache-limit", QuotaPerUnit: unit, Attempts: 1, CacheUsageAttempts: 1, CacheInputTokens: 10}
+				}
+				rows[100].ChannelID = 100
+				require.NoError(t, db.Create(&rows).Error)
+				limited, err := model.GetChannelOverview(context.Background(), "group", 7, "cache-limit")
+				require.NoError(t, err)
+				require.Len(t, limited.ChannelModels, 100)
+				assert.True(t, limited.ChannelModelsTruncated)
+				assert.EqualValues(t, 101, limited.Summary.CacheUsageAttempts, "summary must include rows beyond the detail limit")
+				assert.Equal(t, "model-000", limited.ChannelModels[0].Name)
+				assert.Equal(t, "model-099", limited.ChannelModels[99].Name)
+				selected, err := model.GetChannelOverview(context.Background(), "channel", 7, "99")
+				require.NoError(t, err)
+				assert.Len(t, selected.ChannelModels, 100)
+				assert.False(t, selected.ChannelModelsTruncated, "exactly 100 cohorts are complete")
+				tail, err := model.GetChannelOverview(context.Background(), "channel", 7, "100")
+				require.NoError(t, err)
+				require.Len(t, tail.ChannelModels, 1)
+				assert.Equal(t, "model-100", tail.ChannelModels[0].Name, "filtering happens before limiting")
+			})
 			// A purchase multiplier can yield less than one quota unit. Analysis
 			// preserves that expense instead of applying the user-charge rounding.
 			fractionalBase, fractionalRatio := 0.4, 1.0
@@ -302,6 +481,9 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 					assert.Equal(t, oldEvent.BaseQuota, pending.BaseQuota)
 					assert.Equal(t, oldEvent.CostRatio, pending.CostRatio)
 					assert.False(t, pending.CacheUsageKnown)
+					assert.Nil(t, pending.ImageCount, "historical media quantity is unknown")
+					assert.Nil(t, pending.AudioSeconds)
+					assert.Empty(t, pending.UpstreamRequestID)
 				}
 				for _, index := range []string{"idx_overview_day", "idx_overview_channel", "idx_overview_group", "idx_overview_key", "idx_overview_supplier"} {
 					assert.True(t, db.Migrator().HasIndex(&model.OverviewDaily{}, index), "upgrade preserves aggregate index %s", index)
@@ -340,7 +522,7 @@ func TestChannelOverviewDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.Model(&model.OverviewDaily{}).Where("channel_id = ?", 41).Count(&cohorts).Error)
 				assert.EqualValues(t, 1, cohorts, "the existing primary-key cohort is updated rather than duplicated")
 			})
-			t.Logf("%s: migration twice, request/attempt attribution, fractional currency, unknown/null/zero, request-wide completeness, seven-query budget, cancellation and durable projection recovery passed", fmt.Sprint(dialect))
+			t.Logf("%s: migration twice, request/attempt attribution, fractional currency, unknown/null/zero, channel/model cache comparisons, request-wide completeness, eight-query budget, cancellation and durable projection recovery passed", fmt.Sprint(dialect))
 		})
 	}
 }
@@ -421,3 +603,283 @@ type overviewDailyBeforeCache struct {
 }
 
 func (overviewDailyBeforeCache) TableName() string { return "overview_dailies" }
+
+func TestChannelLimitActualRequestBudget(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	common.SetContextKey(ctx, constant.ContextKeyOriginalModel, "gpt-4")
+	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeChatCompletions, RelayFormat: types.RelayFormatOpenAI,
+		ChannelLimitAttempt: &relaycommon.ChannelLimitRuntime{TPMApplicable: true, MaxOutputTokens: 128}}
+	for _, tc := range []struct {
+		name  string
+		body  string
+		want  int64
+		known bool
+		mode  int
+	}{
+		{"final outbound limit and choices", `{"messages":[{"role":"user","content":"hello"}],"max_completion_tokens":100,"n":3}`, 300, true, relayconstant.RelayModeChatCompletions},
+		{"trusted template fallback", `{"messages":[{"role":"user","content":"hello"}]}`, 128, true, relayconstant.RelayModeChatCompletions},
+		{"explicit zero remains zero", `{"messages":[{"role":"user","content":"hello"}],"max_tokens":0}`, 0, true, relayconstant.RelayModeChatCompletions},
+		{"fractional bound is unknown", `{"messages":[{"role":"user","content":"hello"}],"max_tokens":1.5}`, 0, false, relayconstant.RelayModeChatCompletions},
+		{"completion strings batch", `{"prompt":["hello","world"],"max_tokens":10,"n":2,"best_of":3}`, 60, true, relayconstant.RelayModeCompletions},
+		{"completion flat token IDs", `{"prompt":[10,11,12,13,14],"max_tokens":10,"n":2}`, 20, true, relayconstant.RelayModeCompletions},
+		{"completion nested token IDs", `{"prompt":[[10,11,12],[20,21]],"max_tokens":10,"n":2}`, 40, true, relayconstant.RelayModeCompletions},
+		{"embedding token IDs", `{"input":[[10,11,12],[20,21]]}`, 0, true, relayconstant.RelayModeEmbeddings},
+		{"mixed prompt batch", `{"prompt":["hello",[10,11]],"max_tokens":10}`, 0, false, relayconstant.RelayModeCompletions},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info.RelayMode = tc.mode
+			input, output, total := channelLimitTokenBudget(ctx, info, []byte(tc.body))
+			if !tc.known {
+				assert.Nil(t, output)
+				assert.Nil(t, total)
+				return
+			}
+			require.NotNil(t, input)
+			assert.Positive(t, *input)
+			require.NotNil(t, output)
+			require.NotNil(t, total)
+			assert.Equal(t, tc.want, *output)
+			assert.Equal(t, *input+tc.want, *total)
+			if strings.Contains(tc.name, "token IDs") {
+				assert.GreaterOrEqual(t, *input, int64(5), "token-ID inputs must not disappear from the request estimate")
+			}
+		})
+	}
+	info.RelayMode = relayconstant.RelayModeChatCompletions
+	info.ChannelLimitAttempt.MaxOutputTokens = 0
+	_, output, total := channelLimitTokenBudget(ctx, info, []byte(`{"messages":[{"role":"user","content":"hello"}]}`))
+	assert.Nil(t, output)
+	assert.Nil(t, total)
+}
+
+func TestChannelLimitProcurementUsesFullFrozenBudget(t *testing.T) {
+	ratio := 0.5
+	input, output := int64(1000), int64(100)
+	expression := `tier("base", p * 2 + c * 10)`
+	info := &relaycommon.RelayInfo{
+		ChannelLimitAttempt: &relaycommon.ChannelLimitRuntime{CostRatio: &ratio},
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+			GroupRatio: 0, QuotaPerUnit: 500000, ExprVersion: 1, EstimatedQuotaBeforeGroup: 1000},
+	}
+	budget, err := channelLimitProcurementBudget(info, &input, &output)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2500000), budget, "input, long-TTL cache fallback, and output cost survive a free customer group")
+	assert.Zero(t, info.TieredBillingSnapshot.GroupRatio, "budget estimation must not mutate consumer billing")
+	_, err = channelLimitProcurementBudget(info, &input, nil)
+	assert.ErrorIs(t, err, model.ErrChannelLimitAccounting)
+	expression = `tier("cache", p * 2 + cr * 30 + c * 10)`
+	info.TieredBillingSnapshot.ExprString, info.TieredBillingSnapshot.ExprHash = expression, billingexpr.ExprHashString(expression)
+	budget, err = channelLimitProcurementBudget(info, &input, &output)
+	require.NoError(t, err)
+	assert.Equal(t, int64(17500000), budget, "all cache allocations are bounded conservatively, including omitted long-TTL prices")
+	expression = `tier("request", fixed(0.01))`
+	info.TieredBillingSnapshot.ExprString, info.TieredBillingSnapshot.ExprHash = expression, billingexpr.ExprHashString(expression)
+	budget, err = channelLimitProcurementBudget(info, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5000000), budget)
+
+	for _, tc := range []struct {
+		name       string
+		expression string
+		want       int64
+		invalid    bool
+	}{
+		{"decreasing output price", `tier("decreasing", max(100-c,0)*1000000)`, 50000000000, false},
+		{"mixed cache conditional", `p>0 && cr>0 ? tier("mixed",100000000) : tier("empty",0)`, 50000000000, false},
+		{"interior maximum", `tier("interior",c*(100-c)*1000)`, 5000000000, false},
+		{"long cache normalization", `tier("cache",cc*2)`, 2000000, false},
+		{"request conditional", `tier("request",fixed(0.01))*(header("service-tier")=="fast" ? 2 : 1)`, 10000000, false},
+		{"frozen request amount", `tier("request",param("amount")*1000000)`, 1500000000, false},
+		{"explicit zero", `tier("request",fixed(0))`, 0, false},
+		{"unbounded reciprocal", `tier("bad",100/c)`, 0, true},
+		{"unsupported operator", `tier("unsupported",c^2)`, 0, true},
+		{"mutable usage facts", `tier("usage",u("image_count"))`, 0, true},
+		{"quota saturation", `tier("oversized",1000000000000000)`, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info.TieredBillingSnapshot.ExprString = tc.expression
+			info.TieredBillingSnapshot.ExprHash = billingexpr.ExprHashString(tc.expression)
+			info.BillingRequestInput = &billingexpr.RequestInput{Body: []byte(`{"amount":3}`)}
+			budget, err := channelLimitProcurementBudget(info, &input, &output)
+			if tc.invalid {
+				assert.ErrorIs(t, err, model.ErrChannelLimitAccounting)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, budget)
+		})
+	}
+}
+
+func TestChannelLimitSupplierSnapshotAndNormalizedSettlement(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(":memory:")
+			case "mysql":
+				if os.Getenv("TEST_MYSQL_DSN") == "" {
+					t.Skip("TEST_MYSQL_DSN not configured")
+				}
+				driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+			case "postgres":
+				if os.Getenv("TEST_POSTGRES_DSN") == "" {
+					t.Skip("TEST_POSTGRES_DSN not configured")
+				}
+				driver = postgres.Open(os.Getenv("TEST_POSTGRES_DSN"))
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "supplier_cost_test_"}, Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			connection, err := db.DB()
+			require.NoError(t, err)
+			connection.SetMaxOpenConns(1)
+			previousDB, previousType, previousQuota, previousCache := model.DB, common.MainDatabaseType(), common.QuotaPerUnit, common.MemoryCacheEnabled
+			model.DB, common.QuotaPerUnit, common.MemoryCacheEnabled = db, 500000, false
+			common.SetMainDatabaseType(common.DatabaseType(dialect))
+			schemas := []any{&model.Channel{}, &model.Ability{}, &model.SupplierAccount{}, &model.SupplierChannelDraft{}, &model.UpstreamSupplier{}, &model.UpstreamCredential{}, &model.UpstreamCredentialVersion{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialFingerprintSecret{}, &model.ChannelLimitEvent{}, &model.ChannelLimitConfig{}, &model.ChannelLimitAttempt{}, &model.ChannelDailyBudget{}}
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(schemas...))
+				model.DB, common.QuotaPerUnit, common.MemoryCacheEnabled = previousDB, previousQuota, previousCache
+				common.SetMainDatabaseType(previousType)
+				require.NoError(t, connection.Close())
+			})
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(schemas...))
+			}
+			t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+			t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+			supplierRatio := 0.5
+			supplier, err := model.CreateUpstreamSupplier("Supplier cost contract")
+			require.NoError(t, err)
+			account := model.SupplierAccount{SupplierID: supplier.ID, SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: "gpt-4", Group: "default", PoolWeight: 1, MaxChannels: 5, CostRatio: &supplierRatio, MaxOutputTokens: 128}
+			require.NoError(t, model.SaveSupplierAccount(&account, 0))
+			secret, err := model.EncryptSupplierSecret(account.SupplierID, "supplier-cost-test-secret")
+			require.NoError(t, err)
+			draft := model.SupplierChannelDraft{SupplierID: account.SupplierID, Name: "Supplier cost", Type: constant.ChannelTypeOpenAI, BaseURL: "https://upstream.invalid", Secret: secret, Models: "gpt-4"}
+			channel, err := model.SaveSupplierChannelDraft(&draft, 99, 0, 0)
+			require.NoError(t, err)
+			require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
+			require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, account.SupplierID, channel.SupplierVersion, []string{"gpt-4"}))
+			require.NoError(t, db.Omit("key").First(channel, "id = ?", channel.Id).Error)
+			initial := channel.GetUpstreamCredentialSnapshot(0)
+			assert.Equal(t, account.DefaultCostVersionID(), initial.CostVersionID)
+			_, err = model.UpdateChannelLimits(channel.Id, 1, model.ChannelLimitSettings{RPM: 10, TPM: 2000, DailyUSDNano: model.ChannelLimitUSDScale, ReconcileSeconds: 300}, channel.ProcurementCostReady(), time.Now())
+			require.NoError(t, err)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			common.SetContextKey(ctx, constant.ContextKeyOriginalModel, "gpt-4")
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeChatCompletions, RelayFormat: types.RelayFormatOpenAI, OriginModelName: "gpt-4", ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id, ChannelType: channel.Type}}
+			info.PriceData.UsePrice, info.PriceData.ModelPrice = true, 0.002
+			require.NoError(t, PrepareChannelLimitAttempt(info, channel))
+			PrepareOverviewAttempt(ctx, info, channel)
+			assert.Equal(t, 0.5, *info.ChannelLimitAttempt.CostRatio)
+			assert.Equal(t, info.ChannelLimitAttempt.CostVersionID, info.OverviewAttempt.CostVersionID)
+			request := httptest.NewRequest("POST", "https://upstream.invalid/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"private request text"}]}`))
+			request.Header.Set("Content-Type", "application/json")
+			require.NoError(t, BeforeChannelUpstreamRequest(ctx, info, request))
+			var persisted model.ChannelLimitAttempt
+			require.NoError(t, db.First(&persisted, "id = ?", info.ChannelLimitAttempt.ID).Error)
+			assert.Equal(t, 0.5, *persisted.CostRatio)
+			assert.Equal(t, float64(500000), persisted.QuotaPerUnit)
+			assert.Contains(t, persisted.PricingSnapshot, initial.CostVersionID)
+			assert.NotContains(t, persisted.PricingSnapshot, "private request text")
+			assert.NotContains(t, persisted.PricingSnapshot, "supplier-cost-test-secret")
+			account.CostRatio = common.GetPointer(0.25)
+			require.NoError(t, model.SaveSupplierAccount(&account, account.Revision))
+			base := float64(1000)
+			info.AnalyticsBilling = &relaycommon.OverviewBillingSnapshot{BaseQuota: &base, QuotaPerUnit: 500000, UsageSource: "upstream", InputTokens: 20, OutputTokens: 10, CacheUsageKnown: true, CacheInputTokens: 100}
+			require.NoError(t, FinishChannelLimitAttempt(ctx, info, nil))
+			require.NoError(t, FinishChannelLimitAttempt(ctx, info, nil))
+			state, err := model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.Equal(t, int64(110), state.TPMUsed)
+			assert.Equal(t, int64(1000000), state.DailyUsedNano, "in-flight cost remains frozen")
+			assert.Zero(t, state.DailyHeldNano)
+			assert.Equal(t, int64(1), state.RPMUsed)
+			require.NoError(t, PrepareChannelLimitAttempt(info, channel)) // deliberately reuse stale routing metadata
+			PrepareOverviewAttempt(ctx, info, channel)
+			assert.Equal(t, 0.25, *info.ChannelLimitAttempt.CostRatio)
+			assert.Equal(t, *info.ChannelLimitAttempt.CostRatio, *info.OverviewAttempt.CostRatio)
+			assert.Equal(t, account.DefaultCostVersionID(), info.OverviewAttempt.CostVersionID)
+			credential, err := model.UpdateUpstreamCredentialMetadata(initial.CredentialID, model.UpstreamCredentialMetadata{SupplierID: account.SupplierID, CostRatio: common.GetPointer(0.1)})
+			require.NoError(t, err)
+			account.CostRatio = common.GetPointer(0.75)
+			require.NoError(t, model.SaveSupplierAccount(&account, account.Revision))
+			require.NoError(t, PrepareChannelLimitAttempt(info, channel))
+			PrepareOverviewAttempt(ctx, info, channel)
+			assert.Equal(t, 0.1, *info.ChannelLimitAttempt.CostRatio, "credential override wins over a changed supplier default")
+			assert.Equal(t, "credential", info.OverviewAttempt.CostSource)
+			assert.Equal(t, credential.CostVersionID, info.ChannelLimitAttempt.CostVersionID)
+			assert.Equal(t, info.ChannelLimitAttempt.CostVersionID, info.OverviewAttempt.CostVersionID)
+			candidate := *channel
+			candidate.ProcurementCredentialID = common.GetPointer("")
+			require.NoError(t, PrepareChannelLimitAttempt(info, &candidate))
+			assert.Equal(t, 0.75, *info.ChannelLimitAttempt.CostRatio, "new candidate material cannot inherit the previous Key's override")
+			candidate.ProcurementCredentialID = common.GetPointer(credential.ID)
+			require.NoError(t, PrepareChannelLimitAttempt(info, &candidate))
+			assert.Equal(t, 0.1, *info.ChannelLimitAttempt.CostRatio, "a verified matching credential retains its override during a probe")
+			_, err = model.UpdateUpstreamCredentialMetadata(initial.CredentialID, model.UpstreamCredentialMetadata{SupplierID: account.SupplierID})
+			require.NoError(t, err)
+			require.NoError(t, PrepareChannelLimitAttempt(info, channel))
+			assert.Equal(t, 0.75, *info.ChannelLimitAttempt.CostRatio, "cleared credential override uses the latest inherited default")
+			editable, err := model.GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			editable.CostRatio, editable.CostRatioSet = common.GetPointer(0.4), true
+			require.NoError(t, editable.Update())
+			account.CostRatio = nil
+			require.NoError(t, model.SaveSupplierAccount(&account, account.Revision))
+			require.NoError(t, PrepareChannelLimitAttempt(info, channel))
+			PrepareOverviewAttempt(ctx, info, channel)
+			assert.Equal(t, 0.4, *info.ChannelLimitAttempt.CostRatio, "supplier defaults cannot erase an administrator's channel override")
+			assert.Equal(t, editable.CostVersionID, info.ChannelLimitAttempt.CostVersionID)
+			assert.Equal(t, info.ChannelLimitAttempt.CostVersionID, info.OverviewAttempt.CostVersionID)
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.True(t, state.Config.BudgetReady, "a known channel override remains ready without a supplier default")
+
+			// A pause committed during request inspection still prevents dispatch
+			// and releases the unsent reservation without spending RPM.
+			pausedRequest := httptest.NewRequest("POST", "https://upstream.invalid/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
+			pausedRequest.GetBody = func() (io.ReadCloser, error) {
+				if err := db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("supplier_paused", true).Error; err != nil {
+					return nil, err
+				}
+				return io.NopCloser(strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`)), nil
+			}
+			assert.ErrorContains(t, BeforeChannelUpstreamRequest(ctx, info, pausedRequest), "channel_unavailable")
+			assert.False(t, info.ChannelLimitAttempt.Sent)
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), state.RPMUsed)
+			assert.Zero(t, state.RPMReserved)
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("supplier_paused", false).Error)
+
+			// EOF without the terminal event required by the protocol remains
+			// unknown, retaining both TPM and a trusted partial cost lower bound.
+			ctx, _ = gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			require.NoError(t, PrepareChannelLimitAttempt(info, channel))
+			request = httptest.NewRequest("POST", "https://upstream.invalid/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
+			require.NoError(t, BeforeChannelUpstreamRequest(ctx, info, request))
+			info.StreamStatus = relaycommon.NewStreamStatus()
+			info.StreamStatus.RequireTerminal()
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+			base = 2000
+			info.AnalyticsBilling = &relaycommon.OverviewBillingSnapshot{BaseQuota: &base, QuotaPerUnit: 500000, UsageSource: "upstream", InputTokens: 100, OutputTokens: 20}
+			require.NoError(t, FinishChannelLimitAttempt(ctx, info, types.NewError(fmt.Errorf("missing terminal event"), types.ErrorCodeBadResponse)))
+			persisted = model.ChannelLimitAttempt{}
+			require.NoError(t, db.First(&persisted, "id = ?", info.ChannelLimitAttempt.ID).Error)
+			assert.False(t, persisted.Completed)
+			assert.False(t, persisted.CostActualKnown)
+			assert.NotZero(t, persisted.ReconcileUntilMS)
+			assert.Equal(t, int64(1600000), persisted.HeldUSDNano)
+			ctx.Request = httptest.NewRequest("POST", "/mj/submit/imagine", strings.NewReader(`{}`))
+			ctx.Set("channel_id", channel.Id)
+			mjResponse, _, err := DoMidjourneyHttpRequest(ctx, time.Second, "https://upstream.invalid/mj/submit/imagine")
+			assert.ErrorContains(t, err, "protocol_limit_unsupported", "the legacy asynchronous transport cannot bypass supplier/limit admission")
+			assert.Equal(t, 503, mjResponse.StatusCode)
+		})
+	}
+}

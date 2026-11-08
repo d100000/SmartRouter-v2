@@ -3,6 +3,9 @@ package common
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -51,4 +54,45 @@ func ConfigureTrustedProxies(engine *gin.Engine, trustedProxies []string) error 
 		return fmt.Errorf("invalid TRUSTED_PROXIES: %w", err)
 	}
 	return nil
+}
+
+// RequestUsesTrustedHTTPS accepts proxy transport metadata only from the
+// configured immediate peer. A Secure cookie setting alone is not evidence
+// that credentials reached this request over HTTPS.
+func RequestUsesTrustedHTTPS(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	if request.TLS != nil {
+		return true
+	}
+	proto := request.Header.Values("X-Forwarded-Proto")
+	if len(proto) != 1 || !strings.EqualFold(strings.TrimSpace(proto[0]), "https") {
+		return false
+	}
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	peer := net.ParseIP(host)
+	if peer == nil {
+		return false
+	}
+	trusted, _, err := ResolveTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if err != nil {
+		return false
+	}
+	matched := false
+	for _, value := range trusted {
+		if ip := net.ParseIP(value); ip != nil {
+			matched = matched || ip.Equal(peer)
+			continue
+		}
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			return false
+		}
+		matched = matched || network.Contains(peer)
+	}
+	return matched
 }

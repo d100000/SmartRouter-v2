@@ -81,6 +81,9 @@ func getInferenceChannelStatus(c *gin.Context, channelType int) {
 // fetchInferenceStatus reads only fixed paths on an operator-configured channel.
 // Each endpoint can fail independently; upstream errors never echo credentials.
 func fetchInferenceStatus(ctx context.Context, channel *model.Channel) (*inferenceStatus, error) {
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		return nil, model.ErrSupplierChannelOperation
+	}
 	if channel.Type != constant.ChannelTypeVLLM && channel.Type != constant.ChannelTypeSGLang {
 		return nil, errors.New("This operation is only supported for vLLM or SGLang channels")
 	}

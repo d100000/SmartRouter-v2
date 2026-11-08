@@ -3,11 +3,17 @@ package authz
 import "slices"
 
 import "github.com/casbin/casbin/v2"
+import "github.com/QuantumNous/new-api/common"
 
 // Can reports whether the subject may perform the permission. A superuser role
 // short-circuits to allow. Otherwise a per-user override wins, then the union of
 // the subject's role baselines applies.
 func Can(userID int, systemRole int, permission Permission) bool {
+	// A viewer's additive grant cannot be expanded by stale administrator
+	// overrides. Supplier permissions are scoped by the supplier API instead.
+	if systemRole < common.RoleAdminUser && (systemRole != common.RoleCommonUser || permission != ChannelRead) {
+		return false
+	}
 	roles := resolveSubjectRoles(userID, systemRole)
 	if len(roles) == 0 {
 		return false
@@ -22,6 +28,9 @@ func Can(userID int, systemRole int, permission Permission) bool {
 	e := currentEnforcer()
 	if e == nil {
 		return false
+	}
+	if systemRole == common.RoleCommonUser {
+		return roleBaselineAllows(e, BuiltInRoleChannelViewer, permission)
 	}
 	if effect, ok := explicitSubjectEffect(e, UserSubject(userID), permission); ok {
 		return effect == EffectAllow

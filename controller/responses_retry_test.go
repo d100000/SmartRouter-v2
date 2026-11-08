@@ -234,6 +234,7 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 			for index, tc := range []struct {
 				name, prefix, failure, extra, override, retryAfter, expression                    string
 				disabled, failAgain, httpFailure, noGlobalRetry, passthrough, trusted, noFallback bool
+				localLimit                                                                        bool
 				wantAttempts, wantQuota                                                           int
 			}{
 				{name: "overload then success settles once", wantAttempts: 2, wantQuota: 500},
@@ -243,6 +244,7 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 				{name: "HTTP failure on second attempt cannot start a third", httpFailure: true, wantAttempts: 2},
 				{name: "channel defaults off", disabled: true, wantAttempts: 1},
 				{name: "global retries disabled", noGlobalRetry: true, wantAttempts: 1},
+				{name: "local channel limit does not spend an upstream retry", localLimit: true, noGlobalRetry: true, wantAttempts: 1, wantQuota: 500},
 				{name: "no fallback preserves original overload and refunds", noFallback: true, wantAttempts: 1},
 				{name: "plain EOF never retries", failure: "EOF", wantAttempts: 1},
 				{name: "message alone is insufficient", failure: strings.ReplaceAll(retryOverloadEvent, "server_is_overloaded", "server_error"), wantAttempts: 1},
@@ -297,6 +299,17 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 						require.NoError(t, fallback.AddAbilities(db))
 					}
 					model.InitChannelCache()
+					if tc.localLimit {
+						now := time.Now()
+						require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, now))
+						_, err := model.UpdateChannelLimits(channel.Id, 1, model.ChannelLimitSettings{RPM: 1, ReconcileSeconds: 300}, false, now)
+						require.NoError(t, err)
+						seedID := fmt.Sprintf("previous-%d", channel.Id)
+						_, err = model.ReserveChannelAttempt(model.ChannelAttemptReservation{ID: seedID, ChannelID: channel.Id}, now)
+						require.NoError(t, err)
+						require.NoError(t, model.MarkChannelAttemptSent(channel.Id, seedID, now))
+						require.NoError(t, model.SettleChannelAttempt(model.ChannelAttemptSettlement{ID: seedID, ChannelID: channel.Id, Version: 1}, now))
+					}
 					common.RetryTimes = 4
 					if tc.noGlobalRetry {
 						common.RetryTimes = 0
@@ -321,7 +334,7 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 							body += "data: " + failure + "\n\n"
 						}
 						turn := "failed-turn"
-						if attempts > 1 && !tc.failAgain {
+						if (attempts > 1 || tc.localLimit) && !tc.failAgain {
 							body, turn = "data: "+retryCompletedEvent+"\n\n", "successful-turn"
 							if tc.httpFailure {
 								status, body = http.StatusBadGateway, `{"error":{"message":"unavailable"}}`
@@ -351,6 +364,16 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 					defer service.EndSchedulingRequest(c)
 					Relay(c, types.RelayFormatOpenAIResponses)
 					assert.Equal(t, tc.wantAttempts, attempts, recorder.Body.String())
+					if tc.localLimit {
+						assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						assert.Contains(t, recorder.Body.String(), "successful-response")
+						state, err := model.GetChannelLimitState(channel.Id, time.Now())
+						require.NoError(t, err)
+						assert.Equal(t, int64(1), state.RPMUsed, "local rejection cannot add an actual upstream request")
+						state, err = model.GetChannelLimitState(fallback.Id, time.Now())
+						require.NoError(t, err)
+						assert.Equal(t, int64(1), state.RPMUsed)
+					}
 					if tc.noFallback {
 						assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 						assert.Contains(t, recorder.Body.String(), "server_is_overloaded")

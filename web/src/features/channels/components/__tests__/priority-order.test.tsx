@@ -915,3 +915,81 @@ test.each(['table', 'card'] as const)(
     )
   }
 )
+
+test('owned channel priority and weight show the actual supply pool and link to its configuration', async () => {
+  const original = vi.mocked(api.get).getMockImplementation()
+  if (!original) throw new Error('Expected the channel API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/suppliers/') {
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                id: 'supplier-a',
+                name: 'Supplier A',
+                pool_priority: 81,
+                pool_weight: 22,
+              },
+            ],
+            total: 1,
+          },
+        },
+      }
+    }
+    const response = await original(url, config)
+    if (
+      url === '/api/channel/' ||
+      url === '/api/channel' ||
+      url === '/api/channel/search'
+    ) {
+      const page = response as { data: { data: { items: Channel[] } } }
+      page.data.data.items[0].owner_supplier_id = 'supplier-a'
+    }
+    return response
+  })
+  await mount('table', false)
+  await screen.findByText('81')
+  const priority = await screen.findByRole('link', { name: '81' })
+  expect(priority).toHaveAttribute('href', '/suppliers')
+  expect(screen.getByRole('link', { name: '22' })).toHaveAttribute(
+    'href',
+    '/suppliers'
+  )
+  const row = priority.closest('tr')
+  if (!row) throw new Error('Expected a channel table row')
+  expect(within(row).queryByRole('spinbutton')).not.toBeInTheDocument()
+})
+
+test('filters channels by supplier through the list API before pagination', async () => {
+  const original = vi.mocked(api.get).getMockImplementation()
+  if (!original) throw new Error('Expected the channel API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/suppliers/') {
+      return {
+        data: {
+          success: true,
+          data: { items: [{ id: 'supplier-a', name: 'Supplier A' }], total: 1 },
+        },
+      }
+    }
+    return original(url, config)
+  })
+  await mount('table', false)
+  const user = userEvent.setup()
+  const filter = screen
+    .getAllByRole('button', { name: 'Channel Supplier' })
+    .find((button) => button.getAttribute('aria-haspopup') === 'dialog')
+  if (!filter) throw new Error('Expected the supplier filter')
+  await user.click(filter)
+  await user.click(await screen.findByRole('option', { name: 'Supplier A' }))
+  await waitFor(() =>
+    expect(api.get).toHaveBeenCalledWith('/api/channel/', {
+      params: expect.objectContaining({
+        owner_supplier_id: 'supplier-a',
+        p: 1,
+      }),
+    })
+  )
+})

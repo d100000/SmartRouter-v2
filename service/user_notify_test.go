@@ -122,6 +122,7 @@ func TestChannelNoticesFollowEachAdministratorsSwitch(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
 	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(database))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(database))
 	model.DB = database
 	common.MemoryCacheEnabled, common.RedisEnabled = false, false
 	constant.NotifyLimitCount = 100

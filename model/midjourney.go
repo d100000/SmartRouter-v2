@@ -1,28 +1,39 @@
 package model
 
+import (
+	"github.com/QuantumNous/new-api/common"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+)
+
 type Midjourney struct {
-	Id          int    `json:"id"`
-	Code        int    `json:"code"`
-	UserId      int    `json:"user_id" gorm:"index"`
-	Action      string `json:"action" gorm:"type:varchar(40);index"`
-	MjId        string `json:"mj_id" gorm:"index"`
-	Prompt      string `json:"prompt"`
-	PromptEn    string `json:"prompt_en"`
-	Description string `json:"description"`
-	State       string `json:"state"`
-	SubmitTime  int64  `json:"submit_time" gorm:"index"`
-	StartTime   int64  `json:"start_time" gorm:"index"`
-	FinishTime  int64  `json:"finish_time" gorm:"index"`
-	ImageUrl    string `json:"image_url"`
-	VideoUrl    string `json:"video_url"`
-	VideoUrls   string `json:"video_urls"`
-	Status      string `json:"status" gorm:"type:varchar(20);index"`
-	Progress    string `json:"progress" gorm:"type:varchar(30);index"`
-	FailReason  string `json:"fail_reason"`
-	ChannelId   int    `json:"channel_id"`
-	Quota       int    `json:"quota"`
-	Buttons     string `json:"buttons"`
-	Properties  string `json:"properties"`
+	Id                   int    `json:"id"`
+	Code                 int    `json:"code"`
+	UserId               int    `json:"user_id" gorm:"index"`
+	Action               string `json:"action" gorm:"type:varchar(40);index"`
+	MjId                 string `json:"mj_id" gorm:"index"`
+	Prompt               string `json:"prompt"`
+	PromptEn             string `json:"prompt_en"`
+	Description          string `json:"description"`
+	State                string `json:"state"`
+	SubmitTime           int64  `json:"submit_time" gorm:"index"`
+	StartTime            int64  `json:"start_time" gorm:"index"`
+	FinishTime           int64  `json:"finish_time" gorm:"index"`
+	ImageUrl             string `json:"image_url"`
+	VideoUrl             string `json:"video_url"`
+	VideoUrls            string `json:"video_urls"`
+	Status               string `json:"status" gorm:"type:varchar(20);index"`
+	Progress             string `json:"progress" gorm:"type:varchar(30);index"`
+	FailReason           string `json:"fail_reason"`
+	ChannelId            int    `json:"channel_id"`
+	Quota                int    `json:"quota"`
+	Buttons              string `json:"buttons"`
+	Properties           string `json:"properties"`
+	FundingAttemptData   string `json:"-" gorm:"type:text"`
+	PollingKey           string `json:"-" gorm:"type:text"`
+	ChannelAttemptData   string `json:"-" gorm:"type:text"`
+	ProcurementVersion   int64  `json:"-" gorm:"bigint"`
+	ProcurementPending   bool   `json:"-" gorm:"index"`
+	ProcurementReconcile bool   `json:"-" gorm:"index"`
 
 	TokenId          int `json:"-" gorm:"default:0"`
 	BillingChannelId int `json:"-" gorm:"default:0"`
@@ -97,7 +108,7 @@ func GetAllUnFinishTasks() []*Midjourney {
 	var tasks []*Midjourney
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Find(&tasks).Error
+	err = DB.Where("progress != ? OR procurement_reconcile = ? OR procurement_pending = ? OR (channel_attempt_data <> ? AND status NOT IN ?)", "100%", true, true, "", []string{"SUCCESS", "FAILURE"}).Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -111,7 +122,7 @@ func GetAllUnFinishTasks() []*Midjourney {
 func HasUnfinishedMidjourneyTasks() bool {
 	var id int
 	err := DB.Model(&Midjourney{}).
-		Where("progress != ?", "100%").
+		Where("progress != ? OR procurement_reconcile = ? OR procurement_pending = ? OR (channel_attempt_data <> ? AND status NOT IN ?)", "100%", true, true, "", []string{"SUCCESS", "FAILURE"}).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
@@ -192,7 +203,13 @@ func (midjourney *Midjourney) GetBillingChannelId() int {
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
 // Uses Model().Select("*").Updates() to avoid GORM Save()'s INSERT fallback.
 func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) {
-	result := DB.Model(midjourney).Where("status = ?", fromStatus).Select("*").Updates(midjourney)
+	query := DB.Model(midjourney).Where("status = ?", fromStatus)
+	if midjourney.ChannelAttemptData != "" {
+		query = query.Where("COALESCE(procurement_version, 0) = ?", midjourney.ProcurementVersion)
+		midjourney.ProcurementVersion++
+		midjourney.ProcurementPending = true
+	}
+	result := query.Select("*").Updates(midjourney)
 	if result.Error != nil {
 		return false, result.Error
 	}
@@ -246,4 +263,29 @@ func CountAllUserTask(userId int, queryParams TaskQueryParams) int64 {
 	}
 	_ = query.Count(&total).Error
 	return total
+}
+
+// ChannelAttempt never enters any public Midjourney/task JSON projection.
+func (midjourney *Midjourney) ChannelAttempt() (*relaycommon.TaskChannelSnapshot, error) {
+	if midjourney.ChannelAttemptData == "" {
+		return nil, nil
+	}
+	var snapshot relaycommon.TaskChannelSnapshot
+	if err := common.UnmarshalJsonStr(midjourney.ChannelAttemptData, &snapshot); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
+func (midjourney *Midjourney) SetChannelAttempt(snapshot *relaycommon.TaskChannelSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	raw, err := common.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	midjourney.ChannelAttemptData = string(raw)
+	midjourney.PollingKey = ""
+	return nil
 }

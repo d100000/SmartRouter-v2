@@ -38,6 +38,19 @@ func (cm *ConfigManager) Get(name string) any {
 	return cm.configs[name]
 }
 
+// Snapshot copies a registered configuration while excluding LoadFromDB.
+// It is intended for value-only settings; nested maps and pointers still need
+// their own immutable representation or a deep copy before use by callers.
+func Snapshot[T any](cm *ConfigManager, name string) T {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	if value, ok := cm.configs[name].(*T); ok && value != nil {
+		return *value
+	}
+	var zero T
+	return zero
+}
+
 // LoadFromDB 从数据库加载配置
 func (cm *ConfigManager) LoadFromDB(options map[string]string) error {
 	cm.mutex.Lock()

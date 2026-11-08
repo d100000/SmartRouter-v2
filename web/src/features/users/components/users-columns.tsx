@@ -226,7 +226,13 @@ export function useUsersColumns(): ColumnDef<User>[] {
             return null
           }
 
-          return <span className='text-sm'>{t(roleConfig.labelKey)}</span>
+          return (
+            <span className='text-sm'>
+              {row.original.channel_viewer
+                ? t('Channel Viewer')
+                : t(roleConfig.labelKey)}
+            </span>
+          )
         },
         filterFn: (row, id, value) => {
           return value.includes(String(row.getValue(id)))

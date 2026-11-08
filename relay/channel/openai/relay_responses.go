@@ -69,6 +69,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		imageCounter.Observe(&responsesResponse.Output[i], &i)
 	}
 	imageCounter.Commit(info)
+	info.ObserveImageCount(int64(imageCounter.Count()))
 
 	return usage, nil
 }

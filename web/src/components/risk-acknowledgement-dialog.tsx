@@ -41,6 +41,7 @@ type RequiredTextPart = {
 }
 
 type NormalizedRequiredTextPart = RequiredTextPart & {
+  key: string
   inputIndex?: number
 }
 
@@ -65,7 +66,7 @@ type RiskAcknowledgementDialogProps = {
 }
 
 function getRequiredTextRows(text: string) {
-  return Math.max(1, Math.ceil(Array.from(text).length / 42))
+  return Math.max(1, Math.ceil([...text].length / 42))
 }
 
 export function RiskAcknowledgementDialog({
@@ -95,16 +96,31 @@ export function RiskAcknowledgementDialog({
   const normalizedRequiredTextParts = useMemo<
     NormalizedRequiredTextPart[]
   >(() => {
+    const occurrences = new Map<string, number>()
     return requiredTextParts.reduce<{
       parts: NormalizedRequiredTextPart[]
       inputIndex: number
     }>(
       (acc, part) => {
+        const identity = JSON.stringify([
+          part.type,
+          part.text,
+          part.placeholder,
+        ])
+        const occurrence = occurrences.get(identity) ?? 0
+        occurrences.set(identity, occurrence + 1)
+        const normalizedPart = {
+          ...part,
+          key: JSON.stringify([identity, occurrence]),
+        }
         if (part.type !== 'input') {
-          return { ...acc, parts: [...acc.parts, part] }
+          return { ...acc, parts: [...acc.parts, normalizedPart] }
         }
         return {
-          parts: [...acc.parts, { ...part, inputIndex: acc.inputIndex }],
+          parts: [
+            ...acc.parts,
+            { ...normalizedPart, inputIndex: acc.inputIndex },
+          ],
           inputIndex: acc.inputIndex + 1,
         }
       },
@@ -244,17 +260,17 @@ export function RiskAcknowledgementDialog({
               </div>
               {hasSegmentedRequiredText ? (
                 <div className='flex flex-col gap-2'>
-                  {normalizedRequiredTextParts.map((part, index) =>
+                  {normalizedRequiredTextParts.map((part) =>
                     part.type === 'static' ? (
                       <span
-                        key={`static-${index}`}
+                        key={part.key}
                         className='text-muted-foreground bg-background/70 border-border w-fit rounded-md border px-2 py-1.5 font-mono text-sm select-none'
                       >
                         {part.text}
                       </span>
                     ) : (
                       <Textarea
-                        key={`input-${index}`}
+                        key={part.key}
                         value={typedTextParts[part.inputIndex ?? 0] ?? ''}
                         onChange={(event) =>
                           handleTextPartChange(

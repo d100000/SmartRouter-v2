@@ -36,6 +36,7 @@ import { useIsSidebarModuleVisible } from '@/hooks/use-sidebar-config'
 import { useUserDisplay } from '@/hooks/use-user-display'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
 import { ROLE } from '@/lib/roles'
+import { isSupplier } from '@/lib/supplier-access'
 import { useAuthStore } from '@/stores/auth-store'
 
 const avatarFallbackClassName = 'font-semibold text-white'
@@ -47,7 +48,9 @@ export function ProfileDropdown() {
   const user = useAuthStore((state) => state.auth.user)
   const { displayName, roleLabel } = useUserDisplay(user)
   const isSuperAdmin = user?.role === ROLE.SUPER_ADMIN
-  const isWalletVisible = useIsSidebarModuleVisible('/wallet')
+  const walletConfigured = useIsSidebarModuleVisible('/wallet')
+  const supplier = useAuthStore((state) => isSupplier(state.auth.user))
+  const isWalletVisible = walletConfigured && !supplier
   const isSecurityVisible = useIsSidebarModuleVisible('/security')
   const avatarName = user?.username || displayName
   const avatarFallback = getUserAvatarFallback(avatarName)

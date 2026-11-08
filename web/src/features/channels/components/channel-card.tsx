@@ -68,6 +68,7 @@ function ChannelCardComponent({
   const selectCell = renderCell('select')
   const typeCell = renderCell('type')
   const nameCell = renderCell('name')
+  const fundingCell = renderCell('funding_status')
   const statusCell = renderCell('status')
   const actionsCell = renderCell('actions')
   const priorityCell = renderCell('priority')
@@ -110,6 +111,10 @@ function ChannelCardComponent({
             {actionsCell}
           </div>
         </div>
+
+        {row.original.funding_status && (
+          <div className='flex flex-wrap items-center gap-2'>{fundingCell}</div>
+        )}
 
         {/* Both rows share their columns: identity/balance on the left,
           priority/response and weight/last tested on the right. */}

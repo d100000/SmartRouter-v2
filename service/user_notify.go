@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,6 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 )
+
+var ErrNotificationLimited = errors.New("notification limit exceeded")
 
 // NotifyChannelWatchers sends a channel notice (a channel disabled or enabled
 // automatically, or a test of all channels finished) to every administrator
@@ -78,7 +81,7 @@ func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data 
 		return err
 	}
 	if !canSend {
-		return fmt.Errorf("notification limit exceeded for user %d with type %s", userId, notifyType)
+		return fmt.Errorf("%w for user %d with type %s", ErrNotificationLimited, userId, notifyType)
 	}
 
 	switch notifyType {

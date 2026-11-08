@@ -87,7 +87,7 @@ func openaiImageResponseCount(responseBody []byte) int64 {
 // non-empty string value for field.
 func openaiImageDataHasField(item gjson.Result, field string) bool {
 	value := item.Get(field)
-	return value.Type == gjson.String && value.Raw != `""`
+	return value.Type == gjson.String && strings.TrimSpace(value.Str) != ""
 }
 
 // normalizeOpenAIUsage maps the OpenAI Images usage shape (input_tokens /
@@ -142,6 +142,7 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	usage := &dto.Usage{}
 	var lastStreamData []byte
 	var completedImages int64
+	var payloadImages int64
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		raw := common.StringToByteSlice(data)
@@ -162,6 +163,10 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			}
 			if chunk.Type == "image_generation.completed" || chunk.Type == "image_edit.completed" {
 				completedImages++
+				payload := gjson.ParseBytes(raw)
+				if openaiImageDataHasField(payload, "url") || openaiImageDataHasField(payload, "b64_json") {
+					payloadImages++
+				}
 			}
 		}
 		if err := writeOpenaiImageStreamChunk(c, raw); err != nil {
@@ -188,6 +193,13 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 			info.StreamStatus.EndReason == relaycommon.StreamEndReasonEOF
 		if upstreamFinished || completedImages > int64(info.RequestedImageCount()) {
 			info.UpdateImageCount(completedImages)
+		}
+		// An abort or a completion event without its image payload cannot
+		// establish the total number actually produced, even when billing must
+		// conservatively retain or increase the requested quantity.
+		if !upstreamFinished || payloadImages != completedImages {
+			info.AnalyticsMediaUsage.ImageCount = nil
+			info.AnalyticsMediaUsage.ImageUsageSource = ""
 		}
 	}
 	return usage, nil

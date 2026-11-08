@@ -519,6 +519,13 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   // Channel
   'channel.create': 'Created channel {{name}} (type {{type}}, count {{count}})',
   'channel.update': 'Updated channel {{name}} (ID: {{id}})',
+  'supplier.channel.save': 'Saved supplier channel (ID: {{id}})',
+  'supplier.channel.pause': 'Changed supplier channel pause state (ID: {{id}})',
+  'supplier.channel.copy':
+    'Copied supplier channel (source ID: {{source_id}}, new ID: {{id}})',
+  'supplier.channel.discard': 'Discarded supplier channel draft (ID: {{id}})',
+  'channel.limits.update': 'Updated channel limits (ID: {{id}})',
+  'supplier.configure': 'Updated supplier configuration (ID: {{supplier_id}})',
   'channel.status_update': 'Updated channel status (ID: {{id}})',
   'channel.status_update_batch':
     'Batch updated channel status ({{count}}/{{total}} changed)',

@@ -11,31 +11,34 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
 )
 
 const (
-	VerificationMethodTwoFA              = "2fa"
-	VerificationMethodPasskey            = "passkey"
-	VerificationMethodPassword           = "password"
-	VerificationMethodOAuth              = "oauth"
-	VerificationMethodSession            = "session"
-	VerificationScopeChannelKeyRead      = "channel.key.read"
-	VerificationScopePasskeyRegister     = "passkey.register"
-	VerificationScopePasskeyDelete       = "passkey.delete"
-	VerificationScopeTwoFASetup          = "2fa.setup"
-	VerificationScopeTwoFADisable        = "2fa.disable"
-	VerificationScopeTwoFABackupCodes    = "2fa.backup_codes.regenerate"
-	VerificationScopeLogin               = "auth.login"
-	VerificationScopeAccessTokenGenerate = "access_token.generate"
-	VerificationScopeAccessTokenRevoke   = "access_token.revoke"
-	VerificationScopeAccessTokenUpdate   = "access_token.update"
-	VerificationScopeAccountBind         = "account.binding.bind"
-	VerificationScopeAccountUnbind       = "account.binding.unbind"
-	VerificationScopePasswordSet         = "account.password.set"
-	VerificationScopePasswordChange      = "account.password.change"
-	VerificationScopeAccountDelete       = "account.delete"
+	VerificationMethodTwoFA                     = "2fa"
+	VerificationMethodPasskey                   = "passkey"
+	VerificationMethodPassword                  = "password"
+	VerificationMethodOAuth                     = "oauth"
+	VerificationMethodSession                   = "session"
+	VerificationScopeChannelKeyRead             = "channel.key.read"
+	VerificationScopeSupplierChannelCredentials = "supplier.channel.credentials"
+	VerificationScopeSupplierManage             = "supplier.manage"
+	VerificationScopePasskeyRegister            = "passkey.register"
+	VerificationScopePasskeyDelete              = "passkey.delete"
+	VerificationScopeTwoFASetup                 = "2fa.setup"
+	VerificationScopeTwoFADisable               = "2fa.disable"
+	VerificationScopeTwoFABackupCodes           = "2fa.backup_codes.regenerate"
+	VerificationScopeLogin                      = "auth.login"
+	VerificationScopeAccessTokenGenerate        = "access_token.generate"
+	VerificationScopeAccessTokenRevoke          = "access_token.revoke"
+	VerificationScopeAccessTokenUpdate          = "access_token.update"
+	VerificationScopeAccountBind                = "account.binding.bind"
+	VerificationScopeAccountUnbind              = "account.binding.unbind"
+	VerificationScopePasswordSet                = "account.password.set"
+	VerificationScopePasswordChange             = "account.password.change"
+	VerificationScopeAccountDelete              = "account.delete"
 	// Administrative step-up scopes bind the managed user into the proof so a
 	// proof issued for one account cannot be replayed against another.
 	VerificationScopeAdminUserCreate       = "admin.user.create"
@@ -50,7 +53,7 @@ const (
 
 // adminUserManageActions are the ManageUser actions that change a user's
 // status or role. Quota adjustments are not gated and deletion has its own scope.
-var adminUserManageActions = []string{"disable", "enable", "promote", "demote"}
+var adminUserManageActions = []string{"disable", "enable", "promote", "demote", "grant_channel_viewer", "revoke_channel_viewer"}
 
 var (
 	ErrVerificationFailed         = errors.New("Verification failed. Please try again.")
@@ -70,6 +73,16 @@ type VerificationOperation struct {
 
 type ChannelKeyReadContext struct {
 	ChannelID int `json:"channel_id"`
+}
+
+type SupplierChannelCredentialsContext struct {
+	ChannelID int   `json:"channel_id"`
+	Version   int64 `json:"version"`
+}
+
+type SupplierManageContext struct {
+	SupplierID string `json:"supplier_id"`
+	Version    int64  `json:"version"`
 }
 
 type AccountBindingContext struct {
@@ -163,6 +176,20 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 	}
 	var normalized any
 	switch operation.Scope {
+	case VerificationScopeSupplierChannelCredentials:
+		var context SupplierChannelCredentialsContext
+		if len(fields) != 2 || fields["channel_id"] == nil || fields["version"] == nil || common.Unmarshal(operation.Context, &context) != nil ||
+			context.ChannelID < 0 || context.Version < 0 || (context.ChannelID == 0) != (context.Version == 0) {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
+	case VerificationScopeSupplierManage:
+		var context SupplierManageContext
+		if len(fields) != 2 || fields["supplier_id"] == nil || fields["version"] == nil || common.Unmarshal(operation.Context, &context) != nil ||
+			len(context.SupplierID) > 36 || context.SupplierID != strings.TrimSpace(context.SupplierID) || context.Version < 0 || context.SupplierID == "" && context.Version != 0 {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
 	case VerificationScopeChannelKeyRead:
 		var context ChannelKeyReadContext
 		if len(fields) != 1 || common.Unmarshal(fields["channel_id"], &context.ChannelID) != nil || context.ChannelID <= 0 {
@@ -222,7 +249,7 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 		normalized = context
 	case VerificationScopeAdminUserCreate:
 		var context AdminUserCreateContext
-		if len(fields) != 1 || common.Unmarshal(fields["role"], &context.Role) != nil || context.Role < common.RoleAdminUser || !common.IsValidateRole(context.Role) {
+		if len(fields) != 1 || common.Unmarshal(fields["role"], &context.Role) != nil || (context.Role < common.RoleAdminUser && context.Role != common.RoleSupplierUser) || !common.IsValidateRole(context.Role) {
 			return VerificationBinding{}, ErrVerificationContextInvalid
 		}
 		normalized = context
@@ -325,6 +352,7 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 			return nil, model.ErrTwoFANotEnabled
 		}
 	case VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
+		VerificationScopeSupplierChannelCredentials, VerificationScopeSupplierManage,
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenUpdate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
@@ -381,6 +409,17 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 	if strings.HasPrefix(scope, verificationScopeAdminUserPrefix) && state.Role < common.RoleAdminUser {
 		return nil, ErrVerificationForbidden
 	}
+	if scope == VerificationScopeSupplierManage && state.Role < common.RoleAdminUser {
+		return nil, ErrVerificationForbidden
+	}
+	if scope == VerificationScopeSupplierChannelCredentials {
+		if state.Role != common.RoleSupplierUser && !authz.Can(identity.UserID, state.Role, authz.ChannelSensitiveWrite) {
+			return nil, ErrVerificationForbidden
+		}
+	}
+	if state.Role == common.RoleSupplierUser && (scope == VerificationScopeAccessTokenGenerate || scope == VerificationScopeAccessTokenUpdate || scope == VerificationScopeAccessTokenRevoke || scope == VerificationScopeAccountDelete) {
+		return nil, ErrVerificationForbidden
+	}
 	if err := requireAccessTokenVerificationScope(identity, scope); err != nil {
 		return nil, err
 	}
@@ -393,6 +432,7 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 		if methods[i].Method == VerificationMethodPassword && !common.PasswordLoginEnabled {
 			switch scope {
 			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
+				VerificationScopeSupplierChannelCredentials, VerificationScopeSupplierManage,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 				VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
 				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
@@ -518,6 +558,32 @@ func ConsumeOperationProof(raw string, identity AuthIdentity, operation Verifica
 	}
 	if _, err := RequireVerificationMethod(identity, binding.Scope, claims.Method); err != nil {
 		return nil, err
+	}
+	if operation.Scope == VerificationScopeSupplierChannelCredentials {
+		var context SupplierChannelCredentialsContext
+		if err := common.Unmarshal(operation.Context, &context); err != nil {
+			return nil, ErrVerificationContextInvalid
+		}
+		user, err := model.GetUserCache(identity.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if user.Role == common.RoleSupplierUser && (user.SupplierID == "" || user.MustChangePassword) {
+			return nil, ErrVerificationForbidden
+		}
+		if context.ChannelID != 0 {
+			var channel model.Channel
+			query := model.DB.Select("id", "owner_supplier_id", "supplier_version").Where("id = ? AND supplier_version = ?", context.ChannelID, context.Version)
+			if user.Role == common.RoleSupplierUser {
+				query = query.Where("owner_supplier_id = ?", user.SupplierID)
+			}
+			if err := query.First(&channel).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil, ErrVerificationForbidden
+				}
+				return nil, err
+			}
+		}
 	}
 	flow, err := model.ConsumeAuthFlowWithAction(claims.ID, model.AuthFlowMatch{
 		Purpose: model.AuthFlowPurposeSecurityProof, UserId: identity.UserID, SessionId: identity.SessionID,

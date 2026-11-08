@@ -3059,3 +3059,21 @@ test('AWS interface selection is disabled without sensitive channel write permis
     await screen.findByRole('combobox', { name: 'AWS API' })
   ).toBeDisabled()
 })
+
+test('supplier-owned platform settings direct pool changes to supplier management', async () => {
+  editingChannel.owner_supplier_id = 'supplier-a'
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await userEvent
+    .setup()
+    .click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.queryByRole('spinbutton', { name: 'Priority' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('spinbutton', { name: 'Weight' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('link', { name: 'Channel Suppliers' })
+  ).toHaveAttribute('href', '/suppliers')
+})

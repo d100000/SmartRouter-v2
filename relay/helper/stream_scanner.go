@@ -349,7 +349,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 			payload, isData := strings.CutPrefix(data, "data:")
 			if !isData {
-				if data != "[DONE]" {
+				if strings.TrimSpace(data) != "[DONE]" {
 					continue
 				}
 				payload = data
@@ -360,7 +360,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				continue
 			}
 			eventHasData = true
-			if !strings.HasPrefix(data, "[DONE]") {
+			if data != "[DONE]" {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
 

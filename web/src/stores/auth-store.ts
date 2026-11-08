@@ -34,6 +34,9 @@ export interface AuthUser {
   display_name?: string
   email?: string
   role: number
+  supplier_id?: string
+  channel_viewer?: boolean
+  must_change_password?: boolean
   status?: number
   group?: string
   quota?: number

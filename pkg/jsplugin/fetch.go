@@ -52,12 +52,13 @@ func WithFetcher(ctx context.Context, fetcher Fetcher) context.Context {
 // see it. The engine sets it for one call and clears it when the call ends,
 // so an idle pooled runtime keeps no request data.
 type runtimeCall struct {
-	engine   *Engine
-	runtime  *moejs.Runtime
-	ctx      context.Context
-	hook     string
-	fetcher  Fetcher
-	watchdog *runtimeWatchdog
+	logSecrets []string
+	engine     *Engine
+	runtime    *moejs.Runtime
+	ctx        context.Context
+	hook       string
+	fetcher    Fetcher
+	watchdog   *runtimeWatchdog
 	// holdsSlot and parked are what the call holds of the engine's
 	// semaphore and parked tokens; release returns exactly that.
 	holdsSlot bool

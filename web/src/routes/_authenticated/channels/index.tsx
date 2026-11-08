@@ -20,7 +20,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { Channels } from '@/features/channels'
-import { ROLE } from '@/lib/roles'
+import { canReadChannels } from '@/lib/supplier-access'
 import { useAuthStore } from '@/stores/auth-store'
 
 const channelsSearchSchema = z.object({
@@ -28,6 +28,8 @@ const channelsSearchSchema = z.object({
   pageSize: z.number().optional().catch(undefined),
   filter: z.string().optional().catch(''),
   status: z.array(z.string()).optional().catch([]),
+  supplier: z.array(z.string()).optional().catch([]),
+  funding_status: z.array(z.string()).optional().catch([]),
   type: z.array(z.string()).optional().catch([]),
   group: z.array(z.string()).optional().catch([]),
   model: z.string().optional().catch(''),
@@ -37,7 +39,7 @@ export const Route = createFileRoute('/_authenticated/channels/')({
   beforeLoad: () => {
     const { auth } = useAuthStore.getState()
 
-    if (!auth.user || auth.user.role < ROLE.ADMIN) {
+    if (!canReadChannels(auth.user)) {
       throw redirect({
         to: '/403',
       })

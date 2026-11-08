@@ -17,7 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 /* eslint-disable react-refresh/only-export-components */
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import type { ColumnDef } from '@tanstack/react-table'
 import {
   AlertTriangle,
@@ -46,19 +47,21 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { getSuppliers, supplyQueryKey } from '@/features/suppliers/api'
 import { toIntlLocale } from '@/i18n/languages'
 import {
   formatCurrencyFromUSD,
   formatQuotaWithCurrency,
   getCurrencyLabel,
 } from '@/lib/currency'
-import { formatTimestampToDate } from '@/lib/format'
+import { formatNumber, formatTimestampToDate } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import {
   createServerError,
   translateServerText,
 } from '@/lib/server-error-message'
 import { truncateText } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getCodexUsage, updateChannelBalance } from '../api'
 import {
@@ -90,6 +93,7 @@ import { formatAvailabilityTime } from '../lib/channel-availability'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelCostCell } from './channel-cost-cell'
+import { ChannelFundingBadge, FundingStatusBadge } from './channel-funding'
 import { ChannelRecentStatsCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { TaskPluginChannelBadge } from './channel-type-badge'
@@ -182,6 +186,32 @@ function UpstreamUpdateTags({ channel }: { channel: Channel }) {
         />
       )}
     </div>
+  )
+}
+
+function SupplierPoolSettingLink(props: { value?: number; label: string }) {
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant='link'
+            role='link'
+            className='px-0'
+            render={<Link to='/suppliers' />}
+          />
+        }
+      >
+        {props.value === undefined
+          ? t('Channel Suppliers')
+          : formatNumber(props.value, locale)}
+      </TooltipTrigger>
+      <TooltipContent>
+        {props.label} · {t('Channel Suppliers')}
+      </TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -628,6 +658,17 @@ export function useChannelsColumns(
 ): ColumnDef<Channel>[] {
   const { t, i18n } = useTranslation()
   const { sensitiveVisible } = useChannels()
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  const suppliersQuery = useQuery({
+    queryKey: [...supplyQueryKey, userId, 'admin', 'accounts'],
+    queryFn: ({ signal }) => getSuppliers(signal),
+    meta: { errorRedirect: false },
+  })
+  const suppliersById = useMemo(
+    () =>
+      new Map(suppliersQuery.data?.items?.map((item) => [item.id, item]) ?? []),
+    [suppliersQuery.data]
+  )
   const enableSelection = options.enableSelection ?? true
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   // The column definitions only depend on the translation function, the active
@@ -687,6 +728,15 @@ export function useChannelsColumns(
         size: 80,
       },
       // Name column
+      {
+        accessorKey: 'supplier_name',
+        header: t('Channel Supplier'),
+        cell: ({ row }) =>
+          row.original.supplier_name ||
+          suppliersById.get(row.original.owner_supplier_id ?? '')?.name ||
+          row.original.owner_supplier_id ||
+          t('Unassigned'),
+      },
       {
         accessorKey: 'name',
         header: t('Name'),
@@ -956,6 +1006,29 @@ export function useChannelsColumns(
         enableSorting: false,
       },
 
+      {
+        accessorKey: 'funding_status',
+        header: t('Funding status'),
+        enableSorting: false,
+        size: 180,
+        cell: ({ row }) => {
+          if (isTagAggregateRow(row.original)) {
+            const funding = row.original.funding_status
+            return funding ? (
+              <Button
+                variant='ghost'
+                size='sm'
+                onClick={() => row.toggleExpanded()}
+                aria-label={t('Funding status')}
+              >
+                <FundingStatusBadge funding={funding} />
+              </Button>
+            ) : null
+          }
+          return <ChannelFundingBadge channel={row.original as Channel} />
+        },
+      },
+
       // Status column
       {
         accessorKey: 'status',
@@ -1093,6 +1166,16 @@ export function useChannelsColumns(
               }
             } catch {
               /* empty */
+            }
+
+            const fundingEvent =
+              /^Upstream funding restriction \(event #(\d+)\)$/.exec(
+                statusReason
+              )
+            if (fundingEvent) {
+              statusReason = t('Upstream funding restriction (event #{{id}})', {
+                id: fundingEvent[1],
+              })
             }
 
             if (statusReason || statusTime) {
@@ -1245,7 +1328,28 @@ export function useChannelsColumns(
         accessorKey: 'priority',
         header: t('Priority'),
         meta: { mobileHidden: true },
-        cell: ({ row }) => <PriorityCell channel={row.original} />,
+        cell: ({ row }) => {
+          const channel = row.original
+          if (channel.owner_supplier_id) {
+            return (
+              <SupplierPoolSettingLink
+                value={
+                  suppliersById.get(channel.owner_supplier_id)?.pool_priority
+                }
+                label={t('Platform pool priority')}
+              />
+            )
+          }
+          if (
+            isTagAggregateRow(channel) &&
+            channel.children?.some((child) => child.owner_supplier_id)
+          ) {
+            return (
+              <SupplierPoolSettingLink label={t('Platform pool priority')} />
+            )
+          }
+          return <PriorityCell channel={channel} />
+        },
         size: 100,
       },
 
@@ -1254,7 +1358,26 @@ export function useChannelsColumns(
         accessorKey: 'weight',
         header: t('Weight'),
         meta: { mobileHidden: true },
-        cell: ({ row }) => <WeightCell channel={row.original} />,
+        cell: ({ row }) => {
+          const channel = row.original
+          if (channel.owner_supplier_id) {
+            return (
+              <SupplierPoolSettingLink
+                value={
+                  suppliersById.get(channel.owner_supplier_id)?.pool_weight
+                }
+                label={t('Platform pool weight')}
+              />
+            )
+          }
+          if (
+            isTagAggregateRow(channel) &&
+            channel.children?.some((child) => child.owner_supplier_id)
+          ) {
+            return <SupplierPoolSettingLink label={t('Platform pool weight')} />
+          }
+          return <WeightCell channel={channel} />
+        },
         size: 90,
         enableSorting: false,
       },
@@ -1362,6 +1485,6 @@ export function useChannelsColumns(
         meta: { pinned: 'right' as const },
       },
     ],
-    [enableSelection, t, locale, sensitiveVisible]
+    [enableSelection, t, locale, sensitiveVisible, suppliersById]
   )
 }

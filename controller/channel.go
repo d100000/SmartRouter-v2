@@ -211,6 +211,8 @@ func GetAllChannels(c *gin.Context) {
 	var total int64
 	now := time.Now()
 	baseQuery := model.ApplyChannelGroupFilter(model.DB.Model(&model.Channel{}), groupFilter)
+	baseQuery = model.ApplyChannelSupplierFilter(baseQuery, c.Query("owner_supplier_id"))
+	baseQuery = model.ApplyChannelFundingFilter(baseQuery, c.Query("funding_status"))
 	baseQuery = model.ApplyChannelEffectiveStatusFilter(baseQuery, statusFilter, now)
 	listQuery := baseQuery.Session(&gorm.Session{})
 	if typeFilter >= 0 {
@@ -264,6 +266,10 @@ func GetAllChannels(c *gin.Context) {
 		}
 	}
 
+	if err := model.AttachChannelFunding(channelData); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	for _, datum := range channelData {
 		clearChannelInfo(datum, now)
 	}
@@ -283,11 +289,12 @@ func GetAllChannels(c *gin.Context) {
 		typeCounts[r.Type] = r.Count
 	}
 	common.ApiSuccess(c, gin.H{
-		"items":       channelData,
-		"total":       total,
-		"page":        pageInfo.GetPage(),
-		"page_size":   pageInfo.GetPageSize(),
-		"type_counts": typeCounts,
+		"items":        channelData,
+		"funding_tags": model.ChannelFundingTags(channelData),
+		"total":        total,
+		"page":         pageInfo.GetPage(),
+		"page_size":    pageInfo.GetPageSize(),
+		"type_counts":  typeCounts,
 	})
 	return
 }
@@ -379,7 +386,7 @@ func SearchChannels(c *gin.Context) {
 	enableTagMode, _ := strconv.ParseBool(c.Query("tag_mode"))
 	channelData := make([]*model.Channel, 0)
 	if enableTagMode {
-		tags, err := model.SearchTags(keyword, group, modelKeyword, idSort)
+		tags, err := model.SearchTags(keyword, group, modelKeyword, idSort, c.Query("owner_supplier_id"))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -387,7 +394,7 @@ func SearchChannels(c *gin.Context) {
 		for _, tag := range tags {
 			if tag != nil && *tag != "" {
 				var tagChannels []*model.Channel
-				err := sortOptions.Apply(buildChannelListQuery(group, -1, -1).Where("tag = ?", *tag)).
+				err := sortOptions.Apply(model.ApplyChannelSupplierFilter(buildChannelListQuery(group, -1, -1), c.Query("owner_supplier_id")).Where("tag = ?", *tag)).
 					Omit("key", "upstream_credential_snapshot_data").
 					Find(&tagChannels).Error
 				if err != nil {
@@ -398,7 +405,7 @@ func SearchChannels(c *gin.Context) {
 			}
 		}
 	} else {
-		channels, err := model.SearchChannels(keyword, group, modelKeyword, idSort, sortOptions)
+		channels, err := model.SearchChannelsBySupplier(keyword, group, modelKeyword, idSort, c.Query("owner_supplier_id"), sortOptions)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -426,6 +433,18 @@ func SearchChannels(c *gin.Context) {
 	}
 
 	// calculate type counts for search results
+	if funding := c.Query("funding_status"); funding != "" && funding != "all" {
+		var ids []int
+		if err := model.ApplyChannelFundingFilter(model.DB.Model(&model.Channel{}), funding).Pluck("id", &ids).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		allowed := make(map[int]bool, len(ids))
+		for _, id := range ids {
+			allowed[id] = true
+		}
+		channelData = slices.DeleteFunc(channelData, func(ch *model.Channel) bool { return !allowed[ch.Id] })
+	}
 	typeCounts := make(map[int64]int64)
 	for _, channel := range channelData {
 		typeCounts[int64(channel.Type)]++
@@ -463,6 +482,28 @@ func SearchChannels(c *gin.Context) {
 	endIdx := min(startIdx+pageSize, total)
 
 	pagedData := channelData[startIdx:endIdx]
+	if enableTagMode {
+		tags := make([]string, 0)
+		byTag := make(map[string][]*model.Channel)
+		for _, channel := range channelData {
+			tag := channel.GetTag()
+			if _, exists := byTag[tag]; !exists {
+				tags = append(tags, tag)
+			}
+			byTag[tag] = append(byTag[tag], channel)
+		}
+		total = len(tags)
+		startIdx = min((page-1)*pageSize, total)
+		endIdx = min(startIdx+pageSize, total)
+		pagedData = make([]*model.Channel, 0)
+		for _, tag := range tags[startIdx:endIdx] {
+			pagedData = append(pagedData, byTag[tag]...)
+		}
+	}
+	if err := model.AttachChannelFunding(pagedData); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 
 	for _, datum := range pagedData {
 		clearChannelInfo(datum, now)
@@ -472,9 +513,10 @@ func SearchChannels(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"items":       pagedData,
-			"total":       total,
-			"type_counts": typeCounts,
+			"items":        pagedData,
+			"funding_tags": model.ChannelFundingTags(pagedData),
+			"total":        total,
+			"type_counts":  typeCounts,
 		},
 	})
 	return
@@ -492,6 +534,10 @@ func GetChannel(c *gin.Context) {
 		return
 	}
 	if channel != nil {
+		if err := model.AttachChannelFunding([]*model.Channel{channel}); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 		clearChannelInfo(channel)
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -519,6 +565,10 @@ func GetChannelKey(c *gin.Context) {
 	}
 	if err != nil {
 		writeSecurityOperationError(c, err)
+		return
+	}
+	if channel.SecretsWriteOnly || channel.OwnerSupplierID != "" {
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
 		return
 	}
 
@@ -1133,6 +1183,22 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	originProxy := originChannel.GetSetting().Proxy
+	if originChannel.OwnerSupplierID != "" {
+		connectionChanged := channel.Key != "" || channelHasSensitiveChanges(&channel, originChannel, requestData)
+		if _, supplied := requestData["models"]; supplied && channel.Models != originChannel.Models {
+			connectionChanged = true
+		}
+		if _, supplied := requestData["model_mapping"]; supplied && !equalStringPtr(channel.ModelMapping, originChannel.ModelMapping) {
+			connectionChanged = true
+		}
+		if _, supplied := requestData["status_code_mapping"]; supplied && !equalStringPtr(channel.StatusCodeMapping, originChannel.StatusCodeMapping) {
+			connectionChanged = true
+		}
+		if connectionChanged {
+			common.ApiErrorT(c, "Use the supplier channel editor to change validated connection settings")
+			return
+		}
+	}
 	proxyChanged := false
 	_, settingProvided := requestData["setting"]
 	if settingProvided {
@@ -1687,6 +1753,10 @@ func ManageMultiKeys(c *gin.Context) {
 		common.ApiErrorT(c, "This channel is not in multi-key mode")
 		return
 	}
+	if channel.OwnerSupplierID != "" && (request.Action == "delete_key" || request.Action == "delete_disabled_keys") {
+		common.ApiErrorT(c, "Use the supplier channel editor to change validated connection settings")
+		return
+	}
 	if multiKeyActionRequiresSensitiveWrite(request.Action) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
 		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
@@ -1760,6 +1830,9 @@ func ManageMultiKeys(c *gin.Context) {
 			keyPreview := key
 			if len(key) > 10 {
 				keyPreview = key[:10] + "..."
+			}
+			if channel.SecretsWriteOnly || channel.OwnerSupplierID != "" {
+				keyPreview, reason = "configured", ""
 			}
 
 			allKeyStatusList = append(allKeyStatusList, KeyStatus{
@@ -2136,6 +2209,10 @@ func OllamaPullModel(c *gin.Context) {
 	}
 
 	// 检查是否是 Ollama 渠道
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -2199,6 +2276,10 @@ func OllamaPullModelStream(c *gin.Context) {
 	}
 
 	// 检查是否是 Ollama 渠道
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -2281,6 +2362,10 @@ func OllamaDeleteModel(c *gin.Context) {
 	}
 
 	// 检查是否是 Ollama 渠道
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -2330,6 +2415,10 @@ func OllamaVersion(c *gin.Context) {
 		return
 	}
 
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
 	if channel.Type != constant.ChannelTypeOllama {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,

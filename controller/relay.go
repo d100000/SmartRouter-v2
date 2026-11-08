@@ -85,6 +85,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
 		var err error
+		// Gorilla writes the handshake after hijacking the writer. Retain 101
+		// in Gin so the scheduler does not mistake it for inference output.
+		c.Status(http.StatusSwitchingProtocols)
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()).ToOpenAIError())
@@ -144,6 +147,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	if relayFormat == types.RelayFormatOpenAIRealtime {
 		relayInfo.IsStream = true
+		relayInfo.RealtimeRequestRunner = newResponsesWSRequestRunner(c)
 	}
 
 	defer func() {
@@ -154,6 +158,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, resultErr)
 		service.FinishOverviewAttempt(c, relayInfo, resultErr)
+		if err := service.FinishChannelLimitAttempt(c, relayInfo, resultErr); err != nil {
+			common.SysError("channel limit settlement failed: " + err.Error())
+		}
 		service.CompleteOverviewRelay(relayInfo)
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayOutcome(c.Request.Context(), relayInfo, service.FinalRelayOutcome(c, relayInfo, resultErr))
@@ -167,8 +174,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	// Keep HTTP errors and channel retries available; accepted streams own
 	// their heartbeat lifecycle in StreamScannerHandler.
 
-	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
-		return
+	if relayFormat != types.RelayFormatOpenAIRealtime {
+		if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
+			return
+		}
 	}
 	defer func() {
 		newAPIError = relay.RefundFailedRequestBilling(c, relayInfo, newAPIError)
@@ -184,7 +193,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for retryParam.GetRetry() <= common.RetryTimes {
 		relayInfo.StreamStatus = nil
 		relayInfo.StreamFailure = nil
 		relayInfo.PerformanceBusinessRejection = false
@@ -194,6 +203,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			if relayInfo.LastError != nil && relayInfo.LastError.GetErrorCode() == types.ErrorCode("channel_limit_unavailable") {
+				newAPIError = relayInfo.LastError
+			}
 			if relayInfo.StreamRetryCount > 0 && relayInfo.LastError != nil {
 				// No fallback route must not hide the original upstream failure.
 				newAPIError = relayInfo.LastError
@@ -217,8 +229,24 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
-		service.StartSchedulingAttempt(c, relayInfo)
-		service.PrepareOverviewAttempt(c, relayInfo, channel)
+		relayInfo.InitChannelMeta(c)
+		if err := service.PrepareChannelLimitAttempt(relayInfo, channel); err != nil {
+			newAPIError = service.ChannelLimitRelayError(err)
+			service.FinishSchedulingAttempt(c, relayInfo, newAPIError)
+			relayInfo.LastError = newAPIError
+			c.Set("channel_local_refusals", c.GetInt("channel_local_refusals")+1)
+			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned || service.RequestPolicy(c).SessionMode == "strict" {
+				break
+			}
+			if c.GetInt("channel_local_refusals") >= 512 {
+				break
+			}
+			continue
+		}
+		if relayFormat != types.RelayFormatOpenAIRealtime {
+			service.StartSchedulingAttempt(c, relayInfo)
+			service.PrepareOverviewAttempt(c, relayInfo, channel)
+		}
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -232,11 +260,28 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, newAPIError)
 		service.FinishOverviewAttempt(c, relayInfo, newAPIError)
+		if err := service.FinishChannelLimitAttempt(c, relayInfo, newAPIError); err != nil {
+			common.SysError("channel limit settlement failed: " + err.Error())
+		}
 
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
+			if service.RequestPolicy(c).Successful && relayInfo.ClientWs == nil && relayInfo.RelayFormat != types.RelayFormatOpenAIRealtime {
+				service.ObserveChannelFundingResponseSuccess(c)
+			}
 			relayInfo.LastError = nil
 			return
+		}
+		if relayInfo.ChannelLimitAttempt != nil && !relayInfo.ChannelLimitAttempt.Sent && newAPIError.GetErrorCode() == types.ErrorCode("channel_limit_unavailable") {
+			relayInfo.LastError = newAPIError
+			c.Set("channel_local_refusals", c.GetInt("channel_local_refusals")+1)
+			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned || service.RequestPolicy(c).SessionMode == "strict" {
+				break
+			}
+			if c.GetInt("channel_local_refusals") >= 512 {
+				break
+			}
+			continue
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
@@ -260,6 +305,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.BeginStreamRetry()
 			c.Set(common.UpstreamRequestIdKey, "")
 		}
+		retryParam.IncreaseRetry()
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
@@ -326,7 +372,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
-	if len(c.GetStringSlice("use_channel")) > common.RetryTimes || !service.SchedulingRetryAllowed(c) {
+	if len(c.GetStringSlice("use_channel"))-c.GetInt("channel_local_refusals") > common.RetryTimes || !service.SchedulingRetryAllowed(c) {
 		return nil, types.NewError(errors.New("request retry budget exhausted or response already started"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if retryParam.GetRetry() == 0 && len(c.GetStringSlice("use_channel")) == 0 {
@@ -575,7 +621,8 @@ func executeTaskSubmissionWith(
 			apiErr = types.NewError(fmt.Errorf("submission panic: %v", recovered), types.ErrorCodeBadResponse)
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, apiErr)
-		if !durable && relayInfo.Billing != nil {
+		// A relayed native stream must settle even if its task was not stored.
+		if !durable && relayInfo.Billing != nil && !c.Writer.Written() {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
 		}
@@ -644,6 +691,12 @@ func executeTaskSubmissionWith(
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		stage = "submit"
+		relayInfo.InitChannelMeta(c)
+		if err := service.PrepareChannelLimitAttempt(relayInfo, channel); err != nil {
+			taskErr = service.TaskErrorWrapperLocal(err, "channel_limit_unavailable", http.StatusServiceUnavailable)
+			break
+		}
+		service.PrepareOverviewAttempt(c, relayInfo, channel)
 		service.StartSchedulingAttempt(c, relayInfo)
 		result, taskErr = submit(c, relayInfo)
 		service.FinishSchedulingAttempt(c, relayInfo, taskSubmissionAPIError(taskErr))
@@ -701,17 +754,22 @@ func executeTaskSubmissionWith(
 
 	// Reserve any submit-time upward billing adjustment before persistence.
 	// This keeps insertion failures fully refundable while ensuring settlement
-	// after the barrier normally has a zero positive delta.
+	// after the barrier normally has a zero positive delta. A relayed event
+	// stream is billed even when this reserve fails: settlement then charges
+	// past the available quota, as it does for any usage above its reservation.
 	if relayInfo.Billing != nil {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
 		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {
 			common.SysError(common.LogText("reserve adjusted task billing error: %s", reserveErr.Error()))
-			taskErr = service.TaskErrorWrapperLocal(errors.New("insufficient quota for adjusted task cost"), string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
-			diagnostics.failed("reserve", "insufficient_quota", taskErr, false)
-			return nil, taskErr
+			if !c.Writer.Written() {
+				taskErr = service.TaskErrorWrapperLocal(errors.New("insufficient quota for adjusted task cost"), string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
+				diagnostics.failed("reserve", "insufficient_quota", taskErr, false)
+				return nil, taskErr
+			}
+		} else {
+			diagnostics.reserve("reserve_complete", result.Quota)
 		}
-		diagnostics.reserve("reserve_complete", result.Quota)
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
 		diagnostics.cancelled("before_insert", retryParam.GetRetry()+1)
@@ -720,6 +778,10 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+		identity := attempt.Identity
+		task.PrivateData.FundingAttempt = &identity
+	}
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
@@ -752,6 +814,7 @@ func executeTaskSubmissionWith(
 			}
 		}
 		if immediate.Status == model.TaskStatusFailure {
+			service.RecordChannelFundingError(service.ChannelFundingAttempt(c), http.StatusOK, fmt.Sprint(immediate.Code), "", immediate.Reason)
 			task.FailReason = immediate.Reason
 		}
 		if immediate.Url != "" {
@@ -792,6 +855,15 @@ func executeTaskSubmissionWith(
 		common.SysError(common.LogText("insert task error: %s", insertErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)
+		// The client of a relayed event stream already holds the vendor's
+		// work, so it is settled and logged without a task row.
+		if c.Writer.Written() {
+			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+				common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
+				return nil, taskErr
+			}
+			service.LogTaskConsumption(c, relayInfo, task)
+		}
 		return nil, taskErr
 	}
 	durable = true
@@ -805,6 +877,8 @@ func executeTaskSubmissionWith(
 		diagnostics.failed("settle", "billing_error", taskErr, true)
 		return nil, taskErr
 	}
+	// Terminal task insertion already schedules the durable, deduplicated
+	// performance sample; do not record a second relay event here.
 	if task.Status != model.TaskStatusFailure {
 		service.MarkRequestPolicySuccess(c, nil)
 	} else {
@@ -818,6 +892,11 @@ func executeTaskSubmissionWith(
 
 func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
+	// A native route that relayed the vendor's event stream has answered.
+	if c.Writer.Written() {
+		diagnostics.present(outcome.Task, "native_stream")
+		return
+	}
 	otherRatios := outcome.RelayInfo.PriceData.OtherRatios()
 	if otherRatios == nil {
 		otherRatios = map[string]float64{}
@@ -834,9 +913,12 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 				viewValue, valueErr := taskPluginProtocolJSONValue(view)
 				if valueErr == nil {
 					if body, callErr := pinned.Plugin.Engine.CallPath(c.Request.Context(), "native", []string{pinned.Route.Render}, requestContext.JSValue(), viewValue); callErr == nil {
-						diagnostics.present(outcome.Task, "native_presenter")
-						c.JSON(http.StatusOK, body)
-						return
+						if replyErr := middleware.WriteNativeReply(c, http.StatusOK, body); replyErr == nil {
+							diagnostics.present(outcome.Task, "native_presenter")
+							return
+						} else {
+							logger.LogError(c, common.LogText("task plugin native submit presenter failed: %s", replyErr.Error()))
+						}
 					} else {
 						logger.LogError(c, common.LogText("task plugin native submit presenter failed: %s", callErr.Error()))
 					}
@@ -872,6 +954,11 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	newTaskPluginSubmitDiagnostics(c).presentError(taskErr)
+	// The client of a relayed event stream already has the vendor's events,
+	// including any error event; nothing can follow them.
+	if c.Writer.Written() {
+		return
+	}
 	if middleware.RespondTaskPluginError(c, taskErr) {
 		return
 	}

@@ -59,6 +59,34 @@ func TestStreamResponseGeminiChat2OpenAIAttachesUsageMetadata(t *testing.T) {
 	require.Nil(t, withoutUsage.Usage)
 }
 
+func TestGeminiMeasuredImagesExcludeAudioAndEmptyPayloads(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		imagen     bool
+	}{
+		{"inline image", `{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"image"}},{"inlineData":{"mimeType":"audio/L16","data":"audio"}},{"inlineData":{"mimeType":"image/png","data":""}}]}}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}`, false},
+		{"imagen", `{"predictions":[{"bytesBase64Encoded":"image"},{"bytesBase64Encoded":""},{"bytesBase64Encoded":"filtered","raiFilteredReason":"safety"}]}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}, RelayFormat: types.RelayFormatGemini}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}
+			if tc.imagen {
+				_, apiErr := GeminiImageHandler(ctx, info, resp)
+				require.Nil(t, apiErr)
+			} else {
+				_, apiErr := GeminiChatHandler(ctx, info, resp)
+				require.Nil(t, apiErr)
+			}
+			require.NotNil(t, info.AnalyticsMediaUsage.ImageCount)
+			assert.EqualValues(t, 1, *info.AnalyticsMediaUsage.ImageCount)
+			assert.Equal(t, "upstream_payload", info.AnalyticsMediaUsage.ImageUsageSource)
+			assert.Nil(t, info.AnalyticsMediaUsage.AudioSeconds, "audio tokens and inline bytes without a duration are not seconds")
+		})
+	}
+}
+
 func TestGeminiChatStreamHandlerClaudeFirstFrameUsesUpstreamUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

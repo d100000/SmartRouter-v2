@@ -27,7 +27,7 @@ import { quotaUnitsToDollars } from '@/lib/format'
 import { ROLE } from '@/lib/roles'
 
 import { DEFAULT_GROUP } from '../constants'
-import { type UserFormData, type User } from '../types'
+import type { UserFormData, User } from '../types'
 
 // ============================================================================
 // Form Schema
@@ -38,6 +38,7 @@ export const userFormSchema = z.object({
   display_name: z.string().optional(),
   password: z.string().optional(),
   role: z.number().optional(),
+  supplier_id: z.string().optional(),
   quota_dollars: z.number().min(0).optional(),
   group: z.string().optional(),
   remark: z.string().optional(),
@@ -57,6 +58,7 @@ export const USER_FORM_DEFAULT_VALUES: UserFormValues = {
   display_name: '',
   password: '',
   role: 1, // Default to common user
+  supplier_id: '',
   quota_dollars: 0,
   group: DEFAULT_GROUP,
   remark: '',
@@ -97,6 +99,7 @@ export function transformFormDataToPayload(
   // For create: only send required fields
   if (userId === undefined) {
     payload.role = role
+    if (role === ROLE.SUPPLIER) payload.supplier_id = data.supplier_id
   } else {
     // For update: quota is adjusted atomically via /api/user/manage, not sent here
     payload.group = data.group

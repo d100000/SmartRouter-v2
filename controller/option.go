@@ -211,6 +211,10 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	}
+	if err := operation_setting.ValidateChannelFundingOption(option.Key, option.Value.(string)); err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage(err.Error()))
+		return
+	}
 	if option.Key == "TaskPublicAddress" && option.Value.(string) != "" {
 		if err := service.ValidateTaskArtifactBaseURL(option.Value.(string)); err != nil {
 			common.ApiError(c, err)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -83,7 +84,10 @@ type User struct {
 	HasPassword          bool                       `json:"-" gorm:"-:all"`
 	OriginalPassword     string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
 	DisplayName          string                     `json:"display_name" gorm:"index" validate:"max=20"`
-	Role                 int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
+	Role                 int                        `json:"role" gorm:"type:int;default:1"` // admin, common
+	SupplierID           *string                    `json:"supplier_id" gorm:"type:varchar(36);uniqueIndex"`
+	ChannelViewer        bool                       `json:"channel_viewer"`
+	MustChangePassword   bool                       `json:"must_change_password"`
 	Status               int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
 	Email                string                     `json:"email" gorm:"index" validate:"max=50"`
 	GitHubId             string                     `json:"github_id" gorm:"column:github_id;index"`
@@ -116,16 +120,19 @@ type User struct {
 
 func (user *User) ToBaseUser() *UserBase {
 	cache := &UserBase{
-		Id:          user.Id,
-		Group:       user.Group,
-		Quota:       user.Quota,
-		Status:      user.Status,
-		Role:        user.Role,
-		Username:    user.Username,
-		Setting:     user.Setting,
-		Email:       user.Email,
-		AuthVersion: user.AuthVersion,
-		CacheSchema: userCacheSchemaVersion,
+		Id:                 user.Id,
+		Group:              user.Group,
+		Quota:              user.Quota,
+		Status:             user.Status,
+		Role:               user.Role,
+		SupplierID:         user.GetSupplierID(),
+		ChannelViewer:      user.ChannelViewer,
+		MustChangePassword: user.MustChangePassword,
+		Username:           user.Username,
+		Setting:            user.Setting,
+		Email:              user.Email,
+		AuthVersion:        user.AuthVersion,
+		CacheSchema:        userCacheSchemaVersion,
 	}
 	return cache
 }
@@ -533,7 +540,7 @@ func GetSelfUserById(id int) (*User, error) {
 		"github_id", "discord_id", "oidc_id", "wechat_id", "telegram_id",
 		"group", "quota", "used_quota", "request_count", "aff_code", "aff_count",
 		"aff_quota", "aff_history", "inviter_id", "linux_do_id", "setting",
-		"stripe_customer", "auth_version",
+		"stripe_customer", "auth_version", "supplier_id", "channel_viewer", "must_change_password",
 		"CASE WHEN password <> '' THEN 1 ELSE 0 END AS has_password",
 	}).First(&profile, "id = ?", id).Error
 	profile.User.HasPassword = profile.HasPassword
@@ -622,6 +629,12 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 }
 
 func (user *User) prepareForInsert(tx *gorm.DB) error {
+	if err := user.validateSupplyIdentity(tx); err != nil {
+		return err
+	}
+	if user.Role == common.RoleSupplierUser {
+		user.MustChangePassword = true
+	}
 	user.Email = NormalizeEmail(user.Email)
 	if err := ensureEmailAvailableWithTx(tx, user.Email, 0); err != nil {
 		return err
@@ -679,6 +692,9 @@ func (user *User) Insert(inviterId int) error {
 				return err
 			}
 			user.Quota = common.QuotaForNewUser
+			if user.Role == common.RoleSupplierUser {
+				user.Quota = 0
+			}
 			user.AffCode = common.GetRandomString(4)
 
 			// 初始化用户设置，包括默认的边栏配置
@@ -699,6 +715,9 @@ func (user *User) Insert(inviterId int) error {
 }
 
 func (user *User) finishInsert(inviterId int) {
+	if user.Role == common.RoleSupplierUser {
+		return
+	}
 	// 用户创建成功后，根据角色初始化边栏配置
 	// 需要重新获取用户以确保有正确的ID和Role
 	var createdUser User
@@ -743,6 +762,9 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 			return err
 		}
 		user.Quota = common.QuotaForNewUser
+		if user.Role == common.RoleSupplierUser {
+			user.Quota = 0
+		}
 		user.AffCode = common.GetRandomString(4)
 
 		// 初始化用户设置
@@ -808,6 +830,7 @@ func (user *User) Update(updatePassword bool) error {
 
 func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
+	passwordLength := utf8.RuneCountInString(user.Password)
 	if updatePassword {
 		user.Password, err = common.HashAccountPassword(user.Password)
 		if err != nil {
@@ -819,11 +842,18 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	if err = tx.First(&current, user.Id).Error; err != nil {
 		return err
 	}
+	if updatePassword && current.Role == common.RoleSupplierUser && passwordLength < 15 {
+		return ErrSupplierPasswordLength
+	}
+	if newUser.Role != 0 && newUser.Role != current.Role && (newUser.Role == common.RoleSupplierUser || current.Role == common.RoleSupplierUser) {
+		return common.NewMessage("Invalid parameters")
+	}
 	// Updates(struct) ignores zero values. Match that behavior when deciding
 	// whether this request actually changes authentication-sensitive state;
 	// partial self-profile updates intentionally leave role/status/group empty.
+	roleChanged := newUser.Role != 0 && current.Role != newUser.Role
 	authChanged := (updatePassword && current.Password != newUser.Password) ||
-		(newUser.Role != 0 && current.Role != newUser.Role) ||
+		roleChanged ||
 		(newUser.Status != 0 && current.Status != newUser.Status) ||
 		(newUser.Group != "" && current.Group != newUser.Group)
 	if authChanged {
@@ -841,8 +871,21 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		"aff_quota",
 		"aff_history",
 		"auth_version",
+		"supplier_id",
+		"channel_viewer",
+		"must_change_password",
 	).Updates(newUser).Error; err != nil {
 		return err
+	}
+	if roleChanged {
+		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update("channel_viewer", false).Error; err != nil {
+			return err
+		}
+	}
+	if updatePassword && current.Role == common.RoleSupplierUser {
+		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update("must_change_password", true).Error; err != nil {
+			return err
+		}
 	}
 	return tx.First(user, user.Id).Error
 }
@@ -869,6 +912,7 @@ func (user *User) Edit(updatePassword bool) error {
 
 func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
+	passwordLength := utf8.RuneCountInString(user.Password)
 	if updatePassword {
 		user.Password, err = common.HashAccountPassword(user.Password)
 		if err != nil {
@@ -890,6 +934,12 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	current := User{}
 	if err = tx.First(&current, user.Id).Error; err != nil {
 		return err
+	}
+	if updatePassword && current.Role == common.RoleSupplierUser {
+		if passwordLength < 15 {
+			return ErrSupplierPasswordLength
+		}
+		updates["must_change_password"] = true
 	}
 	authChanged := (updatePassword && current.Password != newUser.Password) || current.Group != newUser.Group
 	if authChanged {

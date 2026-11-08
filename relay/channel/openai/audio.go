@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -15,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) *dto.Usage {
@@ -104,6 +106,11 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			usage.CompletionTokens = estimatedTokens
 			usage.CompletionTokenDetails.AudioTokens = estimatedTokens
 		} else if duration > 0 {
+			contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
+			contentType = strings.ToLower(strings.TrimSpace(contentType))
+			if audioFormat != "pcm" || len(bodyBytes)%2 == 0 && (contentType == "audio/pcm" || contentType == "application/octet-stream") {
+				info.ObserveAudioSeconds(duration, "media_metadata")
+			}
 			// 计算 token: ceil(duration) / 60.0 * 1000，即每分钟 1000 tokens。
 			// duration 解析自上游返回的音频元数据，饱和转换防止 int 回绕。
 			completionTokens := common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
@@ -132,8 +139,16 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	var responseData struct {
 		Usage *dto.Usage `json:"usage"`
 	}
-	if err := common.Unmarshal(responseBody, &responseData); err == nil && responseData.Usage != nil {
-		if responseData.Usage.TotalTokens > 0 {
+	if err := common.Unmarshal(responseBody, &responseData); err == nil {
+		// Check numeric presence separately: malformed optional duration must
+		// neither become zero nor discard otherwise valid upstream token usage.
+		if duration := gjson.GetBytes(responseBody, "duration"); duration.Type == gjson.Number {
+			info.ObserveAudioSeconds(duration.Float(), "upstream_usage")
+		}
+		if duration := gjson.GetBytes(responseBody, "usage.seconds"); gjson.GetBytes(responseBody, "usage.type").String() == "duration" && duration.Type == gjson.Number {
+			info.ObserveAudioSeconds(duration.Float(), "upstream_usage")
+		}
+		if responseData.Usage != nil && responseData.Usage.TotalTokens > 0 {
 			usage := responseData.Usage
 			if usage.PromptTokens == 0 {
 				usage.PromptTokens = usage.InputTokens

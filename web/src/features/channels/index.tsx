@@ -28,8 +28,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { ChannelViewerWorkspace } from '@/features/suppliers'
 import { ROLE } from '@/lib/roles'
 import { requireServerSuccess } from '@/lib/server-error-message'
+import { isChannelViewer } from '@/lib/supplier-access'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getChannelOps } from './api'
@@ -39,6 +41,13 @@ import { ChannelsProvider } from './components/channels-provider'
 import { ChannelsTable } from './components/channels-table'
 
 export function Channels() {
+  const user = useAuthStore((state) => state.auth.user)
+  if (isChannelViewer(user)) return <ChannelViewerWorkspace />
+  if (!user || user.role < ROLE.ADMIN) return null
+  return <AdminChannels />
+}
+
+function AdminChannels() {
   const { t } = useTranslation()
   const isRoot = useAuthStore(
     (state) => state.auth.user?.role === ROLE.SUPER_ADMIN

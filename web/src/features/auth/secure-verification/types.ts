@@ -25,6 +25,8 @@ export type VerificationMethod =
   | 'oauth'
   | 'session'
 export type SecurityProofScope =
+  | 'supplier.channel.credentials'
+  | 'supplier.manage'
   | 'channel.key.read'
   | 'passkey.register'
   | 'passkey.delete'
@@ -48,9 +50,23 @@ export type SecurityProofScope =
   | 'admin.user.binding.clear'
 
 /** ManageUser actions that change a user's status or role and need step-up. */
-export type AdminUserManageAction = 'disable' | 'enable' | 'promote' | 'demote'
+export type AdminUserManageAction =
+  | 'disable'
+  | 'enable'
+  | 'promote'
+  | 'demote'
+  | 'grant_channel_viewer'
+  | 'revoke_channel_viewer'
 
 export type VerificationOperation =
+  | {
+      scope: 'supplier.channel.credentials'
+      context: { channel_id: number; version: number }
+    }
+  | {
+      scope: 'supplier.manage'
+      context: { supplier_id: string; version: number }
+    }
   | { scope: 'channel.key.read'; context: { channel_id: number } }
   | {
       scope: 'account.binding.bind'
@@ -92,6 +108,8 @@ export type VerificationOperation =
       scope: Exclude<
         SecurityProofScope,
         | 'channel.key.read'
+        | 'supplier.channel.credentials'
+        | 'supplier.manage'
         | 'account.binding.bind'
         | 'account.binding.unbind'
         | 'access_token.generate'

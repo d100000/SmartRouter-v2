@@ -44,6 +44,7 @@ var schedulingConfigState = struct {
 	engine          *scheduler.Engine
 	database        *gorm.DB
 	candidates      map[scheduler.Key][]scheduler.Candidate
+	poolCandidates  map[scheduler.Key][]scheduler.Candidate
 }{}
 
 func ValidateSchedulingConfig(config SchedulingConfig) error {
@@ -99,6 +100,14 @@ func SyncSchedulingConfig(requestedKeys ...scheduler.Key) error {
 		schedulingConfigState.candidates[key] = candidates
 		// This comes from complete metadata, never request-filtered candidates.
 		scheduler.Default.RegisterCandidates(key, candidates)
+		poolCandidates := slices.Clone(schedulingConfigState.poolCandidates[normalized])
+		schedulingConfigState.poolCandidates[key] = poolCandidates
+		supplierRouting.Lock()
+		poolEngine := supplierRouting.engine
+		supplierRouting.Unlock()
+		if poolEngine != nil {
+			poolEngine.RegisterCandidates(key, poolCandidates)
+		}
 	}
 	return nil
 }
@@ -219,7 +228,12 @@ func syncSchedulingConfigLocked() error {
 		}
 	}
 	scheduler.Default.ReplaceCandidateMembership(candidateSets, channelMetadata...)
+	poolCandidates, err := syncSupplierRoutingMembership(channels, candidateSets, entries)
+	if err != nil {
+		return err
+	}
 	schedulingConfigState.candidates = candidateSets
+	schedulingConfigState.poolCandidates = poolCandidates
 	schedulingConfigState.metadataVersion = metadataVersion
 	schedulingConfigState.engine = scheduler.Default
 	schedulingConfigState.database = model.DB

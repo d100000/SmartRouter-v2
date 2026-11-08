@@ -14,6 +14,7 @@ import (
 	"net/smtp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ type fakeSMTPServer struct {
 	messages          chan string
 	authCommands      chan string
 	startTLSCommands  chan string
+	failQuit          atomic.Bool
 }
 
 func newFakeSMTPServer(t *testing.T) *fakeSMTPServer {
@@ -194,6 +196,10 @@ func (s *fakeSMTPServer) serve() {
 				return
 			}
 		case upperCommand == "QUIT":
+			if s.failQuit.Load() {
+				_ = writeSMTPLine(rw, "421 closing connection")
+				return
+			}
 			_ = writeSMTPLine(rw, "221 2.0.0 Bye")
 			return
 		default:
@@ -560,4 +566,17 @@ func TestSendEmailExplicitStartTLSRejectsUntrustedCertificateByDefault(t *testin
 	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
 	require.Error(t, err)
 	require.Contains(t, fmt.Sprint(err), "certificate")
+}
+
+func TestSendEmailDoesNotRetryAcceptedMailWhenQuitFails(t *testing.T) {
+	server := newFakeSMTPServer(t)
+	defer server.close()
+	withSMTPSettings(t)
+	server.failQuit.Store(true)
+	SMTPServer, SMTPPort = server.host, server.port
+	SMTPSSLEnabled, SMTPStartTLSEnabled = false, false
+	SMTPAccount, SMTPToken = "", ""
+	SMTPFrom = "sender@example.test"
+	require.NoError(t, SendEmail("Accepted message", "recipient@example.test", "accepted once"))
+	require.Contains(t, <-server.messages, "accepted once")
 }

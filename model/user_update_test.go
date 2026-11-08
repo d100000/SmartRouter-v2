@@ -44,6 +44,105 @@ func createUserBindTestUser(t *testing.T) User {
 	return user
 }
 
+func TestSupplierIdentityRequiresUnusedDedicatedAccount(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*testing.T, *User)
+	}{
+		{"administrator", func(t *testing.T, user *User) {
+			require.NoError(t, DB.Model(user).Update("role", common.RoleAdminUser).Error)
+		}},
+		{"viewer", func(t *testing.T, user *User) {
+			require.NoError(t, DB.Model(user).Update("channel_viewer", true).Error)
+		}},
+		{"balance", func(t *testing.T, user *User) { require.NoError(t, DB.Model(user).Update("quota", 1).Error) }},
+		{"previous usage", func(t *testing.T, user *User) { require.NoError(t, DB.Model(user).Update("request_count", 1).Error) }},
+		{"login history", func(t *testing.T, user *User) { require.NoError(t, DB.Model(user).Update("last_login_at", 1).Error) }},
+		{"retired consumer key", func(t *testing.T, user *User) {
+			token := &Token{UserId: user.Id, Key: "retired-consumer-key"}
+			require.NoError(t, token.Insert())
+			require.NoError(t, DB.Delete(token).Error)
+		}},
+		{"personal access token", func(t *testing.T, user *User) {
+			require.NoError(t, CreateUserAccessToken(user.Id, &UserAccessToken{TokenHash: "personal-token-hash", Name: "existing"}, 5))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setupUserUpdateTestState(t)
+			supplier := UpstreamSupplier{ID: "10000000-0000-0000-0000-000000000001", Name: "A"}
+			require.NoError(t, DB.Create(&supplier).Error)
+			user := createUserBindTestUser(t)
+			test.prepare(t, &user)
+			require.Error(t, AssignSupplierIdentity(user.Id, supplier.ID))
+			var stored User
+			require.NoError(t, DB.First(&stored, user.Id).Error)
+			assert.Nil(t, stored.SupplierID)
+			assert.Equal(t, int64(1), stored.AuthVersion)
+		})
+	}
+}
+
+func TestSupplierIdentityIsUniqueAndBlocksConsumerCredentials(t *testing.T) {
+	setupUserUpdateTestState(t)
+	supplier := UpstreamSupplier{ID: "10000000-0000-0000-0000-000000000001", Name: "A"}
+	require.NoError(t, DB.Create(&supplier).Error)
+	user := createUserBindTestUser(t)
+	require.NoError(t, AssignSupplierIdentity(user.Id, supplier.ID))
+	cached, err := GetUserCache(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.RoleSupplierUser, cached.Role)
+	assert.Equal(t, supplier.ID, cached.SupplierID)
+	assert.True(t, cached.MustChangePassword)
+	assert.Equal(t, int64(2), cached.AuthVersion)
+
+	other := &User{Username: "second-unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, DB.Create(other).Error)
+	require.Error(t, AssignSupplierIdentity(other.Id, supplier.ID))
+	require.NoError(t, DB.First(other, other.Id).Error)
+	assert.Nil(t, other.SupplierID)
+	assert.Equal(t, common.RoleCommonUser, other.Role)
+	require.Error(t, (&Token{UserId: user.Id, Key: "supplier-consumer-key"}).Insert())
+	require.Error(t, CreateUserAccessToken(user.Id, &UserAccessToken{TokenHash: "supplier-personal-token"}, 5))
+	require.Error(t, SetChannelViewer(user.Id, true))
+
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	stored.Role = common.RoleCommonUser
+	require.Error(t, stored.Update(false))
+}
+
+func TestProfileUpdatesCannotChangeSupplierOrViewerIdentity(t *testing.T) {
+	setupUserUpdateTestState(t)
+	user := createUserBindTestUser(t)
+	stale := user
+	require.NoError(t, SetChannelViewer(user.Id, true))
+	stale.DisplayName = "new display"
+	supplierID := "injected-supplier"
+	stale.SupplierID = &supplierID
+	stale.MustChangePassword = true
+	require.NoError(t, stale.Update(false))
+	assert.True(t, stale.ChannelViewer)
+	assert.Nil(t, stale.SupplierID)
+	assert.False(t, stale.MustChangePassword)
+	stale.Role = common.RoleAdminUser
+	require.NoError(t, stale.Update(false))
+	assert.False(t, stale.ChannelViewer, "an old viewer grant must not survive an administrator promotion and later demotion")
+}
+
+func TestSupplierCreationRequiresStrongInitialPasswordAndNoConsumerBalance(t *testing.T) {
+	setupUserUpdateTestState(t)
+	supplier := UpstreamSupplier{ID: "10000000-0000-0000-0000-000000000001", Name: "A"}
+	require.NoError(t, DB.Create(&supplier).Error)
+	user := &User{Username: "new-supplier", Password: "short-password", Role: common.RoleSupplierUser, Status: common.UserStatusEnabled, SupplierID: &supplier.ID}
+	require.ErrorIs(t, user.Insert(0), ErrSupplierPasswordLength)
+	user.Password = "supplier-initial-password"
+	require.NoError(t, user.Insert(0))
+	assert.True(t, user.MustChangePassword)
+	assert.Zero(t, user.Quota)
+	user.Password = "weak-password"
+	require.ErrorIs(t, user.Edit(true), ErrSupplierPasswordLength)
+}
+
 func TestUserUpdateDoesNotOverwriteConcurrentAccountingOrTokenChanges(t *testing.T) {
 	setupUserUpdateTestState(t)
 

@@ -1,8 +1,9 @@
 package authz
 
 const (
-	BuiltInRoleRoot  = "root"
-	BuiltInRoleAdmin = "admin"
+	BuiltInRoleRoot          = "root"
+	BuiltInRoleAdmin         = "admin"
+	BuiltInRoleChannelViewer = "channel_viewer"
 )
 
 // RoleSpec describes a role. A superuser role is allowed every permission
@@ -17,6 +18,13 @@ type RoleSpec struct {
 }
 
 var builtInRoles = []RoleSpec{
+	{
+		Key:         BuiltInRoleChannelViewer,
+		Name:        "Channel viewer",
+		Description: "Ordinary user with read-only channel access",
+		BuiltIn:     true,
+		Sort:        20,
+	},
 	{
 		Key:         BuiltInRoleRoot,
 		Name:        "Root",

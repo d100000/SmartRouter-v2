@@ -63,6 +63,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Textarea } from '@/components/ui/textarea'
+import { getSuppliers, supplyQueryKey } from '@/features/suppliers/api'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -167,10 +168,31 @@ export function UsersMutateDrawer({
 
   const currentQuotaRaw = form.watch('quota_dollars') || 0
   const selectedRole = form.watch('role')
+  const suppliersQuery = useQuery({
+    queryKey: [...supplyQueryKey, currentUser?.id, 'admin', 'accounts'],
+    queryFn: ({ signal }) => getSuppliers(signal),
+    enabled: open && !isUpdate && selectedRole === ROLE.SUPPLIER,
+  })
   const canEditAdminPermissions = currentUser?.role === ROLE.SUPER_ADMIN
   const targetIsAdmin = (selectedRole ?? currentRow?.role ?? 0) >= ROLE.ADMIN
 
   const onSubmit = async (data: UserFormValues) => {
+    if (!isUpdate && data.role === ROLE.SUPPLIER && !data.supplier_id) {
+      form.setError('supplier_id', { message: t('Select a supplier') })
+      return
+    }
+    if (
+      data.role === ROLE.SUPPLIER &&
+      (!isUpdate || data.password) &&
+      [...(data.password ?? '')].length < 15
+    ) {
+      form.setError('password', {
+        message: t(
+          'Supplier account passwords must contain at least 15 characters'
+        ),
+      })
+      return
+    }
     if (!isUpdate || data.password) {
       if (!accountPasswordSchema.safeParse(data.password ?? '').success) {
         form.setError('password', {
@@ -218,14 +240,23 @@ export function UsersMutateDrawer({
           if (!proof) return
           proofToken = proof.proof_token
         }
-      } else if ((payload.role ?? 0) >= ROLE.ADMIN) {
+      } else if (
+        (payload.role ?? 0) >= ROLE.ADMIN ||
+        payload.role === ROLE.SUPPLIER
+      ) {
         const proof = await requestVerification({
           scope: 'admin.user.create',
           context: { role: payload.role ?? ROLE.ADMIN },
-          title: t('Verify to create administrator'),
-          description: t(
-            'Confirm your identity before creating an administrator account.'
-          ),
+          title:
+            payload.role === ROLE.SUPPLIER
+              ? t('Verify to create supplier account')
+              : t('Verify to create administrator'),
+          description:
+            payload.role === ROLE.SUPPLIER
+              ? t('Verify to create supplier account')
+              : t(
+                  'Confirm your identity before creating an administrator account.'
+                ),
         })
         if (!proof) return
         proofToken = proof.proof_token
@@ -336,6 +367,7 @@ export function UsersMutateDrawer({
                         <Select
                           items={[
                             { value: '1', label: t('Common User') },
+                            { value: '2', label: t('Channel Supplier') },
                             { value: '10', label: t('Admin') },
                           ]}
                           onValueChange={(value) =>
@@ -355,11 +387,63 @@ export function UsersMutateDrawer({
                                 {t('Common User')}
                               </SelectItem>
                               <SelectItem value='10'>{t('Admin')}</SelectItem>
+                              <SelectItem value='2'>
+                                {t('Channel Supplier')}
+                              </SelectItem>
                             </SelectGroup>
                           </SelectContent>
                         </Select>
                         <FormDescription>
                           {t("Set the user's role (cannot be Root)")}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+
+                {!isUpdate && selectedRole === ROLE.SUPPLIER && (
+                  <FormField
+                    control={form.control}
+                    name='supplier_id'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Channel Supplier')}</FormLabel>
+                        <Select
+                          value={field.value || ''}
+                          onValueChange={(value) => field.onChange(value ?? '')}
+                          items={(suppliersQuery.data?.items ?? [])
+                            .filter((supplier) => !supplier.user_id)
+                            .map((supplier) => ({
+                              value: supplier.id,
+                              label: supplier.name,
+                            }))}
+                          disabled={suppliersQuery.isPending}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue
+                                placeholder={t('Select a supplier')}
+                              />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {(suppliersQuery.data?.items ?? [])
+                              .filter((supplier) => !supplier.user_id)
+                              .map((supplier) => (
+                                <SelectItem
+                                  key={supplier.id}
+                                  value={supplier.id}
+                                >
+                                  {supplier.name}
+                                </SelectItem>
+                              ))}
+                          </SelectContent>
+                        </Select>
+                        <FormDescription>
+                          {t(
+                            'Create a supplier configuration before binding a dedicated account.'
+                          )}
                         </FormDescription>
                         <FormMessage />
                       </FormItem>

@@ -70,7 +70,18 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, fundingKeyIndex ...int) (testOutcome testResult) {
+	protectedCredentials := channel.OwnerSupplierID != "" || channel.SecretsWriteOnly
+	defer func() {
+		if protectedCredentials && !errors.Is(testOutcome.localErr, model.ErrChannelOutsideSchedule) && (testOutcome.localErr != nil || testOutcome.newAPIError != nil) {
+			testOutcome.localErr = common.NewMessage("Channel test failed")
+			status := http.StatusBadGateway
+			if testOutcome.newAPIError != nil {
+				status = testOutcome.newAPIError.StatusCode
+			}
+			testOutcome.newAPIError = types.NewOpenAIError(testOutcome.localErr, types.ErrorCodeBadResponse, status)
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -172,7 +183,27 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	group, _ := model.GetUserGroup(testUserID, false)
 	c.Set("group", group)
 
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	selectedChannel := channel
+	if len(fundingKeyIndex) > 0 {
+		keys := []string{channel.Key}
+		if channel.ChannelInfo.IsMultiKey {
+			keys = channel.GetKeys()
+		}
+		index := fundingKeyIndex[0]
+		if index < 0 || index >= len(keys) {
+			return testResult{localErr: model.ErrFundingConflict}
+		}
+		probeChannel := *channel
+		probeChannel.Key, probeChannel.Keys, probeChannel.ChannelInfo = keys[index], nil, model.ChannelInfo{}
+		selectedChannel = &probeChannel
+	}
+	newAPIError := middleware.SetupContextForSelectedChannel(c, selectedChannel, testModel)
+	if len(fundingKeyIndex) > 0 && newAPIError == nil {
+		c.Set("channel_funding_probe", true)
+		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, channel.ChannelInfo.IsMultiKey)
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, fundingKeyIndex[0])
+		service.BeginChannelFundingAttempt(c, channel, selectedChannel.Key, fundingKeyIndex[0], testModel)
+	}
 	if newAPIError != nil {
 		return testResult{
 			context:     c,
@@ -232,6 +263,23 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
+	if len(fundingKeyIndex) > 0 || channel.OwnerSupplierID != "" {
+		switch req := request.(type) {
+		case *dto.GeneralOpenAIRequest:
+			if req.MaxCompletionTokens != nil {
+				req.MaxCompletionTokens = common.GetPointer(uint(16))
+				req.MaxTokens = nil
+			} else {
+				req.MaxTokens = common.GetPointer(uint(16))
+			}
+		case *dto.OpenAIResponsesRequest:
+			req.MaxOutputTokens = common.GetPointer(uint(16))
+		case *dto.ClaudeRequest:
+			req.MaxTokens = common.GetPointer(uint(16))
+		case *dto.GeminiChatRequest:
+			req.GenerationConfig.MaxOutputTokens = common.GetPointer(uint(16))
+		}
+	}
 
 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
 
@@ -245,6 +293,17 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 
 	info.IsChannelTest = true
 	info.InitChannelMeta(c)
+	if err := service.PrepareChannelLimitAttempt(info, selectedChannel); err != nil {
+		return testResult{context: c, localErr: err, newAPIError: service.ChannelLimitRelayError(err, c)}
+	}
+	defer func() {
+		if err := service.FinishChannelLimitAttempt(c, info, testOutcome.newAPIError); err != nil {
+			common.SysError("channel test limit settlement failed: " + err.Error())
+		}
+	}()
+	if len(fundingKeyIndex) > 0 && len(info.ParamOverride) > 0 {
+		return testResult{context: c, localErr: errors.New("Funding recovery checks require manual review for channels with parameter overrides")}
+	}
 
 	err = attachTestBillingRequestInput(info, request)
 	if err != nil {
@@ -296,7 +355,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//// 创建一个用于日志的 info 副本，移除 ApiKey
 	//logInfo := info
 	//logInfo.ApiKey = ""
-	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	if !protectedCredentials {
+		common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	}
 
 	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
 	if err != nil {
@@ -449,6 +510,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
+			if protectedCredentials {
+				service.CloseResponseBodyGracefully(httpResp)
+				return testResult{context: c, localErr: common.NewMessage("Channel test failed"), newAPIError: types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, httpResp.StatusCode)}
+			}
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -502,29 +567,58 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	info.SetEstimatePromptTokens(usage.PromptTokens)
 
 	quota, tieredResult := settleTestQuota(info, priceData, usage)
+	service.CaptureChannelTestLimitUsage(c, info, usage, tieredResult)
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
 	consumedTime := float64(milliseconds) / 1000.0
 	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
-	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
-		ChannelId:        channel.Id,
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		ModelName:        info.OriginModelName,
-		TokenName:        "Model test",
-		Quota:            quota,
-		Content:          []*common.Message{common.NewMessage("Model test")},
-		UseTimeSeconds:   int(consumedTime),
-		IsStream:         info.IsStream,
-		Group:            info.UsingGroup,
-		Other:            other,
-	})
-	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	if !protectedCredentials {
+		model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+			ChannelId:        channel.Id,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ModelName:        info.OriginModelName,
+			TokenName:        "Model test",
+			Quota:            quota,
+			Content:          []*common.Message{common.NewMessage("Model test")},
+			UseTimeSeconds:   int(consumedTime),
+			IsStream:         info.IsStream,
+			Group:            info.UsingGroup,
+			Other:            other,
+		})
+		common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	}
+	if len(fundingKeyIndex) > 0 && !fundingProbeCompleted(respBody, relayFormat) {
+		return testResult{context: c, localErr: errors.New("upstream did not return a completed text response")}
+	}
 	return testResult{
 		context:     c,
 		localErr:    nil,
 		newAPIError: nil,
 	}
+}
+
+// A successful handshake, HTTP 200 or partial stream is not evidence of funded
+// inference. Recovery probes request a small non-streaming text completion.
+func fundingProbeCompleted(body []byte, format types.RelayFormat) bool {
+	if !gjson.ValidBytes(body) {
+		return false
+	}
+	root := gjson.ParseBytes(body)
+	if value := root.Get("error"); value.Exists() && value.Type != gjson.Null {
+		return false
+	}
+	switch format {
+	case types.RelayFormatOpenAI:
+		return root.Get("choices.0.message").IsObject() && root.Get("choices.0.finish_reason").String() != ""
+	case types.RelayFormatOpenAIResponses:
+		return root.Get("object").String() == "response" && root.Get("status").String() == "completed"
+	case types.RelayFormatClaude:
+		return root.Get("type").String() == "message" && root.Get("stop_reason").String() != "" && root.Get("content").IsArray()
+	case types.RelayFormatGemini:
+		return root.Get("candidates.0.finishReason").String() != ""
+	}
+	return false
 }
 
 func attachTestBillingRequestInput(info *relaycommon.RelayInfo, request dto.Request) error {
@@ -568,6 +662,12 @@ func buildTestLogOther(c *gin.Context, info *relaycommon.RelayInfo, priceData ho
 		usage.PromptTokensDetails.CachedTokens, priceData.CacheRatio, priceData.ModelPrice, priceData.GroupRatioInfo.GroupSpecialRatio)
 	if tieredResult != nil {
 		service.InjectTieredBillingInfo(other, info, tieredResult)
+	}
+	if c.GetBool("channel_funding_probe") {
+		other.SetAdmin("test_purpose", "channel_funding_recovery")
+		if attempt := service.ChannelFundingAttempt(c); attempt != nil {
+			other.SetAdmin("funding_binding_id", attempt.Identity.BindingID)
+		}
 	}
 	return other
 }

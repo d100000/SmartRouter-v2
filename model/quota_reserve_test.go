@@ -29,8 +29,9 @@ func createReserveTestUser(t *testing.T, quota int) User {
 
 func createReserveTestToken(t *testing.T, remainQuota int) Token {
 	t.Helper()
+	user := createReserveTestUser(t, 0)
 	token := Token{
-		UserId:      1,
+		UserId:      user.Id,
 		Key:         "reserve-token-" + common.GetRandomString(8),
 		Name:        "reserve-test",
 		Status:      common.TokenStatusEnabled,

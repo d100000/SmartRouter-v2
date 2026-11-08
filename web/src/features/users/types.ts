@@ -54,6 +54,8 @@ export const userSchema = z.object({
   linux_do_id: z.string().optional(),
   status: userStatusSchema,
   role: userRoleSchema,
+  supplier_id: z.string().nullable().optional(),
+  channel_viewer: z.boolean().optional(),
   created_at: z.number().optional(),
   updated_at: z.number().optional(),
   last_login_at: z.number().optional(),
@@ -118,6 +120,7 @@ export interface SearchUsersParams {
 }
 
 export interface UserFormData {
+  supplier_id?: string
   username: string
   display_name: string
   password?: string
@@ -135,6 +138,8 @@ export type ManageUserAction =
   | 'disable'
   | 'delete'
   | 'add_quota'
+  | 'grant_channel_viewer'
+  | 'revoke_channel_viewer'
 
 export type QuotaAdjustMode = 'add' | 'subtract' | 'override'
 

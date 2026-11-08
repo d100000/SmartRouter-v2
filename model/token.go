@@ -303,9 +303,16 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 }
 
 func (token *Token) Insert() error {
-	var err error
-	err = DB.Create(token).Error
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Select("id", "role").First(&user, token.UserId).Error; err != nil {
+			return err
+		}
+		if user.Role == common.RoleSupplierUser {
+			return common.NewMessage("Unauthorized, insufficient privileges")
+		}
+		return tx.Create(token).Error
+	})
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values

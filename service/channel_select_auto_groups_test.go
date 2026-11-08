@@ -43,6 +43,7 @@ func setupChannelSelectAutoGroupsTest(t *testing.T) *gorm.DB {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
 	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(db))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(db))
 	model.DB = db
 	common.MemoryCacheEnabled = true
 	common.RetryTimes = 0
@@ -342,6 +343,145 @@ func setSchedulingTestConfig(t *testing.T, entries []SchedulingConfig) {
 		common.OptionMap[schedulingOptionKey] = previousRaw
 		common.OptionMapRWMutex.Unlock()
 	})
+}
+
+func TestSupplierRoutingScopesPriorityAndRetriesToIndependentPools(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	require.NoError(t, db.AutoMigrate(&model.SupplierAccount{}))
+	const modelName = "supplier-routing-model"
+	setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: false, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100}})
+	for _, account := range []model.SupplierAccount{
+		{SupplierID: "supplier-a", SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: modelName, Group: "default", PoolPriority: 20, PoolWeight: 1},
+		{SupplierID: "supplier-b", SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: modelName, Group: "default", PoolPriority: 10, PoolWeight: 1},
+	} {
+		require.NoError(t, db.Create(&account).Error)
+	}
+	for _, channel := range []struct {
+		id       int
+		owner    string
+		priority int64
+	}{{7101, "supplier-a", 100}, {7102, "supplier-a", 10}, {7103, "supplier-b", 999999}} {
+		createChannelSelectAutoGroupsChannel(t, db, channel.id, "default", modelName)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.id).Updates(map[string]any{"owner_supplier_id": channel.owner, "supplier_priority": channel.priority, "supplier_validated": true}).Error)
+	}
+	model.InitChannelCache()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(c)
+	first, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, 7101, first.Id, "the supplier's internal priority must not overtake the administrator's platform priority")
+	// Local admission has not sent anything. Another channel in A remains a
+	// valid choice and the pool receives no failed upstream health sample.
+	AppendUsedChannel(c, first.Id)
+	FinishSchedulingAttempt(c, &relaycommon.RelayInfo{}, nil)
+	second, err := schedulerSelectChannel(c, "default", modelName, 1, nil)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	assert.Equal(t, 7102, second.Id)
+	state := schedulingState(c)
+	pool, err := supplierRoutingPoolForChannel(second)
+	require.NoError(t, err)
+	snapshot := state.poolEngine.Snapshot(scheduler.Key{Group: "default", Model: modelName}, []scheduler.Candidate{pool.candidate}, false)
+	require.Len(t, snapshot.Channels, 1)
+	assert.Zero(t, snapshot.Channels[0].Window30m.Attempts)
+	require.True(t, MarkSupplierRequestSent(c, second))
+	assert.False(t, MarkSupplierRequestSent(c, first))
+	StartSchedulingAttempt(c, &relaycommon.RelayInfo{})
+	FinishSchedulingAttempt(c, &relaycommon.RelayInfo{}, types.NewErrorWithStatusCode(errors.New("upstream failed"), types.ErrorCodeBadResponse, http.StatusBadGateway))
+	third, err := schedulerSelectChannel(c, "default", modelName, 2, nil)
+	require.NoError(t, err)
+	require.NotNil(t, third)
+	assert.Equal(t, 7103, third.Id, "one real dispatch to A excludes every A channel for this logical request")
+	assert.Error(t, ReserveSchedulingChannel(c, first, "default", modelName))
+	assert.NotNil(t, ChannelAvailabilityError(c, first))
+	// Adding a channel preserves the platform identity and its observations.
+	added := *second
+	added.Id, added.SupplierPriority = 7104, 999999999
+	newPool, err := supplierRoutingPoolForChannel(&added)
+	require.NoError(t, err)
+	assert.Equal(t, pool.candidate.ID, newPool.candidate.ID)
+	snapshot = state.poolEngine.Snapshot(scheduler.Key{Group: "default", Model: modelName}, []scheduler.Candidate{newPool.candidate}, false)
+	assert.Equal(t, int64(1), snapshot.Channels[0].Window30m.Attempts)
+}
+
+func TestSupplierPoolWeightDoesNotGrowWithChannelCount(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	require.NoError(t, db.AutoMigrate(&model.SupplierAccount{}))
+	const modelName = "supplier-pool-weight-model"
+	setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: false, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100}})
+	for _, owner := range []string{"supplier-a", "supplier-b"} {
+		require.NoError(t, db.Create(&model.SupplierAccount{SupplierID: owner, SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: modelName, Group: "default", PoolWeight: 1}).Error)
+	}
+	for _, channel := range []struct {
+		id    int
+		owner string
+	}{{7201, "supplier-a"}, {7202, "supplier-a"}, {7203, "supplier-a"}, {7204, "supplier-b"}} {
+		createChannelSelectAutoGroupsChannel(t, db, channel.id, "default", modelName)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.id).Updates(map[string]any{"owner_supplier_id": channel.owner, "supplier_validated": true}).Error)
+	}
+	model.InitChannelCache()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	defer EndSchedulingRequest(c)
+	selected, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	a, err := supplierRoutingPoolForChannel(&model.Channel{OwnerSupplierID: "supplier-a"})
+	require.NoError(t, err)
+	b, err := supplierRoutingPoolForChannel(&model.Channel{OwnerSupplierID: "supplier-b"})
+	require.NoError(t, err)
+	snapshot := schedulingState(c).poolEngine.Snapshot(scheduler.Key{Group: "default", Model: modelName}, []scheduler.Candidate{a.candidate, b.candidate}, false)
+	require.Len(t, snapshot.Channels, 2)
+	for _, channel := range snapshot.Channels {
+		assert.InDelta(t, .5, channel.SelectionProbability, 1e-12)
+	}
+	// A live supply suspension takes effect even with preheated channel cache.
+	require.NoError(t, db.Model(&model.SupplierAccount{}).Where("supplier_id = ?", "supplier-a").Update("supply_enabled", false).Error)
+	FinishSchedulingAttempt(c, &relaycommon.RelayInfo{}, nil)
+	selected, err = schedulerSelectChannel(c, "default", modelName, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, "supplier-b", selected.OwnerSupplierID)
+}
+
+func TestSupplierPoolCapacityChangesApplyAcrossIdleModels(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	require.NoError(t, db.AutoMigrate(&model.SupplierAccount{}))
+	setSchedulingTestConfig(t, []SchedulingConfig{
+		{Group: "default", Model: "supplier-model-a", Enabled: false, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100},
+		{Group: "default", Model: "supplier-model-b", Enabled: false, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100},
+	})
+	require.NoError(t, db.Create(&model.SupplierAccount{SupplierID: "supplier-a", SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: "supplier-model-a,supplier-model-b", Group: "default", PoolWeight: 1, PoolCapacity: 1}).Error)
+	for i, name := range []string{"supplier-model-a", "supplier-model-b"} {
+		createChannelSelectAutoGroupsChannel(t, db, 7301+i, "default", name)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 7301+i).Updates(map[string]any{"owner_supplier_id": "supplier-a", "supplier_validated": true}).Error)
+	}
+	model.InitChannelCache()
+	idle, _ := gin.CreateTestContext(httptest.NewRecorder())
+	selected, err := schedulerSelectChannel(idle, "default", "supplier-model-b", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	EndSchedulingRequest(idle)
+	first, _ := gin.CreateTestContext(httptest.NewRecorder())
+	defer EndSchedulingRequest(first)
+	selected, err = schedulerSelectChannel(first, "default", "supplier-model-a", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	require.NoError(t, db.Model(&model.SupplierAccount{}).Where("supplier_id = ?", "supplier-a").Update("pool_capacity", 2).Error)
+	model.InitChannelCache()
+	second, _ := gin.CreateTestContext(httptest.NewRecorder())
+	defer EndSchedulingRequest(second)
+	selected, err = schedulerSelectChannel(second, "default", "supplier-model-a", 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected, "the idle model must no longer retain the old capacity of one")
+	require.NoError(t, db.Model(&model.SupplierAccount{}).Where("supplier_id = ?", "supplier-a").Update("pool_capacity", 1).Error)
+	model.InitChannelCache()
+	third, _ := gin.CreateTestContext(httptest.NewRecorder())
+	defer EndSchedulingRequest(third)
+	selected, err = schedulerSelectChannel(third, "default", "supplier-model-b", 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected, "decreasing capacity must retain both outstanding leases")
 }
 
 func TestSchedulingColdFallbackSkipsUnavailableTiers(t *testing.T) {

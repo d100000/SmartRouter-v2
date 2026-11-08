@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -26,27 +27,35 @@ import (
 )
 
 type Channel struct {
-	Id                 int      `json:"id"`
-	Type               int      `json:"type" gorm:"default:0"`
-	Key                string   `json:"key" gorm:"not null"`
-	OpenAIOrganization *string  `json:"openai_organization"`
-	TestModel          *string  `json:"test_model"`
-	Status             int      `json:"status" gorm:"default:1"`
-	Name               string   `json:"name" gorm:"index"`
-	Weight             *uint    `json:"weight" gorm:"default:0"`
-	CreatedTime        int64    `json:"created_time" gorm:"bigint"`
-	TestTime           int64    `json:"test_time" gorm:"bigint"`
-	ResponseTime       int      `json:"response_time"` // in milliseconds
-	BaseURL            *string  `json:"base_url" gorm:"column:base_url;default:''"`
-	Other              string   `json:"other"`
-	Balance            float64  `json:"balance"` // in USD
-	BalanceUpdatedTime int64    `json:"balance_updated_time" gorm:"bigint"`
-	Models             string   `json:"models"`
-	Group              string   `json:"group" gorm:"type:varchar(64);default:'default'"`
-	UsedQuota          int64    `json:"used_quota" gorm:"bigint;default:0"`
-	CostRatio          *float64 `json:"cost_ratio"`
-	CostVersionID      string   `json:"cost_version_id" gorm:"type:varchar(36)"`
-	ModelMapping       *string  `json:"model_mapping" gorm:"type:text"`
+	OwnerSupplierID    string                 `json:"owner_supplier_id" gorm:"type:varchar(36);index"`
+	CreatedBy          int                    `json:"created_by"`
+	SupplierPriority   int64                  `json:"supplier_priority" gorm:"bigint"`
+	SupplierPaused     bool                   `json:"supplier_paused"`
+	SupplierVersion    int64                  `json:"supplier_version" gorm:"bigint"`
+	SupplierValidated  bool                   `json:"supplier_validated"`
+	SecretsWriteOnly   bool                   `json:"secrets_write_only"`
+	Funding            *ChannelFundingSummary `json:"funding_status,omitempty" gorm:"-"`
+	Id                 int                    `json:"id"`
+	Type               int                    `json:"type" gorm:"default:0"`
+	Key                string                 `json:"key" gorm:"not null"`
+	OpenAIOrganization *string                `json:"openai_organization"`
+	TestModel          *string                `json:"test_model"`
+	Status             int                    `json:"status" gorm:"default:1"`
+	Name               string                 `json:"name" gorm:"index"`
+	Weight             *uint                  `json:"weight" gorm:"default:0"`
+	CreatedTime        int64                  `json:"created_time" gorm:"bigint"`
+	TestTime           int64                  `json:"test_time" gorm:"bigint"`
+	ResponseTime       int                    `json:"response_time"` // in milliseconds
+	BaseURL            *string                `json:"base_url" gorm:"column:base_url;default:''"`
+	Other              string                 `json:"other"`
+	Balance            float64                `json:"balance"` // in USD
+	BalanceUpdatedTime int64                  `json:"balance_updated_time" gorm:"bigint"`
+	Models             string                 `json:"models"`
+	Group              string                 `json:"group" gorm:"type:varchar(64);default:'default'"`
+	UsedQuota          int64                  `json:"used_quota" gorm:"bigint;default:0"`
+	CostRatio          *float64               `json:"cost_ratio"`
+	CostVersionID      string                 `json:"cost_version_id" gorm:"type:varchar(36)"`
+	ModelMapping       *string                `json:"model_mapping" gorm:"type:text"`
 	//MaxInputTokens     *int    `json:"max_input_tokens" gorm:"default:0"`
 	StatusCodeMapping *string `json:"status_code_mapping" gorm:"type:varchar(1024);default:''"`
 	Priority          *int64  `json:"priority" gorm:"bigint;default:0"`
@@ -68,10 +77,13 @@ type Channel struct {
 	compiledAvailability *channelAvailabilityPlan
 
 	// cache info
-	Keys                           []string               `json:"-" gorm:"-"`
-	CostRatioSet                   bool                   `json:"-" gorm:"-"`
-	CostRuleChange                 *ChannelCostRuleChange `json:"-" gorm:"-"`
-	UpstreamCredentialSnapshotData string                 `json:"-" gorm:"type:text"`
+	Keys           []string               `json:"-" gorm:"-"`
+	CostRatioSet   bool                   `json:"-" gorm:"-"`
+	CostRuleChange *ChannelCostRuleChange `json:"-" gorm:"-"`
+	// A validation candidate uses a known credential ID only when its material
+	// and namespace match. A non-nil empty value means newly submitted material.
+	ProcurementCredentialID        *string `json:"-" gorm:"-"`
+	UpstreamCredentialSnapshotData string  `json:"-" gorm:"type:text"`
 	keyStateExpected               *channelKeyState
 	upstreamCredentialSnapshots    map[int]UpstreamCredentialSnapshot `json:"-" gorm:"-"`
 	upstreamCredentialMirror       string                             `json:"-" gorm:"-"`
@@ -228,7 +240,28 @@ func (c *ChannelInfo) Scan(value any) error {
 	return common.Unmarshal(jsonScanBytes(value), c)
 }
 
+// ApplyChannelSupplierFilter scopes list, count, search, and tag expansion by
+// immutable channel owner, independently of procurement labels on old keys.
+func ApplyChannelSupplierFilter(query *gorm.DB, owner string) *gorm.DB {
+	switch strings.TrimSpace(owner) {
+	case "":
+		return query
+	case "unassigned":
+		return query.Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "")
+	default:
+		return query.Where("owner_supplier_id = ?", strings.TrimSpace(owner))
+	}
+}
+
 func (channel *Channel) GetKeys() []string {
+	if strings.HasPrefix(channel.Key, supplierSecretPrefix) {
+		copy := *channel
+		if copy.openSupplierCredential() != nil {
+			return nil
+		}
+		copy.Keys = nil
+		return copy.GetKeys()
+	}
 	if channel.Key == "" {
 		return []string{}
 	}
@@ -255,6 +288,13 @@ func (channel *Channel) GetKeys() []string {
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
+		if strings.HasPrefix(channel.Key, supplierSecretPrefix) {
+			secret, err := DecryptSupplierSecret(channel.OwnerSupplierID, channel.Key)
+			if err != nil {
+				return "", 0, types.NewError(err, types.ErrorCodeChannelNoAvailableKey)
+			}
+			return secret, 0, nil
+		}
 		return channel.Key, 0, nil
 	}
 
@@ -459,29 +499,22 @@ func GetChannelsByTag(tag string, idSort bool, selectAll bool, sortOptions ...Ch
 }
 
 func SearchChannels(keyword string, group string, model string, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
+	return SearchChannelsBySupplier(keyword, group, model, idSort, "", sortOptions...)
+}
+
+func SearchChannelsBySupplier(keyword, group, model string, idSort bool, owner string, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
 	var channels []*Channel
-	modelsCol := "`models`"
-
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		modelsCol = `"models"`
-	}
-
-	baseURLCol := "`base_url`"
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		baseURLCol = `"base_url"`
-	}
 
 	order := resolveChannelSortOptions(idSort, sortOptions)
 
 	// 构造基础查询
-	baseQuery := DB.Model(&Channel{}).Omit("key", "upstream_credential_snapshot_data")
+	baseQuery := ApplyChannelSupplierFilter(DB.Model(&Channel{}), owner).Omit("key", "upstream_credential_snapshot_data")
 
-	// 构造WHERE子句
-	whereClause := "(id = ? OR name LIKE ? OR " + commonKeyCol + " = ? OR " + baseURLCol + " LIKE ?) AND " + modelsCol + " LIKE ?"
-	args := []any{common.String2Int(keyword), "%" + keyword + "%", keyword, "%" + keyword + "%", "%" + model + "%"}
-	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(whereClause, args...), group)
+	search := DB.Where("id = ?", common.String2Int(keyword)).
+		Or("name LIKE ?", "%"+keyword+"%").
+		Or(clause.Eq{Column: clause.Column{Name: "key"}, Value: keyword}).
+		Or("base_url LIKE ?", "%"+keyword+"%")
+	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(search).Where("models LIKE ?", "%"+model+"%"), group)
 
 	// 执行查询
 	err := order.Apply(baseQuery).Find(&channels).Error
@@ -544,6 +577,10 @@ func BatchInsertChannels(channels []Channel) error {
 			return err
 		}
 		for _, channel_ := range chunk {
+			if err := EnsureChannelLimitTracking(channel_.Id, true, time.Now(), tx); err != nil {
+				tx.Rollback()
+				return err
+			}
 			if err := syncChannelUpstreamCredentials(tx, &channel_); err != nil {
 				tx.Rollback()
 				return err
@@ -575,6 +612,15 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	}
 	var deletedCount int64
 	for _, chunk := range lo.Chunk(ids, 200) {
+		var owned int64
+		if err := tx.Model(&Channel{}).Where("id IN ? AND owner_supplier_id <> ?", chunk, "").Count(&owned).Error; err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		if owned > 0 {
+			tx.Rollback()
+			return 0, ErrSupplierChannelOperation
+		}
 		if err := tx.Model(&ChannelCredentialBinding{}).Where("channel_id IN ?", chunk).Updates(map[string]any{"active": false, "active_slot": nil}).Error; err != nil {
 			tx.Rollback()
 			return 0, err
@@ -651,6 +697,9 @@ func (channel *Channel) Insert() error {
 		if err := tx.Session(&gorm.Session{Logger: gormlogger.Discard}).Create(channel).Error; err != nil {
 			return err
 		}
+		if err := EnsureChannelLimitTracking(channel.Id, true, time.Now(), tx); err != nil {
+			return err
+		}
 		if err := syncChannelUpstreamCredentials(tx, channel); err != nil {
 			return err
 		}
@@ -681,6 +730,16 @@ func (channel *Channel) Update() error {
 		if err := lockForUpdate(tx).First(&existing, "id = ?", channel.Id).Error; err != nil {
 			return err
 		}
+		if existing.OwnerSupplierID != "" && channel.OwnerSupplierID != "" && channel.OwnerSupplierID != existing.OwnerSupplierID {
+			return errors.New("supplier channel ownership cannot be transferred")
+		}
+		channel.OwnerSupplierID = existing.OwnerSupplierID
+		channel.SecretsWriteOnly = existing.SecretsWriteOnly || existing.OwnerSupplierID != ""
+		channel.CreatedBy = existing.CreatedBy
+		channel.SupplierPriority = existing.SupplierPriority
+		channel.SupplierPaused = existing.SupplierPaused
+		channel.SupplierValidated = existing.SupplierValidated
+		channel.SupplierVersion = existing.SupplierVersion
 		if expected := channel.keyStateExpected; expected != nil {
 			if existing.Key != expected.key || existing.ChannelInfo.IsMultiKey != expected.channelInfo.IsMultiKey {
 				return errors.New("channel key state changed; reload and retry")
@@ -815,6 +874,13 @@ func (channel *Channel) Delete() error {
 	upstreamCredentialWriteMutex.Lock()
 	defer upstreamCredentialWriteMutex.Unlock()
 	return DB.Transaction(func(tx *gorm.DB) error {
+		var owned int64
+		if err := tx.Model(&Channel{}).Where("id = ? AND owner_supplier_id <> ?", channel.Id, "").Count(&owned).Error; err != nil {
+			return err
+		}
+		if owned > 0 {
+			return ErrSupplierChannelOperation
+		}
 		if _, err := upstreamFingerprintSecret(tx); err != nil {
 			return err
 		}
@@ -888,31 +954,43 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.SetOtherInfo(info)
 			return
 		}
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
-			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		updateMultiKeyStatusAtIndex(channel, keyIndex, status, reason)
+	}
+}
+
+// Funding incidents address a binding, not key material: duplicate key slots
+// still have distinct bindings and must not update the first matching slot.
+func updateMultiKeyStatusAtIndex(channel *Channel, keyIndex, status int, reason string) {
+	keys := channel.GetKeys()
+	if keyIndex < 0 || keyIndex >= len(keys) {
+		return
+	}
+	if channel.ChannelInfo.MultiKeyStatusList == nil {
+		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+	}
+	if status == common.ChannelStatusEnabled {
+		delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+		delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+		delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
+	} else {
+		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
+		if channel.ChannelInfo.MultiKeyDisabledReason == nil {
+			channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
 		}
-		if status == common.ChannelStatusEnabled {
-			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
-		} else {
-			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
-			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
-				channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
-			}
-			if channel.ChannelInfo.MultiKeyDisabledTime == nil {
-				channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
-			}
-			channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
-			channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+		if channel.ChannelInfo.MultiKeyDisabledTime == nil {
+			channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		}
-		if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
-			channel.Status = common.ChannelStatusAutoDisabled
-			info := channel.GetOtherInfo()
-			info["status_reason"] = ChannelStatusReasonAllKeysDisabled
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-		} else if status == common.ChannelStatusEnabled {
-			channel.Status = common.ChannelStatusEnabled
-		}
+		channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
+		channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+	}
+	if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
+		channel.Status = common.ChannelStatusAutoDisabled
+		info := channel.GetOtherInfo()
+		info["status_reason"] = ChannelStatusReasonAllKeysDisabled
+		info["status_time"] = common.GetTimestamp()
+		channel.SetOtherInfo(info)
+	} else if status == common.ChannelStatusEnabled {
+		channel.Status = common.ChannelStatusEnabled
 	}
 }
 
@@ -930,6 +1008,16 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+	return updateChannelStatus(channelId, usingKey, status, reason, false)
+}
+
+// EnableChannelAutomatically checks funding ownership under the same database
+// lock as the status update. A separate read would race a new funding failure.
+func EnableChannelAutomatically(channelId int, usingKey string) bool {
+	return updateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "", true)
+}
+
+func updateChannelStatus(channelId int, usingKey string, status int, reason string, automatic bool) bool {
 	defer invalidateRoutingMetadata()
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
@@ -946,15 +1034,34 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	channel := &Channel{}
 	changed := false
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			if err := tx.Model(&Channel{}).Where("id = ?", channelId).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+				return err
+			}
+		}
 		if err := lockForUpdate(tx).First(channel, channelId).Error; err != nil {
 			return err
+		}
+		if automatic {
+			owned, err := fundingOwnedDisable(tx, channel, usingKey)
+			if err != nil || owned || channel.Status == common.ChannelStatusManuallyDisabled {
+				return err
+			}
+			if channel.ChannelInfo.IsMultiKey {
+				for index, key := range channel.GetKeys() {
+					if key == usingKey && channel.ChannelInfo.MultiKeyStatusList[index] == common.ChannelStatusManuallyDisabled {
+						return nil
+					}
+				}
+			}
 		}
 		// A manual channel operation must replace the exhaustion reason even
 		// when the status value is already manually disabled.
 		overridesKeyExhaustion := channel.ChannelInfo.IsMultiKey && usingKey == "" &&
 			status == common.ChannelStatusManuallyDisabled && reason != ChannelStatusReasonAllKeysDisabled &&
 			channel.GetOtherInfo()["status_reason"] == ChannelStatusReasonAllKeysDisabled
-		if channel.Status == status && !overridesKeyExhaustion && (!channel.ChannelInfo.IsMultiKey || usingKey == "") {
+		overridesFunding := status == common.ChannelStatusAutoDisabled && strings.HasPrefix(fmt.Sprint(channel.GetOtherInfo()["status_reason"]), "Upstream funding restriction (event #")
+		if channel.Status == status && !overridesKeyExhaustion && !overridesFunding && (!channel.ChannelInfo.IsMultiKey || usingKey == "") {
 			return nil
 		}
 		beforeStatus := channel.Status
@@ -1054,7 +1161,19 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
+	query := DB.Model(&Channel{}).Where("tag = ?", tag)
+	if modelMapping != nil || models != nil || paramOverride != nil || headerOverride != nil {
+		var owned int64
+		if err := query.Session(&gorm.Session{}).Where("owner_supplier_id <> ?", "").Count(&owned).Error; err != nil {
+			return err
+		}
+		if owned > 0 {
+			return ErrSupplierChannelOperation
+		}
+		// A supplier moved into the tag after the check must remain protected.
+		query = query.Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "")
+	}
+	err := query.Updates(updateData).Error
 	if err != nil {
 		return err
 	}
@@ -1094,13 +1213,27 @@ func updateChannelUsedQuota(id int, quota int) {
 
 func DeleteChannelByStatus(status int64) (int64, error) {
 	defer invalidateRoutingMetadata()
-	result := DB.Where("status = ?", status).Delete(&Channel{})
+	var owned int64
+	if err := DB.Model(&Channel{}).Where("status = ? AND owner_supplier_id <> ?", status, "").Count(&owned).Error; err != nil {
+		return 0, err
+	}
+	if owned > 0 {
+		return 0, ErrSupplierChannelOperation
+	}
+	result := DB.Where("status = ?", status).Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "").Delete(&Channel{})
 	return result.RowsAffected, result.Error
 }
 
 func DeleteDisabledChannel() (int64, error) {
 	defer invalidateRoutingMetadata()
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
+	var owned int64
+	if err := DB.Model(&Channel{}).Where("status IN ? AND owner_supplier_id <> ?", []int{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled}, "").Count(&owned).Error; err != nil {
+		return 0, err
+	}
+	if owned > 0 {
+		return 0, ErrSupplierChannelOperation
+	}
+	result := DB.Where("status IN ?", []int{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled}).Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "").Delete(&Channel{})
 	return result.RowsAffected, result.Error
 }
 
@@ -1120,20 +1253,8 @@ func GetPaginatedChannelTags(query *gorm.DB, offset int, limit int) ([]*string, 
 	return tags, err
 }
 
-func SearchTags(keyword string, group string, model string, idSort bool) ([]*string, error) {
+func SearchTags(keyword string, group string, model string, idSort bool, owners ...string) ([]*string, error) {
 	var tags []*string
-	modelsCol := "`models`"
-
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		modelsCol = `"models"`
-	}
-
-	baseURLCol := "`base_url`"
-	// 如果是 PostgreSQL，使用双引号
-	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		baseURLCol = `"base_url"`
-	}
 
 	order := "priority desc"
 	if idSort {
@@ -1143,10 +1264,15 @@ func SearchTags(keyword string, group string, model string, idSort bool) ([]*str
 	// 构造基础查询
 	baseQuery := DB.Model(&Channel{}).Omit("key", "upstream_credential_snapshot_data")
 
-	// 构造WHERE子句
-	whereClause := "(id = ? OR name LIKE ? OR " + commonKeyCol + " = ? OR " + baseURLCol + " LIKE ?) AND " + modelsCol + " LIKE ?"
-	args := []any{common.String2Int(keyword), "%" + keyword + "%", keyword, "%" + keyword + "%", "%" + model + "%"}
-	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(whereClause, args...), group)
+	if len(owners) > 0 {
+		baseQuery = ApplyChannelSupplierFilter(baseQuery, owners[0])
+	}
+
+	search := DB.Where("id = ?", common.String2Int(keyword)).
+		Or("name LIKE ?", "%"+keyword+"%").
+		Or(clause.Eq{Column: clause.Column{Name: "key"}, Value: keyword}).
+		Or("base_url LIKE ?", "%"+keyword+"%")
+	baseQuery = ApplyChannelGroupFilter(baseQuery.Where(search).Where("models LIKE ?", "%"+model+"%"), group)
 
 	subQuery := baseQuery.
 		Select("tag").

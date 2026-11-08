@@ -793,6 +793,20 @@ func TestSecurityEnrollmentOperationContext(t *testing.T) {
 		{"admin binding both", "admin.user.binding.clear", `{"user_id":7,"binding_type":"github","provider_id":3}`, service.ErrVerificationContextInvalid},
 		{"admin binding neither", "admin.user.binding.clear", `{"user_id":7}`, service.ErrVerificationContextInvalid},
 		{"admin create administrator", "admin.user.create", `{"role":10}`, nil},
+		{"admin create supplier", "admin.user.create", `{"role":2}`, nil},
+		{"admin grant viewer", "admin.user.manage", `{"user_id":7,"action":"grant_channel_viewer"}`, nil},
+		{"admin revoke viewer", "admin.user.manage", `{"user_id":7,"action":"revoke_channel_viewer"}`, nil},
+		{"supplier new credentials", "supplier.channel.credentials", `{"channel_id":0,"version":0}`, nil},
+		{"supplier existing credentials", "supplier.channel.credentials", `{"channel_id":7,"version":1}`, nil},
+		{"supplier credentials missing version", "supplier.channel.credentials", `{"channel_id":7}`, service.ErrVerificationContextInvalid},
+		{"supplier credentials stale create context", "supplier.channel.credentials", `{"channel_id":7,"version":0}`, service.ErrVerificationContextInvalid},
+		{"supplier credentials unknown field", "supplier.channel.credentials", `{"channel_id":7,"version":1,"owner":"A"}`, service.ErrVerificationContextInvalid},
+		{"supplier manage create", "supplier.manage", `{"supplier_id":"","version":0}`, nil},
+		{"supplier manage existing", "supplier.manage", `{"supplier_id":"supplier-a","version":1}`, nil},
+		{"supplier manage bind procurement supplier", "supplier.manage", `{"supplier_id":"supplier-a","version":0}`, nil},
+		{"supplier manage empty supplier with revision", "supplier.manage", `{"supplier_id":"","version":1}`, service.ErrVerificationContextInvalid},
+		{"supplier manage negative revision", "supplier.manage", `{"supplier_id":"supplier-a","version":-1}`, service.ErrVerificationContextInvalid},
+		{"supplier manage missing revision", "supplier.manage", `{"supplier_id":"supplier-a"}`, service.ErrVerificationContextInvalid},
 		{"admin create common user", "admin.user.create", `{"role":1}`, service.ErrVerificationContextInvalid},
 		{"admin create unknown role", "admin.user.create", `{"role":50}`, service.ErrVerificationContextInvalid},
 		{"unknown scope", "user.email.change", `{}`, service.ErrProofScope},
@@ -855,6 +869,47 @@ func TestSecurityEnrollmentChannelProofRejectsMismatchesBeforeConsumption(t *tes
 	assert.Positive(t, authorization.ProofID)
 	_, err = service.ConsumeOperationProof(proof.ProofToken, identity, operation)
 	assert.ErrorIs(t, err, service.ErrProofConsumed)
+}
+
+func TestSupplierCredentialProofChecksOwnershipVersionAndIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		role            int
+		supplier        string
+		passwordPending bool
+		channelID       int
+		version         int64
+		wantErr         error
+	}{
+		{"own channel", common.RoleSupplierUser, "supplier-a", false, 1, 1, nil},
+		{"new channel", common.RoleSupplierUser, "supplier-a", false, 0, 0, nil},
+		{"other supplier", common.RoleSupplierUser, "supplier-b", false, 1, 1, service.ErrVerificationForbidden},
+		{"missing channel", common.RoleSupplierUser, "supplier-a", false, 2, 1, service.ErrVerificationForbidden},
+		{"stale version", common.RoleSupplierUser, "supplier-a", false, 1, 2, service.ErrVerificationForbidden},
+		{"unbound supplier", common.RoleSupplierUser, "", false, 1, 1, service.ErrVerificationForbidden},
+		{"initial password", common.RoleSupplierUser, "supplier-a", true, 1, 1, service.ErrVerificationForbidden},
+		{"viewer", common.RoleCommonUser, "", false, 1, 1, service.ErrVerificationForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			user, identity := setupSecurityEnrollmentTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
+			require.NoError(t, model.DB.Create(&model.Channel{Id: 1, Name: "A private channel", OwnerSupplierID: "supplier-a", SupplierVersion: 1}).Error)
+			changes := map[string]any{"role": test.role, "must_change_password": test.passwordPending, "channel_viewer": test.role == common.RoleCommonUser}
+			if test.supplier != "" {
+				changes["supplier_id"] = test.supplier
+			}
+			require.NoError(t, model.DB.Model(user).Updates(changes).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			operation := service.VerificationOperation{Scope: service.VerificationScopeSupplierChannelCredentials, Context: []byte(fmt.Sprintf(`{"channel_id":%d,"version":%d}`, test.channelID, test.version))}
+			proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
+			_, err := service.ConsumeOperationProof(proof, identity, operation)
+			require.ErrorIs(t, err, test.wantErr)
+			if test.wantErr == nil {
+				_, err = service.ConsumeOperationProof(proof, identity, operation)
+				assert.ErrorIs(t, err, service.ErrProofConsumed)
+			}
+		})
+	}
 }
 
 func TestSecurityEnrollmentProofConcurrentConsumption(t *testing.T) {

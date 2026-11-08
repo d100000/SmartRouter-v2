@@ -633,7 +633,8 @@ export function getChannelTableRowId(row: Channel | TagRow): string {
  * Converts flat array into tree structure grouped by tag
  */
 export function aggregateChannelsByTag(
-  channels: Channel[]
+  channels: Channel[],
+  fundingTags?: Record<string, NonNullable<Channel['funding_status']>>
 ): (Channel | TagRow)[] {
   const tagMap = new Map<string, TagRow>()
   const result: (Channel | TagRow)[] = []
@@ -645,6 +646,7 @@ export function aggregateChannelsByTag(
       // Create tag aggregate row
       const tagRow = {
         ...channel,
+        funding_status: null,
         key: tag,
         id: tag as unknown as number,
         tag,
@@ -675,6 +677,39 @@ export function aggregateChannelsByTag(
     // Add to children
     tagRow.children.push(channel)
     const childCount = tagRow.children.length
+
+    if (channel.funding_status) {
+      const previous = tagRow.funding_status
+      const current = channel.funding_status
+      let status = current.status
+      if (
+        previous?.status === 'balance_insufficient' ||
+        current.status === 'balance_insufficient'
+      ) {
+        status = 'balance_insufficient'
+      } else if (
+        previous?.status === 'quota_limited' ||
+        current.status === 'quota_limited'
+      ) {
+        status = 'quota_limited'
+      }
+      tagRow.funding_status = {
+        status,
+        affected_keys: (previous?.affected_keys ?? 0) + current.affected_keys,
+        total_keys: 0,
+        last_seen: Math.max(previous?.last_seen ?? 0, current.last_seen),
+      }
+    }
+    if (tagRow.funding_status) {
+      tagRow.funding_status.total_keys = tagRow.children.reduce(
+        (sum, child) =>
+          sum +
+          (child.channel_info?.is_multi_key
+            ? child.channel_info.multi_key_size
+            : 1),
+        0
+      )
+    }
 
     // Aggregate used_quota (sum)
     tagRow.used_quota += channel.used_quota
@@ -716,6 +751,13 @@ export function aggregateChannelsByTag(
       tagRow.status = 1
     } else if (tagRow.status === undefined) {
       tagRow.status = channel.effective_status ?? channel.status
+    }
+  }
+
+  if (fundingTags) {
+    for (const [tag, row] of tagMap) {
+      const summary = fundingTags[tag]
+      row.funding_status = summary?.affected_keys ? summary : null
     }
   }
 

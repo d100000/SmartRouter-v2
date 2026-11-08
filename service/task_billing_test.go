@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -24,7 +28,10 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 func TestMain(m *testing.M) {
@@ -1807,6 +1814,206 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 
 			assert.Equal(t, testCase.wantSettled, settled)
 			assert.Equal(t, testCase.wantQuota, task.Quota)
+		})
+	}
+}
+
+func TestMidjourneyChannelProcurementLifecycle(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(":memory:")
+			case "mysql":
+				if os.Getenv("TEST_MYSQL_DSN") == "" {
+					t.Skip("TEST_MYSQL_DSN not configured")
+				}
+				driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+			case "postgres":
+				if os.Getenv("TEST_POSTGRES_DSN") == "" {
+					t.Skip("TEST_POSTGRES_DSN not configured")
+				}
+				driver = postgres.Open(os.Getenv("TEST_POSTGRES_DSN"))
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "mj_procurement_test_"}})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			oldDB, oldLog, oldDialect, oldCache, oldSupplierClient := model.DB, model.LOG_DB, common.MainDatabaseType(), common.MemoryCacheEnabled, supplierHTTPClient
+			model.DB, model.LOG_DB, common.MemoryCacheEnabled = db, db, false
+			common.SetMainDatabaseType(common.DatabaseType(dialect))
+			schemas := []any{&model.Channel{}, &model.Ability{}, &model.SupplierAccount{}, &model.SupplierChannelDraft{}, &model.UpstreamSupplier{}, &model.UpstreamCredential{}, &model.UpstreamCredentialVersion{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialFingerprintSecret{}, &model.ChannelLimitEvent{}, &model.ChannelLimitConfig{}, &model.ChannelLimitAttempt{}, &model.ChannelDailyBudget{}, &model.Midjourney{}, &model.OverviewAttemptEvent{}, &model.OverviewDaily{}, &model.OverviewCollectionState{}, &model.User{}, &model.Log{}}
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(schemas...))
+				model.DB, model.LOG_DB, common.MemoryCacheEnabled, supplierHTTPClient = oldDB, oldLog, oldCache, oldSupplierClient
+				common.SetMainDatabaseType(oldDialect)
+				require.NoError(t, sqlDB.Close())
+			})
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(schemas...))
+			}
+			t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+			t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+			supplier, err := model.CreateUpstreamSupplier("MJ supplier")
+			require.NoError(t, err)
+			account := model.SupplierAccount{SupplierID: supplier.ID, SupplyEnabled: true, AllowedTypes: "[2]", AllowedModels: "mj_imagine", Group: "default", MaxChannels: 2, PoolWeight: 1, CostRatio: common.GetPointer(0.5)}
+			require.NoError(t, model.SaveSupplierAccount(&account, 0))
+			secret, err := model.EncryptSupplierSecret(supplier.ID, "original-private-key")
+			require.NoError(t, err)
+			draft := model.SupplierChannelDraft{SupplierID: supplier.ID, Type: constant.ChannelTypeMidjourney, Name: "MJ supplier", BaseURL: "https://8.8.8.8", Secret: secret, Models: "mj_imagine"}
+			channel, err := model.SaveSupplierChannelDraft(&draft, 77, 0, 0)
+			require.NoError(t, err)
+			require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, supplier.ID, channel.SupplierVersion, []string{"mj_imagine"}))
+			require.NoError(t, db.First(channel, channel.Id).Error)
+			require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
+			_, err = model.UpdateChannelLimits(channel.Id, 1, model.ChannelLimitSettings{RPM: 1, TPM: 1, DailyUSDNano: model.ChannelLimitUSDScale, ReconcileSeconds: 300}, true, time.Now())
+			require.NoError(t, err)
+			phase, submits, polls := "queued", 0, 0
+			supplierHTTPClient = func() *http.Client {
+				return &http.Client{Transport: analysisTestTransport(func(r *http.Request) (*http.Response, error) {
+					assert.Equal(t, "8.8.8.8", r.URL.Host)
+					assert.Equal(t, "original-private-key", r.Header.Get("mj-api-secret"))
+					status, body := 200, `{"code":22,"result":"vendor-task","description":"original-\u0070rivate-key","properties":{"diagnostic":["original-private-key"],"id":9007199254740993}}`
+					if strings.Contains(r.URL.Path, "list-by-condition") {
+						polls++
+						var payload struct {
+							IDs []string `json:"ids"`
+						}
+						require.NoError(t, common.DecodeJson(r.Body, &payload))
+						assert.Equal(t, []string{"vendor-task"}, payload.IDs)
+						switch phase {
+						case "queued":
+							body = `[{"id":"vendor-task","status":"IN_PROGRESS","progress":"100%"}]`
+						case "missing":
+							status, body = 404, `{"error":"missing"}`
+						case "failed":
+							body = `[{"id":"vendor-task","status":"FAILURE","progress":"100%","failReason":"Invalid original-\u0070rivate-key","properties":{"secret":"original-private-key"}}]`
+						case "done":
+							body = `[{"id":"vendor-task","status":"SUCCESS","progress":"100%","imageUrl":"https://8.8.8.8/image.png"}]`
+						}
+					} else {
+						submits++
+					}
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+				})}
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/mj/submit/imagine", strings.NewReader(`{"prompt":"private prompt"}`))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(ctx, constant.ContextKeyChannelKey, "original-private-key")
+			common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "default")
+			info := &relaycommon.RelayInfo{UserId: 77, OriginModelName: "mj_imagine", ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id, ChannelType: channel.Type, ChannelBaseUrl: channel.GetBaseURL(), ApiKey: "original-private-key"}, PriceData: types.PriceData{UsePrice: true, ModelPrice: 0.2}}
+			response, responseBody, err := DoMidjourneyHttpRequest(ctx, time.Second, "https://8.8.8.8/mj/submit/imagine", info)
+			require.NoError(t, err)
+			assert.Equal(t, 22, response.Response.Code)
+			assert.Equal(t, "[redacted]", response.Response.Description)
+			assert.NotContains(t, string(responseBody), "original-private-key")
+			assert.Contains(t, string(responseBody), "9007199254740993", "redaction must preserve exact upstream numeric identifiers")
+			task := &model.Midjourney{UserId: 77, ChannelId: channel.Id, MjId: response.Response.Result, Action: constant.MjActionImagine, SubmitTime: time.Now().UnixMilli(), Status: "SUBMITTED", Progress: "0%"}
+			require.NoError(t, AttachMidjourneyChannelAttempt(info, task))
+			require.NoError(t, task.Insert())
+			require.NoError(t, FlushMidjourneyChannelObservation(context.Background(), task))
+			assert.NotContains(t, task.ChannelAttemptData, "original-private-key")
+			assert.Empty(t, task.PollingKey)
+			public, err := common.Marshal(task)
+			require.NoError(t, err)
+			assert.NotContains(t, string(public), "connection")
+			assert.NotContains(t, string(public), "attempt_id")
+			state, err := model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.EqualValues(t, 1, state.RPMUsed)
+			assert.EqualValues(t, 100000000, state.DailyHeldNano)
+			assert.Zero(t, state.TPMReserved)
+			var event model.OverviewAttemptEvent
+			require.NoError(t, db.First(&event, "id = ?", info.OverviewAttempt.EventID).Error)
+			assert.True(t, event.Success)
+			assert.Equal(t, "accepted", event.TaskStatus)
+			assert.Equal(t, supplier.ID, event.AuthorizedSupplierID)
+			// Changing live connection and suspending supply cannot redirect accepted work.
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{"status": common.ChannelStatusManuallyDisabled, "base_url": "https://9.9.9.9", "cost_ratio": 0.9}).Error)
+			require.NoError(t, db.Model(&model.SupplierAccount{}).Where("supplier_id = ?", supplier.ID).Update("supply_enabled", false).Error)
+			require.NoError(t, RefreshMidjourneyTask(context.Background(), task))
+			assert.Equal(t, "IN_PROGRESS", task.Status)
+			assert.True(t, model.HasUnfinishedMidjourneyTasks(), "reported progress alone cannot establish task completion")
+			require.Len(t, model.GetAllUnFinishTasks(), 1)
+			phase = "missing"
+			require.Error(t, RefreshMidjourneyTask(context.Background(), task))
+			snapshot, err := task.ChannelAttempt()
+			require.NoError(t, err)
+			assert.Equal(t, "unknown", snapshot.Observation.Status)
+			var attempt model.ChannelLimitAttempt
+			require.NoError(t, db.First(&attempt, "id = ?", snapshot.AttemptID).Error)
+			deadline := attempt.ReconcileUntilMS
+			require.Positive(t, deadline)
+			require.Error(t, RefreshMidjourneyTask(context.Background(), task))
+			require.NoError(t, db.First(&attempt, "id = ?", snapshot.AttemptID).Error)
+			assert.Equal(t, deadline, attempt.ReconcileUntilMS)
+			// A customer refund affects the customer wallet only, never this purchase.
+			require.NoError(t, db.Create(&model.User{Id: 77, Username: fmt.Sprint("mj-user-", dialect), Quota: 1000, UsedQuota: 20}).Error)
+			task.Quota = 20
+			require.NoError(t, task.UpdateBillingState())
+			assert.True(t, RefundMidjourneyQuota(context.Background(), task, "customer refund"))
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.EqualValues(t, 100000000, state.DailyHeldNano)
+			phase = "failed"
+			require.NoError(t, RefreshMidjourneyTask(context.Background(), task))
+			assert.Equal(t, "FAILURE", task.Status)
+			var persistedTask model.Midjourney
+			require.NoError(t, db.First(&persistedTask, task.Id).Error)
+			assert.Equal(t, "Invalid [redacted]", persistedTask.FailReason)
+			assert.NotContains(t, persistedTask.Properties, "original-private-key")
+			assert.True(t, task.ProcurementReconcile, "a terminal task without purchase cost remains eligible for late cost correction")
+			assert.True(t, model.HasUnfinishedMidjourneyTasks())
+			phase = "done"
+			require.NoError(t, RefreshMidjourneyTask(context.Background(), task))
+			assert.Equal(t, "SUCCESS", task.Status)
+			assert.False(t, task.ProcurementReconcile)
+			state, err = model.GetChannelLimitState(channel.Id, time.Now())
+			require.NoError(t, err)
+			assert.EqualValues(t, 100000000, state.DailyUsedNano)
+			assert.Zero(t, state.DailyHeldNano)
+			assert.EqualValues(t, 1, state.RPMUsed)
+			require.NoError(t, FlushMidjourneyChannelObservation(context.Background(), task))
+			require.NoError(t, RefreshMidjourneyTask(context.Background(), task))
+			assert.Equal(t, 1, submits)
+			assert.Equal(t, 5, polls)
+			require.NoError(t, db.First(&event, "id = ?", info.OverviewAttempt.EventID).Error)
+			assert.Equal(t, "succeeded", event.TaskStatus)
+			require.NotNil(t, event.ImageCount)
+			assert.EqualValues(t, 1, *event.ImageCount)
+		})
+	}
+}
+
+func TestMidjourneyProtectedQueryErrorDoesNotExposeCredential(t *testing.T) {
+	const secret = "private-query-key"
+	oldClient, oldWriter := supplierHTTPClient, gin.DefaultWriter
+	var serverLog strings.Builder
+	gin.DefaultWriter = &serverLog
+	t.Cleanup(func() { supplierHTTPClient, gin.DefaultWriter = oldClient, oldWriter })
+	for _, transportFailure := range []bool{false, true} {
+		t.Run(fmt.Sprint("transport-", transportFailure), func(t *testing.T) {
+			supplierHTTPClient = func() *http.Client {
+				return &http.Client{Transport: analysisTestTransport(func(r *http.Request) (*http.Response, error) {
+					if transportFailure {
+						return nil, fmt.Errorf("unauthorized credential %s", secret)
+					}
+					return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("Invalid " + secret)), Request: r}, nil
+				})}
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/mj/task/source/fetch", nil)
+			c.Set("midjourney_query_channel", &model.Channel{Key: secret, SecretsWriteOnly: true})
+			common.SetContextKey(c, constant.ContextKeyChannelKey, secret)
+			response, body, err := DoMidjourneyHttpRequest(c, time.Second, "https://8.8.8.8/mj/task/source/fetch")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), secret)
+			assert.NotContains(t, response.Response.Description, secret)
+			assert.Empty(t, body)
+			assert.NotContains(t, serverLog.String(), secret)
 		})
 	}
 }

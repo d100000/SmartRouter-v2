@@ -27,7 +27,7 @@ func init() {
 				Action:         ActionRead,
 				LabelKey:       "Read channels",
 				DescriptionKey: "View channel lists and details without secrets.",
-				DefaultRoles:   []string{BuiltInRoleAdmin},
+				DefaultRoles:   []string{BuiltInRoleAdmin, BuiltInRoleChannelViewer},
 			},
 			{
 				Action:         ActionOperate,

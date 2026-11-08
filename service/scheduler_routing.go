@@ -29,6 +29,11 @@ type schedulingRequest struct {
 	mu                        sync.Mutex
 	id                        string
 	requests                  map[scheduler.Key]*scheduler.Request
+	poolEngine                *scheduler.Engine
+	poolRequests              map[scheduler.Key]*scheduler.Request
+	poolRequest               *scheduler.Request
+	poolAttempt               *scheduler.Attempt
+	sentSuppliers             map[string]bool
 	coldPriorities            map[scheduler.Key]int64
 	currentRequest            *scheduler.Request
 	attempt                   *scheduler.Attempt
@@ -56,7 +61,11 @@ func schedulingState(c *gin.Context) *schedulingRequest {
 
 // SchedulerCandidate exposes routing configuration without credentials.
 func SchedulerCandidate(channel *model.Channel) scheduler.Candidate {
-	return scheduler.Candidate{ID: channel.Id, Name: channel.Name, Status: channel.Status, Priority: channel.GetPriority(), Weight: float64(channel.GetWeight())}
+	priority := channel.GetPriority()
+	if channel.OwnerSupplierID != "" {
+		priority = channel.SupplierPriority
+	}
+	return scheduler.Candidate{ID: channel.Id, Name: channel.Name, Status: channel.Status, Priority: priority, Weight: float64(channel.GetWeight())}
 }
 
 func schedulerRequestForGroup(c *gin.Context, group, modelName string) (*schedulingRequest, *scheduler.Request) {
@@ -86,15 +95,25 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 		// Undispatched reservations never count as attempts or health failures.
 		scheduler.Default.FinishAttempt(state.attempt, scheduler.Outcome{})
 		state.attempt, state.currentRequest = nil, nil
+		if state.poolAttempt != nil {
+			state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
+			state.poolAttempt, state.poolRequest = nil, nil
+		}
 	}
 	state.mu.Unlock()
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
+	if slices.ContainsFunc(channels, func(channel *model.Channel) bool { return channel.OwnerSupplierID != "" }) {
+		return selectSupplierPoolChannel(c, state, request, channels, stream, retry > 0)
+	}
 	active := scheduler.Default.IsActive(request.Key)
 	priorities := make([]int64, 0, len(channels))
 	tiers := make(map[int64][]scheduler.Candidate)
 	candidates := make([]scheduler.Candidate, 0, len(channels))
 	byID := make(map[int]*model.Channel, len(channels))
 	for _, channel := range channels {
+		if !supplierChannelEligible(c, channel) {
+			continue
+		}
 		priority := channel.GetPriority()
 		if _, seen := tiers[priority]; !seen {
 			tiers[priority] = nil
@@ -177,6 +196,9 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 		return apiErr
 	}
 	channel = fresh
+	if !supplierChannelEligible(c, channel) {
+		return scheduler.ErrNoEligibleChannel
+	}
 	if group == "" || group == "auto" {
 		group = common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
 		if group == "" {
@@ -208,9 +230,29 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 	if state.attempt != nil {
 		scheduler.Default.FinishAttempt(state.attempt, scheduler.Outcome{})
 	}
+	if state.poolAttempt != nil {
+		state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
+		state.poolAttempt, state.poolRequest = nil, nil
+	}
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
+	if channel.OwnerSupplierID != "" {
+		pool, err := supplierRoutingPoolForChannel(channel)
+		if err != nil {
+			return err
+		}
+		poolRequest := supplierPoolRequest(state, request.Key)
+		poolAttempt, err := state.poolEngine.ReserveCandidate(poolRequest, pool.candidate, stream)
+		if err != nil {
+			return err
+		}
+		state.poolAttempt, state.poolRequest = poolAttempt, poolRequest
+	}
 	attempt, err := scheduler.Default.ReserveCandidate(request, SchedulerCandidate(channel), stream)
 	if err != nil {
+		if state.poolAttempt != nil {
+			state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
+			state.poolAttempt, state.poolRequest = nil, nil
+		}
 		return err
 	}
 	state.mu.Lock()
@@ -224,6 +266,9 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 // StartSchedulingAttempt runs after local validation/billing and immediately
 // before the upstream attempt. A reservation alone never activates learning.
 func StartSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo) {
+	if info.ChannelLimitAttempt != nil && !info.ChannelLimitAttempt.Sent {
+		return
+	}
 	state := schedulingState(c)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -235,6 +280,10 @@ func StartSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo) {
 	state.stream = info.IsStream
 	state.lastOutcome = ""
 	scheduler.Default.StartAttempt(state.attempt, info.IsStream)
+	if state.poolAttempt != nil {
+		state.poolEngine.TouchRequest(state.poolRequest)
+		state.poolEngine.StartAttempt(state.poolAttempt, info.IsStream)
+	}
 	state.started = true
 }
 
@@ -307,6 +356,13 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 		}
 	}
 	scheduler.Default.FinishAttempt(state.attempt, outcome)
+	if state.poolAttempt != nil {
+		if state.started && state.lastOutcome != perfmetrics.OutcomeIgnored {
+			state.poolEngine.ConfirmRequest(state.poolRequest)
+		}
+		state.poolEngine.FinishAttempt(state.poolAttempt, outcome)
+		state.poolAttempt, state.poolRequest = nil, nil
+	}
 	state.attempt, state.started = nil, false
 }
 
@@ -321,6 +377,10 @@ func EndSchedulingRequest(c *gin.Context) {
 	for _, request := range state.requests {
 		scheduler.Default.EndRequest(request)
 	}
+	for _, request := range state.poolRequests {
+		state.poolEngine.EndRequest(request)
+	}
+	state.poolAttempt = nil
 	state.attempt = nil
 }
 

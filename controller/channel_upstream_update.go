@@ -42,6 +42,8 @@ const (
 )
 
 var channelUpstreamModelUpdateSelectFields = []string{
+	"owner_supplier_id",
+	"secrets_write_only",
 	"id",
 	"name",
 	"type",
@@ -364,6 +366,9 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
 }
 
 func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		return nil, model.ErrSupplierChannelOperation
+	}
 	if channel.Type == constant.ChannelTypeTaskPlugin {
 		plugin, ok := jsplugin.DefaultRegistry.Get(channel.GetSetting().TaskPluginKey)
 		if !ok {
@@ -502,6 +507,9 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 }
 
 func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {
+	if channel.OwnerSupplierID != "" || channel.SecretsWriteOnly {
+		return model.ErrSupplierChannelOperation
+	}
 	channel.SetOtherSettings(settings)
 	updates := map[string]any{
 		"settings": channel.OtherSettings,
@@ -721,7 +729,7 @@ func runChannelUpstreamModelUpdateTaskOnce(ctx context.Context, force bool, allo
 	// Count the enabled channels up front so progress can be reported as a
 	// percentage; a count error is non-fatal (progress just won't show a %).
 	var totalChannels int64
-	if err := model.DB.Model(&model.Channel{}).Where("status = ?", common.ChannelStatusEnabled).Count(&totalChannels).Error; err != nil {
+	if err := model.DB.Model(&model.Channel{}).Where("status = ?", common.ChannelStatusEnabled).Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "").Where("secrets_write_only IS NULL OR secrets_write_only = ?", false).Count(&totalChannels).Error; err != nil {
 		totalChannels = 0
 	}
 	processed := 0
@@ -736,6 +744,8 @@ scanLoop:
 		query := model.DB.
 			Select(channelUpstreamModelUpdateSelectFields).
 			Where("status = ?", common.ChannelStatusEnabled).
+			Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "").
+			Where("secrets_write_only IS NULL OR secrets_write_only = ?", false).
 			Order("id asc").
 			Limit(channelUpstreamModelUpdateTaskBatchSize)
 		if lastID > 0 {
@@ -1032,6 +1042,8 @@ func findEnabledChannelsAfterID(lastID int, batchSize int) ([]*model.Channel, er
 	query := model.DB.
 		Select(channelUpstreamModelUpdateSelectFields).
 		Where("status = ?", common.ChannelStatusEnabled).
+		Where("owner_supplier_id IS NULL OR owner_supplier_id = ?", "").
+		Where("secrets_write_only IS NULL OR secrets_write_only = ?", false).
 		Order("id asc").
 		Limit(batchSize)
 	if lastID > 0 {

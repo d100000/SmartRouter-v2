@@ -496,32 +496,35 @@ func buildSelfUserData(user *model.User) map[string]any {
 	permissions := calculateUserPermissions(user.Role)
 	permissions["admin_permissions"] = authz.Capabilities(user.Id, user.Role)
 	return map[string]any{
-		"id":                user.Id,
-		"username":          user.Username,
-		"display_name":      user.DisplayName,
-		"has_password":      user.HasPassword,
-		"role":              user.Role,
-		"status":            user.Status,
-		"email":             user.Email,
-		"github_id":         user.GitHubId,
-		"discord_id":        user.DiscordId,
-		"oidc_id":           user.OidcId,
-		"wechat_id":         user.WeChatId,
-		"telegram_id":       user.TelegramId,
-		"group":             user.Group,
-		"quota":             user.Quota,
-		"used_quota":        user.UsedQuota,
-		"request_count":     user.RequestCount,
-		"aff_code":          user.AffCode,
-		"aff_count":         user.AffCount,
-		"aff_quota":         user.AffQuota,
-		"aff_history_quota": user.AffHistoryQuota,
-		"inviter_id":        user.InviterId,
-		"linux_do_id":       user.LinuxDOId,
-		"setting":           user.Setting,
-		"stripe_customer":   user.StripeCustomer,
-		"sidebar_modules":   userSetting.SidebarModules, // 正确提取sidebar_modules字段
-		"permissions":       permissions,
+		"id":                   user.Id,
+		"username":             user.Username,
+		"display_name":         user.DisplayName,
+		"has_password":         user.HasPassword,
+		"role":                 user.Role,
+		"supplier_id":          user.GetSupplierID(),
+		"channel_viewer":       user.ChannelViewer,
+		"must_change_password": user.MustChangePassword,
+		"status":               user.Status,
+		"email":                user.Email,
+		"github_id":            user.GitHubId,
+		"discord_id":           user.DiscordId,
+		"oidc_id":              user.OidcId,
+		"wechat_id":            user.WeChatId,
+		"telegram_id":          user.TelegramId,
+		"group":                user.Group,
+		"quota":                user.Quota,
+		"used_quota":           user.UsedQuota,
+		"request_count":        user.RequestCount,
+		"aff_code":             user.AffCode,
+		"aff_count":            user.AffCount,
+		"aff_quota":            user.AffQuota,
+		"aff_history_quota":    user.AffHistoryQuota,
+		"inviter_id":           user.InviterId,
+		"linux_do_id":          user.LinuxDOId,
+		"setting":              user.Setting,
+		"stripe_customer":      user.StripeCustomer,
+		"sidebar_modules":      userSetting.SidebarModules, // 正确提取sidebar_modules字段
+		"permissions":          permissions,
 	}
 }
 
@@ -908,6 +911,7 @@ func UpdateSelf(c *gin.Context) {
 		}
 		data := authRotationData(bundle)
 		data["has_password"] = true
+		data["must_change_password"] = false
 		data["notification_warning"] = notificationFailed
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
@@ -1012,6 +1016,10 @@ func CreateUser(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
+	if user.ChannelViewer {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
 	if user.DisplayName == "" {
 		user.DisplayName = user.Username
 	}
@@ -1022,7 +1030,7 @@ func CreateUser(c *gin.Context) {
 	}
 	auditParams := map[string]any{"role": user.Role}
 	// Creating an administrator grants privilege just like promoting one.
-	if user.Role >= common.RoleAdminUser {
+	if user.Role >= common.RoleAdminUser || user.Role == common.RoleSupplierUser {
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserCreate, service.AdminUserCreateContext{Role: user.Role})
 		if authorization == nil {
 			return
@@ -1035,6 +1043,7 @@ func CreateUser(c *gin.Context) {
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
 		Role:        user.Role, // 保持管理员设置的角色
+		SupplierID:  user.SupplierID,
 	}
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
@@ -1156,6 +1165,10 @@ func ManageUser(c *gin.Context) {
 		})
 		return
 	case "promote":
+		if user.Role == common.RoleSupplierUser {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
 		if myRole != common.RoleRootUser {
 			common.ApiErrorT(c, "Regular administrators cannot promote other users to administrator")
 			return
@@ -1166,6 +1179,10 @@ func ManageUser(c *gin.Context) {
 		}
 		user.Role = common.RoleAdminUser
 	case "demote":
+		if user.Role == common.RoleSupplierUser {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
 		if user.Role == common.RoleRootUser {
 			common.ApiErrorT(c, "Cannot demote super administrator user")
 			return
@@ -1175,6 +1192,11 @@ func ManageUser(c *gin.Context) {
 			return
 		}
 		user.Role = common.RoleCommonUser
+	case "grant_channel_viewer", "revoke_channel_viewer":
+		if user.Role != common.RoleCommonUser || user.GetSupplierID() != "" {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
 	default:
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -1182,6 +1204,19 @@ func ManageUser(c *gin.Context) {
 
 	authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserManage, service.AdminUserManageContext{UserID: user.Id, Action: req.Action})
 	if authorization == nil {
+		return
+	}
+	if req.Action == "grant_channel_viewer" || req.Action == "revoke_channel_viewer" {
+		enabled := req.Action == "grant_channel_viewer"
+		if err := model.SetChannelViewer(user.Id, enabled); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		recordManageAuditFor(c, user.Id, "user.manage", map[string]any{
+			"action": req.Action, "username": user.Username, "id": user.Id,
+			"verification_method": authorization.Method, "channel_viewer": enabled,
+		})
+		common.ApiSuccess(c, gin.H{"role": user.Role, "status": user.Status, "channel_viewer": enabled})
 		return
 	}
 	if req.Action == "demote" {

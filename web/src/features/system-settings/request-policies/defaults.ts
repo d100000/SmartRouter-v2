@@ -41,12 +41,23 @@ export type FilteringSettings = Pick<
   SecuritySettings,
   'CheckSensitiveEnabled' | 'CheckSensitiveOnPromptEnabled' | 'SensitiveWords'
 >
+export type FundingSettings = {
+  'channel_funding_setting.enabled': boolean
+  'channel_funding_setting.probe_minutes': number
+  'channel_funding_setting.reminder_hours': number
+  'channel_funding_setting.recovery_notify': boolean
+}
 export type RequestPolicySettings = RetrySettings &
+  FundingSettings &
   HealthSettings &
   FilteringSettings &
   Pick<ChannelAffinitySettings, keyof ChannelAffinitySettings>
 
 export const defaultRequestPolicySettings: RequestPolicySettings = {
+  'channel_funding_setting.enabled': false,
+  'channel_funding_setting.probe_minutes': 10,
+  'channel_funding_setting.reminder_hours': 24,
+  'channel_funding_setting.recovery_notify': true,
   RetryTimes: 0,
   AutomaticRetryStatusCodes:
     '100-199,300-399,401-407,409-499,500-503,505-523,525-599',

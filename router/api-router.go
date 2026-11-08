@@ -237,6 +237,7 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.PUT("/", controller.UpdateOption)
 			optionRoute.PUT("/passkey/domains", controller.UpdatePasskeyDomains)
 			optionRoute.GET("/model_pricing", controller.GetModelPricingConfig)
+			optionRoute.GET("/model_pricing/issues", controller.GetModelPricingIssues)
 			optionRoute.PATCH("/model_pricing", controller.UpdateModelPricingConfig)
 			optionRoute.POST("/model_pricing/convert", controller.PreviewModelPricingConversion)
 			optionRoute.POST("/model_pricing/preview", controller.PreviewModelPricing)
@@ -299,6 +300,7 @@ func SetApiRouter(router *gin.Engine) {
 		}
 		handlePermissionRoute(apiRouter.Group("", middleware.AdminAuth()), http.MethodGet, "/task_plugin_options", authz.TaskPluginBind, controller.GetTaskPluginOptions)
 		registerChannelRoutes(apiRouter)
+		registerSupplierRoutes(apiRouter)
 		registerSchedulingRoutes(apiRouter)
 		registerAuthzRoutes(apiRouter)
 		tokenRoute := apiRouter.Group("/token")

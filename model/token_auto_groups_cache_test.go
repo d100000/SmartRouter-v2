@@ -44,8 +44,9 @@ func TestTokenAllowUserQuotaQueryRoundTripsThroughRedisHashCache(t *testing.T) {
 func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
+	user := createReserveTestUser(t, 0)
 	token := Token{
-		UserId:          7,
+		UserId:          user.Id,
 		Key:             "token-auto-groups-update-cache-key",
 		Name:            "auto-cache-update",
 		Status:          common.TokenStatusEnabled,

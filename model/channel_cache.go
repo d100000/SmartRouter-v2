@@ -156,6 +156,9 @@ func InitChannelCache() {
 				}
 			}
 		}
+		if err := channel.sealSupplierCredential(); err != nil {
+			channel.Key, channel.Keys, channel.Status = "", nil, common.ChannelStatusManuallyDisabled
+		}
 	}
 	channelsIDM = newChannelId2channel
 	channel2advancedCustomConfig = newChannel2advancedCustomConfig
@@ -346,6 +349,9 @@ func CacheUpdateChannel(channel *Channel) {
 	}
 	copy := *channel
 	copy.compiledAvailability = channel.availabilityPlan()
+	if err := copy.sealSupplierCredential(); err != nil {
+		copy.Key, copy.Keys, copy.Status = "", nil, common.ChannelStatusManuallyDisabled
+	}
 	channelsIDM[channel.Id] = &copy
 	if channel2advancedCustomConfig == nil {
 		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)

@@ -190,6 +190,7 @@ describe('request policy settings', () => {
   it.each([
     ['retry', 'Save Changes'],
     ['health', 'Save Changes'],
+    ['funding', 'Save Changes'],
     ['filtering', 'Save sensitive words'],
     ['affinity', 'Save Changes'],
   ])(
@@ -205,6 +206,13 @@ describe('request policy settings', () => {
   )
 
   it.each([
+    [
+      'funding',
+      'First recovery check (minutes)',
+      '20',
+      'channel_funding_setting.probe_minutes',
+      20,
+    ],
     [
       'health',
       'Channel test concurrency',

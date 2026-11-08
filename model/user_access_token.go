@@ -123,8 +123,11 @@ func CreateUserAccessToken(userID int, token *UserAccessToken, limit int) error 
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var user User
-		if err := lockForUpdate(tx).Select("id").First(&user, userID).Error; err != nil {
+		if err := lockForUpdate(tx).Select("id", "role").First(&user, userID).Error; err != nil {
 			return err
+		}
+		if user.Role == common.RoleSupplierUser {
+			return common.NewMessage("Unauthorized, insufficient privileges")
 		}
 		var count int64
 		if err := tx.Model(&UserAccessToken{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {

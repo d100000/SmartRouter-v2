@@ -50,6 +50,8 @@ import { Route as AuthenticatedRedemptionCodesIndexRouteImport } from './routes/
 import { Route as AuthenticatedSchedulingIndexRouteImport } from './routes/_authenticated/scheduling/index'
 import { Route as AuthenticatedSecurityIndexRouteImport } from './routes/_authenticated/security/index'
 import { Route as AuthenticatedSubscriptionsIndexRouteImport } from './routes/_authenticated/subscriptions/index'
+import { Route as AuthenticatedSupplierIndexRouteImport } from './routes/_authenticated/supplier/index'
+import { Route as AuthenticatedSuppliersIndexRouteImport } from './routes/_authenticated/suppliers/index'
 import { Route as AuthenticatedSystemInfoIndexRouteImport } from './routes/_authenticated/system-info/index'
 import { Route as AuthenticatedSystemSettingsIndexRouteImport } from './routes/_authenticated/system-settings/index'
 import { Route as AuthenticatedTaskPluginsIndexRouteImport } from './routes/_authenticated/task-plugins/index'
@@ -294,6 +296,18 @@ const AuthenticatedSubscriptionsIndexRoute =
     path: '/subscriptions/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
+const AuthenticatedSupplierIndexRoute =
+  AuthenticatedSupplierIndexRouteImport.update({
+    id: '/supplier/',
+    path: '/supplier/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedSuppliersIndexRoute =
+  AuthenticatedSuppliersIndexRouteImport.update({
+    id: '/suppliers/',
+    path: '/suppliers/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedSystemInfoIndexRoute =
   AuthenticatedSystemInfoIndexRouteImport.update({
     id: '/system-info/',
@@ -485,6 +499,8 @@ export interface FileRoutesByFullPath {
   '/scheduling/': typeof AuthenticatedSchedulingIndexRoute
   '/security/': typeof AuthenticatedSecurityIndexRoute
   '/subscriptions/': typeof AuthenticatedSubscriptionsIndexRoute
+  '/supplier/': typeof AuthenticatedSupplierIndexRoute
+  '/suppliers/': typeof AuthenticatedSuppliersIndexRoute
   '/system-info/': typeof AuthenticatedSystemInfoIndexRoute
   '/system-settings/': typeof AuthenticatedSystemSettingsIndexRoute
   '/task-plugins/': typeof AuthenticatedTaskPluginsIndexRoute
@@ -550,6 +566,8 @@ export interface FileRoutesByTo {
   '/scheduling': typeof AuthenticatedSchedulingIndexRoute
   '/security': typeof AuthenticatedSecurityIndexRoute
   '/subscriptions': typeof AuthenticatedSubscriptionsIndexRoute
+  '/supplier': typeof AuthenticatedSupplierIndexRoute
+  '/suppliers': typeof AuthenticatedSuppliersIndexRoute
   '/system-info': typeof AuthenticatedSystemInfoIndexRoute
   '/system-settings': typeof AuthenticatedSystemSettingsIndexRoute
   '/task-plugins': typeof AuthenticatedTaskPluginsIndexRoute
@@ -619,6 +637,8 @@ export interface FileRoutesById {
   '/_authenticated/scheduling/': typeof AuthenticatedSchedulingIndexRoute
   '/_authenticated/security/': typeof AuthenticatedSecurityIndexRoute
   '/_authenticated/subscriptions/': typeof AuthenticatedSubscriptionsIndexRoute
+  '/_authenticated/supplier/': typeof AuthenticatedSupplierIndexRoute
+  '/_authenticated/suppliers/': typeof AuthenticatedSuppliersIndexRoute
   '/_authenticated/system-info/': typeof AuthenticatedSystemInfoIndexRoute
   '/_authenticated/system-settings/': typeof AuthenticatedSystemSettingsIndexRoute
   '/_authenticated/task-plugins/': typeof AuthenticatedTaskPluginsIndexRoute
@@ -687,6 +707,8 @@ export interface FileRouteTypes {
     | '/scheduling/'
     | '/security/'
     | '/subscriptions/'
+    | '/supplier/'
+    | '/suppliers/'
     | '/system-info/'
     | '/system-settings/'
     | '/task-plugins/'
@@ -752,6 +774,8 @@ export interface FileRouteTypes {
     | '/scheduling'
     | '/security'
     | '/subscriptions'
+    | '/supplier'
+    | '/suppliers'
     | '/system-info'
     | '/system-settings'
     | '/task-plugins'
@@ -820,6 +844,8 @@ export interface FileRouteTypes {
     | '/_authenticated/scheduling/'
     | '/_authenticated/security/'
     | '/_authenticated/subscriptions/'
+    | '/_authenticated/supplier/'
+    | '/_authenticated/suppliers/'
     | '/_authenticated/system-info/'
     | '/_authenticated/system-settings/'
     | '/_authenticated/task-plugins/'
@@ -1153,6 +1179,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedSubscriptionsIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/supplier/': {
+      id: '/_authenticated/supplier/'
+      path: '/supplier'
+      fullPath: '/supplier/'
+      preLoaderRoute: typeof AuthenticatedSupplierIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/suppliers/': {
+      id: '/_authenticated/suppliers/'
+      path: '/suppliers'
+      fullPath: '/suppliers/'
+      preLoaderRoute: typeof AuthenticatedSuppliersIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/system-info/': {
       id: '/_authenticated/system-info/'
       path: '/system-info'
@@ -1441,6 +1481,8 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedSchedulingIndexRoute: typeof AuthenticatedSchedulingIndexRoute
   AuthenticatedSecurityIndexRoute: typeof AuthenticatedSecurityIndexRoute
   AuthenticatedSubscriptionsIndexRoute: typeof AuthenticatedSubscriptionsIndexRoute
+  AuthenticatedSupplierIndexRoute: typeof AuthenticatedSupplierIndexRoute
+  AuthenticatedSuppliersIndexRoute: typeof AuthenticatedSuppliersIndexRoute
   AuthenticatedSystemInfoIndexRoute: typeof AuthenticatedSystemInfoIndexRoute
   AuthenticatedTaskPluginsIndexRoute: typeof AuthenticatedTaskPluginsIndexRoute
   AuthenticatedUsageLogsIndexRoute: typeof AuthenticatedUsageLogsIndexRoute
@@ -1472,6 +1514,8 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedSchedulingIndexRoute: AuthenticatedSchedulingIndexRoute,
   AuthenticatedSecurityIndexRoute: AuthenticatedSecurityIndexRoute,
   AuthenticatedSubscriptionsIndexRoute: AuthenticatedSubscriptionsIndexRoute,
+  AuthenticatedSupplierIndexRoute: AuthenticatedSupplierIndexRoute,
+  AuthenticatedSuppliersIndexRoute: AuthenticatedSuppliersIndexRoute,
   AuthenticatedSystemInfoIndexRoute: AuthenticatedSystemInfoIndexRoute,
   AuthenticatedTaskPluginsIndexRoute: AuthenticatedTaskPluginsIndexRoute,
   AuthenticatedUsageLogsIndexRoute: AuthenticatedUsageLogsIndexRoute,

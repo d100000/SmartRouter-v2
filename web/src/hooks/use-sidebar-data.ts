@@ -40,7 +40,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-import type { SidebarData } from '@/components/layout/types'
+import type { SidebarBadges, SidebarData } from '@/components/layout/types'
 import { ROLE } from '@/lib/roles'
 
 /**
@@ -49,11 +49,23 @@ import { ROLE } from '@/lib/roles'
  * These are shown when the URL does not match any nested sidebar view
  * registered in `layout/lib/sidebar-view-registry.ts`.
  */
-export function useSidebarData(): SidebarData {
+export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
   const { t } = useTranslation()
 
   return {
     navGroups: [
+      {
+        id: 'supply',
+        title: t('Supply'),
+        items: [
+          { title: t('Supplier Workspace'), url: '/supplier', icon: Radio },
+        ],
+      },
+      {
+        id: 'channel-viewer',
+        title: t('Channels'),
+        items: [{ title: t('Channel Viewer'), url: '/channels', icon: Radio }],
+      },
       {
         id: 'chat',
         title: t('Chat'),
@@ -134,6 +146,12 @@ export function useSidebarData(): SidebarData {
         title: t('Admin'),
         items: [
           {
+            title: t('Channel Suppliers'),
+            url: '/suppliers',
+            icon: Users,
+            requiredRole: ROLE.ADMIN,
+          },
+          {
             title: t('Error analysis'),
             url: '/error-analysis',
             icon: HeartPulse,
@@ -201,6 +219,8 @@ export function useSidebarData(): SidebarData {
             activeUrls: ['/system-settings'],
             icon: Settings,
             requiredRole: ROLE.SUPER_ADMIN,
+            // Model pricing lives in System Settings.
+            badge: badges.modelPricing,
           },
         ],
       },

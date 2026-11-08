@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -80,9 +82,19 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+// OverviewMediaUsage contains only measured output quantities. Nil is unknown;
+// request estimates and synthetic tokens never populate these fields.
+type OverviewMediaUsage struct {
+	ImageCount       *int64
+	AudioSeconds     *float64
+	ImageUsageSource string
+	AudioUsageSource string
+}
+
 // OverviewBillingSnapshot is reporting data, independent of the user charge.
 // A nil base means procurement cost cannot be established from actual usage.
 type OverviewBillingSnapshot struct {
+	OverviewMediaUsage
 	BaseQuota            *float64
 	QuotaPerUnit         float64
 	RevenueQuota         int64
@@ -101,6 +113,13 @@ type OverviewBillingSnapshot struct {
 
 // OverviewAttempt contains only non-secret frozen procurement metadata.
 type OverviewAttempt struct {
+	AuthorizedSupplierID    string
+	SupplierReference       string
+	UpstreamStatusCode      int
+	UpstreamRequestID       string
+	CallStage               string
+	IsStream                bool
+	FirstTokenMS            *int64
 	EventID                 string
 	RequestID               string
 	BillingSource           string
@@ -132,8 +151,32 @@ type OverviewAttempt struct {
 	Billing                 *OverviewBillingSnapshot
 }
 
+// ChannelLimitRuntime is per-attempt admission state, independent of consumer
+// billing and of the asynchronously projected overview. It holds no secrets.
+type ChannelLimitRuntime struct {
+	WriteOnlyCredentials    bool
+	TemplateID              string
+	ID                      string
+	ChannelID               int
+	SupplierID              string
+	CostRatio               *float64
+	CostSource              string
+	CostVersionID           string
+	CredentialCostVersionID string
+	ChannelCostVersionID    string
+	MaxInputTokens          int64
+	MaxOutputTokens         int64
+	Sent                    bool
+	Finished                bool
+	TPMApplicable           bool
+}
+
 type RelayInfo struct {
+	TaskChannelSnapshot           *TaskChannelSnapshot
+	TaskUsageUnits                map[string]string
+	ChannelLimitAttempt           *ChannelLimitRuntime
 	AnalyticsBilling              *OverviewBillingSnapshot
+	AnalyticsMediaUsage           OverviewMediaUsage
 	AnalyticsRealtimeRevenueQuota int64
 	AnalyticsRevenueUnitAmbiguous bool
 	OverviewAttempts              []*OverviewAttempt
@@ -168,12 +211,15 @@ type RelayInfo struct {
 	DisablePing        bool // 是否禁止向下游发送自定义 Ping
 	ClientWs           *websocket.Conn
 	TargetWs           *websocket.Conn
-	InputAudioFormat   string
-	OutputAudioFormat  string
-	RealtimeTools      []dto.RealTimeTool
-	IsFirstRequest     bool
-	AudioUsage         bool
-	ReasoningEffort    string
+	// Each realtime operation re-enters token authorization using a new context.
+	RealtimeRequestRunner func(*http.Request, string, func(*gin.Context) *types.NewAPIError) *types.NewAPIError
+	RealtimeMetered       bool
+	InputAudioFormat      string
+	OutputAudioFormat     string
+	RealtimeTools         []dto.RealTimeTool
+	IsFirstRequest        bool
+	AudioUsage            bool
+	ReasoningEffort       string
 	// ReasoningConversion is the suffix-derived reasoning intent attached
 	// after model mapping. Converters read it via ReasoningState().
 	ReasoningConversion *dto.ReasoningConversionState
@@ -335,6 +381,7 @@ func (info *RelayInfo) UpdateImageCount(count int64) {
 	if info == nil || count <= 0 || count > int64(dto.MaxImageN) {
 		return
 	}
+	info.ObserveImageCount(count)
 	if info.PriceData.UsePrice {
 		info.PriceData.AddOtherRatio("n", float64(count))
 	}
@@ -342,6 +389,28 @@ func (info *RelayInfo) UpdateImageCount(count int64) {
 		n := int(count)
 		info.BillingImageCount = &n
 	}
+}
+
+// ObserveImageCount records measured output independently of the billing mode
+// and requested quantity. A missing or incomplete response stays unknown.
+func (info *RelayInfo) ObserveImageCount(count int64) {
+	if info == nil || count <= 0 || count > int64(dto.MaxImageN) {
+		return
+	}
+	info.AnalyticsMediaUsage.ImageCount = &count
+	info.AnalyticsMediaUsage.ImageUsageSource = "upstream_payload"
+}
+
+// ObserveAudioSeconds retains a measured duration, never a token/price-derived
+// estimate. The broad quota bound prevents absurd metadata from reaching the
+// report without imposing the video task's duration limit on audio recordings.
+func (info *RelayInfo) ObserveAudioSeconds(seconds float64, source string) {
+	if info == nil || seconds < 0 || seconds > float64(common.MaxQuota) || math.IsNaN(seconds) || math.IsInf(seconds, 0) ||
+		(source != "upstream_usage" && source != "media_metadata") {
+		return
+	}
+	info.AnalyticsMediaUsage.AudioSeconds = &seconds
+	info.AnalyticsMediaUsage.AudioUsageSource = source
 }
 
 func (info *RelayInfo) RequestedImageCount() int {
@@ -1221,6 +1290,7 @@ func (t *TaskSubmitReq) UnmarshalMetadata(v any) error {
 }
 
 type TaskInfo struct {
+	Unconfirmed      bool   `json:"-"`
 	Code             int    `json:"code"`
 	TaskID           string `json:"task_id"`
 	Status           string `json:"status"`
