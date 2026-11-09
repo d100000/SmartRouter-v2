@@ -238,7 +238,16 @@ func runSystemTaskClaimPass(runnerID string) {
 		if task == nil {
 			continue
 		}
-		claimedTask, claimed, err := model.ClaimSystemTask(task.ID, handler.Type(), runnerID, systemTaskLockUntil())
+		claimRunnerID := runnerID
+		if handler.Type() == model.ErrorAnalysisTaskType {
+			var payload struct {
+				WorkflowVersion int `json:"workflow_version"`
+			}
+			if task.DecodePayload(&payload) == nil && payload.WorkflowVersion == 2 {
+				claimRunnerID = runnerID + "-" + common.GetRandomString(12)
+			}
+		}
+		claimedTask, claimed, err := model.ClaimSystemTask(task.ID, handler.Type(), claimRunnerID, systemTaskLockUntil())
 		if err != nil {
 			logger.LogWarn(context.Background(), common.LogText("system task claim failed: %v", err))
 			continue
@@ -249,8 +258,8 @@ func runSystemTaskClaimPass(runnerID string) {
 		dispatchHandler := handler
 		dispatchTask := claimedTask
 		gopool.Go(func() {
-			runWithLeaseHeartbeat(dispatchTask, runnerID, func(ctx context.Context) {
-				dispatchHandler.Run(ctx, dispatchTask, runnerID)
+			runWithLeaseHeartbeat(dispatchTask, claimRunnerID, func(ctx context.Context) {
+				dispatchHandler.Run(ctx, dispatchTask, claimRunnerID)
 			})
 		})
 	}

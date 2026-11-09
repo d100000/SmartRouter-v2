@@ -31,6 +31,7 @@ export function useAnalysisStream(id: string) {
     'connecting' | 'live' | 'polling'
   >('connecting')
   const query = useQuery({
+    meta: { errorRedirect: false },
     queryKey: ['error-analysis', 'report', id],
     queryFn: () => getReport(id),
     enabled: !!id,

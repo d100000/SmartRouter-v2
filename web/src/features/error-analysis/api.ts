@@ -24,6 +24,7 @@ import type {
   AnalysisFilter,
   AnalysisTask,
   ConfigInput,
+  FailureLog,
   Snapshot,
 } from './types'
 
@@ -76,6 +77,25 @@ export async function getReport(id: string): Promise<AnalysisTask> {
   const response = await api.get<Response<AnalysisTask>>(
     `/api/error-analysis/reports/${encodeURIComponent(id)}`,
     { disableDuplicate: true }
+  )
+  return requireServerSuccess(response.data).data
+}
+
+export async function resumeAnalysis(id: string) {
+  const response = await api.post<
+    Response<{ task: AnalysisTask; created: boolean }>
+  >(`/api/error-analysis/reports/${encodeURIComponent(id)}/resume`, {})
+  return requireServerSuccess(response.data).data
+}
+
+export async function getReportEvidence(
+  taskID: string,
+  requestID: string,
+  signal?: AbortSignal
+): Promise<FailureLog> {
+  const response = await api.get<Response<FailureLog>>(
+    `/api/error-analysis/reports/${encodeURIComponent(taskID)}/evidence`,
+    { params: { request_id: requestID }, signal, disableDuplicate: true }
   )
   return requireServerSuccess(response.data).data
 }

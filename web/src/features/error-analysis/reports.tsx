@@ -17,7 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { lazy, Suspense, useState } from 'react'
+import { RotateCcw } from 'lucide-react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { CopyButton } from '@/components/copy-button'
@@ -26,30 +27,30 @@ import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { formatTimestamp } from '@/lib/format'
+import { Progress } from '@/components/ui/progress'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatNumber, formatTimestamp } from '@/lib/format'
 
 import { getReports } from './api'
 import { useAnalysisLabels } from './labels'
+import { ReportContent } from './report-content'
 import type { AnalysisFilter } from './types'
 import { useAnalysisStream } from './use-analysis-stream'
-
-const Markdown = lazy(() =>
-  import('@/components/ui/markdown').then((module) => ({
-    default: module.Markdown,
-  }))
-)
 
 export function AnalysisReports(props: {
   selected: string
   onSelect: (id: string) => void
   onRerun: (filter: AnalysisFilter) => void
+  onResume: (id: string) => void
   pending: boolean
   configured: boolean
 }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const labels = useAnalysisLabels()
   const [offset, setOffset] = useState(0)
   const history = useQuery({
+    meta: { errorRedirect: false },
     queryKey: ['error-analysis', 'reports', offset],
     queryFn: () => getReports(offset),
     refetchInterval: 10000,
@@ -60,6 +61,13 @@ export function AnalysisReports(props: {
   const busy = report?.status === 'running' || report?.status === 'pending'
   const content = report?.result?.report || report?.state?.report || ''
   const attempts = report?.result?.attempts || report?.state?.attempts || []
+  const coverage =
+    report?.state?.version === 2 ? report.state : report?.result?.coverage
+  const versioned =
+    report?.state?.version === 2 || report?.result?.version === 2
+  const totalKnown =
+    coverage?.total_known ??
+    ((coverage?.total_rows ?? 0) > 0 || report?.state?.phase !== 'collecting')
   const anyActive = history.data?.items.some(
     (task) => task.status === 'running' || task.status === 'pending'
   )
@@ -183,11 +191,21 @@ export function AnalysisReports(props: {
                   </p>
                 )}
               </div>
-              <div className='flex gap-2'>
+              <div className='flex flex-wrap gap-2'>
                 {content && (
                   <CopyButton value={content} size='sm' variant='outline'>
                     {t('Copy report')}
                   </CopyButton>
+                )}
+                {report.state?.can_resume && !busy && (
+                  <Button
+                    size='sm'
+                    disabled={anyActive || props.pending || !props.configured}
+                    onClick={() => props.onResume(report.task_id)}
+                  >
+                    <RotateCcw aria-hidden />
+                    {t('Continue analysis')}
+                  </Button>
                 )}
                 <Button
                   size='sm'
@@ -212,7 +230,9 @@ export function AnalysisReports(props: {
                     report.status === 'failed' ? 'destructive' : 'outline'
                   }
                 >
-                  {labels[report.status]}
+                  {!busy && versioned && report.result?.complete === false
+                    ? t('Partial analysis')
+                    : labels[report.status]}
                 </Badge>
                 {busy && (
                   <span>{labels[report.state?.phase ?? 'pending']}</span>
@@ -226,6 +246,47 @@ export function AnalysisReports(props: {
                   </span>
                 ) : null}
               </div>
+              {coverage && (
+                <div className='space-y-2'>
+                  <p>
+                    {t('Log rows scanned: {{done}} / {{total}}', {
+                      done: formatNumber(coverage.scanned_rows ?? 0, locale),
+                      total: totalKnown
+                        ? formatNumber(coverage.total_rows ?? 0, locale)
+                        : t('Unknown'),
+                    })}
+                  </p>
+                  {coverage.total_chunks != null && (
+                    <p>
+                      {t('Segments completed: {{done}} / {{total}}', {
+                        done: formatNumber(
+                          coverage.completed_chunks ?? 0,
+                          locale
+                        ),
+                        total: formatNumber(coverage.total_chunks ?? 0, locale),
+                      })}
+                    </p>
+                  )}
+                  {(coverage.total_chunks ?? 0) > 0 && (
+                    <Progress
+                      aria-label={t('Segment progress')}
+                      value={coverage.completed_chunks ?? 0}
+                      max={coverage.total_chunks}
+                    />
+                  )}
+                </div>
+              )}
+              {report.state?.current_step && (
+                <p className='break-words'>{report.state.current_step}</p>
+              )}
+              {report.state?.max_calls != null && (
+                <p className='text-muted-foreground text-xs'>
+                  {t('Model calls: {{used}} / {{total}}', {
+                    used: formatNumber(report.state.calls_used ?? 0, locale),
+                    total: formatNumber(report.state.max_calls, locale),
+                  })}
+                </p>
+              )}
               {busy && (
                 <p>
                   {reportQuery.connection === 'polling'
@@ -258,15 +319,55 @@ export function AnalysisReports(props: {
                 })}
               </p>
             </div>
-            {report.status === 'failed' && (
-              <div role='alert' className='text-destructive space-y-2 text-sm'>
-                <p>{labels[report.error] || report.error}</p>
-                <p>
-                  {t(
-                    'Any text below is an incomplete draft. A new analysis creates a separate history entry.'
-                  )}
-                </p>
+            {!busy &&
+              (report.status === 'failed' ||
+                (versioned && report.result?.complete === false)) && (
+                <div
+                  role='alert'
+                  className='text-destructive space-y-2 text-sm'
+                >
+                  <p>
+                    {report.state?.can_resume &&
+                    report.error === 'task lease expired'
+                      ? t(
+                          'The worker stopped responding. Continue from the saved progress.'
+                        )
+                      : labels[report.error] || report.error}
+                  </p>
+                  <p>
+                    {t(
+                      versioned
+                        ? 'This report covers only completed analysis. Unfinished segments are listed in the progress above.'
+                        : 'Any text below is an incomplete draft. A new analysis creates a separate history entry.'
+                    )}
+                  </p>
+                </div>
+              )}
+            {(report.result?.coverage?.warnings?.length ?? 0) > 0 && (
+              <div
+                role='status'
+                className='bg-muted space-y-1 rounded-lg p-3 text-sm'
+              >
+                {report.result?.coverage?.warnings?.map((warning) => (
+                  <p key={warning}>
+                    {labels[warning] ??
+                      t(
+                        'Some analysis data is incomplete. Review coverage before drawing conclusions.'
+                      )}
+                  </p>
+                ))}
               </div>
+            )}
+            {content ||
+            report.result?.summary ||
+            (report.result?.sections?.length ?? 0) > 0 ? (
+              <ReportContent key={report.task_id} task={report} />
+            ) : (
+              <EmptyState
+                title={
+                  busy ? t('Waiting for model output') : t('No report content')
+                }
+              />
             )}
             {attempts.length > 0 && (
               <details
@@ -289,6 +390,58 @@ export function AnalysisReports(props: {
                           ? ` · HTTP ${attempt.status_code}`
                           : ''}
                       </p>
+                      <div className='text-muted-foreground mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs'>
+                        {attempt.duration_ms != null && (
+                          <span>
+                            {t('Elapsed: {{seconds}} seconds', {
+                              seconds: formatNumber(
+                                attempt.duration_ms / 1000,
+                                locale,
+                                { maximumFractionDigits: 3 }
+                              ),
+                            })}
+                          </span>
+                        )}
+                        {attempt.timeout_seconds != null && (
+                          <span>
+                            {t('Timeout: {{seconds}} seconds', {
+                              seconds: formatNumber(
+                                attempt.timeout_seconds,
+                                locale
+                              ),
+                            })}
+                          </span>
+                        )}
+                        {attempt.idle_seconds != null && (
+                          <span>
+                            {t('No-token timeout: {{seconds}} seconds', {
+                              seconds: formatNumber(
+                                attempt.idle_seconds,
+                                locale
+                              ),
+                            })}
+                          </span>
+                        )}
+                        {attempt.max_output_tokens != null && (
+                          <span>
+                            {t('Output limit: {{tokens}} tokens', {
+                              tokens: formatNumber(
+                                attempt.max_output_tokens,
+                                locale
+                              ),
+                            })}
+                          </span>
+                        )}
+                        {attempt.finish_reason && (
+                          <span>
+                            {t('Finish reason: {{reason}}', {
+                              reason:
+                                labels[`finish_${attempt.finish_reason}`] ||
+                                t('Unknown'),
+                            })}
+                          </span>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ol>
@@ -323,18 +476,12 @@ export function AnalysisReports(props: {
                 )}
               </div>
             )}
-            {content ? (
-              <Suspense fallback={<LoadingState />}>
-                <Markdown blockRemoteContent className='min-w-0 break-words'>
-                  {content}
-                </Markdown>
-              </Suspense>
-            ) : (
-              <EmptyState
-                title={
-                  busy ? t('Waiting for model output') : t('No report content')
-                }
-              />
+            {report.result?.snapshot_omitted && (
+              <p role='status' className='bg-muted rounded-lg p-3 text-sm'>
+                {t(
+                  'Diagnostic samples could not be saved. The analysis report was preserved.'
+                )}
+              </p>
             )}
             <p className='text-muted-foreground text-xs'>
               {t(

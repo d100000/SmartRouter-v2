@@ -87,6 +87,11 @@ export type AnalysisConfig = {
   sample_limit: number
   report_language: string
   api_key_configured: boolean
+  context_window_tokens?: number
+  chunk_input_tokens?: number
+  max_output_tokens?: number
+  safety_margin_tokens?: number
+  max_calls?: number
 }
 export type ConfigInput = AnalysisConfig & {
   api_key: string
@@ -99,6 +104,11 @@ export type AnalysisAttempt = {
   code: string
   status_code: number
   retryable: boolean
+  duration_ms?: number
+  timeout_seconds?: number
+  idle_seconds?: number
+  max_output_tokens?: number
+  finish_reason?: string
 }
 export type AnalysisTask = {
   task_id: string
@@ -108,6 +118,7 @@ export type AnalysisTask = {
   updated_at: number
   error: string
   state: {
+    version?: number
     phase: string
     attempt: number
     max_attempts: number
@@ -115,13 +126,47 @@ export type AnalysisTask = {
     next_retry_at: number
     report: string
     attempts: AnalysisAttempt[]
+    scanned_rows?: number
+    total_rows?: number
+    total_known?: boolean
+    completed_chunks?: number
+    total_chunks?: number
+    current_step?: string
+    can_resume?: boolean
+    calls_used?: number
+    max_calls?: number
   } | null
   result: {
+    version?: number
+    summary?: string
+    timezone?: string
+    timeline_interval?: 'hour' | 'day'
     report: string
     model: string
     snapshot: Snapshot | null
+    snapshot_omitted?: boolean
     sample_count: number
     attempts: AnalysisAttempt[]
+    comparison?: Snapshot | null
+    comparison_available?: boolean
+    complete?: boolean
+    sections?: {
+      id: string
+      title: string
+      content: string
+      evidence_ids?: string[]
+    }[]
+    coverage?: {
+      stable?: boolean
+      complete?: boolean
+      source?: string
+      warnings?: string[]
+      total_known?: boolean
+      scanned_rows: number
+      total_rows: number
+      completed_chunks?: number
+      total_chunks?: number
+    }
   } | null
 }
 

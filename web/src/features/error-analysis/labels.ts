@@ -37,9 +37,20 @@ export function useAnalysisLabels(): Record<string, string> {
     succeeded: t('Completed'),
     failed: t('Failed'),
     collecting: t('Collecting evidence'),
-    analyzing: t('Generating report'),
+    analyzing: t('Analyzing segments'),
+    merging: t('Combining findings'),
+    writing: t('Writing report sections'),
+    summarizing: t('Preparing the summary'),
+    paused: t('Paused'),
     retrying: t('Waiting to retry'),
     completed: t('Completed'),
+    finish_stop: t('Completed'),
+    finish_length: t('Output token limit reached'),
+    finish_content_filter: t('Content filtered'),
+    finish_tool_calls: t('Tool call requested'),
+    finish_function_call: t('Function call requested'),
+    finish_insufficient_system_resource: t('Provider resource limit'),
+    finish_aborted: t('Generation aborted'),
     analysis_http_error: t('Request failed'),
     analysis_input_error: t('Request failed'),
     analysis_invalid_range: t('Invalid analysis time range or filters'),
@@ -95,6 +106,38 @@ export function useAnalysisLabels(): Record<string, string> {
     ),
     analysis_internal_error: t(
       'The analysis worker failed. Review server logs before retrying.'
+    ),
+    analysis_call_budget_exhausted: t(
+      'The model call budget was reached. Completed results have been saved.'
+    ),
+    analysis_context_limit: t(
+      'The request exceeded the model context limit. Review the context settings.'
+    ),
+    analysis_invalid_response: t('The provider returned an invalid response.'),
+    analysis_invalid_finding: t(
+      'The model returned findings that could not be verified.'
+    ),
+    analysis_incomplete_coverage: t(
+      'Some analysis data is incomplete. Review coverage before drawing conclusions.'
+    ),
+    analysis_budget_too_small: t(
+      'The token budget is too small for the required instructions and evidence.'
+    ),
+    analysis_evidence_unavailable: t('Saved analysis evidence is unavailable.'),
+    analysis_resume_unavailable: t(
+      'This analysis cannot be resumed. Start a new analysis.'
+    ),
+    analysis_source_changed: t(
+      'The log database changed before collection finished. Start a new analysis.'
+    ),
+    cross_filter_retry_evidence_incomplete: t(
+      'Retries on other models or channels may be missing from this filtered analysis.'
+    ),
+    clickhouse_snapshot_engine_unverified: t(
+      'This log storage engine cannot guarantee a stable analysis snapshot.'
+    ),
+    source_rows_changed_during_scan: t(
+      'Log records changed during collection. This report has incomplete coverage.'
     ),
     'task lease expired': t(
       'The worker stopped responding. Start a new analysis to recover.'

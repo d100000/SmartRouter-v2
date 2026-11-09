@@ -19,7 +19,7 @@ func GetErrorAnalysis(c *gin.Context) {
 		common.ApiErrorStatus(c, 400, common.NewMessage("Invalid analysis time range or filters"))
 		return
 	}
-	if err := filter.Normalize(time.Now()); err != nil {
+	if err := service.NormalizeErrorAnalysisFilter(&filter); err != nil {
 		common.ApiErrorStatus(c, 400, err)
 		return
 	}
@@ -134,6 +134,42 @@ func GetErrorAnalysisReport(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, task.ToResponse())
+}
+
+func ResumeErrorAnalysis(c *gin.Context) {
+	task, err := service.ResumeErrorAnalysis(c.Param("task_id"))
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Unable to resume this analysis"))
+		return
+	}
+	common.ApiSuccess(c, gin.H{"task": task.ToResponse(), "created": false})
+}
+
+func GetErrorAnalysisReportEvidence(c *gin.Context) {
+	task, err := model.GetSystemTaskByTaskID(c.Param("task_id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if task == nil || task.Type != model.ErrorAnalysisTaskType {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("Analysis report not found"))
+		return
+	}
+	requestID := c.Query("request_id")
+	if requestID == "" || len(requestID) > 64 {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid analysis time range or filters"))
+		return
+	}
+	entry, err := model.GetErrorAnalysisRequestEvidence(task.TaskID, requestID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if entry == nil {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("Analysis evidence not found"))
+		return
+	}
+	common.ApiSuccess(c, entry)
 }
 
 // StreamErrorAnalysis emits replaceable snapshots, so reconnecting never

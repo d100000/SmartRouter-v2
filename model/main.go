@@ -392,6 +392,7 @@ func migrateDB() error {
 		&SystemResourceSample{},
 		&SystemTask{},
 		&SystemTaskLock{},
+		&ErrorAnalysisArtifact{},
 		&CasbinRule{},
 		&AuthzRole{},
 		&UserAccessToken{},

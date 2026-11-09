@@ -20,23 +20,28 @@ import (
 const errorAnalysisConfigOption = "ErrorAnalysisConfigSecret"
 
 type ErrorAnalysisConfig struct {
-	Version          int64  `json:"version"`
-	Enabled          bool   `json:"enabled"`
-	Endpoint         string `json:"endpoint"`
-	Model            string `json:"model"`
-	Timezone         string `json:"timezone"`
-	Hour             int    `json:"hour"`
-	MaxAttempts      int    `json:"max_attempts"`
-	TimeoutSeconds   int    `json:"timeout_seconds"`
-	IdleSeconds      int    `json:"idle_seconds"`
-	SampleLimit      int    `json:"sample_limit"`
-	ReportLanguage   string `json:"report_language"`
-	APIKeyConfigured bool   `json:"api_key_configured"`
-	EncryptedKey     string `json:"encrypted_key,omitempty"`
+	Version             int64  `json:"version"`
+	Enabled             bool   `json:"enabled"`
+	Endpoint            string `json:"endpoint"`
+	Model               string `json:"model"`
+	Timezone            string `json:"timezone"`
+	Hour                int    `json:"hour"`
+	MaxAttempts         int    `json:"max_attempts"`
+	TimeoutSeconds      int    `json:"timeout_seconds"`
+	IdleSeconds         int    `json:"idle_seconds"`
+	SampleLimit         int    `json:"sample_limit"`
+	ReportLanguage      string `json:"report_language"`
+	APIKeyConfigured    bool   `json:"api_key_configured"`
+	EncryptedKey        string `json:"encrypted_key,omitempty"`
+	ContextWindowTokens int    `json:"context_window_tokens"`
+	ChunkInputTokens    int    `json:"chunk_input_tokens"`
+	MaxOutputTokens     int    `json:"max_output_tokens"`
+	SafetyMarginTokens  int    `json:"safety_margin_tokens"`
+	MaxCalls            int    `json:"max_calls"`
 }
 
 func GetErrorAnalysisConfig() (ErrorAnalysisConfig, error) {
-	config := ErrorAnalysisConfig{Endpoint: "https://api.bob-api.com/v1/chat/completions", Model: "deepseek-v4.1-flash", Timezone: "Asia/Shanghai", Hour: 3, MaxAttempts: 3, TimeoutSeconds: 240, IdleSeconds: 60, SampleLimit: 60, ReportLanguage: "zh"}
+	config := ErrorAnalysisConfig{Endpoint: "https://api.bob-api.com/v1/chat/completions", Model: "deepseek-v4.1-flash", Timezone: "Asia/Shanghai", Hour: 3, MaxAttempts: 3, TimeoutSeconds: 600, IdleSeconds: 60, SampleLimit: 60, ReportLanguage: "zh", ContextWindowTokens: 32768, ChunkInputTokens: 8000, MaxOutputTokens: 2048, SafetyMarginTokens: 4096, MaxCalls: 100}
 	var option model.Option
 	err := model.DB.Where(map[string]any{"key": errorAnalysisConfigOption}).Take(&option).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -48,17 +53,22 @@ func GetErrorAnalysisConfig() (ErrorAnalysisConfig, error) {
 	if err := common.UnmarshalJsonStr(option.Value, &config); err != nil {
 		return config, common.NewMessage("Invalid error analysis configuration")
 	}
+	config = normalizeAnalysisBudgets(config)
 	config.APIKeyConfigured = config.EncryptedKey != ""
 	return config, nil
 }
 
 func validateErrorAnalysisConfig(config ErrorAnalysisConfig) error {
+	config = normalizeAnalysisBudgets(config)
 	u, err := url.Parse(config.Endpoint)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasSuffix(u.Path, "/chat/completions") || len(config.Endpoint) > 1000 {
 		return common.NewMessage("Use an HTTPS chat completions endpoint without credentials or query parameters")
 	}
-	if strings.TrimSpace(config.Model) == "" || len(config.Model) > 200 || config.Hour < 0 || config.Hour > 23 || config.MaxAttempts < 1 || config.MaxAttempts > 5 || config.TimeoutSeconds < 30 || config.TimeoutSeconds > 600 || config.IdleSeconds < 10 || config.IdleSeconds > config.TimeoutSeconds || config.SampleLimit < 1 || config.SampleLimit > 200 {
+	if strings.TrimSpace(config.Model) == "" || len(config.Model) > 200 || config.Hour < 0 || config.Hour > 23 || config.MaxAttempts < 1 || config.MaxAttempts > 5 || config.TimeoutSeconds < 30 || config.TimeoutSeconds > 600 || config.IdleSeconds < 10 || config.IdleSeconds > 600 || config.SampleLimit < 1 || config.SampleLimit > 200 {
 		return common.NewMessage("Invalid error analysis configuration")
+	}
+	if config.ContextWindowTokens < 4096 || config.ContextWindowTokens > 2000000 || config.ChunkInputTokens < 256 || config.ChunkInputTokens > 2000000 || config.MaxOutputTokens < 128 || config.MaxOutputTokens > 32768 || config.SafetyMarginTokens < 256 || config.SafetyMarginTokens >= config.ContextWindowTokens || config.MaxOutputTokens+config.SafetyMarginTokens+512 >= config.ContextWindowTokens || config.MaxCalls < 1 || config.MaxCalls > 1000 {
+		return common.NewMessage("Invalid analysis token budget")
 	}
 	if _, err := time.LoadLocation(config.Timezone); err != nil {
 		return common.NewMessage("Invalid analysis timezone")
@@ -107,6 +117,7 @@ func analysisAPIKey(config ErrorAnalysisConfig) (string, error) {
 }
 
 func SaveErrorAnalysisConfig(config ErrorAnalysisConfig, key string, clearKey bool) error {
+	config = normalizeAnalysisBudgets(config)
 	if err := validateErrorAnalysisConfig(config); err != nil {
 		return err
 	}

@@ -29,26 +29,32 @@ import { formatNumber } from '@/lib/format'
 
 import type { Distribution } from './types'
 
-export default function TrendChart(props: { data: Distribution[] }) {
+export default function TrendChart(props: {
+  data: Distribution[]
+  interval?: 'hour' | 'day'
+  timezone?: string
+}) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const date = new Intl.DateTimeFormat(locale, {
     month: 'short',
     day: 'numeric',
-    hour: '2-digit',
+    ...(props.interval !== 'day' ? { hour: '2-digit' as const } : {}),
+    timeZone: props.timezone,
   })
+  const title =
+    props.interval === 'day'
+      ? t('Daily failure distribution')
+      : t('Hourly failure distribution')
   const config = {
     zero_output: { label: t('Zero output'), color: 'var(--chart-1)' },
     interrupted: { label: t('Interrupted streams'), color: 'var(--chart-2)' },
     errors: { label: t('Request errors'), color: 'var(--chart-3)' },
   }
   return (
-    <section
-      className='min-w-0 space-y-4'
-      aria-label={t('Hourly failure distribution')}
-    >
+    <section className='min-w-0 space-y-4' aria-label={title}>
       <div className='flex flex-wrap items-center justify-between gap-2'>
-        <h2 className='font-semibold'>{t('Hourly failure distribution')}</h2>
+        <h2 className='font-semibold'>{title}</h2>
         <div className='flex flex-wrap gap-4 text-xs'>
           {Object.values(config).map((series) => (
             <span key={series.label} className='flex items-center gap-1.5'>
@@ -65,7 +71,7 @@ export default function TrendChart(props: { data: Distribution[] }) {
       <ChartContainer
         config={config}
         className='h-56 w-full'
-        aria-label={t('Hourly failure distribution')}
+        aria-label={title}
       >
         <LineChart accessibilityLayer data={props.data}>
           <CartesianGrid vertical={false} />

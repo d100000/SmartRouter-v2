@@ -28,7 +28,7 @@ import { Badge } from '@/components/ui/badge'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber, formatTimestamp } from '@/lib/format'
 
-import { getAnalysis } from './api'
+import { getAnalysis, getReportEvidence } from './api'
 import { useAnalysisLabels } from './labels'
 import type { FailureLog, UpstreamEvidence } from './types'
 
@@ -177,26 +177,41 @@ function RecordEvidence(props: { record: FailureLog }) {
 }
 
 export function RequestEvidenceDialog(props: {
-  row: FailureLog
+  row?: FailureLog
+  requestID?: string
+  taskID?: string
   onClose: () => void
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const labels = useAnalysisLabels()
+  const requestID = props.requestID ?? props.row?.request_id ?? ''
   const query = useQuery({
-    queryKey: ['error-analysis', 'request', props.row.request_id],
-    queryFn: ({ signal }) =>
-      getAnalysis(
-        { start: 0, end: 0, request_id: props.row.request_id },
+    meta: { errorRedirect: false },
+    queryKey: ['error-analysis', 'request', props.taskID ?? '', requestID],
+    queryFn: async ({ signal }) => {
+      if (props.taskID) {
+        return {
+          detail: await getReportEvidence(props.taskID, requestID, signal),
+          truncated: false,
+        }
+      }
+      const response = await getAnalysis(
+        { start: 0, end: 0, request_id: requestID },
         0,
         '',
         signal,
         true
-      ),
-    enabled: !!props.row.request_id,
+      )
+      return {
+        detail: response.snapshot.logs[0],
+        truncated: response.snapshot.truncated,
+      }
+    },
+    enabled: !!requestID,
     staleTime: 15000,
   })
-  const detail = props.row.request_id ? query.data?.snapshot.logs[0] : props.row
+  const detail = requestID ? query.data?.detail : props.row
   const records = detail?.records ?? (detail ? [detail] : [])
   // Newer snapshots contain the fullest version of an internal retry. Include
   // earlier log rows as well so failed attempts on other channels remain visible.
@@ -208,7 +223,7 @@ export function RequestEvidenceDialog(props: {
   }
   const upstream = [...attempts.values()].sort((a, b) => a.attempt - b.attempt)
   const incomplete =
-    query.data?.snapshot.truncated ||
+    query.data?.truncated ||
     detail?.records_truncated ||
     records.some((record) => record.evidence?.attempts_truncated)
   return (
@@ -235,7 +250,7 @@ export function RequestEvidenceDialog(props: {
         ) : undefined
       }
     >
-      {query.isPending && props.row.request_id && <LoadingState />}
+      {query.isPending && requestID && <LoadingState />}
       {query.isError && <ErrorState onRetry={() => void query.refetch()} />}
       {query.isSuccess && !detail && (
         <EmptyState title={t('Request ID not found')} />

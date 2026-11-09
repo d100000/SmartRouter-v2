@@ -190,13 +190,15 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/ratio_sync/fetch":                accessTokenScopeRule("option:write"),
 
 	// router/api-router.go: /api/error-analysis
-	"GET /api/error-analysis":                         accessTokenSessionRule,
-	"GET /api/error-analysis/config":                  accessTokenSessionRule,
-	"PUT /api/error-analysis/config":                  accessTokenSessionRule,
-	"POST /api/error-analysis/reports":                accessTokenSessionRule,
-	"GET /api/error-analysis/reports":                 accessTokenSessionRule,
-	"GET /api/error-analysis/reports/:task_id":        accessTokenSessionRule,
-	"GET /api/error-analysis/reports/:task_id/stream": accessTokenSessionRule,
+	"GET /api/error-analysis":                           accessTokenSessionRule,
+	"GET /api/error-analysis/config":                    accessTokenSessionRule,
+	"PUT /api/error-analysis/config":                    accessTokenSessionRule,
+	"POST /api/error-analysis/reports":                  accessTokenSessionRule,
+	"GET /api/error-analysis/reports":                   accessTokenSessionRule,
+	"GET /api/error-analysis/reports/:task_id":          accessTokenSessionRule,
+	"GET /api/error-analysis/reports/:task_id/stream":   accessTokenSessionRule,
+	"POST /api/error-analysis/reports/:task_id/resume":  accessTokenSessionRule,
+	"GET /api/error-analysis/reports/:task_id/evidence": accessTokenSessionRule,
 
 	// router/api-router.go: /api/performance, /api/system-task, /api/system-info
 	"GET /api/performance/stats":                   accessTokenScopeRule("ops:read"),

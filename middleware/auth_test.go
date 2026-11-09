@@ -326,6 +326,8 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	expiredModel, _ := createMiddlewareScopedToken(t, admin.Id, time.Now().Unix()-1, "model:write")
 	member := createMiddlewarePATUser(t, "preset-member", "preset-member-legacy")
 	memberModels, _ := createMiddlewareScopedToken(t, member.Id, 0, "model:read", "model:write")
+	adminSession, _ := createDashboardIdentityTestSession(t, admin, "analysis-admin-session")
+	memberSession, _ := createDashboardIdentityTestSession(t, member, "analysis-member-session")
 
 	ok := func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id")}) }
 	router := gin.New()
@@ -337,6 +339,8 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	router.GET("/api/performance-health/presets", AdminAuth(), ok)
 	router.POST("/api/performance-health/presets/preview", AdminAuth(), ok)
 	router.POST("/api/performance-health/presets/apply", AdminAuth(), ok)
+	router.GET("/api/error-analysis/reports/:task_id/evidence", AdminAuth(), ok)
+	router.POST("/api/error-analysis/reports/:task_id/resume", AdminAuth(), SessionCookieOriginGuard(), ok)
 
 	for _, test := range []struct {
 		name, method, path, token string
@@ -351,6 +355,14 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 		{"anonymous preview", http.MethodPost, "/api/performance-health/presets/preview", "", http.StatusUnauthorized},
 		{"scope cannot elevate member read", http.MethodGet, "/api/performance-health/presets", memberModels, http.StatusForbidden},
 		{"scope cannot elevate member write", http.MethodPost, "/api/performance-health/presets/apply", memberModels, http.StatusForbidden},
+		{"admin session can read evidence", http.MethodGet, "/api/error-analysis/reports/report/evidence", adminSession, http.StatusOK},
+		{"admin session can resume", http.MethodPost, "/api/error-analysis/reports/report/resume", adminSession, http.StatusOK},
+		{"member session cannot read evidence", http.MethodGet, "/api/error-analysis/reports/report/evidence", memberSession, http.StatusForbidden},
+		{"member session cannot resume", http.MethodPost, "/api/error-analysis/reports/report/resume", memberSession, http.StatusForbidden},
+		{"admin PAT cannot read evidence", http.MethodGet, "/api/error-analysis/reports/report/evidence", modelRead, http.StatusForbidden},
+		{"admin PAT cannot resume", http.MethodPost, "/api/error-analysis/reports/report/resume", modelWrite, http.StatusForbidden},
+		{"legacy admin PAT cannot read evidence", http.MethodGet, "/api/error-analysis/reports/report/evidence", legacy, http.StatusForbidden},
+		{"legacy admin PAT cannot resume", http.MethodPost, "/api/error-analysis/reports/report/resume", legacy, http.StatusForbidden},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(test.method, test.path, nil)

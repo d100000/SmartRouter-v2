@@ -31,7 +31,13 @@ import { Label } from '@/components/ui/label'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-import { getAnalysis, getConfig, saveConfig, startAnalysis } from './api'
+import {
+  getAnalysis,
+  getConfig,
+  resumeAnalysis,
+  saveConfig,
+  startAnalysis,
+} from './api'
 import { ConfigDialog } from './config-dialog'
 import { FailureDashboard } from './dashboard'
 import { AnalysisReports } from './reports'
@@ -43,21 +49,20 @@ export function ErrorAnalysis() {
   const [tab, setTab] = useState('statistics')
   const [configure, setConfigure] = useState(false)
   const [selected, setSelected] = useState('')
-  const [range, setRange] = useState('1')
+  const [range, setRange] = useState('calendar7')
   const [requestId, setRequestId] = useState('')
   const [model, setModel] = useState('')
   const [channel, setChannel] = useState('')
   const [offset, setOffset] = useState(0)
   const [category, setCategory] = useState('')
-  const [filter, setFilter] = useState<AnalysisFilter>(() => {
-    const end = Math.floor(Date.now() / 1000)
-    return { start: end - 86400, end }
-  })
+  const [filter, setFilter] = useState<AnalysisFilter>({ start: 0, end: 0 })
   const config = useQuery({
+    meta: { errorRedirect: false },
     queryKey: ['error-analysis', 'config'],
     queryFn: getConfig,
   })
   const dashboard = useQuery({
+    meta: { errorRedirect: false },
     queryKey: ['error-analysis', 'statistics', filter, offset, category],
     queryFn: ({ signal }) => getAnalysis(filter, offset, category, signal),
     enabled: tab === 'statistics',
@@ -86,6 +91,17 @@ export function ErrorAnalysis() {
       }
     },
   })
+  const resume = useMutation({
+    mutationFn: resumeAnalysis,
+    onSuccess: (data) => {
+      setSelected(data.task.task_id)
+      client.setQueryData(
+        ['error-analysis', 'report', data.task.task_id],
+        data.task
+      )
+      void client.invalidateQueries({ queryKey: ['error-analysis', 'reports'] })
+    },
+  })
   const applyFilter = () => {
     const end = Math.floor(Date.now() / 1000)
     setOffset(0)
@@ -93,8 +109,8 @@ export function ErrorAnalysis() {
     setTab('statistics')
     setFilter({
       request_id: requestId.trim(),
-      start: end - Number(range) * 86400,
-      end,
+      start: range === 'calendar7' ? 0 : end - Number(range) * 86400,
+      end: range === 'calendar7' ? 0 : end,
       model: model.trim(),
       channel: Number(channel) || 0,
     })
@@ -118,7 +134,9 @@ export function ErrorAnalysis() {
         <Button
           size='sm'
           disabled={start.isPending || !config.data?.api_key_configured}
-          onClick={() => start.mutate(filter)}
+          onClick={() =>
+            start.mutate(dashboard.data?.snapshot.filter ?? filter)
+          }
         >
           <Play aria-hidden />
           {start.isPending ? t('Starting...') : t('Start analysis')}
@@ -179,6 +197,9 @@ export function ErrorAnalysis() {
                 value={range}
                 onChange={(event) => setRange(event.target.value)}
               >
+                <NativeSelectOption value='calendar7'>
+                  {t('Previous 7 complete days')}
+                </NativeSelectOption>
                 <NativeSelectOption value='1'>
                   {t('Last 24 hours')}
                 </NativeSelectOption>
@@ -265,7 +286,8 @@ export function ErrorAnalysis() {
                 selected={selected}
                 onSelect={setSelected}
                 onRerun={(range) => start.mutate(range)}
-                pending={start.isPending}
+                onResume={(id) => resume.mutate(id)}
+                pending={start.isPending || resume.isPending}
                 configured={!!config.data?.api_key_configured}
               />
             </TabsContent>

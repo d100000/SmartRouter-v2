@@ -17,13 +17,22 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { AxiosHeaders, type AxiosAdapter } from 'axios'
+import { AxiosError, AxiosHeaders, type AxiosAdapter } from 'axios'
+import i18next from 'i18next'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { createAppQueryClient } from '@/lib/query-client'
 
 import { ErrorAnalysis } from '../index'
 import type { AnalysisConfig, AnalysisTask, Snapshot } from '../types'
@@ -110,6 +119,16 @@ beforeEach(() => {
       if (request.url?.endsWith('/config')) {
         config = { ...config, ...body, api_key_configured: true }
         data = config
+      } else if (request.url?.endsWith('/resume')) {
+        const task = tasks.find((item) => request.url?.includes(item.task_id))
+        if (!task) throw new Error('Unknown analysis task')
+        task.status = 'running'
+        task.error = ''
+        if (task.state) {
+          task.state.phase = 'analyzing'
+          task.state.can_resume = false
+        }
+        data = { task, created: false }
       } else {
         const task: AnalysisTask = {
           task_id: 'new-report',
@@ -151,11 +170,415 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  cleanup()
   api.defaults.adapter = originalAdapter
   client.clear()
 })
 
 describe('Error analysis workflow', () => {
+  test.each([
+    '/api/error-analysis/config',
+    '/api/error-analysis',
+    '/api/error-analysis/reports',
+    '/api/error-analysis/reports/saved-report',
+  ])(
+    'keeps unsaved settings when %s refresh returns HTTP 500',
+    async (failedPath) => {
+      const onInternalServerError = vi.fn()
+      client = createAppQueryClient(onInternalServerError)
+      tasks = [
+        {
+          task_id: 'saved-report',
+          status: 'succeeded',
+          payload: { start: 1000, end: 2000 },
+          created_at: 2000,
+          updated_at: 2100,
+          error: '',
+          state: null,
+          result: {
+            report: 'Saved report',
+            model: 'test-model',
+            snapshot,
+            sample_count: 0,
+            attempts: [],
+          },
+        },
+      ]
+      const user = userEvent.setup()
+      render(<ErrorAnalysis />, { wrapper: Wrapper })
+      await screen.findByText('No requests in this time range')
+      if (failedPath.includes('/reports')) {
+        await user.click(
+          screen.getByRole('tab', { name: 'AI analysis & history' })
+        )
+        await screen.findByText('Saved report')
+      }
+      await user.click(
+        screen.getByRole('button', { name: 'Analysis settings' })
+      )
+      const dialog = screen.getByRole('dialog')
+      await user.clear(within(dialog).getByLabelText('Model'))
+      await user.type(within(dialog).getByLabelText('Model'), 'unsaved-model')
+      await user.type(
+        within(dialog).getByLabelText('API Key'),
+        'test-analysis-key'
+      )
+      const adapter = api.defaults.adapter as AxiosAdapter
+      api.defaults.adapter = async (request) => {
+        if (request.url === failedPath) {
+          throw new AxiosError(
+            'Unavailable',
+            'ERR_BAD_RESPONSE',
+            request,
+            undefined,
+            {
+              data: { success: false, message: 'Unavailable' },
+              status: 500,
+              statusText: 'Internal Server Error',
+              headers: new AxiosHeaders(),
+              config: request,
+            }
+          )
+        }
+        return adapter(request)
+      }
+      await act(async () =>
+        client.refetchQueries({ queryKey: ['error-analysis'] })
+      )
+      expect(onInternalServerError).not.toHaveBeenCalled()
+      expect(within(dialog).getByLabelText('Model')).toHaveValue(
+        'unsaved-model'
+      )
+      expect(within(dialog).getByLabelText('API Key')).toHaveValue(
+        'test-analysis-key'
+      )
+      expect(writes).toHaveLength(0)
+    }
+  )
+
+  test('context settings reject a budget that leaves no room for input', async () => {
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await screen.findByText('No requests in this time range')
+    await user.click(screen.getByRole('button', { name: 'Analysis settings' }))
+    const dialog = screen.getByRole('dialog')
+    const context = within(dialog).getByLabelText(
+      'Model context limit (tokens)'
+    )
+    expect(context).toHaveValue(32768)
+    expect(
+      within(dialog).queryByLabelText('No-token timeout (seconds)')
+    ).not.toBeInTheDocument()
+    await user.clear(context)
+    await user.type(context, '4096')
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(
+      'The context limit must exceed the output reserve and safety margin.'
+    )
+    expect(writes).toHaveLength(0)
+    await user.clear(context)
+    await user.type(context, '32768')
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    expect(writes[0].data).toMatchObject({
+      context_window_tokens: 32768,
+      chunk_input_tokens: 8000,
+      max_output_tokens: 2048,
+      safety_margin_tokens: 4096,
+      max_calls: 100,
+    })
+  })
+
+  test('a resumable analysis keeps completed segments and resumes the same history entry', async () => {
+    config.api_key_configured = true
+    tasks = [
+      {
+        task_id: 'resumable-report',
+        status: 'failed',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2100,
+        error: 'analysis_call_budget_exhausted',
+        state: {
+          version: 2,
+          phase: 'paused',
+          attempt: 0,
+          max_attempts: 3,
+          updated_at: 2100,
+          next_retry_at: 0,
+          report: '',
+          attempts: [],
+          scanned_rows: 120,
+          total_rows: 120,
+          completed_chunks: 2,
+          total_chunks: 5,
+          current_step: 'Timeout investigation',
+          can_resume: true,
+          calls_used: 3,
+          max_calls: 3,
+        },
+        result: null,
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    const report = await screen.findByRole('region', {
+      name: 'Analysis report',
+    })
+    expect(
+      await within(report).findByText('Segments completed: 2 / 5')
+    ).toBeVisible()
+    expect(within(report).getByText('Timeout investigation')).toBeVisible()
+    await user.click(
+      within(report).getByRole('button', { name: 'Continue analysis' })
+    )
+    await waitFor(() =>
+      expect(writes).toContainEqual({
+        url: '/api/error-analysis/reports/resumable-report/resume',
+        data: {},
+      })
+    )
+    expect(tasks).toHaveLength(1)
+    expect(await within(report).findByText('Analyzing segments')).toBeVisible()
+    expect(within(report).getByText('Segments completed: 2 / 5')).toBeVisible()
+    expect(
+      within(report).getByRole('button', { name: 'Analyze again' })
+    ).toBeDisabled()
+  })
+
+  test('collection with an unknown total shows counts without an invented percentage', async () => {
+    tasks = [
+      {
+        task_id: 'collecting-report',
+        status: 'running',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2100,
+        error: '',
+        result: null,
+        state: {
+          version: 2,
+          phase: 'collecting',
+          attempt: 0,
+          max_attempts: 3,
+          updated_at: 2100,
+          next_retry_at: 0,
+          report: '',
+          attempts: [],
+          scanned_rows: 120,
+          total_rows: 0,
+          total_known: false,
+        },
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    const report = await screen.findByRole('region', {
+      name: 'Analysis report',
+    })
+    expect(
+      await within(report).findByText('Log rows scanned: 120 / Unknown')
+    ).toBeVisible()
+    expect(within(report).queryByRole('progressbar')).not.toBeInTheDocument()
+  })
+
+  test('a partial versioned report shows its summary and missing comparison without claiming completion', async () => {
+    tasks = [
+      {
+        task_id: 'partial-report',
+        status: 'failed',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2100,
+        error: '',
+        state: null,
+        result: {
+          version: 2,
+          summary: 'Timeouts remain concentrated on one channel.',
+          report: '',
+          model: 'test',
+          snapshot: null,
+          sample_count: 0,
+          attempts: [],
+          complete: false,
+          comparison_available: false,
+          sections: [
+            {
+              id: 'priority',
+              title: 'Timeout investigation',
+              content: 'Check upstream response times.',
+            },
+          ],
+          coverage: {
+            scanned_rows: 90,
+            total_rows: 100,
+            completed_chunks: 2,
+            total_chunks: 3,
+          },
+        },
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    const report = await screen.findByRole('region', {
+      name: 'Analysis report',
+    })
+    expect(
+      await within(report).findByText(
+        'Timeouts remain concentrated on one channel.'
+      )
+    ).toBeVisible()
+    expect(
+      within(report).getByText(
+        'This report covers only completed analysis. Unfinished segments are listed in the progress above.'
+      )
+    ).toBeVisible()
+    expect(
+      within(report).getByText(
+        'Previous-period data is unavailable or incomplete; changes cannot be compared.'
+      )
+    ).toBeVisible()
+    expect(
+      await within(report).findByText('Check upstream response times.')
+    ).toBeVisible()
+    expect(
+      within(report).queryByText('Exported full report')
+    ).not.toBeInTheDocument()
+    expect(
+      within(report).queryByRole('button', { name: 'Copy to clipboard' })
+    ).not.toBeInTheDocument()
+  })
+
+  test('period comparison uses each periods request denominator and labels the report timezone', async () => {
+    tasks = [
+      {
+        task_id: 'compared-report',
+        status: 'succeeded',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2100,
+        error: '',
+        state: null,
+        result: {
+          version: 2,
+          summary: 'Traffic increased while the affected-request rate fell.',
+          report: 'Full report',
+          model: 'test',
+          sample_count: 0,
+          attempts: [],
+          complete: true,
+          timezone: 'Pacific/Honolulu',
+          timeline_interval: 'day',
+          comparison_available: true,
+          snapshot: { ...snapshot, requests: 200, affected: 20 },
+          comparison: {
+            ...snapshot,
+            filter: { start: 0, end: 1000 },
+            requests: 100,
+            affected: 15,
+          },
+        },
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    const comparison = await screen.findByRole('region', {
+      name: 'Period comparison',
+    })
+    const affected = within(comparison).getByRole('row', {
+      name: /Affected requests/,
+    })
+    expect(within(affected).getByText('20')).toBeVisible()
+    expect(within(affected).getByText('15')).toBeVisible()
+    expect(within(affected).getByText('15% → 10%')).toBeVisible()
+    expect(
+      within(comparison).getByText('Timezone: Pacific/Honolulu')
+    ).toBeVisible()
+  })
+
+  test('a saved report opens its captured evidence instead of querying live logs', async () => {
+    const row = {
+      id: 9,
+      request_id: 'captured-request',
+      upstream_request_id: '',
+      created_at: 1500,
+      model: 'test',
+      channel: 1,
+      is_stream: false,
+      completion_tokens: 0,
+      attempts: 1,
+      categories: ['error'],
+      diagnostic: {},
+      error_message: 'Captured at analysis time',
+    }
+    tasks = [
+      {
+        task_id: 'captured-report',
+        status: 'succeeded',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2100,
+        error: '',
+        state: null,
+        result: {
+          version: 2,
+          summary: 'A request failed.',
+          report: 'Full report',
+          model: 'test',
+          snapshot: { ...snapshot, logs: [] },
+          sections: [
+            {
+              id: 'issue-1',
+              title: 'A failed request',
+              content: 'Inspect the saved request.',
+              evidence_ids: ['captured-request'],
+            },
+          ],
+          sample_count: 1,
+          attempts: [],
+          complete: true,
+        },
+      },
+    ]
+    const adapter = api.defaults.adapter as AxiosAdapter
+    let capturedEvidenceRead = false
+    api.defaults.adapter = async (request) => {
+      if (
+        request.url === '/api/error-analysis/reports/captured-report/evidence'
+      ) {
+        capturedEvidenceRead = true
+        expect(request.params.request_id).toBe('captured-request')
+        return {
+          data: { success: true, data: row },
+          status: 200,
+          statusText: 'OK',
+          headers: new AxiosHeaders(),
+          config: request,
+        }
+      }
+      return adapter(request)
+    }
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    await user.click(
+      await screen.findByRole('button', { name: 'captured-request' })
+    )
+    expect(
+      await within(screen.getByRole('dialog')).findByText(
+        'Captured at analysis time'
+      )
+    ).toBeVisible()
+    expect(capturedEvidenceRead).toBe(true)
+    expect(reads.every((read) => !read.details)).toBe(true)
+  })
+
   test('SSE disconnection falls back to polling and exposes a stalled queue and worker failure', async () => {
     const now = Math.floor(Date.now() / 1000)
     tasks = [
@@ -289,6 +712,8 @@ describe('Error analysis workflow', () => {
       within(report).getByText('Model: historic-model · Channel ID: All')
     ).toBeVisible()
     expect(within(report).getByText('Analysis model: test-model')).toBeVisible()
+    expect(within(report).queryByText(/Elapsed:/)).not.toBeInTheDocument()
+    expect(within(report).queryByText(/Output limit:/)).not.toBeInTheDocument()
     expect(
       within(report).getByText(
         'Request error logging is disabled. Enable ERROR_LOG_ENABLED on gateway nodes to include ordinary request failures.'
@@ -303,6 +728,116 @@ describe('Error analysis workflow', () => {
     })
     expect(tasks).toHaveLength(2)
     expect(tasks[1].task_id).toBe('old-report')
+  })
+
+  test('a completed report shows per-attempt timing, output limits and why a retry was needed', async () => {
+    tasks = [
+      {
+        task_id: 'diagnosed-report',
+        status: 'succeeded',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2600,
+        error: '',
+        state: null,
+        result: {
+          report: 'Complete diagnosis',
+          complete: false,
+          model: 'test-model',
+          snapshot: null,
+          snapshot_omitted: true,
+          sample_count: 1,
+          attempts: [
+            {
+              number: 1,
+              started_at: 2000,
+              finished_at: 2300,
+              code: 'analysis_incomplete_report',
+              status_code: 200,
+              retryable: true,
+              duration_ms: 282949,
+              timeout_seconds: 600,
+              idle_seconds: 60,
+              max_output_tokens: 6000,
+              finish_reason: 'length',
+            },
+            {
+              number: 2,
+              started_at: 2301,
+              finished_at: 2600,
+              code: 'completed',
+              status_code: 200,
+              retryable: false,
+              duration_ms: 299000,
+              timeout_seconds: 600,
+              idle_seconds: 60,
+              max_output_tokens: 12000,
+              finish_reason: 'stop',
+            },
+          ],
+        },
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    const diagnostics = await screen.findByText('Model execution diagnostics')
+    await user.click(diagnostics)
+    const attempts = screen.getByRole('region', { name: 'Analysis report' })
+    expect(
+      within(attempts).queryByText('Partial analysis')
+    ).not.toBeInTheDocument()
+    expect(within(attempts).getByText('Elapsed: 282.949 seconds')).toBeVisible()
+    expect(within(attempts).getAllByText('Timeout: 600 seconds')).toHaveLength(
+      2
+    )
+    expect(
+      within(attempts).getAllByText('No-token timeout: 60 seconds')
+    ).toHaveLength(2)
+    expect(
+      within(attempts).getByText('Output limit: 6,000 tokens')
+    ).toBeVisible()
+    expect(
+      within(attempts).getByText('Output limit: 12,000 tokens')
+    ).toBeVisible()
+    expect(
+      within(attempts).getByText('Finish reason: Output token limit reached')
+    ).toBeVisible()
+    expect(within(attempts).getByText('Finish reason: Completed')).toBeVisible()
+    expect(
+      within(attempts).getByText(
+        'Diagnostic samples could not be saved. The analysis report was preserved.'
+      )
+    ).toBeVisible()
+    try {
+      for (const [language, elapsed, limit] of [
+        ['zhCN', '282.949', '12,000'],
+        ['zhTW', '282.949', '12,000'],
+        ['fr', '282,949', '12\u202f000'],
+        ['ru', '282,949', '12\u00a0000'],
+        ['ja', '282.949', '12,000'],
+        ['vi', '282,949', '12.000'],
+        ['not_a_locale', '282.949', '12,000'],
+        ['en', '282.949', '12,000'],
+      ]) {
+        // Keep the labels stable while checking numbers after each language change.
+        i18next.addResourceBundle(language, 'translation', {
+          'Elapsed: {{seconds}} seconds': 'Elapsed: {{seconds}} seconds',
+          'Output limit: {{tokens}} tokens': 'Output limit: {{tokens}} tokens',
+        })
+        await act(() => i18next.changeLanguage(language))
+        expect(
+          within(attempts).getByText(`Elapsed: ${elapsed} seconds`)
+        ).toBeVisible()
+        expect(
+          within(attempts).getByText(`Output limit: ${limit} tokens`, {
+            normalizer: (value) => value,
+          })
+        ).toBeVisible()
+      }
+    } finally {
+      await act(() => i18next.changeLanguage('en'))
+    }
   })
 
   test('limited coverage and missing output evidence remain visible with diagnostic details', async () => {
@@ -448,6 +983,8 @@ describe('Error analysis workflow', () => {
     ).toBeVisible()
   })
   test('a failed detail fetch shows retry and does not substitute the incomplete list record', async () => {
+    const onInternalServerError = vi.fn()
+    client = createAppQueryClient(onInternalServerError)
     snapshot.logs = [
       {
         id: 5,
@@ -471,7 +1008,19 @@ describe('Error analysis workflow', () => {
         request.params?.details &&
         failDetails
       ) {
-        throw new Error('detail fetch unavailable')
+        throw new AxiosError(
+          'detail fetch unavailable',
+          'ERR_BAD_RESPONSE',
+          request,
+          undefined,
+          {
+            data: { success: false, message: 'Unavailable' },
+            status: 500,
+            statusText: 'Internal Server Error',
+            headers: new AxiosHeaders(),
+            config: request,
+          }
+        )
       }
       return adapter(request)
     }
@@ -481,6 +1030,7 @@ describe('Error analysis workflow', () => {
     await user.click(screen.getByRole('button', { name: 'View details' }))
     const dialog = screen.getByRole('dialog')
     const retry = await within(dialog).findByRole('button', { name: 'Retry' })
+    expect(onInternalServerError).not.toHaveBeenCalled()
     expect(
       within(dialog).queryByText('Recorded consumption quota')
     ).not.toBeInTheDocument()

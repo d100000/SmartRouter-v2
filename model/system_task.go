@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/tidwall/gjson"
 
 	"gorm.io/gorm"
 )
@@ -32,8 +33,8 @@ type SystemTask struct {
 	Status    SystemTaskStatus `json:"status" gorm:"type:varchar(32);index"`
 	ActiveKey *string          `json:"active_key,omitempty" gorm:"type:varchar(64);uniqueIndex"`
 	Payload   string           `json:"payload" gorm:"type:text"`
-	State     string           `json:"state" gorm:"type:text"`
-	Result    string           `json:"result" gorm:"type:text"`
+	State     LongText         `json:"state"`
+	Result    LongText         `json:"result"`
 	Error     string           `json:"error" gorm:"type:text"`
 	LockedBy  string           `json:"locked_by" gorm:"type:varchar(128);index"`
 	CreatedAt int64            `json:"created_at" gorm:"bigint;index"`
@@ -109,7 +110,7 @@ func CreateSystemTask(taskType string, payload any, state any) (*SystemTask, err
 		Status:    SystemTaskStatusPending,
 		ActiveKey: &taskType,
 		Payload:   payloadText,
-		State:     stateText,
+		State:     LongText(stateText),
 	}
 
 	if err := DB.Create(task).Error; err != nil {
@@ -182,7 +183,11 @@ type SystemTaskFilter struct {
 }
 
 func (filter SystemTaskFilter) query() *gorm.DB {
-	query := DB.Model(&SystemTask{})
+	return filter.queryDB(DB)
+}
+
+func (filter SystemTaskFilter) queryDB(db *gorm.DB) *gorm.DB {
+	query := db.Model(&SystemTask{})
 	switch filter.Scope {
 	case "active":
 		query = query.Where("status IN ?", activeSystemTaskStatuses())
@@ -228,8 +233,42 @@ func DeleteSystemTaskHistory(filter SystemTaskFilter) (int64, error) {
 		newestID = max(newestID, id)
 	}
 	filter.Scope = "history"
-	result := filter.query().Where("id < ? AND id NOT IN ?", newestID, latestIDs).Delete(&SystemTask{})
-	return result.RowsAffected, result.Error
+	var deleted int64
+	for {
+		var count int64
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var tasks []SystemTask
+			if err := lockForUpdate(filter.queryDB(tx)).Where("id < ? AND id NOT IN ?", newestID, latestIDs).Order("id asc").Limit(200).Find(&tasks).Error; err != nil {
+				return err
+			}
+			if len(tasks) == 0 {
+				return nil
+			}
+			ids := make([]int64, 0, len(tasks))
+			analysisIDs := []string{}
+			for _, task := range tasks {
+				ids = append(ids, task.ID)
+				if task.Type == ErrorAnalysisTaskType && gjson.Get(task.Payload, "workflow_version").Int() == ErrorAnalysisWorkflowVersion {
+					analysisIDs = append(analysisIDs, task.TaskID)
+				}
+			}
+			if len(analysisIDs) > 0 {
+				if err := tx.Where("task_id IN ?", analysisIDs).Delete(&ErrorAnalysisArtifact{}).Error; err != nil {
+					return err
+				}
+			}
+			result := tx.Where("id IN ? AND status IN ?", ids, []SystemTaskStatus{SystemTaskStatusSucceeded, SystemTaskStatusFailed}).Delete(&SystemTask{})
+			count = result.RowsAffected
+			return result.Error
+		})
+		if err != nil {
+			return deleted, err
+		}
+		deleted += count
+		if count == 0 {
+			return deleted, nil
+		}
+	}
 }
 
 // GetLatestSystemTask returns the most recent task row of the given type
@@ -407,6 +446,9 @@ func RenewSystemTaskLock(taskID string, lockedBy string, lockUntil int64) error 
 }
 
 func MarkSystemTaskLeaseExpired(taskID string) error {
+	if recovered, err := recoverExpiredErrorAnalysisTask(taskID); recovered || err != nil {
+		return err
+	}
 	result := DB.Model(&SystemTask{}).
 		Where("task_id = ? AND status = ?", taskID, SystemTaskStatusRunning).
 		Updates(map[string]any{
@@ -471,7 +513,7 @@ func (task *SystemTask) DecodePayload(v any) error {
 }
 
 func (task *SystemTask) DecodeState(v any) error {
-	return decodeSystemTaskJSONString(task.State, v)
+	return decodeSystemTaskJSONString(string(task.State), v)
 }
 
 func (task *SystemTask) ToResponse() SystemTaskResponse {
@@ -482,8 +524,8 @@ func (task *SystemTask) ToResponse() SystemTaskResponse {
 		Status:    task.Status,
 		ActiveKey: task.ActiveKey,
 		Payload:   decodeSystemTaskJSONValue(task.Payload),
-		State:     decodeSystemTaskJSONValue(task.State),
-		Result:    decodeSystemTaskJSONValue(task.Result),
+		State:     decodeSystemTaskJSONValue(string(task.State)),
+		Result:    decodeSystemTaskJSONValue(string(task.Result)),
 		Error:     task.Error,
 		LockedBy:  task.LockedBy,
 		CreatedAt: task.CreatedAt,

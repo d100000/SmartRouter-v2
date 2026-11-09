@@ -60,18 +60,39 @@ export function ConfigDialog(props: {
       timeout_seconds: z.number().int().min(30).max(600),
       idle_seconds: z.number().int().min(10).max(600),
       sample_limit: z.number().int().min(1).max(200),
+      context_window_tokens: z.number().int().min(4096).max(2000000),
+      chunk_input_tokens: z.number().int().min(256).max(2000000),
+      max_output_tokens: z.number().int().min(128).max(32768),
+      safety_margin_tokens: z.number().int().min(256).max(2000000),
+      max_calls: z.number().int().min(1).max(1000),
       report_language: z.string(),
       enabled: z.boolean(),
       api_key: z.string().max(4096),
       clear_key: z.boolean(),
     })
-    .refine((value) => value.idle_seconds <= value.timeout_seconds, {
-      message: t('Idle timeout must not exceed the attempt timeout'),
-      path: ['idle_seconds'],
-    })
+    .refine(
+      (value) =>
+        value.context_window_tokens >
+        value.max_output_tokens + value.safety_margin_tokens + 512,
+      {
+        message: t(
+          'The context limit must exceed the output reserve and safety margin.'
+        ),
+        path: ['context_window_tokens'],
+      }
+    )
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
-    defaultValues: { ...props.config, api_key: '', clear_key: false },
+    defaultValues: {
+      ...props.config,
+      context_window_tokens: props.config.context_window_tokens ?? 32768,
+      chunk_input_tokens: props.config.chunk_input_tokens ?? 8000,
+      max_output_tokens: props.config.max_output_tokens ?? 2048,
+      safety_margin_tokens: props.config.safety_margin_tokens ?? 4096,
+      max_calls: props.config.max_calls ?? 100,
+      api_key: '',
+      clear_key: false,
+    },
   })
   const fields = [
     { name: 'endpoint', label: t('Chat completions endpoint'), type: 'url' },
@@ -99,18 +120,39 @@ export function ConfigDialog(props: {
       max: 600,
     },
     {
-      name: 'idle_seconds',
-      label: t('No-token timeout (seconds)'),
+      name: 'context_window_tokens',
+      label: t('Model context limit (tokens)'),
       type: 'number',
-      min: 10,
-      max: 600,
+      min: 4096,
+      max: 2000000,
     },
     {
-      name: 'sample_limit',
-      label: t('Maximum diagnostic samples'),
+      name: 'chunk_input_tokens',
+      label: t('Segment input target (tokens)'),
+      type: 'number',
+      min: 256,
+      max: 2000000,
+    },
+    {
+      name: 'max_output_tokens',
+      label: t('Maximum output (tokens)'),
+      type: 'number',
+      min: 128,
+      max: 32768,
+    },
+    {
+      name: 'safety_margin_tokens',
+      label: t('Context safety margin (tokens)'),
+      type: 'number',
+      min: 256,
+      max: 2000000,
+    },
+    {
+      name: 'max_calls',
+      label: t('Model call budget'),
       type: 'number',
       min: 1,
-      max: 200,
+      max: 1000,
     },
   ] as const
   return (
@@ -145,6 +187,11 @@ export function ConfigDialog(props: {
           props.onSave({ ...props.config, ...values })
         )}
       >
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'Analysis uses non-streaming model requests. Set the context limit supported by your provider; oversized evidence is split automatically.'
+          )}
+        </p>
         <div className='grid gap-4 sm:grid-cols-2'>
           {fields.map((field) => (
             <div key={field.name} className='min-w-0 space-y-2'>
@@ -222,7 +269,7 @@ export function ConfigDialog(props: {
                 disabled={props.pending}
               />
               <Label htmlFor='analysis-enabled'>
-                {t('Analyze the previous day automatically')}
+                {t('Analyze the previous seven days automatically')}
               </Label>
             </div>
           )}

@@ -363,6 +363,8 @@ func SetApiRouter(router *gin.Engine) {
 			errorAnalysisRoute.GET("/reports", controller.ListErrorAnalysisReports)
 			errorAnalysisRoute.GET("/reports/:task_id", controller.GetErrorAnalysisReport)
 			errorAnalysisRoute.GET("/reports/:task_id/stream", controller.StreamErrorAnalysis)
+			errorAnalysisRoute.POST("/reports/:task_id/resume", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), controller.ResumeErrorAnalysis)
+			errorAnalysisRoute.GET("/reports/:task_id/evidence", controller.GetErrorAnalysisReportEvidence)
 		}
 		systemTaskRoute := apiRouter.Group("/system-task")
 		systemTaskRoute.Use(middleware.RootAuth())
