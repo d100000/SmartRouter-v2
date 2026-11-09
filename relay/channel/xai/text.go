@@ -39,7 +39,6 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	usage := &dto.Usage{}
 	var responseTextBuilder strings.Builder
 	var toolCount int
-	var containStreamUsage bool
 
 	helper.SetEventStreamHeaders(c)
 
@@ -53,10 +52,10 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 		// 把 xAI 的usage转换为 OpenAI 的usage
 		if xAIResp.Usage != nil {
-			containStreamUsage = true
-			usage.PromptTokens = xAIResp.Usage.PromptTokens
-			usage.TotalTokens = xAIResp.Usage.TotalTokens
-			usage.CompletionTokens = usage.TotalTokens - usage.PromptTokens
+			dto.MergeUsageNonZero(usage, xAIResp.Usage)
+			if usage.PromptTokens > 0 && usage.TotalTokens > 0 {
+				usage.CompletionTokens = max(usage.TotalTokens-usage.PromptTokens, 0)
+			}
 		}
 
 		openaiResponse := streamResponseXAI2OpenAI(xAIResp, usage)
@@ -67,9 +66,11 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	})
 
-	if !containStreamUsage {
-		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	missingOutput := usage.CompletionTokens == 0 && usage.OutputTokens == 0
+	usage = service.CompleteTextUsage(c, info, usage, responseTextBuilder.String())
+	if missingOutput {
 		usage.CompletionTokens += toolCount * 7
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 
 	helper.Done(c)
@@ -90,9 +91,19 @@ func xAIHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if xaiResponse.Usage != nil {
-		xaiResponse.Usage.CompletionTokens = xaiResponse.Usage.TotalTokens - xaiResponse.Usage.PromptTokens
-		xaiResponse.Usage.CompletionTokenDetails.TextTokens = xaiResponse.Usage.CompletionTokens - xaiResponse.Usage.CompletionTokenDetails.ReasoningTokens
+		if xaiResponse.Usage.PromptTokens > 0 && xaiResponse.Usage.TotalTokens > 0 {
+			xaiResponse.Usage.CompletionTokens = max(xaiResponse.Usage.TotalTokens-xaiResponse.Usage.PromptTokens, 0)
+		}
 	}
+	var output strings.Builder
+	if xaiResponse.Usage == nil || xaiResponse.Usage.CompletionTokens == 0 {
+		for _, choice := range xaiResponse.Choices {
+			output.WriteString(choice.Message.StringContent())
+			output.WriteString(choice.Message.GetReasoningContent())
+		}
+	}
+	xaiResponse.Usage = service.CompleteTextUsage(c, info, xaiResponse.Usage, output.String())
+	xaiResponse.Usage.CompletionTokenDetails.TextTokens = max(xaiResponse.Usage.CompletionTokens-xaiResponse.Usage.CompletionTokenDetails.ReasoningTokens, 0)
 
 	// new body
 	encodeJson, err := common.Marshal(xaiResponse)

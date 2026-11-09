@@ -259,9 +259,9 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 
 	if usage == nil {
 		usage = &dto.Usage{
-			PromptTokens:     relayInfo.GetEstimatePromptTokens(),
+			PromptTokens:     relayInfo.GetFallbackPromptTokens(),
 			CompletionTokens: 0,
-			TotalTokens:      relayInfo.GetEstimatePromptTokens(),
+			TotalTokens:      relayInfo.GetFallbackPromptTokens(),
 		}
 	}
 
@@ -432,10 +432,9 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	var tieredTokens billingexpr.TokenParams
 	tieredBillingApplied := false
 	snap := relayInfo.TieredBillingSnapshot
-	// Providers normally estimate missing usage before settlement. Preserve the
-	// same prompt estimate when a fixed-price expression reaches us without it;
-	// its conditions must still run and may select a token-priced fallback.
-	if billingUsage == nil && snap != nil && billingexpr.UsesFixedPricingByHash(snap.ExprString, snap.ExprHash) {
+	// Providers normally fill missing usage before settlement. If one returns
+	// none, use the same deferred prompt count for expression pricing and logs.
+	if billingUsage == nil && snap != nil {
 		billingUsage = &dto.Usage{PromptTokens: summary.PromptTokens, CompletionTokens: summary.CompletionTokens, TotalTokens: summary.TotalTokens}
 	}
 	if billingUsage != nil {
@@ -492,6 +491,9 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		}
 	}
 	actualUsage := originUsage != nil && !common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens)
+	if originUsage != nil && originUsage.BillingUsage != nil && originUsage.BillingUsage.Estimated {
+		actualUsage = false
+	}
 	if _, imageRequest := relayInfo.Request.(*dto.ImageRequest); imageRequest && relayInfo.BillingImageCount == nil {
 		actualUsage = false
 	}

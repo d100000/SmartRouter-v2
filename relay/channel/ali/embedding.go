@@ -175,7 +175,7 @@ func MultimodalEmbeddingHandler(c *gin.Context, resp *http.Response, info *relay
 		usage.PromptTokensDetails.ImageTokens = u.ImageTokens
 	}
 	if usage.PromptTokens == 0 {
-		usage.PromptTokens = info.GetEstimatePromptTokens()
+		usage.PromptTokens = info.GetFallbackPromptTokens()
 	}
 	usage.TotalTokens = usage.PromptTokens
 

@@ -46,17 +46,38 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 }
 
 func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {
-	// 是否统计token
+	// CountToken controls pre-consume estimation, not the missing-usage fallback.
 	if !constant.CountToken {
+		if request := info.Request; request != nil {
+			info.SetPromptTokenFallback(func() int {
+				tokens, err := countRequestToken(c, request.GetTokenCountMeta(), info, true)
+				if err != nil {
+					logger.LogError(c, common.LogText("failed to count request tokens after response: %s", err.Error()))
+				}
+				common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+				return tokens
+			})
+		}
 		return 0, nil
 	}
-	return CountRequestToken(c, meta, info)
+	tokens, err := CountRequestToken(c, meta, info)
+	if err == nil {
+		info.SetPromptTokenFallback(func() int {
+			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+			return tokens
+		})
+	}
+	return tokens, err
 }
 
 // CountRequestToken counts request tokens regardless of the billing estimation
 // switch. Utility endpoints such as Claude's messages/count_tokens must remain
 // available even when operators disable request-token estimation for relays.
 func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {
+	return countRequestToken(c, meta, info, false)
+}
+
+func countRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo, allowMediaFallback bool) (int, error) {
 	if meta == nil {
 		return 0, errors.New("token count meta is nil")
 	}
@@ -96,6 +117,7 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 
 	model := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 	tkm := 0
+	var mediaErr error
 
 	if meta.TokenType == types.TokenTypeTextNumber {
 		tkm += utf8.RuneCountInString(meta.CombineText)
@@ -140,7 +162,10 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 			cachedData, err := LoadFileSource(c, file.Source, "token_counter")
 			if err != nil {
 				if shouldFetchFiles {
-					return 0, fmt.Errorf("error getting file type: %v", err)
+					if !allowMediaFallback {
+						return 0, fmt.Errorf("error getting file type: %v", err)
+					}
+					mediaErr = errors.Join(mediaErr, err)
 				}
 				continue
 			}
@@ -153,7 +178,14 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 		case types.FileTypeImage:
 			token, err := getImageToken(c, file, model, info.IsStream)
 			if err != nil {
-				return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
+				if !allowMediaFallback {
+					return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
+				}
+				// Upstream may already have consumed this image even if it is
+				// no longer downloadable after the response or a client abort.
+				// Keep the text count and use the usual unknown-size estimate.
+				mediaErr = errors.Join(mediaErr, err)
+				token = tokenkit.ImageTokens(model, tokenkit.Image{Detail: file.Detail})
 			}
 			tkm += token
 		case types.FileTypeAudio:
@@ -168,7 +200,7 @@ func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relayco
 	}
 
 	common.SetContextKey(c, constant.ContextKeyPromptTokens, tkm)
-	return tkm, nil
+	return tkm, mediaErr
 }
 
 func CountTokenRealtime(info *relaycommon.RelayInfo, request dto.RealtimeEvent, model string) (int, int, error) {

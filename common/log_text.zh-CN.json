@@ -468,6 +468,7 @@
   "failed to count channel types: %s": "统计渠道类型失败: %s",
   "failed to count channels: %s": "统计渠道数量失败: %s",
   "failed to count hourly user session issuance: %s": "统计近一小时新建的登录会话数失败: %s",
+  "failed to count request tokens after response: %s": "响应结束后补算请求 token 失败: %s",
   "failed to count search tokens: %s": "统计令牌搜索结果数量失败: %s",
   "failed to count search topups: %s": "统计充值记录搜索结果数量失败: %s",
   "failed to count tags: %s": "统计标签数量失败: %s",

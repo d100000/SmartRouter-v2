@@ -257,9 +257,20 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	if !containStreamUsage {
-		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetFallbackPromptTokens())
 		usage.CompletionTokens += toolCount * 7
+	} else {
+		if usage.CompletionTokens == 0 {
+			usage.CompletionTokens = usage.OutputTokens
+		}
+		if usage.CompletionTokens == 0 && responseTextBuilder.Len() > 0 {
+			usage.CompletionTokens = tokenkit.Estimate(info.UpstreamModelName, responseTextBuilder.String()) + toolCount*7
+			usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
+			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+		}
+		service.FillMissingPromptTokens(info, usage)
 	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	if usageFrame == "" {
 		usageFrame = lastStreamData
 	}
@@ -604,21 +615,29 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	usageModified := false
-	if simpleResponse.Usage.PromptTokens == 0 {
-		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-		completionTokens := simpleResponse.Usage.CompletionTokens
-		if completionTokens == 0 {
-			for _, choice := range simpleResponse.Choices {
-				ctkm := tokenkit.Count(info.UpstreamModelName, choice.Message.StringContent()+choice.Message.GetReasoningContent())
-				completionTokens += ctkm
+	if simpleResponse.Usage.CompletionTokens == 0 && simpleResponse.Usage.OutputTokens > 0 {
+		simpleResponse.Usage.CompletionTokens = simpleResponse.Usage.OutputTokens
+		usageModified = true
+	}
+	if simpleResponse.Usage.CompletionTokens == 0 {
+		for _, choice := range simpleResponse.Choices {
+			simpleResponse.Usage.CompletionTokens += tokenkit.Count(info.UpstreamModelName, choice.Message.StringContent()+choice.Message.GetReasoningContent())
+			for _, tool := range choice.Message.ParseToolCalls() {
+				simpleResponse.Usage.CompletionTokens += tokenkit.Count(info.UpstreamModelName, tool.Function.Name+tool.Function.Arguments) + 7
 			}
 		}
-		fallbackUsage := &dto.Usage{
-			PromptTokens:     info.GetEstimatePromptTokens(),
-			CompletionTokens: completionTokens,
-			TotalTokens:      info.GetEstimatePromptTokens() + completionTokens,
+		if simpleResponse.Usage.CompletionTokens > 0 {
+			simpleResponse.Usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(simpleResponse.Usage.BillingUsage, simpleResponse.Usage.CompletionTokens)
+			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+			usageModified = true
 		}
-		simpleResponse.Usage = *fallbackUsage
+	}
+	usageModified = service.FillMissingPromptTokens(info, &simpleResponse.Usage) || usageModified
+	if simpleResponse.Usage.UsageSource == "local" {
+		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+	}
+	if usageModified || simpleResponse.Usage.TotalTokens == 0 {
+		simpleResponse.Usage.TotalTokens = simpleResponse.Usage.PromptTokens + simpleResponse.Usage.CompletionTokens
 		usageModified = true
 	}
 

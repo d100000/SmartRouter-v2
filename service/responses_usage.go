@@ -97,19 +97,30 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	}
+	estimatedOutput := false
 	if a.usage.CompletionTokens == 0 {
 		if output := a.outputText.String(); output != "" {
 			a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
+			estimatedOutput = a.usage.CompletionTokens > 0
 		}
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream
 	// that produced any event but no usage still owes its input tokens unless
 	// upstream reported an explicit failure.
 	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
-	if a.usage.PromptTokens == 0 && billsPrompt {
-		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
+	if billsPrompt {
+		FillMissingPromptTokens(a.info, a.usage)
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
+	if (estimatedOutput || a.usage.UsageSource == "local") && a.usage.BillingUsage == nil {
+		// Native Responses streams do not otherwise need a billing sidecar.
+		// Keep the estimate marker on usage for HTTP, WebSocket and channel-test
+		// settlement, which must not treat local counts as actual supplier cost.
+		a.usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(a.usage)
+		if a.usage.BillingUsage != nil {
+			a.usage.BillingUsage.Estimated = true
+		}
+	}
 	if a.usage.BillingUsage != nil {
 		a.usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(a.usage.BillingUsage, a.usage.CompletionTokens)
 	}

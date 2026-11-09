@@ -42,7 +42,7 @@ func (a *Adaptor) doSGLangRerankResponse(c *gin.Context, resp *http.Response, in
 	// Per-result counts therefore cannot account for the full request; use the
 	// existing prompt estimate, as with other rerank providers without usage.
 	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-	response.Usage = dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), TotalTokens: info.GetEstimatePromptTokens()}
+	response.Usage = dto.Usage{PromptTokens: info.GetFallbackPromptTokens(), TotalTokens: info.GetFallbackPromptTokens()}
 	c.JSON(http.StatusOK, response)
 	return &response.Usage, nil
 }

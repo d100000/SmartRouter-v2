@@ -422,8 +422,11 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData,
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []*common.Message) {
 	actualUsage := usage != nil && !common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens)
+	if usage != nil && usage.BillingUsage != nil && usage.BillingUsage.Estimated {
+		actualUsage = false
+	}
 	if usage == nil {
-		usage = &dto.Usage{PromptTokens: relayInfo.GetEstimatePromptTokens(), TotalTokens: relayInfo.GetEstimatePromptTokens()}
+		usage = &dto.Usage{PromptTokens: relayInfo.GetFallbackPromptTokens(), TotalTokens: relayInfo.GetFallbackPromptTokens()}
 	}
 
 	var tieredUsedVars map[string]bool

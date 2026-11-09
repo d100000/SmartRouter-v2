@@ -14,8 +14,10 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -51,6 +53,15 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	// compute usage
 	usage := &dto.Usage{}
 	service.ApplyResponsesUsage(usage, responsesResponse.Usage)
+	if usage.CompletionTokens == 0 {
+		usage.CompletionTokens = tokenkit.Count(info.UpstreamModelName, relayconvert.ExtractOutputTextFromResponses(&responsesResponse))
+		usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
+		if usage.CompletionTokens > 0 {
+			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+		}
+	}
+	service.FillMissingPromptTokens(info, usage)
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	// Count actual tool invocations from Output (not tool declarations).
 	for _, output := range responsesResponse.Output {
 		switch output.Type {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -80,6 +81,7 @@ type ChannelMeta struct {
 type TokenCountMeta struct {
 	//promptTokens int
 	estimatePromptTokens int
+	fallbackPromptTokens func() int
 }
 
 // OverviewMediaUsage contains only measured output quantities. Nil is unknown;
@@ -998,6 +1000,23 @@ func (info *RelayInfo) SetEstimatePromptTokens(promptTokens int) {
 func (info *RelayInfo) GetEstimatePromptTokens() int {
 	if info == nil {
 		return 0
+	}
+	return info.estimatePromptTokens
+}
+
+// SetPromptTokenFallback defers input counting until a response has missing
+// usage. The result is shared by response formatting and settlement, including
+// retries, without making the pre-consume or conversion getters do any work.
+func (info *RelayInfo) SetPromptTokenFallback(count func() int) {
+	info.fallbackPromptTokens = sync.OnceValue(count)
+}
+
+func (info *RelayInfo) GetFallbackPromptTokens() int {
+	if info == nil {
+		return 0
+	}
+	if info.fallbackPromptTokens != nil {
+		return info.fallbackPromptTokens()
 	}
 	return info.estimatePromptTokens
 }

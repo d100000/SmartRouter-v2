@@ -187,9 +187,9 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 
 	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
+		PromptTokens:     info.GetFallbackPromptTokens(),
 		CompletionTokens: 0,
-		TotalTokens:      info.GetEstimatePromptTokens(),
+		TotalTokens:      info.GetFallbackPromptTokens(),
 	}
 
 	return usage, nil
@@ -297,9 +297,9 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 				c.Status(http.StatusOK)
 				common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 				usage = &dto.Usage{
-					PromptTokens:     info.GetEstimatePromptTokens(),
+					PromptTokens:     info.GetFallbackPromptTokens(),
 					CompletionTokens: 0,
-					TotalTokens:      info.GetEstimatePromptTokens(),
+					TotalTokens:      info.GetFallbackPromptTokens(),
 				}
 				return usage, nil
 			}
@@ -311,9 +311,9 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	c.Status(http.StatusOK)
 	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
+		PromptTokens:     info.GetFallbackPromptTokens(),
 		CompletionTokens: 0,
-		TotalTokens:      info.GetEstimatePromptTokens(),
+		TotalTokens:      info.GetFallbackPromptTokens(),
 	}
 	return usage, nil
 }

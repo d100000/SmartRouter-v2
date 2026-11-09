@@ -40,6 +40,7 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 		mode                     string
 		expression               string
 		local, missing, overflow bool
+		estimatedNative          bool
 		changedUnit              bool
 		base                     *float64
 		revenue                  int64
@@ -47,6 +48,7 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 		{name: "free group preserves cache image tool and request multipliers", group: 0, base: common.GetPointer(2399.75)},
 		{name: "paid group preserves unrounded base", group: .8, base: common.GetPointer(2399.75), revenue: 1920},
 		{name: "locally estimated usage has unknown cost", group: .8, local: true, revenue: 1920},
+		{name: "estimated native usage has unknown cost without context flag", group: .8, estimatedNative: true, revenue: 1920},
 		{name: "missing usage has unknown cost", group: .8, missing: true, revenue: 1840},
 		{name: "free tiered group preserves actual base", group: 0, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0)},
 		{name: "historical tiered unit preserves monetary tool cost", group: 0, changedUnit: true, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0)},
@@ -56,6 +58,7 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 		{name: "audio free group preserves pre group cost", group: 0, mode: "audio", base: common.GetPointer(120.0)},
 		{name: "audio paid group preserves pre group cost", group: .8, mode: "audio", base: common.GetPointer(120.0), revenue: 96},
 		{name: "audio estimate has unknown cost", group: .8, mode: "audio", local: true, revenue: 96},
+		{name: "audio estimated native usage has unknown cost without context flag", group: .8, mode: "audio", estimatedNative: true, revenue: 96},
 		{name: "realtime total usage preserves pre group cost", group: .8, mode: "realtime", base: common.GetPointer(120.0), revenue: 96},
 		{name: "requested image count has unknown procurement cost", group: .8, mode: "image_estimate", revenue: 49600},
 		{name: "measured image count preserves procurement cost", group: .8, mode: "image_actual", base: common.GetPointer(62000.0), revenue: 49600},
@@ -87,6 +90,10 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 			info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{"overview_test_tool": {CallCount: 1}}}
 			info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: 831}}
 			usage := &dto.Usage{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 20, CachedCreationTokens: 5, ImageTokens: 10, TextTokens: 100}, CompletionTokenDetails: dto.OutputTokenDetails{TextTokens: 20}}
+			if tc.estimatedNative {
+				usage.BillingUsage = dto.NewOpenAIResponsesBillingUsage(usage)
+				usage.BillingUsage.Estimated = true
+			}
 			if tc.overflow {
 				usage.PromptTokens = 1_000_000_000
 				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
@@ -113,7 +120,7 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 			}
 			require.NotNil(t, info.AnalyticsBilling)
 			if tc.mode == "" || tc.mode == "audio" {
-				assert.Equal(t, !tc.local && !tc.missing, info.AnalyticsBilling.CacheUsageKnown)
+				assert.Equal(t, !tc.local && !tc.missing && !tc.estimatedNative, info.AnalyticsBilling.CacheUsageKnown)
 				if info.AnalyticsBilling.CacheUsageKnown {
 					assert.EqualValues(t, usage.PromptTokens, info.AnalyticsBilling.CacheInputTokens)
 					assert.EqualValues(t, 20, info.AnalyticsBilling.CacheReadTokens)
@@ -133,7 +140,7 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 				require.NotNil(t, info.AnalyticsBilling.BaseQuota)
 				assert.InDelta(t, *tc.base, *info.AnalyticsBilling.BaseQuota, 0.000001)
 			}
-			if tc.local || tc.missing {
+			if tc.local || tc.missing || tc.estimatedNative {
 				assert.Equal(t, "local_estimate", info.AnalyticsBilling.UsageSource)
 			}
 		})
@@ -520,6 +527,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 	for index, tc := range []struct {
 		name, expression                          string
 		estimate                                  int
+		deferred, wantDeferredCalls               int
 		usage                                     *dto.Usage
 		audio, stream, refund, insufficient, tool bool
 		realtime, reserveInsufficient             bool
@@ -537,6 +545,10 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		{name: "token reservation refunds to fixed price", expression: mixed, estimate: 50000, usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "fixed reservation settles token fallback", expression: mixed, estimate: 100, usage: &dto.Usage{PromptTokens: 50000, TotalTokens: 50000}, want: 50000, unit: billingexpr.BillingUnitToken},
 		{name: "missing usage uses estimated token fallback", expression: mixed, estimate: 50000, want: 50000, unit: billingexpr.BillingUnitToken},
+		{name: "deferred input settles actual long-context tier", expression: mixed, deferred: 60000, usage: &dto.Usage{PromptTokens: 50000, CompletionTokens: 1000, TotalTokens: 51000}, want: 50000, unit: billingexpr.BillingUnitToken},
+		{name: "missing usage counts deferred input once", expression: mixed, deferred: 50000, wantDeferredCalls: 1, want: 50000, unit: billingexpr.BillingUnitToken},
+		{name: "token-only expression bills deferred input without usage", expression: `p * 2 + c * 3`, deferred: 50000, wantDeferredCalls: 1, want: 50000, unit: billingexpr.BillingUnitToken},
+		{name: "partial native usage settles deferred input", expression: mixed, deferred: 50000, wantDeferredCalls: 1, usage: &dto.Usage{CompletionTokens: 1000, TotalTokens: 1000, BillingUsage: dto.NewOpenAIChatBillingUsage(&dto.Usage{CompletionTokens: 1000, TotalTokens: 1000})}, want: 50000, unit: billingexpr.BillingUnitToken},
 		{name: "evaluation error retains fixed reservation metadata", expression: `p == 50 ? tier("error", param("missing") * p + img_cr * 2) : tier("request", fixed(0.01))`, estimate: 100, usage: &dto.Usage{PromptTokens: 50, TotalTokens: 50}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "explicit zero remains free", expression: `tier("free", fixed(0))`, usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, unit: billingexpr.BillingUnitRequest},
 		{name: "multipliers and separate tool surcharge", expression: flat + ` * (param("fast") == true ? 2 : 1)`, groupRatio: 1.5, tool: true, want: 18000, unit: billingexpr.BillingUnitRequest},
@@ -593,6 +605,13 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			snapshot.EstimatedImageCount = trace.ImageCount
 			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, OriginModelName: "fixed-test", UsingGroup: "default", UserGroup: "default", UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}, ForcePreConsume: true, StartTime: time.Now(), IsStream: tc.stream, RelayFormat: types.RelayFormatOpenAI, PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: group}}, TieredBillingSnapshot: snapshot, BillingRequestInput: request}
 			info.SetEstimatePromptTokens(tc.estimate)
+			deferredCalls := 0
+			if tc.deferred > 0 {
+				info.SetPromptTokenFallback(func() int {
+					deferredCalls++
+					return tc.deferred
+				})
+			}
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
 			if tc.expression == imageExpression {
@@ -600,6 +619,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 				info.RelayMode = relayconstant.RelayModeImagesGenerations
 			}
 			apiErr := PreConsumeBilling(ctx, reservation, info)
+			assert.Zero(t, deferredCalls, "reservation must not tokenize input")
 			if tc.insufficient {
 				require.NotNil(t, apiErr)
 				assert.Equal(t, types.ErrorCodeInsufficientUserQuota, apiErr.GetErrorCode())
@@ -650,6 +670,9 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 						t.Fatal("refund did not finish")
 					}
 				} else {
+					if tc.deferred > 0 && tc.usage != nil {
+						FillMissingPromptTokens(info, tc.usage)
+					}
 					info.UpdateImageCount(int64(tc.actualImages))
 					if tc.tool {
 						info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{"fixed_billing_tool": {CallCount: 1}}}
@@ -678,6 +701,9 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					assert.Equal(t, tc.stream, log.IsStream)
 					assert.NotContains(t, log.Content, "nothing was charged")
 					var other map[string]any
+					if tc.deferred > 0 {
+						assert.Equal(t, 50000, log.PromptTokens)
+					}
 					require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
 					assert.Equal(t, string(tc.unit), other["billing_unit"])
 					if tc.requestedImages > 0 {
@@ -720,6 +746,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 				}
 			}
 			require.NoError(t, db.First(&user, user.Id).Error)
+			assert.Equal(t, tc.wantDeferredCalls, deferredCalls)
 			require.NoError(t, db.First(&token, token.Id).Error)
 			assert.Equal(t, quota-tc.want, user.Quota)
 			assert.Equal(t, startingQuota-tc.want, token.RemainQuota)

@@ -84,7 +84,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	responseId := helper.GetResponseID(c)
 	createdTime := common.GetTimestamp()
 	usage := &dto.Usage{}
-	responseText := ""
+	var responseText strings.Builder
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		if atEOF && len(data) == 0 {
@@ -154,7 +154,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 						Index: 0,
 					},
 				}
-				responseText += cohereResp.Text
+				responseText.WriteString(cohereResp.Text)
 			}
 			jsonStr, err := common.Marshal(openaiResp)
 			if err != nil {
@@ -168,9 +168,7 @@ func cohereStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			return false
 		}
 	})
-	if usage.PromptTokens == 0 {
-		usage = service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
-	}
+	usage = service.CompleteTextUsage(c, info, usage, responseText.String())
 	return usage, nil
 }
 
@@ -190,6 +188,7 @@ func cohereHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	usage.PromptTokens = cohereResp.Meta.BilledUnits.InputTokens
 	usage.CompletionTokens = cohereResp.Meta.BilledUnits.OutputTokens
 	usage.TotalTokens = cohereResp.Meta.BilledUnits.InputTokens + cohereResp.Meta.BilledUnits.OutputTokens
+	service.CompleteTextUsage(c, info, &usage, cohereResp.Text)
 
 	var openaiResp dto.TextResponse
 	openaiResp.Id = cohereResp.ResponseId
@@ -230,9 +229,9 @@ func cohereRerankHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	usage := dto.Usage{}
 	if cohereResp.Meta.BilledUnits.InputTokens == 0 {
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-		usage.PromptTokens = info.GetEstimatePromptTokens()
+		usage.PromptTokens = info.GetFallbackPromptTokens()
 		usage.CompletionTokens = 0
-		usage.TotalTokens = info.GetEstimatePromptTokens()
+		usage.TotalTokens = info.GetFallbackPromptTokens()
 	} else {
 		usage.PromptTokens = cohereResp.Meta.BilledUnits.InputTokens
 		usage.CompletionTokens = cohereResp.Meta.BilledUnits.OutputTokens

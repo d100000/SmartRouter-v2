@@ -161,11 +161,12 @@ func convertResponsesResponseForClient(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	usage := relayconvert.UsageFromResponsesUsage(response.Usage)
-	if usage == nil || usage.TotalTokens == 0 {
-		text := service.ExtractOutputTextFromResponses(response)
-		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
-		response.Usage = relayconvert.UsageFromChatUsage(usage)
+	output := ""
+	if usage.CompletionTokens == 0 {
+		output = service.ExtractOutputTextFromResponses(response)
 	}
+	usage = service.CompleteTextUsage(c, info, usage, output)
+	response.Usage = relayconvert.UsageFromChatUsage(usage)
 
 	result, err := service.ConvertResponse(c, info, info.RelayFormat, response)
 	if err != nil {
@@ -339,24 +340,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if usage.TotalTokens == 0 {
 			usage = state.Usage()
 		}
-		if usage == nil || usage.TotalTokens == 0 {
-			usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-		} else if usage.CompletionTokens == 0 || usage.PromptTokens == 0 {
-			// As in the native Responses accumulator, reported usage that
-			// omits the output or the prompt is completed from the estimate of
-			// the delivered output and the prompt.
-			estimate := service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-			if usage.CompletionTokens == 0 {
-				usage.CompletionTokens = estimate.CompletionTokens
-			}
-			if usage.PromptTokens == 0 {
-				usage.PromptTokens = estimate.PromptTokens
-			}
-			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-			if usage.BillingUsage != nil {
-				usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
-			}
-		}
+		usage = service.CompleteTextUsage(c, info, usage, state.UsageText())
 		logger.LogError(c, common.LogText("responses stream failed after output was delivered, billing the delivered output: %s", streamErr.Error()))
 		streamErr.SetMessage(common.MessageWithRequestId(streamErr.Error(), c.GetString(common.RequestIdKey)))
 		if info.RelayFormat == types.RelayFormatClaude {
@@ -368,10 +352,8 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	usage := state.Usage()
-	if usage == nil || usage.TotalTokens == 0 {
-		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-		state.SetUsage(usage)
-	}
+	usage = service.CompleteTextUsage(c, info, usage, state.UsageText())
+	state.SetUsage(usage)
 	if info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone {
 		return usage, nil
 	}

@@ -56,8 +56,8 @@ func RerankHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		jinaResp = dto.RerankResponse{
 			Results: jinaRespResults,
 			Usage: dto.Usage{
-				PromptTokens: info.GetEstimatePromptTokens(),
-				TotalTokens:  info.GetEstimatePromptTokens(),
+				PromptTokens: info.GetFallbackPromptTokens(),
+				TotalTokens:  info.GetFallbackPromptTokens(),
 			},
 		}
 	} else {

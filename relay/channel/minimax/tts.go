@@ -166,7 +166,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 
 	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
+		PromptTokens:     info.GetFallbackPromptTokens(),
 		CompletionTokens: 0,
 		TotalTokens:      int(minimaxResp.ExtraInfo.UsageCharacters),
 	}

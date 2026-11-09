@@ -52,12 +52,12 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if !responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: responsesResp}, nil) {
 		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	usage := convertResult.Usage
-	if usage == nil || usage.TotalTokens == 0 {
-		text := service.ExtractOutputTextFromResponses(responsesResp)
-		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
-		responsesResp.Usage = relayconvert.UsageFromChatUsage(usage)
+	output := ""
+	if convertResult.Usage == nil || convertResult.Usage.CompletionTokens == 0 {
+		output = service.ExtractOutputTextFromResponses(responsesResp)
 	}
+	usage := service.CompleteTextUsage(c, info, convertResult.Usage, output)
+	responsesResp.Usage = relayconvert.UsageFromChatUsage(usage)
 
 	responseBody, err := common.Marshal(responsesResp)
 	if err != nil {
@@ -198,7 +198,6 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	usage := state.Usage()
-	noUpstreamUsage := usage == nil || usage.TotalTokens == 0
 	if upstreamFailure == nil && !hasOutput {
 		upstreamFailure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
@@ -209,10 +208,8 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return nil, upstreamFailure
 		}
 	}
-	if noUpstreamUsage {
-		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-		state.SetUsage(usage)
-	}
+	usage = service.CompleteTextUsage(c, info, usage, state.UsageText())
+	state.SetUsage(usage)
 	if info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone {
 		return usage, nil
 	}

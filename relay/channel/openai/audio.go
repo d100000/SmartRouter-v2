@@ -28,8 +28,6 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	// and can be terminated directly.
 	defer service.CloseResponseBodyGracefully(resp)
 	usage := &dto.Usage{}
-	usage.PromptTokens = info.GetEstimatePromptTokens()
-	usage.TotalTokens = info.GetEstimatePromptTokens()
 	actualUsage := false
 	for k, v := range resp.Header {
 		if !service.ShouldCopyUpstreamHeader(c, k, v) {
@@ -48,8 +46,8 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 					sr.Error(err)
 				} else if simpleResponse.Usage.TotalTokens != 0 {
 					usage.PromptTokens = simpleResponse.Usage.InputTokens
-					usage.CompletionTokens = simpleResponse.OutputTokens
-					usage.TotalTokens = simpleResponse.TotalTokens
+					usage.CompletionTokens = simpleResponse.Usage.OutputTokens
+					usage.TotalTokens = simpleResponse.Usage.TotalTokens
 					actualUsage = usage.PromptTokens+usage.CompletionTokens == usage.TotalTokens
 				}
 			}
@@ -96,6 +94,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			duration, durationErr = common.GetAudioDuration(c.Request.Context(), reader, ext)
 		}
 
+		service.FillMissingPromptTokens(info, usage)
 		usage.PromptTokensDetails.TextTokens = usage.PromptTokens
 
 		if durationErr != nil {
@@ -121,6 +120,10 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	}
 	if !actualUsage {
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+		service.FillMissingPromptTokens(info, usage)
+		if usage.TotalTokens == 0 {
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		}
 	}
 
 	return usage
@@ -162,7 +165,7 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 
 	usage := &dto.Usage{}
 	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-	usage.PromptTokens = info.GetEstimatePromptTokens()
+	usage.PromptTokens = info.GetFallbackPromptTokens()
 	usage.CompletionTokens = 0
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	return nil, usage

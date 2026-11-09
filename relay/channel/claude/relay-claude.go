@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/tokenkit"
 
 	"github.com/gin-gonic/gin"
 )
@@ -85,6 +86,12 @@ func patchClaudeMessageDeltaUsageData(data string, usage *dto.ClaudeUsage) strin
 }
 
 func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *dto.ChatCompletionsStreamResponse, claudeInfo *ClaudeResponseInfo) bool {
+	if claudeResponse.Type == "content_block_start" && claudeResponse.ContentBlock != nil {
+		claudeInfo.ResponseText.WriteString(claudeResponse.ContentBlock.GetText())
+		if claudeResponse.ContentBlock.Thinking != nil {
+			claudeInfo.ResponseText.WriteString(*claudeResponse.ContentBlock.Thinking)
+		}
+	}
 	return relayconvert.FormatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo)
 }
 
@@ -296,7 +303,7 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 			common.SysLog(common.LogText("claude response usage is not complete, maybe upstream error"))
 		}
 		// 只补缺失字段，不整份覆盖——保留 message_start 已拿到的 cache 字段
-		fallback := service.ResponseText2Usage(c, claudeInfo.ResponseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+		fallback := service.ResponseText2Usage(c, claudeInfo.ResponseText.String(), info.UpstreamModelName, 0)
 		// Each tool_use block costs about 40 output tokens beyond its name and JSON
 		// input (measured on Claude Haiku 4.5 and Sonnet 5 agent turns).
 		fallback.CompletionTokens += claudeInfo.ToolUseCount * 40
@@ -305,9 +312,10 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 			claudeInfo.Usage.CompletionTokens = fallback.CompletionTokens
 		}
 		if missingInputUsage {
-			claudeInfo.Usage.PromptTokens = fallback.PromptTokens
+			service.FillMissingPromptTokens(info, claudeInfo.Usage)
 		}
 		claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
+		claudeInfo.Usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(claudeInfo.Usage.BillingUsage, claudeInfo.Usage.CompletionTokens)
 	}
 	if claudeInfo.Usage != nil {
 		claudeInfo.Usage.UsageSemantic = "anthropic"
@@ -484,6 +492,30 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.ClaudeCacheCreation5mTokens = claudeResponse.Usage.GetCacheCreation5mTokens()
 		claudeInfo.Usage.ClaudeCacheCreation1hTokens = claudeResponse.Usage.GetCacheCreation1hTokens()
 	}
+	claudeInfo.Usage.UsageSemantic = "anthropic"
+	if claudeInfo.Usage.CompletionTokens == 0 {
+		var output strings.Builder
+		toolCount := 0
+		for _, block := range claudeResponse.Content {
+			output.WriteString(block.GetText())
+			if block.Thinking != nil {
+				output.WriteString(*block.Thinking)
+			}
+			if block.Type == "tool_use" {
+				toolCount++
+				output.WriteString(block.Name)
+				input, _ := common.Marshal(block.Input)
+				output.Write(input)
+			}
+		}
+		claudeInfo.Usage.CompletionTokens = tokenkit.Estimate(info.UpstreamModelName, output.String()) + toolCount*40
+		if claudeInfo.Usage.CompletionTokens > 0 {
+			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+			claudeInfo.Usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(claudeInfo.Usage.BillingUsage, claudeInfo.Usage.CompletionTokens)
+		}
+	}
+	service.FillMissingPromptTokens(info, claudeInfo.Usage)
+	claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
 	var responseData []byte
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:

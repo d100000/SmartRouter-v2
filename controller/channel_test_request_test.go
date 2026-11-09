@@ -255,6 +255,7 @@ func TestCloudflareEmbeddingResponseCompatibility(t *testing.T) {
 		body        string
 		forceFormat bool
 		wantTokens  int
+		wantSource  string
 	}{
 		{
 			name:       "single embedding preserves upstream usage",
@@ -277,6 +278,7 @@ func TestCloudflareEmbeddingResponseCompatibility(t *testing.T) {
 			body:        `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,-0.2]}],"model":"@cf/baai/bge-large-en-v1.5"}`,
 			forceFormat: true,
 			wantTokens:  99,
+			wantSource:  "local",
 		},
 	}
 	for _, tt := range tests {
@@ -303,7 +305,7 @@ func TestCloudflareEmbeddingResponseCompatibility(t *testing.T) {
 			usage, apiErr := (&cloudflare.Adaptor{}).DoResponse(c, resp, info)
 			require.Nil(t, apiErr)
 			require.IsType(t, &dto.Usage{}, usage)
-			assert.Equal(t, &dto.Usage{PromptTokens: tt.wantTokens, TotalTokens: tt.wantTokens}, usage)
+			assert.Equal(t, &dto.Usage{PromptTokens: tt.wantTokens, TotalTokens: tt.wantTokens, UsageSource: tt.wantSource}, usage)
 			assert.Equal(t, http.StatusOK, w.Code)
 			assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
 			assert.JSONEq(t, tt.body, w.Body.String())
