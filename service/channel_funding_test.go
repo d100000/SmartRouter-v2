@@ -185,7 +185,7 @@ func TestChannelFundingProtocolEvidence(t *testing.T) {
 	var row model.ChannelFundingIncident
 	require.NoError(t, db.Where("channel_id = ?", channel.Id).First(&row).Error)
 	channel.Key = "replacement-key"
-	require.NoError(t, channel.Update())
+	require.NoError(t, channel.UpdateWithKey(func(stored *model.Channel) error { stored.Key = channel.Key; return nil }))
 	ObserveTaskFundingFailure(&task, "insufficient balance", "insufficient_balance")
 	require.NoError(t, db.First(&row, row.ID).Error)
 	assert.Equal(t, "dismissed", row.State)
@@ -342,7 +342,7 @@ func TestChannelFundingDatabaseMatrix(t *testing.T) {
 					assert.ErrorIs(t, model.ResolveChannelFunding(row.ID, row.Revision, row.LastFailureAt, false, false, 0, "late success"), model.ErrFundingConflict)
 					// Reordering must retain identity and disabled ownership.
 					current.Key = "matrix-key-b\nmatrix-key-a"
-					require.NoError(t, current.Update())
+					require.NoError(t, current.UpdateWithKey(func(stored *model.Channel) error { stored.Key = current.Key; return nil }))
 					require.NoError(t, model.ResolveChannelFunding(row.ID, row.Revision, row.LastFailureAt+1, true, true, 0, "probe"))
 					var recovery []model.ChannelFundingDelivery
 					require.NoError(t, db.Where("incident_id = ? AND kind = ?", row.ID, "recovery").Find(&recovery).Error)
@@ -366,9 +366,9 @@ func TestChannelFundingDatabaseMatrix(t *testing.T) {
 					// Removing and reintroducing identical material changes its activation epoch.
 					oldIdentity := fundingIdentity(current, 1)
 					current.Key = "matrix-key-b"
-					require.NoError(t, current.Update())
+					require.NoError(t, current.UpdateWithKey(func(stored *model.Channel) error { stored.Key = current.Key; return nil }))
 					current.Key = "matrix-key-b\nmatrix-key-a"
-					require.NoError(t, current.Update())
+					require.NoError(t, current.UpdateWithKey(func(stored *model.Channel) error { stored.Key = current.Key; return nil }))
 					assert.Equal(t, oldIdentity.BindingID, current.GetUpstreamCredentialSnapshot(1).BindingID)
 					_, err = model.RecordChannelFundingFailure(oldIdentity, "balance_insufficient", "test", "insufficient_balance", "detached response", 402, true, 10)
 					assert.ErrorIs(t, err, model.ErrFundingConflict)
@@ -849,7 +849,7 @@ func TestChannelFundingSwitchesAndTaskAttribution(t *testing.T) {
 	task := model.Task{TaskID: "batch-old", ChannelId: channel.Id, Status: model.TaskStatusInProgress, PrivateData: model.TaskPrivateData{UpstreamTaskID: "old", FundingAttempt: &identity}}
 	require.NoError(t, db.Create(&task).Error)
 	channel.Key = "new-polling-key"
-	require.NoError(t, channel.Update())
+	require.NoError(t, channel.UpdateWithKey(func(stored *model.Channel) error { stored.Key = channel.Key; return nil }))
 	currentIdentity := fundingIdentity(&channel, 0)
 	currentTask := model.Task{TaskID: "batch-new", ChannelId: channel.Id, Status: model.TaskStatusInProgress, PrivateData: model.TaskPrivateData{UpstreamTaskID: "new", FundingAttempt: &currentIdentity}}
 	require.NoError(t, db.Create(&currentTask).Error)

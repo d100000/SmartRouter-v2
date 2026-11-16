@@ -31,10 +31,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { ModelReliabilityDemo } from '@/features/performance-metrics/components/model-reliability-demo'
 import { ROLE } from '@/lib/roles'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
-import { ModelReliabilityDemo } from '@/features/performance-metrics/components/model-reliability-demo'
 
 import { ModelsChartPreferences } from './components/models/models-chart-preferences'
 import { ModelsFilter } from './components/models/models-filter-dialog'

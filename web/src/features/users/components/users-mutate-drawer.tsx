@@ -31,6 +31,8 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { PasswordInput } from '@/components/password-input'
+import { PasswordStrength } from '@/components/password-strength'
 import { PermissionMatrix } from '@/components/permission-matrix'
 import { Button } from '@/components/ui/button'
 import { Combobox } from '@/components/ui/combobox'
@@ -75,7 +77,11 @@ import {
 import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
 import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
-import { accountPasswordSchema } from '@/lib/password-policy'
+import {
+  accountPasswordSchema,
+  ACCOUNT_PASSWORD_MIN_LENGTH,
+  SUPPLIER_PASSWORD_MIN_LENGTH,
+} from '@/lib/password-policy'
 import { ROLE } from '@/lib/roles'
 import { AuthOperationError } from '@/lib/secure-verification'
 import { requireServerSuccess } from '@/lib/server-error-message'
@@ -168,6 +174,10 @@ export function UsersMutateDrawer({
 
   const currentQuotaRaw = form.watch('quota_dollars') || 0
   const selectedRole = form.watch('role')
+  const passwordMinLength =
+    selectedRole === ROLE.SUPPLIER
+      ? SUPPLIER_PASSWORD_MIN_LENGTH
+      : ACCOUNT_PASSWORD_MIN_LENGTH
   const suppliersQuery = useQuery({
     queryKey: [...supplyQueryKey, currentUser?.id, 'admin', 'accounts'],
     queryFn: ({ signal }) => getSuppliers(signal),
@@ -184,7 +194,7 @@ export function UsersMutateDrawer({
     if (
       data.role === ROLE.SUPPLIER &&
       (!isUpdate || data.password) &&
-      [...(data.password ?? '')].length < 15
+      [...(data.password ?? '')].length < SUPPLIER_PASSWORD_MIN_LENGTH
     ) {
       form.setError('password', {
         message: t(
@@ -477,17 +487,30 @@ export function UsersMutateDrawer({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel>{t('Password')}</FormLabel>
-                      <FormControl>
-                        <Input
+                      <FormControl
+                        describedBy={
+                          !isUpdate || field.value
+                            ? 'user-password-strength'
+                            : undefined
+                        }
+                      >
+                        <PasswordInput
                           {...field}
-                          type='password'
+                          value={field.value ?? ''}
+                          autoComplete='new-password'
                           placeholder={
                             isUpdate
                               ? t('Leave empty to keep unchanged')
-                              : t('Enter password (8–128 characters)')
+                              : t('Password')
                           }
                         />
                       </FormControl>
+                      <PasswordStrength
+                        id='user-password-strength'
+                        value={field.value ?? ''}
+                        minLength={passwordMinLength}
+                        quietWhenEmpty={isUpdate}
+                      />
                       <FormMessage />
                     </FormItem>
                   )}

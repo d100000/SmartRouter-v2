@@ -19,13 +19,17 @@ For commercial licensing, please contact support@quantumnous.com
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Loader2 } from 'lucide-react'
 import { useEffect } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
 import { Dialog } from '@/components/dialog'
 import { PasswordInput } from '@/components/password-input'
+import {
+  PasswordConfirmationStatus,
+  PasswordStrength,
+} from '@/components/password-strength'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -38,7 +42,10 @@ import {
 import { SecureVerificationDialog } from '@/features/auth/secure-verification'
 import { changeAccountPassword } from '@/features/profile/api'
 import { refreshAuthentication } from '@/lib/auth-session'
-import { accountPasswordSchema } from '@/lib/password-policy'
+import {
+  accountPasswordSchema,
+  SUPPLIER_PASSWORD_MIN_LENGTH,
+} from '@/lib/password-policy'
 import { isSupplier } from '@/lib/supplier-access'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -78,6 +85,14 @@ export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
     resolver: zodResolver(passwordChangeSchema),
     defaultValues: emptyPasswordForm,
   })
+  const newPasswordValue = useWatch({
+    control: form.control,
+    name: 'newPassword',
+  })
+  const confirmPasswordValue = useWatch({
+    control: form.control,
+    name: 'confirmPassword',
+  })
   const reset = form.reset
   const cancel = security.cancel
 
@@ -99,7 +114,10 @@ export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
     props.onOpenChange(open)
   }
   const submit = async (values: PasswordChangeValues) => {
-    if (supplier && [...values.newPassword].length < 15) {
+    if (
+      supplier &&
+      [...values.newPassword].length < SUPPLIER_PASSWORD_MIN_LENGTH
+    ) {
       form.setError(
         'newPassword',
         {
@@ -227,16 +245,20 @@ export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>{t('New Password')}</FormLabel>
-                  <FormControl>
+                  <FormControl describedBy='change-password-strength'>
                     <PasswordInput
                       {...field}
                       autoComplete='new-password'
                       disabled={security.pending}
                     />
                   </FormControl>
-                  <p className='text-muted-foreground text-xs'>
-                    {t('Use 8–128 characters.')}
-                  </p>
+                  <PasswordStrength
+                    id='change-password-strength'
+                    value={newPasswordValue}
+                    minLength={
+                      supplier ? SUPPLIER_PASSWORD_MIN_LENGTH : undefined
+                    }
+                  />
                   <FormMessage />
                 </FormItem>
               )}
@@ -244,16 +266,22 @@ export function ChangePasswordDialog(props: ChangePasswordDialogProps) {
             <FormField
               control={form.control}
               name='confirmPassword'
-              render={({ field }) => (
+              render={({ field, fieldState }) => (
                 <FormItem>
                   <FormLabel>{t('Confirm New Password')}</FormLabel>
-                  <FormControl>
+                  <FormControl describedBy='change-password-confirmation-status'>
                     <PasswordInput
                       {...field}
                       autoComplete='new-password'
                       disabled={security.pending}
                     />
                   </FormControl>
+                  <PasswordConfirmationStatus
+                    id='change-password-confirmation-status'
+                    password={newPasswordValue}
+                    confirmation={confirmPasswordValue}
+                    hasFieldError={!!fieldState.error}
+                  />
                   <FormMessage />
                 </FormItem>
               )}

@@ -275,7 +275,19 @@ export function RiskAcknowledgementDialog({
                         onChange={(event) =>
                           handleTextPartChange(
                             part.inputIndex ?? 0,
-                            event.target.value
+                            event.currentTarget.value
+                          )
+                        }
+                        onCompositionEnd={(event) =>
+                          handleTextPartChange(
+                            part.inputIndex ?? 0,
+                            event.currentTarget.value
+                          )
+                        }
+                        onBlur={(event) =>
+                          handleTextPartChange(
+                            part.inputIndex ?? 0,
+                            event.currentTarget.value
                           )
                         }
                         placeholder={
@@ -296,7 +308,11 @@ export function RiskAcknowledgementDialog({
               ) : (
                 <Textarea
                   value={typedText}
-                  onChange={(event) => setTypedText(event.target.value)}
+                  onChange={(event) => setTypedText(event.currentTarget.value)}
+                  onCompositionEnd={(event) =>
+                    setTypedText(event.currentTarget.value)
+                  }
+                  onBlur={(event) => setTypedText(event.currentTarget.value)}
                   placeholder={
                     inputPlaceholder ?? t('Type the confirmation text here')
                   }

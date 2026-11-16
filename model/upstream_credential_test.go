@@ -18,6 +18,14 @@ import (
 	"gorm.io/gorm/schema"
 )
 
+func updateCredentialChannel(channel *Channel) error {
+	key := channel.Key
+	return channel.UpdateWithKey(func(current *Channel) error {
+		current.Key = key
+		return nil
+	})
+}
+
 func TestSupplierCredentialsRemainEncryptedAndTenantOwned(t *testing.T) {
 	truncateTables(t)
 	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
@@ -52,11 +60,11 @@ func TestSupplierCredentialsRemainEncryptedAndTenantOwned(t *testing.T) {
 	_, err = UpdateUpstreamCredentialMetadata(a.GetUpstreamCredentialSnapshot(0).CredentialID, UpstreamCredentialMetadata{SupplierID: "supplier-b"})
 	assert.Error(t, err)
 	a.OwnerSupplierID = "supplier-b"
-	assert.Error(t, a.Update())
+	assert.Error(t, updateCredentialChannel(&a))
 	a.OwnerSupplierID = "supplier-a"
 	a.SecretsWriteOnly = false
 	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", a.Id).Updates(map[string]any{"supplier_version": 5, "supplier_priority": 7, "supplier_paused": true, "supplier_validated": false}).Error)
-	require.NoError(t, a.Update())
+	require.NoError(t, updateCredentialChannel(&a))
 	assert.True(t, a.SecretsWriteOnly)
 	assert.EqualValues(t, 5, a.SupplierVersion)
 	assert.EqualValues(t, 7, a.SupplierPriority)
@@ -70,7 +78,7 @@ func TestSupplierCredentialsRemainEncryptedAndTenantOwned(t *testing.T) {
 	assert.NotContains(t, a.Key, secret, "shared cache value must remain encrypted")
 	a.Key = secret + "\nsecond-secret"
 	a.ChannelInfo = ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}
-	require.NoError(t, a.Update())
+	require.NoError(t, updateCredentialChannel(&a))
 	previousCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousCache })
@@ -105,9 +113,11 @@ func TestUpstreamCredentialIdentityAndCostSnapshots(t *testing.T) {
 	supplier, err := CreateUpstreamSupplier("  Procurement A  ")
 	require.NoError(t, err)
 	zero := 0.0
+	revision := channelsRevision(t)
 	credential, err := UpdateUpstreamCredentialMetadata(original[1].CredentialID, UpstreamCredentialMetadata{Alias: "primary", SupplierID: supplier.ID, Tags: []string{"production", "shared", "production"}, CostRatio: &zero})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"production", "shared"}, credential.Tags)
+	assert.Greater(t, channelsRevision(t), revision, "committed supplier and cost metadata changes invalidate other nodes")
 	current, err := GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	free := current.GetUpstreamCredentialSnapshot(1)
@@ -133,7 +143,7 @@ func TestUpstreamCredentialIdentityAndCostSnapshots(t *testing.T) {
 
 	// Reordering and deleting keys changes slots without transferring ownership.
 	current.Key = "test-credential-c\ntest-credential-b"
-	require.NoError(t, current.Update())
+	require.NoError(t, updateCredentialChannel(current))
 	assert.Equal(t, original[2].CredentialID, current.GetUpstreamCredentialSnapshot(0).CredentialID)
 	assert.Equal(t, original[2].BindingID, current.GetUpstreamCredentialSnapshot(0).BindingID)
 	assert.Equal(t, free.BindingID, current.GetUpstreamCredentialSnapshot(1).BindingID)
@@ -148,7 +158,7 @@ func TestUpstreamCredentialIdentityAndCostSnapshots(t *testing.T) {
 	common.CryptoSecret = "different-process-secret"
 	t.Cleanup(func() { common.CryptoSecret = cryptoSecret })
 	current.Key = "test-credential-a\ntest-credential-new"
-	require.NoError(t, current.Update())
+	require.NoError(t, updateCredentialChannel(current))
 	assert.Equal(t, original[0].BindingID, current.GetUpstreamCredentialSnapshot(0).BindingID)
 	assert.NotEqual(t, free.CredentialID, current.GetUpstreamCredentialSnapshot(1).CredentialID)
 	assert.Empty(t, current.GetUpstreamCredentialSnapshot(1).SupplierID)
@@ -156,13 +166,13 @@ func TestUpstreamCredentialIdentityAndCostSnapshots(t *testing.T) {
 
 	// Clearing a channel cost retains unknown; overriding with zero stays known.
 	current.CostRatio, current.CostRatioSet = nil, true
-	require.NoError(t, current.Update())
+	require.NoError(t, updateCredentialChannel(current))
 	unknown := current.GetUpstreamCredentialSnapshot(1)
 	assert.Nil(t, unknown.EffectiveCostRatio)
 	assert.Equal(t, "unknown", unknown.CostSource)
 	assert.NotEqual(t, original[0].CostVersionID, unknown.CostVersionID)
 	current.CostRatio = &zero
-	require.NoError(t, current.Update())
+	require.NoError(t, updateCredentialChannel(current))
 	require.NotNil(t, current.GetUpstreamCredentialSnapshot(1).EffectiveCostRatio)
 	assert.Zero(t, *current.GetUpstreamCredentialSnapshot(1).EffectiveCostRatio)
 
@@ -207,8 +217,10 @@ func TestUpstreamCredentialValidationAndAtomicConfiguration(t *testing.T) {
 			tx.AddError(gorm.ErrInvalidData)
 		}
 	}))
+	revision := channelsRevision(t)
 	channel.Key, channel.Models = "replacement-material", "model-b"
-	assert.Error(t, channel.Update())
+	assert.Error(t, updateCredentialChannel(&channel))
+	assert.Equal(t, revision, channelsRevision(t), "a rolled-back edit publishes no cluster reload")
 	require.NoError(t, DB.Callback().Update().Remove(callback))
 	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callback) })
 	stored, err := GetChannelById(channel.Id, true)
@@ -293,7 +305,7 @@ func TestUpstreamCredentialReorderPreservesKeyAvailability(t *testing.T) {
 	require.NoError(t, err)
 	staleEnable.ExpectKeyState(staleEnable)
 	require.True(t, UpdateChannelStatus(channel.Id, "state-key-b", common.ChannelStatusAutoDisabled, "upstream key rejected"))
-	assert.ErrorContains(t, staleEnable.Update(), "channel key state changed")
+	assert.ErrorContains(t, updateCredentialChannel(staleEnable), "channel key state changed")
 	disabled, err := GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	disabledTime := disabled.ChannelInfo.MultiKeyDisabledTime[1]
@@ -302,7 +314,7 @@ func TestUpstreamCredentialReorderPreservesKeyAvailability(t *testing.T) {
 	// A reorder without an expected availability edit preserves the latest
 	// disabled material instead of saving the older availability map.
 	stale.Key = "state-key-b\nstate-key-a"
-	require.NoError(t, stale.Update())
+	require.NoError(t, updateCredentialChannel(stale))
 	assert.Equal(t, originalB.CredentialID, stale.GetUpstreamCredentialSnapshot(0).CredentialID)
 	assert.Equal(t, originalA.CredentialID, stale.GetUpstreamCredentialSnapshot(1).CredentialID)
 	assert.Equal(t, map[int]int{0: common.ChannelStatusAutoDisabled}, stale.ChannelInfo.MultiKeyStatusList)
@@ -316,7 +328,7 @@ func TestUpstreamCredentialReorderPreservesKeyAvailability(t *testing.T) {
 	// Replacing the disabled material gives the new credential its default
 	// enabled state, with no previous credential's reason or failure time.
 	stale.Key = "state-key-c\nstate-key-a"
-	require.NoError(t, stale.Update())
+	require.NoError(t, updateCredentialChannel(stale))
 	assert.NotEqual(t, originalB.CredentialID, stale.GetUpstreamCredentialSnapshot(0).CredentialID)
 	assert.Empty(t, stale.ChannelInfo.MultiKeyStatusList)
 	assert.Empty(t, stale.ChannelInfo.MultiKeyDisabledReason)
@@ -330,7 +342,7 @@ func TestUpstreamCredentialReorderPreservesKeyAvailability(t *testing.T) {
 	stale.ChannelInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
 	stale.ChannelInfo.MultiKeyDisabledReason = map[int]string{1: "manual operation"}
 	stale.ChannelInfo.MultiKeyDisabledTime = map[int]int64{1: 1234}
-	require.NoError(t, stale.Update())
+	require.NoError(t, updateCredentialChannel(stale))
 	pollingSnapshot.ChannelInfo.MultiKeyPollingIndex = 1
 	require.NoError(t, pollingSnapshot.SaveChannelInfo())
 	current, err := GetChannelById(channel.Id, true)
@@ -342,7 +354,7 @@ func TestUpstreamCredentialReorderPreservesKeyAvailability(t *testing.T) {
 	current.ChannelInfo.MultiKeyStatusList = map[int]int{}
 	current.ChannelInfo.MultiKeyDisabledReason = map[int]string{}
 	current.ChannelInfo.MultiKeyDisabledTime = map[int]int64{}
-	require.NoError(t, current.Update())
+	require.NoError(t, updateCredentialChannel(current))
 	assert.Empty(t, current.ChannelInfo.MultiKeyStatusList)
 	assert.Empty(t, current.ChannelInfo.MultiKeyDisabledReason)
 	assert.Empty(t, current.ChannelInfo.MultiKeyDisabledTime)
@@ -376,7 +388,7 @@ func TestUpstreamCredentialStaleKeyManagementCannotOverrideAvailability(t *testi
 				stale.Status = common.ChannelStatusManuallyDisabled
 				stale.SetOtherInfo(map[string]any{"status_reason": ChannelStatusReasonAllKeysDisabled})
 			}
-			assert.ErrorContains(t, stale.Update(), "channel key state changed")
+			assert.ErrorContains(t, updateCredentialChannel(stale), "channel key state changed")
 			current, err := GetChannelById(channel.Id, true)
 			require.NoError(t, err)
 			assert.Equal(t, "delete-a\ndelete-b", current.Key)
@@ -404,7 +416,7 @@ func TestUpstreamCredentialStaleKeyManagementCannotOverrideAvailability(t *testi
 		stale.ChannelInfo.MultiKeyStatusList = map[int]int{}
 		stale.Status = common.ChannelStatusEnabled
 		stale.SetOtherInfo(map[string]any{"status_reason": ""})
-		assert.ErrorContains(t, stale.Update(), "channel key state changed")
+		assert.ErrorContains(t, updateCredentialChannel(stale), "channel key state changed")
 		current, err := GetChannelById(channel.Id, true)
 		require.NoError(t, err)
 		assert.Equal(t, common.ChannelStatusManuallyDisabled, current.Status)
@@ -450,7 +462,7 @@ func TestUpstreamCredentialExplicitRotationPreservesProcurementIdentity(t *testi
 	assert.Equal(t, rotated.CredentialID, oldVersion.CredentialID)
 	// General editing continues to mean an unrelated replacement.
 	loaded.Key = "unrelated-account-material"
-	require.NoError(t, loaded.Update())
+	require.NoError(t, updateCredentialChannel(loaded))
 	assert.NotEqual(t, rotated.CredentialID, loaded.GetUpstreamCredentialSnapshot(0).CredentialID)
 	assert.Empty(t, loaded.GetUpstreamCredentialSnapshot(0).SupplierID)
 	assert.Nil(t, loaded.GetUpstreamCredentialSnapshot(0).CostRatio)
@@ -525,7 +537,7 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			common.MemoryCacheEnabled = false
 			initCol()
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&ChannelLimitEvent{}, &ChannelLimitAttempt{}, &ChannelDailyBudget{}, &ChannelLimitConfig{}, &Ability{}, &Channel{}, &ChannelCredentialBinding{}, &UpstreamCredentialVersion{}, &UpstreamCredential{}, &UpstreamSupplier{}, &UpstreamCredentialFingerprintSecret{}))
+				require.NoError(t, db.Migrator().DropTable(&SystemTask{}, &ChannelLimitEvent{}, &ChannelLimitAttempt{}, &ChannelDailyBudget{}, &ChannelLimitConfig{}, &Ability{}, &Channel{}, &ChannelCredentialBinding{}, &UpstreamCredentialVersion{}, &UpstreamCredential{}, &UpstreamSupplier{}, &UpstreamCredentialFingerprintSecret{}))
 				DB = previousDB
 				common.SetMainDatabaseType(previousType)
 				common.MemoryCacheEnabled = previousMemoryCache
@@ -543,7 +555,7 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			legacy := legacyUpstreamMatrixChannel{Type: constant.ChannelTypeOpenAI, Key: "matrix-legacy-material", Name: "legacy", Models: "test-model", Group: "default", UsedQuota: 1234}
 			require.NoError(t, db.Create(&legacy).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+				require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}, &SystemTask{}))
 				require.NoError(t, AutoMigrateUpstreamCredentialSchema(db))
 				require.NoError(t, AutoMigrateChannelLimitSchema(db))
 				require.NoError(t, BackfillUpstreamCredentials())
@@ -578,9 +590,9 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			fresh.ExpectKeyState(&fresh)
 			require.True(t, UpdateChannelStatus(fresh.Id, "matrix-other-material", common.ChannelStatusAutoDisabled, "matrix key rejected"))
 			fresh.Key = "matrix-other-material\nmatrix-legacy-material"
-			assert.ErrorContains(t, fresh.Update(), "channel key state changed")
+			assert.ErrorContains(t, updateCredentialChannel(&fresh), "channel key state changed")
 			fresh.keyStateExpected = nil // An unconditional reorder still carries the latest key state.
-			require.NoError(t, fresh.Update())
+			require.NoError(t, updateCredentialChannel(&fresh))
 			assert.Equal(t, before.BindingID, fresh.GetUpstreamCredentialSnapshot(1).BindingID)
 			assert.Equal(t, map[int]int{0: common.ChannelStatusAutoDisabled}, fresh.ChannelInfo.MultiKeyStatusList)
 			assert.Equal(t, map[int]string{0: "matrix key rejected"}, fresh.ChannelInfo.MultiKeyDisabledReason)
@@ -589,7 +601,7 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, fresh.ChannelInfo, *info)
 			fresh.CostRatio, fresh.CostRatioSet = &zero, true
-			require.NoError(t, fresh.Update())
+			require.NoError(t, updateCredentialChannel(&fresh))
 			require.NotNil(t, fresh.CostRuleChange)
 			assert.Nil(t, fresh.CostRuleChange.BeforeRatio)
 			require.NotNil(t, fresh.CostRuleChange.AfterRatio)
@@ -597,7 +609,7 @@ func TestUpstreamCredentialDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, fresh.CostVersionID, fresh.CostRuleChange.AfterVersionID)
 			assert.NotEqual(t, fresh.CostRuleChange.BeforeVersionID, fresh.CostRuleChange.AfterVersionID)
 			fresh.CostRatio = nil
-			require.NoError(t, fresh.Update())
+			require.NoError(t, updateCredentialChannel(&fresh))
 			require.NotNil(t, fresh.CostRuleChange)
 			require.NotNil(t, fresh.CostRuleChange.BeforeRatio)
 			assert.Zero(t, *fresh.CostRuleChange.BeforeRatio)

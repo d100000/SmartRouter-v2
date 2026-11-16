@@ -148,6 +148,7 @@ func SaveSupplierAccount(account *SupplierAccount, expected int64, transactions 
 		err := DB.Transaction(func(tx *gorm.DB) error { return SaveSupplierAccount(account, expected, tx) })
 		if err == nil {
 			invalidateRoutingMetadata()
+			BumpSyncTopic(SyncTopicChannels)
 		}
 		return err
 	}
@@ -353,6 +354,7 @@ func PublishSupplierChannelDraft(channelID int, owner string, version int64, mod
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
 	}
 	return err
 }
@@ -430,6 +432,7 @@ func CopySupplierChannel(id int, owner string, version int64, userID int, name s
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
 	}
 	return copyID, err
 }
@@ -473,6 +476,7 @@ func DiscardSupplierChannelDraft(id int, owner string, version int64) error {
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
 	}
 	return err
 }

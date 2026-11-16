@@ -508,6 +508,7 @@ func SaveSupplierChannel(c *gin.Context) {
 	// on a test that could be blocked by a daily budget or a manual pause.
 	if metadataOnly {
 		model.InitChannelCache()
+		model.BumpSyncTopic(model.SyncTopicChannels)
 		GetSupplierChannel(c)
 		return
 	}
@@ -537,6 +538,7 @@ func SetSupplierChannelStatus(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	model.BumpSyncTopic(model.SyncTopicChannels)
 	recordManageAudit(c, "supplier.channel.pause", map[string]any{"id": channel.Id, "paused": request.Paused})
 	common.ApiSuccess(c, gin.H{"version": request.Version, "paused": request.Paused})
 }
@@ -567,6 +569,7 @@ func CopySupplierChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	model.BumpSyncTopic(model.SyncTopicChannels)
 	recordManageAudit(c, "supplier.channel.copy", map[string]any{"id": id, "source_id": channel.Id, "supplier_id": channel.OwnerSupplierID})
 	common.ApiSuccess(c, gin.H{"id": id})
 }
@@ -587,6 +590,7 @@ func DiscardSupplierChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	model.BumpSyncTopic(model.SyncTopicChannels)
 	recordManageAudit(c, "supplier.channel.discard", map[string]any{"id": channel.Id, "supplier_id": channel.OwnerSupplierID})
 	common.ApiSuccess(c, nil)
 }
@@ -920,6 +924,7 @@ func SaveSupplierAccount(c *gin.Context) {
 		_, _ = model.RevokeAllUserSessions(request.UserID, "supplier_configuration_changed")
 	}
 	model.InitChannelCache()
+	model.BumpSyncTopic(model.SyncTopicChannels)
 	recordManageAudit(c, "supplier.configure", map[string]any{"supplier_id": id, "revision": account.Revision, "supply_enabled": account.SupplyEnabled})
 	if !account.SupplyEnabled {
 		var ids []int
@@ -1385,6 +1390,7 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 	defer func() {
 		_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ? AND status = ?", id, version, "testing").Updates(map[string]any{"status": status, "error_code": status}).Error
 		model.InitChannelCache()
+		model.BumpSyncTopic(model.SyncTopicChannels)
 	}()
 	account, err := model.GetSupplierAccount(owner)
 	if err != nil || !account.SupplyEnabled || !account.AllowsTemplate(draft.Template(), strings.Split(draft.Models, ",")) {

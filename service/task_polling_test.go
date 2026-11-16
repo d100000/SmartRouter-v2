@@ -195,6 +195,12 @@ func TestRedactVideoResponseBodyDropsInteractionInlineVideo(t *testing.T) {
 	assert.Equal(t, "done", content[1].(map[string]any)["text"])
 }
 
+func TestRedactVideoResponseBodyKeepsUntouchedBytes(t *testing.T) {
+	body := []byte(`{"name":"op","response":{"videos":[{"uri":"u","bytesBase64Encoded":"x"}],"durationSeconds":8.0,"bytesBase64Encoded":"y"},"done":true}`)
+
+	assert.Equal(t, `{"name":"op","response":{"videos":[{"uri":"u"}],"durationSeconds":8.0},"done":true}`, string(redactVideoResponseBody(body)))
+}
+
 func seedTaskPollingChannel(t *testing.T, id int, disableSleep bool) {
 	t.Helper()
 	ch := &model.Channel{
@@ -1340,4 +1346,102 @@ func TestTaskProcurementEstimateAndUnknownCompletion(t *testing.T) {
 			assert.Equal(t, tc.audio, snapshot.Observation.AudioSeconds != nil)
 		})
 	}
+}
+
+// A task reports once, when it reaches its final state: not per poll, not
+// when another poller lost the race, never when no instance may report it.
+func TestTaskReportsOnceAtTheFinalState(t *testing.T) {
+	truncate(t)
+	const userID, tokenID, channelID = 520, 520, 520
+	seedUser(t, userID, 10_000)
+	seedToken(t, tokenID, userID, "sk-poll-report", 7_000)
+	ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Name: "poll", Key: "sk-test", Status: common.ChannelStatusEnabled}
+
+	var reported []string
+	previous := ReportTaskFunc
+	ReportTaskFunc = func(task *model.Task) { reported = append(reported, task.TaskID+":"+string(task.Status)) }
+	t.Cleanup(func() { ReportTaskFunc = previous })
+
+	newTask := func(id string, plugins bool) *model.Task {
+		task := makeTask(userID, channelID, 1_000, tokenID, BillingSourceWallet, 0)
+		task.TaskID = id
+		task.PrivateData.UpstreamTaskID = "upstream_" + id
+		if plugins {
+			task.PrivateData.RequestPlugins = &model.TaskRequestPlugins{Instances: []string{"audit"}}
+		}
+		require.NoError(t, model.DB.Create(task).Error)
+		return task
+	}
+	reload := func(task *model.Task) *model.Task {
+		var stored model.Task
+		require.NoError(t, model.DB.First(&stored, task.ID).Error)
+		return &stored
+	}
+	poll := func(task *model.Task, status model.TaskStatus) {
+		adaptor := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: string(status), Url: "https://cdn.example.com/v.mp4"}}
+		require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{
+			task.GetUpstreamTaskID(): task,
+		}))
+	}
+
+	task := newTask("report_once", true)
+	stale := reload(task)
+	poll(task, model.TaskStatusInProgress)
+	poll(reload(task), model.TaskStatusInProgress)
+	assert.Empty(t, reported)
+
+	poll(reload(task), model.TaskStatusSuccess)
+	assert.Equal(t, []string{"report_once:SUCCESS"}, reported)
+	// Another poller that read the row before it finished loses the update.
+	poll(stale, model.TaskStatusSuccess)
+	assert.Len(t, reported, 1)
+
+	plain := newTask("no_plugins", false)
+	poll(plain, model.TaskStatusSuccess)
+	assert.Len(t, reported, 1)
+
+	failed := newTask("fails", true)
+	poll(failed, model.TaskStatusFailure)
+	assert.Equal(t, "fails:FAILURE", reported[1])
+
+	previousTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+	timedOut := newTask("times_out", true)
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", timedOut.ID).Update("submit_time", time.Now().Add(-time.Hour).Unix()).Error)
+	sweepTimedOutTasks(context.Background())
+	sweepTimedOutTasks(context.Background())
+	assert.Equal(t, []string{"report_once:SUCCESS", "fails:FAILURE", "times_out:FAILURE"}, reported)
+}
+
+func TestTaskCredentialLookupFailuresRespectRefundThreshold(t *testing.T) {
+	truncate(t)
+	const userID, tokenID, channelID = 521, 521, 521
+	seedUser(t, userID, 10_000)
+	seedToken(t, tokenID, userID, "sk-credential-poll", 7_000)
+	previous := constant.TaskPollMaxFailures
+	constant.TaskPollMaxFailures = 2
+	t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
+	task := makeTask(userID, channelID, 1_000, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "credential_lookup_failure"
+	task.PrivateData.UpstreamTaskID = "upstream-credential"
+	require.NoError(t, model.DB.Create(task).Error)
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeTaskPlugin, Key: "old", Status: common.ChannelStatusEnabled}
+	adaptor := &scriptedPollingAdaptor{fetchErr: errors.New("task credential connection changed")}
+	poll := func(task *model.Task) {
+		require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+	}
+	poll(task)
+	assert.NotEqualValues(t, model.TaskStatusFailure, task.Status)
+	assert.Equal(t, 1, task.PrivateData.PollFailures)
+	assert.Equal(t, 10_000, getUserQuota(t, userID), "a credential lookup failure is not an upstream terminal failure")
+	var stale model.Task
+	require.NoError(t, model.DB.First(&stale, task.ID).Error)
+	poll(task)
+	assert.EqualValues(t, model.TaskStatusFailure, task.Status)
+	assert.Equal(t, 11_000, getUserQuota(t, userID))
+	assert.Equal(t, 8_000, getTokenRemainQuota(t, tokenID))
+	poll(&stale)
+	assert.Equal(t, 11_000, getUserQuota(t, userID), "a stale poll cannot refund twice")
+	assert.EqualValues(t, 1, countLogs(t))
 }

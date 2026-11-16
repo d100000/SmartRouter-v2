@@ -14,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -321,6 +322,73 @@ func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
 	return tx.Model(&ChannelLimitConfig{}).Where("channel_id = ?", channel.Id).Update("budget_ready", channel.ProcurementCostReady()).Error
 }
 
+// syncPluginCredentialRotation keeps procurement ownership across a refresh
+// of the same authenticated plugin account. Replacements with a different or
+// missing account identity use ordinary material-based identity assignment.
+func syncPluginCredentialRotation(tx *gorm.DB, previousKey string, channel *Channel) error {
+	if channel.Type != constant.ChannelTypeTaskPlugin || previousKey == channel.Key {
+		return syncChannelUpstreamCredentials(tx, channel)
+	}
+	previous := *channel
+	previous.Key, previous.Keys = previousKey, nil
+	previousAccounts := make(map[string]int)
+	for index, line := range channelCredentialKeys(&previous) {
+		if credential, ok := jsplugin.ParseCredential(line); ok && credential.AccountID != "" {
+			previousAccounts[credential.Plugin+"\x00"+credential.AccountID] = index
+		}
+	}
+	material, err := upstreamFingerprintSecret(tx)
+	if err != nil {
+		return err
+	}
+	namespace, err := upstreamCredentialNamespace(channel)
+	if err != nil {
+		return err
+	}
+	privateDB := tx.Session(&gorm.Session{Logger: gormlogger.Discard})
+	for _, line := range channelCredentialKeys(channel) {
+		credential, ok := jsplugin.ParseCredential(line)
+		if !ok || credential.AccountID == "" {
+			continue
+		}
+		index, ok := previousAccounts[credential.Plugin+"\x00"+credential.AccountID]
+		if !ok {
+			continue
+		}
+		var binding ChannelCredentialBinding
+		err := tx.Where("channel_id = ? AND active_slot = ? AND active = ?", channel.Id, index, true).First(&binding).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		fingerprint := common.GenerateHMACWithKey(material, namespace+"\x00"+line)
+		var version UpstreamCredentialVersion
+		err = privateDB.Where("fingerprint = ?", fingerprint).First(&version).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			version = UpstreamCredentialVersion{ID: uuid.NewString(), CredentialID: binding.CredentialID, Fingerprint: fingerprint, CreatedTime: common.GetTimestamp()}
+			if channel.SecretsWriteOnly {
+				version.SecretCiphertext, err = EncryptSupplierSecret(channel.OwnerSupplierID, line)
+				if err != nil {
+					return err
+				}
+			}
+			if err := privateDB.Create(&version).Error; err != nil {
+				return errors.New("failed to register rotated plugin credential")
+			}
+		} else if err != nil {
+			return errors.New("failed to inspect rotated plugin credential")
+		} else if version.CredentialID != binding.CredentialID {
+			return errors.New("replacement material already belongs to another procurement identity")
+		}
+		if err := tx.Model(&binding).Update("credential_version_id", version.ID).Error; err != nil {
+			return err
+		}
+	}
+	return syncChannelUpstreamCredentials(tx, channel)
+}
+
 // refreshProcurementCostSnapshots updates only non-secret pricing metadata.
 // Supplier defaults can therefore change without loading or decrypting Keys.
 func (channel *Channel) refreshProcurementCostSnapshots() error {
@@ -502,6 +570,7 @@ func RotateChannelUpstreamCredential(channelID int, expectedKey, newKey string) 
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
 	}
 	return err
 }
@@ -685,5 +754,9 @@ func UpdateUpstreamCredentialMetadata(id string, metadata UpstreamCredentialMeta
 		}
 		return nil
 	})
+	if err == nil {
+		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
+	}
 	return &credential, err
 }

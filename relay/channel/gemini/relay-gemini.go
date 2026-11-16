@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
@@ -22,7 +23,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 )
 
 func buildUsageFromGeminiMetadata(metadata *dto.GeminiUsageMetadata, fallbackPromptTokens int) dto.Usage {
@@ -218,12 +218,12 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	responseText := strings.Builder{}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		upstreamError := gjson.Get(data, "error")
-		if upstreamError.Exists() && upstreamError.Type != gjson.Null && upstreamError.Type != gjson.False || strings.EqualFold(sr.Event, "error") {
+		upstreamError := ojson.Get(data, "error")
+		if upstreamError.Exists() && upstreamError.Type != ojson.Null && upstreamError.Type != ojson.False || strings.EqualFold(sr.Event, "error") {
 			message := i18n.T(c, i18n.MsgRelayStreamUpstreamError)
-			if detail := upstreamError.Get("message"); detail.Type == gjson.String && strings.TrimSpace(detail.Str) != "" {
+			if detail := upstreamError.Get("message"); detail.Type == ojson.String && strings.TrimSpace(detail.Str) != "" {
 				message = common.MaskSensitiveInfo(detail.Str, common.UpstreamAddresses(c)...)
-			} else if upstreamError.Type == gjson.String && strings.TrimSpace(upstreamError.Str) != "" {
+			} else if upstreamError.Type == ojson.String && strings.TrimSpace(upstreamError.Str) != "" {
 				message = common.MaskSensitiveInfo(upstreamError.Str, common.UpstreamAddresses(c)...)
 			}
 			if len(message) > common.LocalLogContentLimit {
@@ -248,7 +248,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			info.PerformanceBusinessRejection = true
 			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
 		}
-		info.ObserveResponseModel(gjson.Get(data, "modelVersion").Str)
+		info.ObserveResponseModel(ojson.Get(data, "modelVersion").Str)
 		for _, candidate := range geminiResponse.Candidates {
 			if candidate.FinishReason == nil || *candidate.FinishReason == "" || *candidate.FinishReason == "FINISH_REASON_UNSPECIFIED" {
 				continue
@@ -491,7 +491,7 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	info.ObserveResponseModel(gjson.GetBytes(responseBody, "modelVersion").Str)
+	info.ObserveResponseModel(ojson.GetBytes(responseBody, "modelVersion").Str)
 	var grounding geminiGroundingCounter
 	grounding.observe(&geminiResponse)
 	grounding.commit(info)
@@ -599,7 +599,13 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 	// Google has not yet clarified how embedding models will be billed
 	// refer to openai billing method to use input tokens billing
 	// https://platform.openai.com/docs/guides/embeddings#what-are-embeddings
-	usage := service.ResponseText2Usage(c, "", info.UpstreamModelName, info.GetFallbackPromptTokens())
+	var usage *dto.Usage
+	if upstream := geminiResponse.UsageMetadata.GeminiUsageMetadata(); upstream != nil {
+		upstreamUsage := buildUsageFromGeminiMetadata(upstream, 0)
+		usage = &upstreamUsage
+	} else {
+		usage = service.ResponseText2Usage(c, "", info.UpstreamModelName, info.GetFallbackPromptTokens())
+	}
 	openAIResponse.Usage = *usage
 
 	jsonResponse, jsonErr := common.Marshal(openAIResponse)

@@ -24,6 +24,7 @@ import (
 )
 
 const schedulerContextKey = "scheduling_request"
+const unsentCredentialRetryChannelKey = "unsent_credential_retry_channel"
 
 type schedulingRequest struct {
 	mu                        sync.Mutex
@@ -88,6 +89,8 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 		return nil, err
 	}
 	state, request := schedulerRequestForGroup(c, group, modelName)
+	credentialRetryChannel := c.GetInt(unsentCredentialRetryChannelKey)
+	c.Set(unsentCredentialRetryChannelKey, 0)
 	state.mu.Lock()
 	if state.attempt != nil && !state.started {
 		// Plugin preparation can reject a provisional candidate. Release its
@@ -119,7 +122,7 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 			tiers[priority] = nil
 			priorities = append(priorities, priority)
 		}
-		if slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
+		if channel.Id != credentialRetryChannel && slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
 			continue
 		}
 		candidate := SchedulerCandidate(channel)
@@ -261,6 +264,16 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 	state.currentRequest = request
 	state.mu.Unlock()
 	return nil
+}
+
+// PrepareUnsentPluginCredentialRetry permits another enabled key on the same
+// channel only when the rejected key required login and no request was sent.
+// The normal retry budget and channel reservations still apply; the failed key
+// has already been disabled by the credential resolver.
+func PrepareUnsentPluginCredentialRetry(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
+	if info != nil && info.ChannelIsMultiKey && info.ChannelLimitAttempt != nil && !info.ChannelLimitAttempt.Sent && !info.ChannelLimitAttempt.PriorPhysicalRequestSent && errors.Is(apiErr, ErrPluginCredentialNeedsLogin) {
+		c.Set(unsentCredentialRetryChannelKey, info.ChannelId)
+	}
 }
 
 // StartSchedulingAttempt runs after local validation/billing and immediately
@@ -452,7 +465,7 @@ func (w *schedulingResponseWriter) Write(body []byte) (int, error) {
 	}
 	if n > 0 {
 		observeFailureOutput(w.ctx, body[:n])
-		ObserveSchedulingOutput(w.ctx, body[:n])
+		observeSchedulingOutput(w.ctx, body[:n], w.ResponseWriter.Status())
 	}
 	return n, err
 }
@@ -466,6 +479,14 @@ func (w *schedulingResponseWriter) WriteString(body string) (int, error) {
 // The bounded partial-line buffer supports split SSE writes without retaining
 // an entire response or any request content in the scheduler.
 func ObserveSchedulingOutput(c *gin.Context, body []byte) {
+	status := http.StatusOK
+	if c.Writer != nil {
+		status = c.Writer.Status()
+	}
+	observeSchedulingOutput(c, body, status)
+}
+
+func observeSchedulingOutput(c *gin.Context, body []byte, status int) {
 	value, exists := c.Get(schedulerContextKey)
 	if !exists || len(body) == 0 {
 		return
@@ -479,7 +500,7 @@ func ObserveSchedulingOutput(c *gin.Context, body []byte) {
 	}
 	useful := false
 	if !state.stream {
-		useful = c.Writer == nil || c.Writer.Status() < 400
+		useful = status < http.StatusBadRequest
 	} else if len(state.pending) == 0 && !state.lineParsed && gjson.ValidBytes(body) {
 		useful = meaningfulSchedulingPayload(body)
 	} else {

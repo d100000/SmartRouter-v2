@@ -83,6 +83,11 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		})
 	}
 
+	RecordRelayErrorLog(c, channelError.ChannelId, err, relayInfo)
+}
+
+func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
+	upstreamURLs := common.UpstreamAddresses(c)
 	streamFailure := relayInfo != nil && relayInfo.StreamFailure != nil && relayInfo.StreamFailure.Error != nil
 	if streamFailure || constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
 		userId := c.GetInt("id")
@@ -98,6 +103,7 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		other.SetPublic("error_code", err.GetErrorCode())
 		other.SetPublic("status_code", err.StatusCode)
 		AppendRelayLogAdminInfo(c, relayInfo, other)
+		appendRequestPluginRecord(relayInfo, other)
 		AppendResponseModelLogInfo(relayInfo, other)
 		AppendTaskPluginContextAuditInfo(c, other)
 		appendStreamStatus(relayInfo, other)
@@ -112,6 +118,6 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		if streamMessage != "" {
 			message = streamMessage
 		}
-		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, message, tokenId, useTimeSeconds, isStream, userGroup, other)
+		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, message, tokenId, useTimeSeconds, isStream, userGroup, other)
 	}
 }

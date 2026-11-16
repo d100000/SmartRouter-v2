@@ -184,6 +184,7 @@ func RecordChannelFundingFailure(attempt hosttypes.ChannelFundingAttempt, catego
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
 		CacheUpdateChannel(&channel)
 		CacheUpdateChannelStatus(channel.Id, channel.Status)
 	}
@@ -361,6 +362,7 @@ func resolveChannelFunding(id, revision, startedAt int64, enable, notify bool, u
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
 		CacheUpdateChannel(&channel)
 		CacheUpdateChannelStatus(channel.Id, channel.Status)
 	}

@@ -27,7 +27,10 @@ import type { SupplyLog } from '../types'
 export function SupplyTaskStatus(props: { log: SupplyLog }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  if (props.log.stage !== 'task_submit' && props.log.protocol !== 'async_task') {
+  if (
+    props.log.stage !== 'task_submit' &&
+    props.log.protocol !== 'async_task'
+  ) {
     return '—'
   }
   const status = props.log.task_status || 'unknown'

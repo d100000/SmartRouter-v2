@@ -161,11 +161,26 @@ func setupRelayRouterTestDB(t *testing.T) {
 	common.RedisEnabled = false
 	common.SQLitePath = fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
-	require.NoError(t, os.Setenv("SQL_DSN", "local"))
+	dsn := os.Getenv("TEST_ROUTER_SQL_DSN")
+	if dsn == "" {
+		dsn = "local"
+	}
+	require.NoError(t, os.Setenv("SQL_DSN", dsn))
 	require.NoError(t, model.InitDB())
 	model.LOG_DB = model.DB
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.Channel{}))
+	common.SetLogDatabaseType(common.MainDatabaseType())
+	if dsn != "local" {
+		// TEST_ROUTER_SQL_DSN names a dedicated, disposable integration
+		// database. Reset it between fixtures just like a new SQLite database.
+		tables, err := model.DB.Migrator().GetTables()
+		require.NoError(t, err)
+		for _, table := range tables {
+			require.NoError(t, model.DB.Migrator().DropTable(table))
+		}
+	}
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.Channel{}, &model.Option{}, &model.SystemTask{}, &model.UpstreamSupplier{}, &model.UpstreamCredential{}, &model.UpstreamCredentialVersion{}, &model.ChannelCredentialBinding{}, &model.UpstreamCredentialFingerprintSecret{}))
 
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(model.DB))
 	t.Cleanup(func() {
 		if sqlDB, err := model.DB.DB(); err == nil {
 			_ = sqlDB.Close()

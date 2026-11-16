@@ -310,7 +310,7 @@ func TestOverviewRealtimeRevenueMatchesCommittedContributions(t *testing.T) {
 				}
 			}))
 			t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callback)) })
-			err := PreWssConsumeQuota(ctx, info, &dto.RealtimeUsage{InputTokens: 10, TotalTokens: 10, InputTokenDetails: dto.InputTokenDetails{TextTokens: 10}})
+			_, err := PreWssConsumeQuota(ctx, info, &dto.RealtimeUsage{InputTokens: 10, TotalTokens: 10, InputTokenDetails: dto.InputTokenDetails{TextTokens: 10}})
 			if tc.directFailure != "" {
 				require.Error(t, err)
 			} else {
@@ -322,7 +322,8 @@ func TestOverviewRealtimeRevenueMatchesCommittedContributions(t *testing.T) {
 				common.QuotaPerUnit = unit * 2
 				t.Cleanup(func() { common.QuotaPerUnit = unit })
 			}
-			require.NoError(t, PreWssConsumeQuota(ctx, info, &dto.RealtimeUsage{InputTokens: 20, TotalTokens: 20, InputTokenDetails: dto.InputTokenDetails{TextTokens: 20}}))
+			_, err = PreWssConsumeQuota(ctx, info, &dto.RealtimeUsage{InputTokens: 20, TotalTokens: 20, InputTokenDetails: dto.InputTokenDetails{TextTokens: 20}})
+			require.NoError(t, err)
 			assert.Equal(t, tc.directRevenue, info.AnalyticsRealtimeRevenueQuota)
 			require.NotNil(t, info.AnalyticsBilling)
 			assert.False(t, info.AnalyticsBilling.RevenueConfirmed)

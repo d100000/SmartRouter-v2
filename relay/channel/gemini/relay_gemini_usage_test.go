@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -780,5 +781,42 @@ func TestGeminiHandlersCountGroundingQueries(t *testing.T) {
 			}
 			assert.Equal(t, tt.want, counts)
 		})
+	}
+}
+
+func TestEmbeddingUsageUsesUpstreamWithoutEagerFallback(t *testing.T) {
+	for _, protocol := range []string{"openai", "native", "native_batch"} {
+		for _, measured := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/measured=%t", protocol, measured), func(t *testing.T) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil)
+				info := &relaycommon.RelayInfo{IsGeminiBatchEmbedding: protocol == "native_batch", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-embedding-001"}}
+				fallbackCalls := 0
+				info.SetPromptTokenFallback(func() int { fallbackCalls++; return 17 })
+				body := `{"embedding":{"values":[0.2]},"embeddings":[{"values":[0.2]}]`
+				if measured {
+					body += `,"usageMetadata":{"promptTokenCount":11,"totalTokenCount":11}`
+				}
+				body += `}`
+				response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+				var usage *dto.Usage
+				var apiErr *types.NewAPIError
+				if protocol == "openai" {
+					usage, apiErr = GeminiEmbeddingHandler(c, info, response)
+				} else {
+					usage, apiErr = NativeGeminiEmbeddingHandler(c, response, info)
+				}
+				require.Nil(t, apiErr)
+				require.NotNil(t, usage)
+				if measured {
+					assert.Equal(t, 11, usage.PromptTokens)
+					assert.Zero(t, fallbackCalls)
+				} else {
+					assert.Equal(t, 17, usage.PromptTokens)
+					assert.Equal(t, 1, fallbackCalls)
+				}
+				assert.Zero(t, usage.CompletionTokens)
+			})
+		}
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -24,7 +25,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tidwall/gjson"
 )
 
 func TestAdaptorUsesExactRouteAndQueryAuth(t *testing.T) {
@@ -61,14 +61,18 @@ func TestAdaptorUsesExactRouteAndQueryAuth(t *testing.T) {
 // URL, and a channel proxy is dialed before the upstream; a failed handshake
 // must hide both.
 func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
-	previousDialer := websocket.DefaultDialer
-	dialer := *previousDialer
+	originalDialer := websocket.DefaultDialer
+	dialer := *originalDialer
 	dialer.Proxy = nil
-	dialer.NetDialContext = func(_ context.Context, _, address string) (net.Conn, error) {
-		return nil, fmt.Errorf("dial tcp %s: connection refused", address)
+	dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if strings.HasPrefix(address, "localhost:") {
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		}
+		return nil, fmt.Errorf("dial %s %s: test connection failure", network, address)
 	}
 	websocket.DefaultDialer = &dialer
-	t.Cleanup(func() { websocket.DefaultDialer = previousDialer })
+	t.Cleanup(func() { websocket.DefaultDialer = originalDialer })
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
@@ -1090,7 +1094,7 @@ func TestAdaptorConvertsClaudeAndGeminiRequestsToResponsesUpstream(t *testing.T)
 				require.NoError(t, err)
 				wire, err := common.Marshal(converted)
 				require.NoError(t, err)
-				assert.JSONEq(t, `[{"type":"web_search"}]`, gjson.GetBytes(wire, "tools").Raw)
+				assert.JSONEq(t, `[{"type":"web_search"}]`, ojson.GetBytes(wire, "tools").Raw)
 				url, err := adaptor.GetRequestURL(info)
 				require.NoError(t, err)
 				assert.Equal(t, "https://fallback.example/v1/responses", url)

@@ -25,6 +25,9 @@ var channelsIDM map[int]*Channel                     // all channels include dis
 var channel2advancedCustomConfig map[int]*kitdto.AdvancedCustomConfig
 var channelSyncLock sync.RWMutex
 
+// channelCacheReloadLock serializes full cache publication.
+var channelCacheReloadLock sync.Mutex
+
 // RoutingMetadataVersion changes after channel CRUD and cache publication.
 // Scheduling reconciles complete membership once per version, never from a
 // request-filtered candidate list or a full database scan on every request.
@@ -87,6 +90,8 @@ func GetSatisfiedChannelCandidates(group, modelName string, filters []dto.Channe
 
 func InitChannelCache() {
 	defer invalidateRoutingMetadata()
+	channelCacheReloadLock.Lock()
+	defer channelCacheReloadLock.Unlock()
 	if !common.MemoryCacheEnabled {
 		InvalidatePricingCache()
 		rebuildTaskAliasView()

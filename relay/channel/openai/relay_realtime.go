@@ -20,6 +20,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relay/requestplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -76,6 +77,19 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	sessionContext, cancelSession := context.WithCancel(c.Request.Context())
 	c.Request = c.Request.Clone(sessionContext)
 	defer target.Close()
+	var pluginWriteErr error
+	plugins := requestplugin.NewRealtime(c, info, func(message []byte) {
+		if err := writeRealtimeFrame(client, service.RedactUpstreamWebSocketCredential(message, info.ApiKey)); err != nil {
+			pluginWriteErr = err
+		}
+	}, func(message []byte) {
+		if err := writeRealtimeFrame(target, message); err != nil {
+			pluginWriteErr = err
+		}
+	})
+	if plugins != nil {
+		defer plugins.Close(info)
+	}
 	clientFrames, targetFrames := make(chan realtimeFrame, 4), make(chan realtimeFrame, 4)
 	go readRealtimeFrames(client, clientFrames, done)
 	go readRealtimeFrames(target, targetFrames, done)
@@ -170,6 +184,19 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				continue
 			}
 			event := gjson.ParseBytes(frame.body)
+			if plugins != nil {
+				patched, dropped := plugins.ClientEvent(event.Get("type").String(), frame.body)
+				if pluginWriteErr != nil {
+					return nil, &dto.RealtimeUsage{}
+				}
+				if dropped {
+					continue
+				}
+				if patched != nil {
+					frame.body = patched
+					event = gjson.ParseBytes(frame.body)
+				}
+			}
 			eventID := event.Get("event_id").String()
 			switch event.Get("type").String() {
 			case "session.update":
@@ -387,7 +414,17 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					completionOrder = completionOrder[1:]
 				}
 				usage := ParseRealtimeUsage(event.Get("response.usage"))
-				finishRealtimeGeneration(generation, usage, event.Get("response.status").String(), nil)
+				if plugins != nil {
+					plugins.SettleResponse(service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey), usage, generation.info, func() int {
+						finishRealtimeGeneration(generation, usage, event.Get("response.status").String(), nil)
+						if consumed, ok := common.GetContextKeyType[*model.RecordConsumeLogParams](generation.context, constant.ContextKeyConsumeLog); ok && consumed != nil {
+							return consumed.Quota
+						}
+						return 0
+					})
+				} else {
+					finishRealtimeGeneration(generation, usage, event.Get("response.status").String(), nil)
+				}
 				if controls.enabled && controls.create && controls.idle > 0 && len(active) == 0 && len(pending) == 0 {
 					playback := time.Duration(0)
 					if controls.outputBytesPerSecond > 0 {
@@ -436,7 +473,14 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					service.ObserveSchedulingOutput(generation.context, frame.body)
 				}
 			}
-			if err := writeRealtimeFrame(client, service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey)); err != nil {
+			if plugins != nil {
+				if event.Get("type").String() != "response.done" {
+					plugins.ServerEvent(event.Get("type").String(), service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey), nil, 0)
+				}
+				if pluginWriteErr != nil {
+					return nil, &dto.RealtimeUsage{}
+				}
+			} else if err := writeRealtimeFrame(client, service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey)); err != nil {
 				return nil, &dto.RealtimeUsage{}
 			}
 		}

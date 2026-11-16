@@ -165,16 +165,14 @@ test('opens evidence on demand and uses event revision for probe and dismissal',
 })
 
 test('read-only admins see evidence without operational controls', async () => {
-  useAuthStore
-    .getState()
-    .auth.setUser({
-      id: 2,
-      username: 'reader',
-      role: ROLE.ADMIN,
-      permissions: {
-        admin_permissions: { channel: { read: true, operate: false } },
-      },
-    })
+  useAuthStore.getState().auth.setUser({
+    id: 2,
+    username: 'reader',
+    role: ROLE.ADMIN,
+    permissions: {
+      admin_permissions: { channel: { read: true, operate: false } },
+    },
+  })
   render(<ChannelFundingBadge channel={channel} />, { wrapper: Wrapper })
   await userEvent.click(screen.getByRole('button', { name: 'Funding status' }))
   await screen.findByText(event.evidence)

@@ -221,8 +221,14 @@ func RecordChannelFundingError(attempt *FundingAttempt, status int, code, kind, 
 		return false
 	}
 	attempt.recorded, attempt.confirmed = true, row.State == "confirmed"
-	if row.AutoDisabled && shouldCloseActiveWebSocketsAfterDisable(row.ChannelID) {
-		CloseActiveWebSocketsForChannel(row.ChannelID, ChannelDisabledCloseReason)
+	if row.AutoDisabled {
+		closeWebSockets, channel := shouldCloseActiveWebSocketsAfterDisable(row.ChannelID)
+		if closeWebSockets {
+			CloseActiveWebSocketsForChannel(row.ChannelID, ChannelDisabledCloseReason)
+		}
+		if common.IsMasterNode && channel != nil {
+			scheduledPlugins.disabled(channel, attempt.secret, time.Now())
+		}
 	}
 	if row.NotificationQueued {
 		_, _, _ = EnqueueSystemTask(ChannelFundingNotifyTaskType, nil)

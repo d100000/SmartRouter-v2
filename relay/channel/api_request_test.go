@@ -363,3 +363,33 @@ func TestToWebSocketURL(t *testing.T) {
 		assert.Equal(t, want, toWebSocketURL(input), input)
 	}
 }
+
+func TestDoRequestLeavesEarlyResponseBodyOwnedByTransport(t *testing.T) {
+	service.InitHttpClient()
+	client := service.GetHttpClient()
+	previousTransport := client.Transport
+	t.Cleanup(func() { client.Transport = previousTransport })
+	client.Transport = relayRequestTransport(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+	})
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Request.Body = nil
+	body, writer := io.Pipe()
+	t.Cleanup(func() { _ = body.Close(); _ = writer.Close() })
+	req, err := http.NewRequest(http.MethodPost, "https://provider.invalid/chat", body)
+	require.NoError(t, err)
+	resp, err := doRequest(c, req, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	written := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, "still uploading")
+		_ = writer.Close()
+		written <- err
+	}()
+	remaining, err := io.ReadAll(req.Body)
+	require.NoError(t, err, "early response headers must not close the transport's ongoing upload")
+	require.NoError(t, <-written)
+	assert.Equal(t, "still uploading", string(remaining))
+}

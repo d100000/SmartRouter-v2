@@ -62,7 +62,7 @@ func channelUsesMeteredHTTP(channelType int) bool {
 		constant.ChannelTypeMoonshot, constant.ChannelTypePerplexity, constant.ChannelTypeMistral,
 		constant.ChannelTypeXinference, constant.ChannelTypeXai, constant.ChannelTypeCodex,
 		constant.ChannelTypeAdvancedCustom, constant.ChannelTypeSub2API, constant.ChannelTypeNewAPI,
-		constant.ChannelTypeVLLM, constant.ChannelTypeSGLang, constant.ChannelTypeSubmodel:
+		constant.ChannelTypeVLLM, constant.ChannelTypeSGLang, constant.ChannelTypeSubmodel, constant.ChannelTypeTaskPlugin:
 		return true
 	}
 	return false
@@ -151,6 +151,30 @@ func PrepareChannelEventAttempt(info *relaycommon.RelayInfo, channel *model.Chan
 		attempt.TPMApplicable = false
 	}
 	info.ChannelLimitAttempt = attempt
+	return nil
+}
+
+// PrepareNextPluginRelayAttempt gives each physical request of a provider
+// chain its own RPM admission. Intermediate responses have no host-verified
+// billable usage, so their reservations remain unknown rather than being
+// released or charged again to the client's wallet. Frozen procurement rules
+// and the logical request's supplier claim survive the transition.
+func PrepareNextPluginRelayAttempt(info *relaycommon.RelayInfo) error {
+	if info == nil || info.ChannelLimitAttempt == nil || !info.ChannelLimitAttempt.Sent {
+		return nil
+	}
+	previous := info.ChannelLimitAttempt
+	if !previous.Finished {
+		if err := model.MarkChannelAttemptUnknown(previous.ChannelID, previous.ID, 0, time.Now()); err != nil {
+			return err
+		}
+		previous.Finished = true
+		liveChannelLimitAttempts.Delete(previous.ID)
+	}
+	next := *previous
+	next.ID, next.Sent, next.Finished = uuid.NewString(), false, false
+	next.PriorPhysicalRequestSent = true
+	info.ChannelLimitAttempt = &next
 	return nil
 }
 
@@ -330,15 +354,22 @@ func AdmitChannelEvent(c *gin.Context, info *relaycommon.RelayInfo, prompt, outp
 		_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, time.Now())
 		return err
 	}
-	if !MarkSupplierRequestSent(c, &model.Channel{Id: attempt.ChannelID, OwnerSupplierID: attempt.SupplierID}) {
-		_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, now)
-		return &model.ChannelLimitError{Reason: "supplier_attempt_already_sent"}
+	claimedSupplier := false
+	if !attempt.SupplierRequestClaimed {
+		if !MarkSupplierRequestSent(c, &model.Channel{Id: attempt.ChannelID, OwnerSupplierID: attempt.SupplierID}) {
+			_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, now)
+			return &model.ChannelLimitError{Reason: "supplier_attempt_already_sent"}
+		}
+		claimedSupplier = attempt.SupplierID != ""
 	}
 	if err := model.MarkChannelAttemptSent(attempt.ChannelID, attempt.ID, time.Now()); err != nil {
-		ReleaseSupplierRequestSent(c, &model.Channel{Id: attempt.ChannelID, OwnerSupplierID: attempt.SupplierID})
+		if claimedSupplier {
+			ReleaseSupplierRequestSent(c, &model.Channel{Id: attempt.ChannelID, OwnerSupplierID: attempt.SupplierID})
+		}
 		_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, now)
 		return err
 	}
+	attempt.SupplierRequestClaimed = attempt.SupplierRequestClaimed || claimedSupplier
 	attempt.Sent = true
 	StartSchedulingAttempt(c, info)
 	liveChannelLimitAttempts.Store(attempt.ID, attempt.ChannelID)
