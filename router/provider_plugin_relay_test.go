@@ -225,6 +225,62 @@ func (h *relayHarness) send(t *testing.T, path, contentType, body string) relayO
 	return outcome
 }
 
+func TestRestrictedTokenValidatesRequiredModelBeforeModelAccess(t *testing.T) {
+	h := newRelayHarness(t)
+	h.install(t, h.newChannel(constant.ChannelTypeOpenAI, "upstream-secret"))
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", h.tokenID).Updates(map[string]any{
+		"model_limits_enabled": true,
+		"model_limits":         relayTestModel,
+	}).Error)
+
+	for _, tc := range []struct {
+		name   string
+		body   string
+		token  string
+		status int
+	}{
+		{name: "missing model", body: `{"messages":[{"role":"user","content":"hello"}]}`, token: relayTestToken, status: http.StatusBadRequest},
+		{name: "empty model", body: `{"model":"","messages":[{"role":"user","content":"hello"}]}`, token: relayTestToken, status: http.StatusBadRequest},
+		{name: "unauthorized model", body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`, token: relayTestToken, status: http.StatusForbidden},
+		{name: "invalid token and missing model", body: `{"messages":[{"role":"user","content":"hello"}]}`, token: "invalid-token", status: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var tokenBefore model.Token
+			var userBefore model.User
+			require.NoError(t, model.DB.First(&tokenBefore, h.tokenID).Error)
+			require.NoError(t, model.DB.First(&userBefore, h.userID).Error)
+			logsBefore := consumeLogCount(t)
+			request, err := http.NewRequest(http.MethodPost, h.gateway.URL+"/v1/chat/completions", strings.NewReader(tc.body))
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer "+tc.token)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept-Language", "en")
+			response, err := http.DefaultClient.Do(request)
+			require.NoError(t, err)
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			h.waitIdle(t)
+
+			assert.Equal(t, tc.status, response.StatusCode, string(body))
+			if tc.status == http.StatusBadRequest {
+				assert.Contains(t, gjson.GetBytes(body, "error.message").String(), "Model name not specified, model name cannot be empty")
+			}
+			assert.NotContains(t, string(body), "upstream-secret")
+			assert.Empty(t, h.upstream.captured())
+			assert.Equal(t, logsBefore, consumeLogCount(t))
+			var tokenAfter model.Token
+			var userAfter model.User
+			require.NoError(t, model.DB.First(&tokenAfter, h.tokenID).Error)
+			require.NoError(t, model.DB.First(&userAfter, h.userID).Error)
+			assert.Equal(t, tokenBefore.RemainQuota, tokenAfter.RemainQuota)
+			assert.Equal(t, tokenBefore.UsedQuota, tokenAfter.UsedQuota)
+			assert.Equal(t, userBefore.Quota, userAfter.Quota)
+			assert.Equal(t, userBefore.UsedQuota, userAfter.UsedQuota)
+		})
+	}
+}
+
 func registerRelayPlugin(t *testing.T, source string) *jsplugin.LoadedPlugin {
 	t.Helper()
 	plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
