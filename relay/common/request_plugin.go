@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
@@ -155,6 +156,10 @@ func CapRequestPluginRecord(record []RequestPluginRecord) []RequestPluginRecord 
 	}
 }
 
+// MaxTokensLimit is shared by client validation and plugin effects so a
+// request rewritten after validation cannot send an unbounded token count.
+const MaxTokensLimit = math.MaxInt32 / 2
+
 // billingFields are the request members whose value sets the price of a
 // relay request (billing.md): plugin effects on an upstream body must leave
 // them as they are. Max-token caps are not among them: settlement bills the
@@ -173,7 +178,8 @@ var billingFields = []string{
 	"service_tier",
 }
 
-// SameBillingFields rejects a change to any member that prices the request.
+// SameBillingFields rejects a change to any member that prices the request
+// and validates the token caps that the effects leave.
 // It compares values, not text: applying effects re-encodes the body, which
 // reformats members the effects leave alone.
 func SameBillingFields(before, after []byte) error {
@@ -181,6 +187,18 @@ func SameBillingFields(before, after []byte) error {
 		previous, next := gjson.GetBytes(before, field), gjson.GetBytes(after, field)
 		if previous.Exists() != next.Exists() || !reflect.DeepEqual(previous.Value(), next.Value()) {
 			return fmt.Errorf("effects must not change the billing field %s", field)
+		}
+	}
+	// Token caps may change, but they still obey the client request bounds.
+	// Null and an absent member both mean no explicit cap; zero is preserved.
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "max_tokens_to_sample", "min_tokens", "generationConfig.maxOutputTokens", "generation_config.max_output_tokens"} {
+		value := gjson.GetBytes(after, field)
+		if value.Type == gjson.Null {
+			continue
+		}
+		var tokens uint
+		if value.Type != gjson.Number || common.Unmarshal([]byte(value.Raw), &tokens) != nil || tokens > MaxTokensLimit {
+			return fmt.Errorf("effects must keep %s an integer between 0 and %d", field, MaxTokensLimit)
 		}
 	}
 	return nil

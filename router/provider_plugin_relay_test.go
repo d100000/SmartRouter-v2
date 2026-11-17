@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
+	"github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -2146,6 +2147,84 @@ export function outbound(ctx, req) {
 		gjson.Get(errorLog.Other, "request_plugins").Raw)
 	assert.Equal(t, "reject", gjson.Get(errorLog.Other, `admin_info.request_plugins.0.action`).Str)
 	assert.Equal(t, "door", gjson.Get(errorLog.Other, `admin_info.request_plugins.0.instance`).Str)
+}
+
+func TestRequestPluginOutputTokenBoundsBeforeDispatch(t *testing.T) {
+	h := newRelayHarness(t)
+	// Enough input for a nonzero reservation at this model's low token price.
+	body := strings.Replace(relayTestBody, "hello there", "Explain how an API gateway validates a request, selects an upstream provider, forwards the request, and records the final token usage without charging the same request twice.", 1)
+	previousTrust, previousCount := operation_setting.GetQuotaSetting().TrustQuotaUSD, constant.CountToken
+	operation_setting.GetQuotaSetting().TrustQuotaUSD, constant.CountToken = 0, true
+	t.Cleanup(func() {
+		operation_setting.GetQuotaSetting().TrustQuotaUSD, constant.CountToken = previousTrust, previousCount
+	})
+	source, err := plugins.Source("param-override")
+	require.NoError(t, err)
+	registerRelayPlugin(t, source)
+	h.install(t, h.newChannel(constant.ChannelTypeOpenAI, "upstream-secret"))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{request_plugin_setting.InstancesOption: "[]"}))
+	})
+	var reservedQuota int64
+	for _, tc := range []struct {
+		name, field string
+		value       string
+		allowed     bool
+		remove      bool
+	}{
+		{name: "negative max tokens", field: "max_tokens", value: `-1`},
+		{name: "oversized completion limit", field: "max_completion_tokens", value: `2147483647`},
+		{name: "fractional limit", field: "max_tokens", value: `1.5`},
+		{name: "non-numeric limit", field: "max_tokens", value: `"64"`},
+		{name: "valid larger limit", field: "max_tokens", value: `64`, allowed: true},
+		{name: "explicit zero", field: "max_completion_tokens", value: `0`, allowed: true},
+		{name: "null cap", field: "max_tokens", value: `null`, allowed: true},
+		{name: "removed cap", field: "max_tokens", allowed: true, remove: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.upstream.reset()
+			override := fmt.Sprintf(`{"%s":%s}`, tc.field, tc.value)
+			if tc.remove {
+				override = fmt.Sprintf(`{"operations":[{"path":"%s","mode":"delete"}]}`, tc.field)
+			}
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{request_plugin_setting.InstancesOption: fmt.Sprintf(`[
+				{"id":"limit","name":"Limit","plugin":"param-override","enabled":true,"global":true,"config":{"override":%s}}
+			]`, override)}))
+			logsBefore := consumeLogCount(t)
+			var userBefore model.User
+			require.NoError(t, model.DB.First(&userBefore, h.userID).Error)
+			outcome := h.post(t, "/v1/chat/completions", body)
+			requests := h.upstream.captured()
+			if tc.allowed {
+				require.Equal(t, http.StatusOK, outcome.status, outcome.body)
+				require.Len(t, requests, 1)
+				if tc.remove {
+					assert.False(t, gjson.Get(requests[0].Body, tc.field).Exists())
+				} else {
+					assert.Equal(t, gjson.Parse(tc.value).Value(), gjson.Get(requests[0].Body, tc.field).Value())
+					assert.True(t, gjson.Get(requests[0].Body, tc.field).Exists())
+				}
+				assert.Equal(t, logsBefore+1, consumeLogCount(t))
+				assert.Equal(t, outcome.log.Quota, outcome.quota)
+				reservation := gjson.Get(outcome.log.Other, "admin_info.settlement_evidence.local.pre_consumed_quota").Int()
+				assert.Positive(t, reservation)
+				if reservedQuota == 0 {
+					reservedQuota = reservation
+				}
+				assert.Equal(t, reservedQuota, reservation, "output caps do not change the input-only reservation")
+				return
+			}
+			assert.Equal(t, http.StatusInternalServerError, outcome.status, outcome.body)
+			assert.Equal(t, "request_plugin_failed", gjson.Get(outcome.body, "error.code").Str)
+			assert.Empty(t, requests, "invalid plugin output must never reach the upstream")
+			assert.Zero(t, outcome.quota)
+			assert.Equal(t, logsBefore, consumeLogCount(t))
+			var userAfter model.User
+			require.NoError(t, model.DB.First(&userAfter, h.userID).Error)
+			assert.Equal(t, userBefore.Quota, userAfter.Quota)
+			assert.Equal(t, userBefore.UsedQuota, userAfter.UsedQuota)
+		})
+	}
 }
 
 // The channel's own settings win over request plugins: its param override

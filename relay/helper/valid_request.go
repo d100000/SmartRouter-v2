@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -119,10 +119,9 @@ func GetAndValidateEmbeddingRequest(c *gin.Context, relayMode int) (*dto.Embeddi
 	return embeddingRequest, nil
 }
 
-// maxTokensLimit bounds user-supplied max token fields. These values feed
-// pre-consume quota math (preConsumedTokens * ratio); an unbounded value can
-// overflow the conversion and corrupt billing.
-const maxTokensLimit = math.MaxInt32 / 2
+// maxTokensLimit bounds client token caps before billing and channel budget
+// calculations. Plugin rewrites share the same ceiling.
+const maxTokensLimit = relaycommon.MaxTokensLimit
 
 // ExceedsMaxTokensLimit checks token limits before they reach billing arithmetic.
 func ExceedsMaxTokensLimit(values ...*uint) bool {
