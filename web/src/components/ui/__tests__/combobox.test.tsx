@@ -49,6 +49,33 @@ function Fixture() {
 }
 
 describe('searchable single selection', () => {
+  it('opens from its native trigger without submitting the form or reporting button semantics errors', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const submit = vi.fn()
+    render(
+      <form
+        onSubmit={(event) => {
+          event.preventDefault()
+          submit()
+        }}
+      >
+        <Fixture />
+      </form>
+    )
+    const user = userEvent.setup()
+    const trigger = screen.getByRole('button', { name: 'Provider' })
+    expect(trigger).toHaveAttribute('type', 'button')
+
+    await user.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    await user.click(screen.getByRole('option', { name: 'Google' }))
+    expect(screen.getByRole('combobox', { name: 'Provider' })).toHaveValue(
+      'Google'
+    )
+    expect(submit).not.toHaveBeenCalled()
+    expect(consoleError).not.toHaveBeenCalled()
+  })
+
   it.each(['dialog', 'sheet'] as const)(
     'keeps the options closed when a %s autofocuses the input, then opens on click',
     async (container) => {
