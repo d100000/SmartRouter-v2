@@ -1,7 +1,10 @@
 package model
 
 import (
+	"crypto/sha256"
+	_ "embed"
 	"errors"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -9,7 +12,40 @@ import (
 	"gorm.io/gorm"
 )
 
-var ErrSupplierPasswordLength = errors.New("Supplier account passwords must contain at least 15 characters")
+const minSupplierPasswordLength = 15
+
+var (
+	ErrSupplierPasswordLength    = errors.New("Supplier account passwords must contain at least 15 characters")
+	ErrSupplierPasswordTooCommon = errors.New("This password is too common. Choose a different password.")
+)
+
+// This is the sorted SHA-256 digest set of the first 3,000 distinct valid UTF-8
+// entries containing 15–128 characters in the ranked SecLists Xato list.
+// Source: https://github.com/danielmiessler/SecLists/blob/1a89b46c204032247592a1626e29f841cb0fe2a5/Passwords/Common-Credentials/xato-net-10-million-passwords.txt
+// See supplier_passwords.LICENSE for the original MIT notice.
+//
+//go:embed supplier_passwords.sha256
+var commonSupplierPasswords string
+
+func ValidateSupplierPassword(password string) error {
+	if err := common.ValidateNewAccountPassword(password); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(password) < minSupplierPasswordLength {
+		return ErrSupplierPasswordLength
+	}
+	digest := sha256.Sum256([]byte(password))
+	needle := string(digest[:])
+	count := len(commonSupplierPasswords) / sha256.Size
+	index := sort.Search(count, func(i int) bool {
+		offset := i * sha256.Size
+		return commonSupplierPasswords[offset:offset+sha256.Size] >= needle
+	})
+	if index < count && commonSupplierPasswords[index*sha256.Size:(index+1)*sha256.Size] == needle {
+		return ErrSupplierPasswordTooCommon
+	}
+	return nil
+}
 
 func (user *User) GetSupplierID() string {
 	if user.SupplierID == nil {
@@ -32,9 +68,6 @@ func (user *User) validateSupplyIdentity(tx *gorm.DB) error {
 	}
 	if supplierID == "" || len(supplierID) > 36 || user.ChannelViewer {
 		return common.NewMessage("Invalid parameters")
-	}
-	if user.Password != "" && utf8.RuneCountInString(user.Password) < 15 {
-		return ErrSupplierPasswordLength
 	}
 	var supplier UpstreamSupplier
 	if err := tx.Select("id").Where("id = ?", supplierID).First(&supplier).Error; err != nil {

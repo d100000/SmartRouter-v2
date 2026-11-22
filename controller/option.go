@@ -202,6 +202,11 @@ func UpdateOption(c *gin.Context) {
 		option.Value = fmt.Sprintf("%v", option.Value)
 	}
 	switch option.Key {
+	case "SchedulingConfig", "SchedulingConfigVersion":
+		// The scheduling center validates entries, channel ownership and its
+		// own channel:write permission before publishing routing settings.
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Scheduling configuration can only be changed in the Scheduling Center"))
+		return
 	case "QuotaForInviter", "QuotaForInvitee":
 		if isPositiveOptionValue(option.Value.(string)) && !operation_setting.IsPaymentComplianceConfirmed() {
 			common.ApiErrorT(c, "Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")

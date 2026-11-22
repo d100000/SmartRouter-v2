@@ -1,46 +1,66 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
 var ErrSupplierChannelOperation = errors.New("This operation is not available for supplier channels")
 
+const (
+	SupplierDraftReady        = "ready_for_review"
+	SupplierDraftClosed       = "closed"
+	SupplierDraftQueued       = "review_queued"
+	SupplierDraftTesting      = "review_testing"
+	SupplierDraftWaiting      = "review_waiting"
+	SupplierDraftUnknown      = "review_unknown"
+	SupplierDraftCostMissing  = "review_cost_missing"
+	SupplierDraftPriceMissing = "review_model_price_missing"
+)
+
 // SupplierAccount grants access to a procurement identity explicitly. Existing
 // procurement labels never grant access to a login account or historical data.
 type SupplierAccount struct {
-	SupplierID       string   `json:"supplier_id" gorm:"type:varchar(36);primaryKey"`
-	SupplyEnabled    bool     `json:"supply_enabled"`
-	AllowedTemplates string   `json:"-" gorm:"type:text"`
-	AllowedTypes     string   `json:"-" gorm:"type:text"`
-	AllowedModels    string   `json:"-" gorm:"type:text"`
-	Group            string   `json:"group" gorm:"type:varchar(64)"`
-	MaxChannels      int      `json:"max_channels"`
-	MaxInputTokens   int64    `json:"max_input_tokens" gorm:"bigint"`
-	MaxOutputTokens  int64    `json:"max_output_tokens" gorm:"bigint"`
-	CostRatio        *float64 `json:"cost_ratio"`
-	PoolPriority     int64    `json:"pool_priority" gorm:"bigint"`
-	PoolWeight       int      `json:"pool_weight"`
-	PoolCapacity     int      `json:"pool_capacity"`
-	Revision         int64    `json:"revision" gorm:"bigint"`
-	CreatedAt        int64    `json:"created_at" gorm:"bigint"`
-	UpdatedAt        int64    `json:"updated_at" gorm:"bigint"`
+	SupplierID        string   `json:"supplier_id" gorm:"type:varchar(36);primaryKey"`
+	SupplyEnabled     bool     `json:"supply_enabled"`
+	AllowAllTemplates bool     `json:"allow_all_templates"`
+	AllowAllModels    bool     `json:"allow_all_models"`
+	AllowedTemplates  string   `json:"-" gorm:"type:text"`
+	AllowedTypes      string   `json:"-" gorm:"type:text"`
+	AllowedModels     string   `json:"-" gorm:"type:text"`
+	Group             string   `json:"group" gorm:"type:varchar(64)"`
+	MaxChannels       int      `json:"max_channels"`
+	MaxInputTokens    int64    `json:"max_input_tokens" gorm:"bigint"`
+	MaxOutputTokens   int64    `json:"max_output_tokens" gorm:"bigint"`
+	CostRatio         *float64 `json:"cost_ratio"`
+	PoolPriority      int64    `json:"pool_priority" gorm:"bigint"`
+	PoolWeight        int      `json:"pool_weight"`
+	PoolCapacity      int      `json:"pool_capacity"`
+	Revision          int64    `json:"revision" gorm:"bigint"`
+	CreatedAt         int64    `json:"created_at" gorm:"bigint"`
+	UpdatedAt         int64    `json:"updated_at" gorm:"bigint"`
 }
 
 // Drafts preserve the last verified configuration while a replacement is
 // tested. Secrets are encrypted and are never serialized in a management API.
 type SupplierChannelDraft struct {
 	ProbeTaskIDs string `json:"-" gorm:"type:text"`
+	TestedModels string `json:"-" gorm:"type:text"`
+	TestToken    string `json:"-" gorm:"type:varchar(36)"`
+	TestOnly     bool   `json:"-"`
 	ChannelID    int    `gorm:"primaryKey"`
 	TemplateID   string `gorm:"type:varchar(96)"`
 	SupplierID   string `gorm:"type:varchar(36);index"`
@@ -55,6 +75,25 @@ type SupplierChannelDraft struct {
 	ErrorCode    string `gorm:"type:varchar(64)"`
 	CreatedAt    int64  `gorm:"bigint"`
 	LeaseUntil   int64  `gorm:"bigint"`
+}
+
+func (draft *SupplierChannelDraft) ValidationStatus() string {
+	switch draft.Status {
+	case SupplierDraftQueued:
+		return "pending"
+	case SupplierDraftTesting:
+		return "testing"
+	case SupplierDraftWaiting:
+		return "waiting"
+	case SupplierDraftUnknown:
+		return "result_unknown"
+	case SupplierDraftCostMissing:
+		return "cost_config_missing"
+	case SupplierDraftPriceMissing:
+		return "model_price_error"
+	default:
+		return draft.Status
+	}
 }
 
 func GetSupplierAccount(id string) (*SupplierAccount, error) {
@@ -102,13 +141,21 @@ func (account *SupplierAccount) Allows(channelType int, models []string) bool {
 	return account.AllowsTemplate(strconv.Itoa(channelType), models)
 }
 
+// AllowsTemplateID checks the account's restriction. Callers selecting a
+// template must also check that it exists in the platform's supplier catalog.
+func (account *SupplierAccount) AllowsTemplateID(id string) bool {
+	return id != "" && id != strconv.Itoa(constant.ChannelTypeTaskPlugin) &&
+		(account.AllowAllTemplates || slices.Contains(account.TemplateIDs(), id))
+}
+
 func (account *SupplierAccount) AllowsTemplate(id string, models []string) bool {
-	if !slices.Contains(account.TemplateIDs(), id) || len(models) == 0 {
+	if !account.AllowsTemplateID(id) || len(models) == 0 {
 		return false
 	}
 	allowed := account.Models()
 	for _, name := range models {
-		if name == "" || !slices.Contains(allowed, name) {
+		if strings.TrimSpace(name) == "" || strings.ContainsAny(name, ",\r\n") ||
+			!account.AllowAllModels && !slices.Contains(allowed, name) {
 			return false
 		}
 	}
@@ -172,7 +219,7 @@ func SaveSupplierAccount(account *SupplierAccount, expected int64, transactions 
 	if err := lockForUpdate(db).First(&previous, "supplier_id = ? AND revision = ?", account.SupplierID, expected).Error; err != nil {
 		return err
 	}
-	result := db.Model(&SupplierAccount{}).Where("supplier_id = ? AND revision = ?", account.SupplierID, expected).Select("supply_enabled", "allowed_types", "allowed_templates", "allowed_models", "group", "max_channels", "max_input_tokens", "max_output_tokens", "cost_ratio", "pool_priority", "pool_weight", "pool_capacity", "revision", "updated_at").Updates(account)
+	result := db.Model(&SupplierAccount{}).Where("supplier_id = ? AND revision = ?", account.SupplierID, expected).Select("supply_enabled", "allow_all_templates", "allow_all_models", "allowed_types", "allowed_templates", "allowed_models", "group", "max_channels", "max_input_tokens", "max_output_tokens", "cost_ratio", "pool_priority", "pool_weight", "pool_capacity", "revision", "updated_at").Updates(account)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -185,17 +232,13 @@ func SaveSupplierAccount(account *SupplierAccount, expected int64, transactions 
 	}
 	for i := range channels {
 		channel := &channels[i]
-		channel.Group = account.Group
 		if channel.CostRatio == nil || channel.CostVersionID == previous.DefaultCostVersionID() {
 			channel.CostRatio, channel.CostVersionID = account.CostRatio, account.DefaultCostVersionID()
 		}
 		if err := channel.refreshProcurementCostSnapshots(); err != nil {
 			return err
 		}
-		if err := db.Model(channel).Select("group", "cost_ratio", "cost_version_id", "upstream_credential_snapshot_data").Updates(channel).Error; err != nil {
-			return err
-		}
-		if err := channel.UpdateAbilities(db); err != nil {
+		if err := db.Model(channel).Select("cost_ratio", "cost_version_id", "upstream_credential_snapshot_data").Updates(channel).Error; err != nil {
 			return err
 		}
 		if err := db.Model(&ChannelLimitConfig{}).Where("channel_id = ?", channel.Id).Update("budget_ready", channel.ProcurementCostReady()).Error; err != nil {
@@ -205,15 +248,15 @@ func SaveSupplierAccount(account *SupplierAccount, expected int64, transactions 
 	return nil
 }
 
-// SaveSupplierChannelDraft fences each change by the caller's displayed
-// version. Ownership and platform routing fields come from the account, never
-// from the supplier's request body.
-func SaveSupplierChannelDraft(draft *SupplierChannelDraft, userID int, expected, priority int64, transactions ...*gorm.DB) (*Channel, error) {
+// SaveSupplierChannelDraft leaves the published configuration available until
+// an administrator publishes the candidate.
+func SaveSupplierChannelDraft(draft *SupplierChannelDraft, userID int, expected int64, transactions ...*gorm.DB) (*Channel, error) {
 	db := DB
 	if len(transactions) > 0 {
 		db = transactions[0]
 	}
 	var channel Channel
+	status := "configuring"
 	err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&SupplierAccount{}).Where("supplier_id = ?", draft.SupplierID).UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
 			return err
@@ -227,18 +270,24 @@ func SaveSupplierChannelDraft(draft *SupplierChannelDraft, userID int, expected,
 		}
 		if draft.ChannelID == 0 {
 			var count int64
-			if err := tx.Model(&Channel{}).Where("owner_supplier_id = ?", draft.SupplierID).Count(&count).Error; err != nil {
+			closed := tx.Model(&SupplierChannelDraft{}).Select("channel_id").Where("supplier_id = ? AND status = ?", draft.SupplierID, SupplierDraftClosed)
+			if err := tx.Model(&Channel{}).Where("owner_supplier_id = ?", draft.SupplierID).
+				Where("supplier_validated = ? OR id NOT IN (?)", true, closed).Count(&count).Error; err != nil {
 				return err
 			}
 			if count >= int64(account.MaxChannels) {
 				return errors.New("supplier channel limit reached")
 			}
-			channel = Channel{OwnerSupplierID: draft.SupplierID, CreatedBy: userID, Name: draft.Name, Type: draft.Type, Group: account.Group, Status: common.ChannelStatusEnabled, CreatedTime: time.Now().Unix(), SecretsWriteOnly: true, SupplierVersion: 1, SupplierPriority: priority, CostRatio: account.CostRatio, CostVersionID: account.DefaultCostVersionID()}
-			draft.ApplyTemplate(&channel)
+			channel = Channel{OwnerSupplierID: draft.SupplierID, CreatedBy: userID, Name: draft.Name, Type: draft.Type, Status: common.ChannelStatusManuallyDisabled, CreatedTime: time.Now().Unix(), SecretsWriteOnly: true, SupplierVersion: 1, CostRatio: account.CostRatio, CostVersionID: account.DefaultCostVersionID()}
 			channel.Remark = &draft.Remark
 			if err := tx.Create(&channel).Error; err != nil {
 				return err
 			}
+			// GORM applies the default group on insert. A new draft has no public group.
+			if err := tx.Model(&channel).UpdateColumn("group", "").Error; err != nil {
+				return err
+			}
+			channel.Group = ""
 			draft.ChannelID = channel.Id
 		} else {
 			if err := lockForUpdate(tx).First(&channel, "id = ? AND owner_supplier_id = ?", draft.ChannelID, draft.SupplierID).Error; err != nil {
@@ -247,20 +296,36 @@ func SaveSupplierChannelDraft(draft *SupplierChannelDraft, userID int, expected,
 			if channel.SupplierVersion != expected {
 				return errors.New("supplier channel changed; reload and retry")
 			}
+			var current SupplierChannelDraft
+			err := lockForUpdate(tx).First(&current, "channel_id = ? AND supplier_id = ? AND version = ?", draft.ChannelID, draft.SupplierID, expected).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if !channel.SupplierValidated && current.Status == SupplierDraftClosed {
+				return errors.New("This channel draft is closed.")
+			}
+			currentStatus := current.ValidationStatus()
+			if currentStatus == "testing" {
+				return errors.New("A channel test is already in progress.")
+			}
+			if draft.ProbeTaskIDs != "" && currentStatus == "waiting" {
+				status = SupplierDraftWaiting
+			} else if draft.ProbeTaskIDs != "" && currentStatus == "result_unknown" {
+				status = SupplierDraftUnknown
+			}
 			channel.SupplierVersion++
-			if err := tx.Model(&Channel{}).Where("id = ? AND supplier_version = ?", channel.Id, expected).Updates(map[string]any{"supplier_version": channel.SupplierVersion, "name": draft.Name, "remark": draft.Remark, "supplier_priority": priority}).Error; err != nil {
+			if err := tx.Model(&Channel{}).Where("id = ? AND supplier_version = ?", channel.Id, expected).Update("supplier_version", channel.SupplierVersion).Error; err != nil {
 				return err
 			}
 		}
-		draft.Version, draft.Status, draft.CreatedAt = channel.SupplierVersion, "configuring", time.Now().Unix()
+		draft.Version, draft.Status, draft.CreatedAt = channel.SupplierVersion, status, time.Now().Unix()
 		return tx.Save(draft).Error
 	})
 	return &channel, err
 }
 
-// QueueSupplierChannelValidation re-tests the current version without changing
-// the live connection. Copies have no candidate yet, so snapshot their active
-// credentials under the same owner/version fence before scheduling a probe.
+// QueueSupplierChannelValidation runs an unpublished candidate or takes a
+// diagnostic snapshot of the published configuration.
 func QueueSupplierChannelValidation(id int, owner string, version int64) (string, error) {
 	status := "pending"
 	err := DB.Transaction(func(tx *gorm.DB) error {
@@ -276,7 +341,13 @@ func QueueSupplierChannelValidation(id int, owner string, version int64) (string
 		}
 		var draft SupplierChannelDraft
 		err := lockForUpdate(tx).First(&draft, "channel_id = ? AND supplier_id = ? AND version = ?", id, owner, version).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if draft.Status == SupplierDraftClosed {
+			return errors.New("This channel draft is closed.")
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) || draft.Status == "validated" {
 			if !channel.SupplierValidated || channel.Key == "" {
 				return errors.New("supplier channel changed; reload and retry")
 			}
@@ -284,29 +355,68 @@ func QueueSupplierChannelValidation(id int, owner string, version int64) (string
 			if err != nil {
 				return err
 			}
-			draft = SupplierChannelDraft{TemplateID: SupplierChannelTemplateID(&channel), ChannelID: id, SupplierID: owner, Version: version, Type: channel.Type, Name: channel.Name, BaseURL: channel.GetBaseURL(), Secret: secret, Models: channel.Models, Status: status, CreatedAt: time.Now().Unix()}
+			draft = SupplierChannelDraft{TemplateID: SupplierChannelTemplateID(&channel), ChannelID: id, SupplierID: owner, Version: version, Type: channel.Type, Name: channel.Name, BaseURL: channel.GetBaseURL(), Secret: secret, Models: channel.Models, Status: SupplierDraftQueued, CreatedAt: time.Now().Unix(), TestOnly: true}
 			if channel.Remark != nil {
 				draft.Remark = *channel.Remark
 			}
-			return tx.Create(&draft).Error
+			return tx.Save(&draft).Error
 		}
-		if err != nil {
-			return err
-		}
-		if draft.Status == "testing" && draft.LeaseUntil > time.Now().Unix() {
-			status = "testing"
+		switch draft.ValidationStatus() {
+		case "testing", "waiting", "result_unknown", "pending":
+			status = draft.ValidationStatus()
 			return nil
 		}
-		return tx.Model(&draft).Updates(map[string]any{"status": status, "error_code": "", "lease_until": 0}).Error
+		if draft.Status == SupplierDraftReady || draft.Status == "failed" {
+			draft.ProbeTaskIDs = ""
+		}
+		return tx.Model(&draft).Updates(map[string]any{"status": SupplierDraftQueued, "error_code": "", "lease_until": 0, "test_token": "", "tested_models": "", "probe_task_ids": draft.ProbeTaskIDs}).Error
 	})
 	return status, err
 }
 
-func PublishSupplierChannelDraft(channelID int, owner string, version int64, models []string) error {
+// SupplierChannelRevision binds an administrator's confirmation to the latest
+// test result and the routing configuration they reviewed.
+func SupplierChannelRevision(channel *Channel, draft *SupplierChannelDraft) string {
+	var status, testToken, testedModels string
+	if draft != nil {
+		status, testToken, testedModels = draft.Status, draft.TestToken, draft.TestedModels
+	}
+	data, _ := common.Marshal([]any{channel.Id, channel.SupplierVersion, channel.SupplierValidated,
+		channel.Status, channel.SupplierPaused, channel.Group, channel.Models, channel.GetPriority(),
+		channel.SupplierPriority, channel.GetWeight(), status, testToken, testedModels})
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+type SupplierChannelRouting struct {
+	Groups   []string `json:"groups"`
+	Priority int64    `json:"priority"`
+	Weight   uint     `json:"weight"`
+}
+
+func (routing SupplierChannelRouting) Validate() error {
+	if len(routing.Groups) == 0 || utf8.RuneCountInString(strings.Join(routing.Groups, ",")) > 64 || routing.Priority < -1000 || routing.Priority > 1000 || routing.Weight > 1000 {
+		return common.NewMessage("Invalid parameters")
+	}
+	seen := make(map[string]bool, len(routing.Groups))
+	for _, group := range routing.Groups {
+		if group == "" || strings.ContainsAny(group, ",\r\n") || !ratio_setting.ContainsGroupRatio(group) || seen[group] {
+			return common.NewMessage("Invalid parameters")
+		}
+		seen[group] = true
+	}
+	return nil
+}
+
+func PublishSupplierChannelDraft(channelID int, owner string, version int64, revision string, models []string, routing SupplierChannelRouting) error {
 	upstreamCredentialWriteMutex.Lock()
 	defer upstreamCredentialWriteMutex.Unlock()
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		if _, err := upstreamFingerprintSecret(tx); err != nil {
+			return err
+		}
+		var account SupplierAccount
+		if err := lockForUpdate(tx).First(&account, "supplier_id = ?", owner).Error; err != nil {
 			return err
 		}
 		var channel Channel
@@ -314,15 +424,20 @@ func PublishSupplierChannelDraft(channelID int, owner string, version int64, mod
 			return err
 		}
 		var draft SupplierChannelDraft
-		if err := tx.First(&draft, "channel_id = ? AND supplier_id = ? AND version = ?", channelID, owner, version).Error; err != nil {
+		if err := lockForUpdate(tx).First(&draft, "channel_id = ? AND supplier_id = ? AND version = ?", channelID, owner, version).Error; err != nil {
 			return err
 		}
-		if channel.SupplierVersion != version || len(models) == 0 {
-			return errors.New("supplier channel changed; reload and retry")
+		if channel.SupplierVersion != version || draft.Status != SupplierDraftReady || draft.TestOnly || SupplierChannelRevision(&channel, &draft) != revision {
+			return common.NewMessage("Conflict: the resource was updated. Refresh and try again.")
 		}
-		var account SupplierAccount
-		if err := tx.First(&account, "supplier_id = ?", owner).Error; err != nil {
+		if err := routing.Validate(); err != nil {
 			return err
+		}
+		testedModels := strings.Split(draft.TestedModels, ",")
+		for _, name := range models {
+			if !slices.Contains(testedModels, name) {
+				return common.NewMessage("Select only models that passed testing.")
+			}
 		}
 		if !account.AllowsTemplate(draft.Template(), models) {
 			return errors.New("supplier model or template is not authorized")
@@ -333,15 +448,21 @@ func PublishSupplierChannelDraft(channelID int, owner string, version int64, mod
 		}
 		channel.Type, channel.Key, channel.BaseURL = draft.Type, secret, &draft.BaseURL
 		draft.ApplyTemplate(&channel)
+		if !channel.SupplierValidated {
+			channel.Status = common.ChannelStatusEnabled
+		}
+		channel.Name, channel.Remark = draft.Name, &draft.Remark
 		channel.Models, channel.SupplierValidated = strings.Join(models, ","), true
-		channel.Group = account.Group
+		channel.Group, channel.Weight = strings.Join(routing.Groups, ","), &routing.Weight
+		channel.Priority, channel.SupplierPriority = &routing.Priority, routing.Priority
 		if channel.CostRatio == nil || channel.CostVersionID == account.DefaultCostVersionID() {
 			channel.CostRatio, channel.CostVersionID = account.CostRatio, account.DefaultCostVersionID()
 		}
 		channel.Keys = nil
 		channel.ChannelInfo.IsMultiKey = strings.Contains(secret, "\n")
 		channel.ChannelInfo.MultiKeySize = len(channel.GetKeys())
-		if err := tx.Model(&channel).Select("type", "setting", "key", "base_url", "models", "supplier_validated", "secrets_write_only", "cost_ratio", "cost_version_id", "group", "channel_info").Updates(&channel).Error; err != nil {
+		if err := tx.Model(&channel).Select("type", "setting", "name", "remark", "key", "base_url", "models", "supplier_validated", "secrets_write_only", "cost_ratio", "cost_version_id",
+			"status", "group", "priority", "supplier_priority", "weight", "channel_info").Updates(&channel).Error; err != nil {
 			return err
 		}
 		if err := syncChannelUpstreamCredentials(tx, &channel); err != nil {
@@ -351,6 +472,37 @@ func PublishSupplierChannelDraft(channelID int, owner string, version int64, mod
 			return err
 		}
 		return tx.Model(&draft).Updates(map[string]any{"status": "validated", "error_code": ""}).Error
+	})
+	if err == nil {
+		invalidateRoutingMetadata()
+		BumpSyncTopic(SyncTopicChannels)
+	}
+	return err
+}
+
+func UpdateSupplierChannelRouting(id int, owner, revision string, routing SupplierChannelRouting) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		if err := lockForUpdate(tx).First(&channel, "id = ? AND owner_supplier_id = ?", id, owner).Error; err != nil {
+			return err
+		}
+		var draft SupplierChannelDraft
+		err := lockForUpdate(tx).First(&draft, "channel_id = ? AND supplier_id = ? AND version = ?", id, owner, channel.SupplierVersion).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if !channel.SupplierValidated || SupplierChannelRevision(&channel, &draft) != revision {
+			return common.NewMessage("Conflict: the resource was updated. Refresh and try again.")
+		}
+		if err := routing.Validate(); err != nil {
+			return err
+		}
+		channel.Group, channel.Weight = strings.Join(routing.Groups, ","), &routing.Weight
+		channel.Priority, channel.SupplierPriority = &routing.Priority, routing.Priority
+		if err := tx.Model(&channel).Select("group", "weight", "priority", "supplier_priority").Updates(&channel).Error; err != nil {
+			return err
+		}
+		return channel.UpdateAbilities(tx)
 	})
 	if err == nil {
 		invalidateRoutingMetadata()
@@ -373,72 +525,12 @@ func SupplierChannelAvailable(channel *Channel) bool {
 	return err == nil && account.SupplyEnabled && account.AllowsTemplate(SupplierChannelTemplateID(channel), channel.GetModels())
 }
 
-// CopySupplierChannel keeps the credential lineage inside its owner. It never
-// accepts a target owner or returns a secret to the caller.
-func CopySupplierChannel(id int, owner string, version int64, userID int, name string) (int, error) {
-	upstreamCredentialWriteMutex.Lock()
-	defer upstreamCredentialWriteMutex.Unlock()
-	copyID := 0
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		if _, err := upstreamFingerprintSecret(tx); err != nil {
-			return err
-		}
-		if err := tx.Model(&SupplierAccount{}).Where("supplier_id = ?", owner).UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
-			return err
-		}
-		var account SupplierAccount
-		if err := lockForUpdate(tx).First(&account, "supplier_id = ?", owner).Error; err != nil {
-			return err
-		}
-		var source Channel
-		if err := lockForUpdate(tx).First(&source, "id = ? AND owner_supplier_id = ?", id, owner).Error; err != nil {
-			return err
-		}
-		if source.SupplierVersion != version || !source.SupplierValidated || !account.AllowsTemplate(SupplierChannelTemplateID(&source), source.GetModels()) {
-			return errors.New("supplier channel changed; reload and retry")
-		}
-		var count int64
-		if err := tx.Model(&Channel{}).Where("owner_supplier_id = ?", owner).Count(&count).Error; err != nil {
-			return err
-		}
-		if count >= int64(account.MaxChannels) {
-			return errors.New("supplier channel limit reached")
-		}
-		copy := source
-		copy.Id, copy.CreatedBy, copy.CreatedTime, copy.SupplierVersion = 0, userID, time.Now().Unix(), 1
-		copy.Name, copy.SecretsWriteOnly = name, true
-		copy.Balance, copy.UsedQuota, copy.TestTime, copy.ResponseTime = 0, 0, 0, 0
-		if err := tx.Create(&copy).Error; err != nil {
-			return err
-		}
-		if err := syncChannelUpstreamCredentials(tx, &copy); err != nil {
-			return err
-		}
-		if err := copy.AddAbilities(tx); err != nil {
-			return err
-		}
-		config := ChannelLimitConfig{ChannelID: copy.Id, Revision: 1, HistoryComplete: true, ObservedSince: time.Now().UnixMilli(), BudgetReady: copy.ProcurementCostReady(), ChannelLimitSettings: ChannelLimitSettings{ReconcileSeconds: ChannelLimitDefaultReconcile}}
-		var original ChannelLimitConfig
-		if err := tx.First(&original, "channel_id = ?", id).Error; err == nil {
-			config.ChannelLimitSettings = original.ChannelLimitSettings
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		if err := tx.Create(&config).Error; err != nil {
-			return err
-		}
-		copyID = copy.Id
-		return nil
-	})
-	if err == nil {
-		invalidateRoutingMetadata()
-		BumpSyncTopic(SyncTopicChannels)
-	}
-	return copyID, err
-}
-
-func DiscardSupplierChannelDraft(id int, owner string, version int64) error {
-	err := DB.Transaction(func(tx *gorm.DB) error {
+// CloseSupplierChannelDraft preserves test and channel records. An unpublished
+// channel's closed draft no longer counts toward the supplier's channel limit.
+func CloseSupplierChannelDraft(id int, owner string, version int64) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		// Match draft creation's lock order so closure and allocation see the
+		// same available channel slots even on SQLite.
 		if err := tx.Model(&SupplierAccount{}).Where("supplier_id = ?", owner).UpdateColumn("updated_at", gorm.Expr("updated_at")).Error; err != nil {
 			return err
 		}
@@ -447,36 +539,16 @@ func DiscardSupplierChannelDraft(id int, owner string, version int64) error {
 			return err
 		}
 		var draft SupplierChannelDraft
-		if err := lockForUpdate(tx).First(&draft, "channel_id = ? AND supplier_id = ?", id, owner).Error; err != nil {
+		if err := lockForUpdate(tx).First(&draft, "channel_id = ? AND supplier_id = ? AND version = ?", id, owner, version).Error; err != nil {
 			return err
 		}
-		if channel.SupplierVersion != version || channel.SupplierValidated || draft.Status == "testing" {
-			return errors.New("Only unused, idle channel drafts can be discarded")
+		if channel.SupplierVersion != version || draft.TestOnly || draft.Status == "validated" || draft.Status == SupplierDraftClosed {
+			return common.NewMessage("Conflict: the resource was updated. Refresh and try again.")
 		}
-		var used int64
-		if err := tx.Model(&ChannelLimitAttempt{}).Where("channel_id = ? AND sent_at_ms > 0", id).Count(&used).Error; err != nil {
-			return err
+		status := draft.ValidationStatus()
+		if status == "testing" || status == "waiting" || status == "result_unknown" || status == "pending" && draft.ProbeTaskIDs != "" {
+			return common.NewMessage("A channel test is already in progress.")
 		}
-		if used > 0 {
-			return errors.New("Only unused, idle channel drafts can be discarded")
-		}
-		if err := tx.Model(&OverviewAttemptEvent{}).Where("channel_id = ?", id).Count(&used).Error; err != nil {
-			return err
-		}
-		if used > 0 {
-			return errors.New("Only unused, idle channel drafts can be discarded")
-		}
-		if err := tx.Where("channel_id = ?", id).Delete(&Ability{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Delete(&draft).Error; err != nil {
-			return err
-		}
-		return tx.Delete(&channel).Error
+		return tx.Model(&draft).Updates(map[string]any{"status": SupplierDraftClosed, "lease_until": 0}).Error
 	})
-	if err == nil {
-		invalidateRoutingMetadata()
-		BumpSyncTopic(SyncTopicChannels)
-	}
-	return err
 }

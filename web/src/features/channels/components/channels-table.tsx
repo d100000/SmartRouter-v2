@@ -204,6 +204,10 @@ export function ChannelsTable() {
   )?.[0]
   const statusFilter =
     (columnFilters.find((f) => f.id === 'status')?.value as string[]) || []
+  const supplierReview = statusFilter.includes('supplier_review')
+  const selectedStatus = statusFilter.find(
+    (value) => value !== 'all' && value !== 'supplier_review'
+  )
   const typeFilter = useMemo(
     () => (columnFilters.find((f) => f.id === 'type')?.value as string[]) || [],
     [columnFilters]
@@ -269,16 +273,14 @@ export function ChannelsTable() {
     queryKey: channelsQueryKeys.list({
       funding_status: fundingFilter,
       owner_supplier_id: supplierFilter,
+      supplier_review: supplierReview || undefined,
       keyword: globalFilter,
       model: modelFilter,
       group:
         groupFilter.length > 0 && !groupFilter.includes('all')
           ? groupFilter[0]
           : undefined,
-      status:
-        statusFilter.length > 0 && !statusFilter.includes('all')
-          ? statusFilter[0]
-          : undefined,
+      status: selectedStatus,
       type:
         typeFilter.length > 0 && !typeFilter.includes('all')
           ? Number(typeFilter[0])
@@ -295,16 +297,14 @@ export function ChannelsTable() {
           await searchChannels({
             funding_status: fundingFilter,
             owner_supplier_id: supplierFilter,
+            supplier_review: supplierReview || undefined,
             keyword: globalFilter,
             model: modelFilter,
             group:
               groupFilter.length > 0 && !groupFilter.includes('all')
                 ? groupFilter[0]
                 : undefined,
-            status:
-              statusFilter.length > 0 && !statusFilter.includes('all')
-                ? statusFilter[0]
-                : undefined,
+            status: selectedStatus,
             type:
               typeFilter.length > 0 && !typeFilter.includes('all')
                 ? Number(typeFilter[0])
@@ -321,14 +321,12 @@ export function ChannelsTable() {
           await getChannels({
             funding_status: fundingFilter,
             owner_supplier_id: supplierFilter,
+            supplier_review: supplierReview || undefined,
             group:
               groupFilter.length > 0 && !groupFilter.includes('all')
                 ? groupFilter[0]
                 : undefined,
-            status:
-              statusFilter.length > 0 && !statusFilter.includes('all')
-                ? statusFilter[0]
-                : undefined,
+            status: selectedStatus,
             type:
               typeFilter.length > 0 && !typeFilter.includes('all')
                 ? Number(typeFilter[0])
@@ -639,7 +637,13 @@ export function ChannelsTable() {
                 {
                   columnId: 'status',
                   title: t('Status'),
-                  options: [...CHANNEL_STATUS_OPTIONS],
+                  options: [
+                    ...CHANNEL_STATUS_OPTIONS,
+                    {
+                      value: 'supplier_review',
+                      label: t('Awaiting publication'),
+                    },
+                  ],
                   singleSelect: true,
                 },
                 {

@@ -644,6 +644,7 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 			ch := model.Channel{Name: "test provider", Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled}
 			require.NoError(t, db.Create(&ch).Error)
 			model.InitChannelCache()
+			require.NoError(t, service.SyncSchedulingConfig())
 			c := taskSubmissionTestContext()
 			c.Set("group", "default")
 			c.Set("username", user.Username)

@@ -619,14 +619,16 @@ func (r *Realtime) done(response *realtimeResponse, message []byte, usage *dto.R
 
 // SettleResponse finishes the reply check before the metered response writes its
 // consume log, then queues the report with the quota that was actually charged.
-func (r *Realtime) SettleResponse(message []byte, usage *dto.RealtimeUsage, info *relaycommon.RelayInfo, settle func() int) {
+// It reports whether the reply check allowed the response through.
+func (r *Realtime) SettleResponse(message []byte, usage *dto.RealtimeUsage, info *relaycommon.RelayInfo, settle func() int) bool {
 	if response := r.responseOf(message); response != nil && !r.isClosed() {
 		r.done(response, message, usage, 0, info, settle)
-		return
+		return response.writer == nil || !response.writer.stopped
 	}
 	r.toClient(message)
 	r.copyRecord(info)
 	settle()
+	return true
 }
 
 func (r *Realtime) copyRecord(info *relaycommon.RelayInfo) {

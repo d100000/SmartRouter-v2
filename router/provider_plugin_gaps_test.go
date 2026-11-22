@@ -126,18 +126,23 @@ func TestGapsChainedRequests(t *testing.T) {
 		var attempts []model.ChannelLimitAttempt
 		require.NoError(t, model.DB.Order("created_at_ms, id").Find(&attempts).Error)
 		require.Len(t, attempts, 3)
-		completed := 0
+		// The create and poll steps carry no billable work of their own; the
+		// final step carries the logical request's usage, so the sum is what ran.
+		// Attempts can share a millisecond and their IDs are random, so check
+		// the shape rather than a position: one step carries all the usage.
+		var tokens int64
+		var carriers int
 		for _, attempt := range attempts {
-			if attempt.Completed {
-				completed++
-				assert.True(t, attempt.TokenActualKnown)
-				assert.EqualValues(t, 3000, attempt.ActualTokens)
-			} else {
-				assert.Positive(t, attempt.ReconcileStartedMS, "intermediate unknown usage is retained")
-				assert.False(t, attempt.TokenActualKnown)
+			assert.True(t, attempt.Completed)
+			assert.True(t, attempt.TokenActualKnown)
+			tokens += attempt.ActualTokens
+			if attempt.ActualTokens > 0 {
+				carriers++
+				assert.EqualValues(t, 3000, attempt.ActualTokens, "the final response has the verified usage")
 			}
 		}
-		assert.Equal(t, 1, completed, "only the final response has verified usage")
+		assert.EqualValues(t, 3000, tokens)
+		assert.Equal(t, 1, carriers, "only the final step carries the logical request's usage")
 	})
 
 	for _, tc := range []struct {
@@ -146,9 +151,11 @@ func TestGapsChainedRequests(t *testing.T) {
 		fixedPrice bool
 		wantSends  int
 	}{
-		{name: "RPM counts every poll", limits: model.ChannelLimitSettings{RPM: 2, ReconcileSeconds: 300}, wantSends: 2},
-		{name: "unknown poll tokens cannot bypass TPM", limits: model.ChannelLimitSettings{TPM: 10000, ReconcileSeconds: 300}, wantSends: 1},
-		{name: "intermediate budget remains held", limits: model.ChannelLimitSettings{DailyUSDNano: 1500000, ReconcileSeconds: 300}, fixedPrice: true, wantSends: 1},
+		// Once the first step ran upstream, its polls are recorded and counted
+		// but never refused for capacity: refusing would abandon work that ran.
+		{name: "RPM counts every poll without refusing it", limits: model.ChannelLimitSettings{RPM: 2, ReconcileSeconds: 300}, wantSends: 3},
+		{name: "unbounded poll tokens do not refuse a follow-up", limits: model.ChannelLimitSettings{TPM: 10000, ReconcileSeconds: 300}, wantSends: 3},
+		{name: "daily budget settles the chain at its full cost", limits: model.ChannelLimitSettings{DailyUSDNano: 1500000, ReconcileSeconds: 300}, fixedPrice: true, wantSends: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			harness := newRelayHarness(t)
@@ -179,16 +186,17 @@ func TestGapsChainedRequests(t *testing.T) {
 			_, err := model.UpdateChannelLimits(channel.Id, 1, tc.limits, true, time.Now())
 			require.NoError(t, err)
 			outcome := harness.post(t, "/v1/chat/completions", relayTestBody)
-			assert.GreaterOrEqual(t, outcome.status, http.StatusBadRequest, outcome.body)
+			assert.Equal(t, http.StatusOK, outcome.status, outcome.body)
 			assert.Len(t, harness.upstream.captured(), tc.wantSends)
-			assert.Zero(t, outcome.quota)
-			assert.Zero(t, consumeLogCount(t))
+			assert.Positive(t, outcome.quota)
+			assert.EqualValues(t, 1, consumeLogCount(t))
 			state, err := model.GetChannelLimitState(channel.Id, time.Now())
 			require.NoError(t, err)
 			assert.EqualValues(t, tc.wantSends, state.RPMUsed)
+			assert.Zero(t, state.UnknownCosts)
 			if tc.fixedPrice {
-				assert.EqualValues(t, 1000000, state.DailyHeldNano, "unknown intermediate cost is not released to fund the next send")
-				assert.Zero(t, state.DailyUsedNano, "unknown procurement usage is not final wallet billing")
+				assert.Zero(t, state.DailyHeldNano, "every step's hold is released")
+				assert.EqualValues(t, 1000000, state.DailyUsedNano, "the chain settles at the logical request's cost")
 			}
 		})
 	}

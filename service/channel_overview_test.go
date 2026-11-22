@@ -758,10 +758,13 @@ func TestChannelLimitSupplierSnapshotAndNormalizedSettlement(t *testing.T) {
 			secret, err := model.EncryptSupplierSecret(account.SupplierID, "supplier-cost-test-secret")
 			require.NoError(t, err)
 			draft := model.SupplierChannelDraft{SupplierID: account.SupplierID, Name: "Supplier cost", Type: constant.ChannelTypeOpenAI, BaseURL: "https://upstream.invalid", Secret: secret, Models: "gpt-4"}
-			channel, err := model.SaveSupplierChannelDraft(&draft, 99, 0, 0)
+			channel, err := model.SaveSupplierChannelDraft(&draft, 99, 0)
 			require.NoError(t, err)
 			require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
-			require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, account.SupplierID, channel.SupplierVersion, []string{"gpt-4"}))
+			draft.Status, draft.TestedModels = model.SupplierDraftReady, draft.Models
+			require.NoError(t, db.Model(&draft).Updates(map[string]any{"status": draft.Status, "tested_models": draft.TestedModels}).Error)
+			require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, account.SupplierID, channel.SupplierVersion,
+				model.SupplierChannelRevision(channel, &draft), []string{"gpt-4"}, model.SupplierChannelRouting{Groups: []string{"default"}}))
 			require.NoError(t, db.Omit("key").First(channel, "id = ?", channel.Id).Error)
 			initial := channel.GetUpstreamCredentialSnapshot(0)
 			assert.Equal(t, account.DefaultCostVersionID(), initial.CostVersionID)
@@ -856,8 +859,8 @@ func TestChannelLimitSupplierSnapshotAndNormalizedSettlement(t *testing.T) {
 			assert.Zero(t, state.RPMReserved)
 			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("supplier_paused", false).Error)
 
-			// EOF without the terminal event required by the protocol remains
-			// unknown, retaining both TPM and a trusted partial cost lower bound.
+			// EOF without the terminal event required by the protocol: once the
+			// customer settlement computed an amount, the request ran at that cost.
 			ctx, _ = gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
 			require.NoError(t, PrepareChannelLimitAttempt(info, channel))
@@ -871,10 +874,10 @@ func TestChannelLimitSupplierSnapshotAndNormalizedSettlement(t *testing.T) {
 			require.NoError(t, FinishChannelLimitAttempt(ctx, info, types.NewError(fmt.Errorf("missing terminal event"), types.ErrorCodeBadResponse)))
 			persisted = model.ChannelLimitAttempt{}
 			require.NoError(t, db.First(&persisted, "id = ?", info.ChannelLimitAttempt.ID).Error)
-			assert.False(t, persisted.Completed)
-			assert.False(t, persisted.CostActualKnown)
-			assert.NotZero(t, persisted.ReconcileUntilMS)
-			assert.Equal(t, int64(1600000), persisted.HeldUSDNano)
+			assert.True(t, persisted.Completed)
+			assert.True(t, persisted.CostActualKnown)
+			assert.Equal(t, int64(1600000), persisted.ActualUSDNano)
+			assert.Zero(t, persisted.HeldUSDNano)
 			ctx.Request = httptest.NewRequest("POST", "/mj/submit/imagine", strings.NewReader(`{}`))
 			ctx.Set("channel_id", channel.Id)
 			mjResponse, _, err := DoMidjourneyHttpRequest(ctx, time.Second, "https://upstream.invalid/mj/submit/imagine")

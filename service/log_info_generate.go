@@ -148,10 +148,11 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	return other
 }
 
-// appendStreamFailureLogInfo preserves the failure when usable output allows
-// the normal settlement path. Upstream usage alone never permits a charge.
-// Consumption rows must never present themselves as exempt from billing,
-// including free models.
+// appendStreamFailureLogInfo records a failed generation. A generation that
+// upstream reported usage for or that produced output ran upstream and is
+// settled normally (upstream usage first, otherwise the local estimate); only
+// one with neither is exempt. Consumption rows must never present themselves
+// as exempt from billing, including free models.
 func appendStreamFailureLogInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other *model.LogOther, errorLog bool) string {
 	if ctx == nil || relayInfo == nil || relayInfo.StreamFailure == nil || relayInfo.StreamFailure.Error == nil || other == nil {
 		return ""
@@ -172,7 +173,7 @@ func appendStreamFailureLogInfo(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	} else if failure.HasEffectiveOutput {
 		usageSource = "local_estimate"
 	}
-	noCharge := errorLog && failure.NoCharge && !failure.HasEffectiveOutput
+	noCharge := errorLog && failure.NoCharge && !failure.HasEffectiveOutput && !failure.HasActualUsage
 	other.SetPublic("stream_failure", map[string]any{
 		"code":         string(apiErr.GetErrorCode()),
 		"type":         apiErr.ToOpenAIError().Type,
@@ -346,6 +347,9 @@ func GenerateWssOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	info.SetPublic("text_output", usage.OutputTokenDetails.TextTokens)
 	info.SetPublic("audio_ratio", audioRatio)
 	info.SetPublic("audio_completion_ratio", audioCompletionRatio)
+	if relayInfo.RealtimeSettlement != nil {
+		info.SetAdmin("realtime_settlement", *relayInfo.RealtimeSettlement)
+	}
 	return info
 }
 

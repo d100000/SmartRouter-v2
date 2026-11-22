@@ -37,6 +37,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { CHANNEL_RECENT_STATS_QUERY_KEY } from '@/features/channels/constants'
 import { toIntlLocale } from '@/i18n/languages'
 import {
   ADMIN_PERMISSION_ACTIONS,
@@ -84,7 +85,7 @@ export function ChannelLimitsDialog(props: Props) {
     <Dialog
       open
       onOpenChange={(open) => !open && props.onClose()}
-      title={`${t('Limits and daily budget')} · ${props.channelName}`}
+      title={`${t('Limits and daily cost')} · ${props.channelName}`}
       description={t(
         'Daily procurement costs use USD and reset at 00:00 Beijing time.'
       )}
@@ -107,14 +108,13 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
   const queryClient = useQueryClient()
   const user = useAuthStore((state) => state.auth.user)
   const readonly =
-    props.audience === 'viewer' ||
-    (props.audience === 'admin' &&
-      !hasPermission(
-        user,
-        ADMIN_PERMISSION_RESOURCES.CHANNEL,
-        ADMIN_PERMISSION_ACTIONS.WRITE
-      ))
-  const [budgetVisible, setBudgetVisible] = useState(false)
+    props.audience !== 'admin' ||
+    !hasPermission(
+      user,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.WRITE
+    )
+  const [costVisible, setCostVisible] = useState(false)
   const [historyVisible, setHistoryVisible] = useState(false)
   const form = useForm<ChannelLimitsEditorForm>({
     resolver: zodResolver(channelLimitsEditorSchema),
@@ -125,10 +125,10 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
   })
   const mutation = useMutation({
     mutationFn: (values: ChannelLimitsEditorForm) => {
-      if (readonly || props.audience === 'viewer') {
+      if (readonly) {
         throw new Error('Permission denied')
       }
-      return saveChannelLimits(props.channelId, props.audience, {
+      return saveChannelLimits(props.channelId, {
         ...limitsPayload(values, props.data.config.revision),
         ...(props.audience === 'admin'
           ? { reconcile_seconds: Number(values.reconcile_seconds) }
@@ -138,10 +138,14 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
     onSuccess: () => {
       toast.success(t('Saved successfully'))
       void queryClient.invalidateQueries({ queryKey: supplyQueryKey })
+      void queryClient.invalidateQueries({
+        queryKey: CHANNEL_RECENT_STATS_QUERY_KEY,
+      })
       props.onClose()
     },
   })
   const usage = props.data.usage
+  const rpmSupported = props.data.config.rpm_supported !== false
   const tpmApplicable = props.data.config.tpm_applicable !== false
   const reason = usage.reason
   const money = (value: string | null) =>
@@ -160,9 +164,19 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
         <div>
           <dt className='text-muted-foreground'>{t('RPM usage')}</dt>
           <dd className='tabular-nums'>
-            {formatNumber(usage.rpm_used, locale)}
+            {rpmSupported
+              ? formatNumber(usage.rpm_used, locale)
+              : t('Not applicable')}
           </dd>
         </div>
+        {rpmSupported && usage.rpm_reserved != null && (
+          <div>
+            <dt className='text-muted-foreground'>{t('Reserved requests')}</dt>
+            <dd className='tabular-nums'>
+              {formatNumber(usage.rpm_reserved, locale)}
+            </dd>
+          </div>
+        )}
         <div>
           <dt className='text-muted-foreground'>{t('TPM usage')}</dt>
           <dd className='tabular-nums'>
@@ -189,21 +203,22 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
           <dt className='text-muted-foreground'>{t('Reserved cost')}</dt>
           <dd className='tabular-nums'>{money(usage.daily_reserved_usd)}</dd>
         </div>
-        <div>
-          <dt className='text-muted-foreground'>{t('Remaining budget')}</dt>
-          <dd className='tabular-nums'>
-            {props.data.config.daily_usd == null
-              ? t('Unlimited')
-              : money(usage.daily_remaining_usd)}
-          </dd>
-        </div>
       </dl>
+      {usage.rpm_retry_at_ms != null && usage.rpm_retry_at_ms > 0 && (
+        <p className='text-muted-foreground text-xs'>
+          {t('Estimated time for the next RPM slot: {{time}}', {
+            time: new Intl.DateTimeFormat(locale, {
+              timeStyle: 'medium',
+            }).format(usage.rpm_retry_at_ms),
+          })}
+        </p>
+      )}
       <p className='text-muted-foreground text-xs'>
-        {t('Budget date (Beijing time)')}: {usage.budget_day || '—'}
+        {t('Cost date (Beijing time)')}: {usage.budget_day || '—'}
         {usage.reset_at > 0 && (
           <>
             {' '}
-            · {t('Next budget reset')}:{' '}
+            · {t('Next daily cost reset')}:{' '}
             {new Intl.DateTimeFormat(locale, {
               timeZone: 'Asia/Shanghai',
               dateStyle: 'medium',
@@ -218,31 +233,31 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
           onSubmit={form.handleSubmit((values) => mutation.mutate(values))}
           className='space-y-4'
         >
-          <div className='grid gap-4 sm:grid-cols-3'>
-            {(['rpm', 'tpm', 'daily_usd'] as const).map((name) => (
+          <div className='grid gap-4 sm:grid-cols-2'>
+            {(['rpm', 'tpm'] as const).map((name) => (
               <FormField
                 key={name}
                 control={form.control}
                 name={name}
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>
-                      {name === 'daily_usd'
-                        ? t('Daily limit (USD)')
-                        : name.toUpperCase()}
-                    </FormLabel>
+                    <FormLabel>{name.toUpperCase()}</FormLabel>
                     <FormControl>
                       <Input
                         {...field}
-                        inputMode={name === 'daily_usd' ? 'decimal' : 'numeric'}
+                        inputMode='numeric'
                         placeholder={
-                          name === 'tpm' && !tpmApplicable
+                          (name === 'rpm' && !rpmSupported) ||
+                          (name === 'tpm' && !tpmApplicable)
                             ? t('Not applicable')
                             : t('Unlimited')
                         }
                         disabled={
                           readonly ||
                           mutation.isPending ||
+                          (name === 'rpm' &&
+                            !rpmSupported &&
+                            props.data.config.rpm == null) ||
                           (name === 'tpm' && !tpmApplicable)
                         }
                       />
@@ -291,13 +306,6 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
               'Leave a limit blank for unlimited usage. Changing limits does not reset usage.'
             )}
           </p>
-          {!readonly && !props.data.config.budget_ready && (
-            <p className='text-muted-foreground text-sm'>
-              {t(
-                'A daily budget requires an administrator to configure procurement costs.'
-              )}
-            </p>
-          )}
           <div className='flex justify-end gap-2'>
             <Button type='button' variant='outline' onClick={props.onClose}>
               {t('Close')}
@@ -333,12 +341,12 @@ function LimitsEditor(props: Props & { data: ChannelLimits }) {
           <Button
             type='button'
             variant='outline'
-            aria-expanded={budgetVisible}
-            onClick={() => setBudgetVisible(!budgetVisible)}
+            aria-expanded={costVisible}
+            onClick={() => setCostVisible(!costVisible)}
           >
-            {t('Budget details')}
+            {t('Cost details')}
           </Button>
-          {budgetVisible && (
+          {costVisible && (
             <SupplierBudgetEvents
               channelId={props.channelId}
               day={usage.budget_day}
@@ -355,16 +363,6 @@ function limitReason(reason: string, t: (key: string) => string): string {
       return t('RPM limit reached')
     case 'tpm_limited':
       return t('TPM limit reached')
-    case 'daily_exhausted':
-      return t(
-        'Daily budget exhausted. The budget resets at 00:00 Beijing time.'
-      )
-    case 'budget_reserved':
-      return t('Budget is reserved by pending requests')
-    case 'cost_config_missing':
-      return t(
-        'Waiting for an administrator to configure procurement costs. The daily limit is not active yet.'
-      )
     case 'accounting_unavailable':
       return t('Usage accounting is temporarily unavailable')
     default:

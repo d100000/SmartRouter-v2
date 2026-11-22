@@ -2,10 +2,13 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"math"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -24,6 +28,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/tidwall/gjson"
+	"gorm.io/gorm"
 )
 
 // Limit support follows transports with durable dispatch and terminal hooks.
@@ -48,10 +53,14 @@ func ValidateChannelLimitSupport(channel *model.Channel, settings model.ChannelL
 	return &model.ChannelLimitError{Reason: "protocol_limit_unsupported"}
 }
 
+// channelUsesMeteredHTTP reports channel types whose every billable relay
+// send is admitted into the procurement ledger right before it leaves: through
+// relay/channel.doRequest, or through an explicit BeforeChannelUpstream call
+// where the adaptor bypasses that transport (AWS Bedrock SDK, Xunfei and
+// VolcEngine TTS WebSockets). Task submissions are admitted by the task path.
+// A new channel type must be added here or listed as non-billable in the
+// coverage test; a configured channel's cost is always recorded.
 func channelUsesMeteredHTTP(channelType int) bool {
-	// These adaptors dispatch synchronously through relay/channel.doRequest.
-	// Do not infer support from the fallback API type: task and SDK channels
-	// can share an OpenAI-facing route while bypassing that transport.
 	switch channelType {
 	case constant.ChannelTypeOpenAI, constant.ChannelTypeAzure, constant.ChannelTypeOpenAIMax,
 		constant.ChannelTypeOhMyGPT, constant.ChannelTypeCustom, constant.ChannelTypeAILS,
@@ -62,10 +71,41 @@ func channelUsesMeteredHTTP(channelType int) bool {
 		constant.ChannelTypeMoonshot, constant.ChannelTypePerplexity, constant.ChannelTypeMistral,
 		constant.ChannelTypeXinference, constant.ChannelTypeXai, constant.ChannelTypeCodex,
 		constant.ChannelTypeAdvancedCustom, constant.ChannelTypeSub2API, constant.ChannelTypeNewAPI,
-		constant.ChannelTypeVLLM, constant.ChannelTypeSGLang, constant.ChannelTypeSubmodel, constant.ChannelTypeTaskPlugin:
+		constant.ChannelTypeVLLM, constant.ChannelTypeSGLang, constant.ChannelTypeSubmodel, constant.ChannelTypeTaskPlugin,
+		constant.ChannelTypeAli, constant.ChannelTypeVolcEngine, constant.ChannelTypeZhipu, constant.ChannelTypeZhipu_v4,
+		constant.ChannelTypeTencent, constant.ChannelTypeBaidu, constant.ChannelTypeBaiduV2, constant.ChannelTypeCohere,
+		constant.ChannelTypeMiniMax, constant.ChannelTypeJina, constant.ChannelCloudflare, constant.ChannelTypeMokaAI,
+		constant.ChannelTypeReplicate, constant.ChannelTypeOllama, constant.ChannelTypePaLM, constant.ChannelTypeDify,
+		constant.ChannelTypeCoze, constant.ChannelTypeJimeng, constant.ChannelTypeAws, constant.ChannelTypeXunfei,
+		// Task channel types: a non-task relay routed to them uses the
+		// OpenAI-compatible adaptor and therefore doRequest.
+		constant.ChannelTypeMidjourney, constant.ChannelTypeMidjourneyPlus, constant.ChannelTypeSunoAPI,
+		constant.ChannelTypeKling, constant.ChannelTypeVidu, constant.ChannelTypeDoubaoVideo, constant.ChannelTypeSora:
 		return true
 	}
 	return false
+}
+
+func channelLimitUpstreamStatusKey(attemptID string) string {
+	return "channel_limit_upstream_status:" + attemptID
+}
+
+// ObserveChannelLimitUpstreamStatus records the HTTP status the upstream
+// answered for the current physical request. It distinguishes a request the
+// upstream rejected (no work ran) from one whose outcome is unknown.
+func ObserveChannelLimitUpstreamStatus(c *gin.Context, info *relaycommon.RelayInfo, status int) {
+	if c == nil || info == nil || info.ChannelLimitAttempt == nil || !info.ChannelLimitAttempt.Sent || status <= 0 {
+		return
+	}
+	c.Set(channelLimitUpstreamStatusKey(info.ChannelLimitAttempt.ID), status)
+}
+
+func channelLimitUpstreamRejected(c *gin.Context, attempt *relaycommon.ChannelLimitRuntime) bool {
+	if c == nil {
+		return false
+	}
+	status := c.GetInt(channelLimitUpstreamStatusKey(attempt.ID))
+	return status > 0 && (status < http.StatusOK || status >= http.StatusMultipleChoices)
 }
 
 var liveChannelLimitAttempts sync.Map
@@ -78,13 +118,31 @@ func StartChannelLimitLeaseWorker() {
 func maintainChannelLimitLeases() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for now := range ticker.C {
+	for range ticker.C {
+		byChannel := make(map[int][]string)
 		liveChannelLimitAttempts.Range(func(key, value any) bool {
-			if err := model.RenewChannelAttemptLease(value.(int), key.(string), now); err != nil {
-				common.SysError("channel attempt lease update failed: " + err.Error())
-			}
+			channelID := value.(int)
+			byChannel[channelID] = append(byChannel[channelID], key.(string))
 			return true
 		})
+		workers := 4
+		if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			workers = 1
+		}
+		slots := make(chan struct{}, workers)
+		var renewals sync.WaitGroup
+		for channelID, ids := range byChannel {
+			slots <- struct{}{}
+			renewals.Go(func() {
+				defer func() { <-slots }()
+				for batch := range slices.Chunk(ids, 128) {
+					if err := model.RenewChannelAttemptLeases(channelID, batch, time.Time{}); err != nil {
+						common.SysError("channel attempt lease update failed: " + err.Error())
+					}
+				}
+			})
+		}
+		renewals.Wait()
 	}
 }
 
@@ -93,18 +151,26 @@ func PrepareChannelLimitAttempt(info *relaycommon.RelayInfo, channel *model.Chan
 		return model.ErrChannelAttemptState
 	}
 	info.ChannelLimitAttempt = nil
-	state, err := model.GetChannelLimitState(channel.Id, time.Now())
+	// Every request records its procurement cost, whether or not a limit is
+	// configured: the ledger is the channel's cost evidence, not only a limiter.
+	config, err := model.GetChannelLimitConfig(channel.Id)
 	if err != nil {
 		return err
 	}
-	if err := ValidateChannelLimitSupport(channel, state.Config.ChannelLimitSettings); err != nil {
+	if err := ValidateChannelLimitSupport(channel, config.ChannelLimitSettings); err != nil {
 		return err
+	}
+	// A realtime handshake has no RPM charge. Generations are admitted individually.
+	if info.RelayFormat != types.RelayFormatOpenAIRealtime && info.RelayMode != relayconstant.RelayModeRealtime {
+		if err := model.CheckChannelRPM(config, time.Time{}); err != nil {
+			return err
+		}
 	}
 	if info.TaskRelayInfo != nil {
 		return PrepareTaskChannelAttempt(info, channel)
 	}
 	if !channelUsesMeteredHTTP(channel.Type) {
-		if channel.OwnerSupplierID != "" || state.Config.RPM > 0 || state.Config.TPM > 0 || state.Config.DailyUSDNano > 0 {
+		if channel.OwnerSupplierID != "" || config.RPM > 0 || config.TPM > 0 || config.DailyUSDNano > 0 {
 			return &model.ChannelLimitError{Reason: "protocol_limit_unsupported"}
 		}
 		return nil
@@ -155,17 +221,21 @@ func PrepareChannelEventAttempt(info *relaycommon.RelayInfo, channel *model.Chan
 }
 
 // PrepareNextPluginRelayAttempt gives each physical request of a provider
-// chain its own RPM admission. Intermediate responses have no host-verified
-// billable usage, so their reservations remain unknown rather than being
-// released or charged again to the client's wallet. Frozen procurement rules
-// and the logical request's supplier claim survive the transition.
+// chain its own ledger record. An intermediate step (authentication, polling,
+// a rejected credential that is refreshed and resent) carries no billable work
+// of its own: it settles at zero and releases its hold. The logical request's
+// whole cost settles on its final step, so the records sum to what ran.
+// Later steps are recorded but never refused for capacity, because the first
+// step already ran upstream. Frozen procurement rules and the logical
+// request's supplier claim survive the transition.
 func PrepareNextPluginRelayAttempt(info *relaycommon.RelayInfo) error {
 	if info == nil || info.ChannelLimitAttempt == nil || !info.ChannelLimitAttempt.Sent {
 		return nil
 	}
 	previous := info.ChannelLimitAttempt
 	if !previous.Finished {
-		if err := model.MarkChannelAttemptUnknown(previous.ChannelID, previous.ID, 0, time.Now()); err != nil {
+		zero := int64(0)
+		if err := model.SettleChannelAttempt(model.ChannelAttemptSettlement{ID: previous.ID, ChannelID: previous.ChannelID, Version: 1, Tokens: &zero, CostUSDNano: &zero}, time.Time{}); err != nil {
 			return err
 		}
 		previous.Finished = true
@@ -188,6 +258,9 @@ func BeforeChannelUpstream(c *gin.Context, info *relaycommon.RelayInfo) error {
 func checkChannelLimitDispatchState(info *relaycommon.RelayInfo) error {
 	attempt := info.ChannelLimitAttempt
 	channel, err := model.GetChannelById(attempt.ChannelID, false)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return &model.ChannelLimitError{Reason: "channel_unavailable"}
+	}
 	if err != nil {
 		return err
 	}
@@ -200,6 +273,9 @@ func checkChannelLimitDispatchState(info *relaycommon.RelayInfo) error {
 			return &model.ChannelLimitError{Reason: "channel_unavailable"}
 		}
 		account, err := model.GetSupplierAccount(attempt.SupplierID)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
 		if err != nil || !account.SupplyEnabled || !account.AllowsTemplate(attempt.TemplateID, []string{info.OriginModelName}) {
 			return &model.ChannelLimitError{Reason: "channel_unavailable"}
 		}
@@ -224,11 +300,11 @@ func BeforeChannelUpstreamRequest(c *gin.Context, info *relaycommon.RelayInfo, r
 		if err != nil {
 			return err
 		}
-		state, err := model.GetChannelLimitState(channel.Id, time.Now())
+		config, err := model.GetChannelLimitConfig(channel.Id)
 		if err != nil {
 			return err
 		}
-		if channel.OwnerSupplierID != "" || state.Config.RPM > 0 || state.Config.TPM > 0 || state.Config.DailyUSDNano > 0 {
+		if channel.OwnerSupplierID != "" || config.RPM > 0 || config.TPM > 0 || config.DailyUSDNano > 0 {
 			return &model.ChannelLimitError{Reason: "protocol_limit_unsupported"}
 		}
 		return nil
@@ -238,19 +314,22 @@ func BeforeChannelUpstreamRequest(c *gin.Context, info *relaycommon.RelayInfo, r
 		// Reusing a transport request ID for another send would evade RPM.
 		return model.ErrChannelAttemptDuplicate
 	}
-	if err := checkChannelLimitDispatchState(info); err != nil {
-		return err
-	}
-	now := time.Now()
-	state, err := model.GetChannelLimitState(attempt.ChannelID, now)
-	if err != nil {
-		return err
-	}
 	if info.RelayFormat == types.RelayFormatOpenAIRealtime || info.RelayMode == relayconstant.RelayModeRealtime || request != nil && strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
 		return CheckChannelEventConnection(info)
 	}
+	config, err := model.GetChannelLimitConfig(attempt.ChannelID)
+	if err != nil {
+		return err
+	}
 	var body []byte
-	needsEstimate := attempt.TPMApplicable && (state.Config.TPM > 0 || state.Config.DailyUSDNano > 0)
+	needsEstimate := attempt.TPMApplicable && (config.TPM > 0 || config.DailyUSDNano > 0)
+	// Fail fast before a slow token estimate. Without one, the recheck in
+	// AdmitChannelEvent right before dispatch is sufficient.
+	if needsEstimate {
+		if err := checkChannelLimitDispatchState(info); err != nil {
+			return err
+		}
+	}
 	if needsEstimate && request != nil && request.Body != nil && (strings.Contains(request.Header.Get("Content-Type"), "json") || request.Header.Get("Content-Type") == "") {
 		reader := request.Body
 		if request.GetBody != nil {
@@ -301,9 +380,6 @@ func AdmitChannelEvent(c *gin.Context, info *relaycommon.RelayInfo, prompt, outp
 	if attempt.Sent {
 		return model.ErrChannelAttemptDuplicate
 	}
-	if err := checkChannelLimitDispatchState(info); err != nil {
-		return err
-	}
 	for _, bound := range []*int64{prompt, output, budget} {
 		if bound != nil && (*bound < 0 || *bound > model.ChannelLimitMaxValue) {
 			return model.ErrChannelLimitAccounting
@@ -339,34 +415,27 @@ func AdmitChannelEvent(c *gin.Context, info *relaycommon.RelayInfo, prompt, outp
 	if err != nil {
 		return err
 	}
-	now := time.Now()
-	_, err = model.ReserveChannelAttempt(model.ChannelAttemptReservation{
-		ID: attempt.ID, ChannelID: attempt.ChannelID, TPMApplicable: attempt.TPMApplicable,
-		TokenBudget: budget, CostBudgetNano: costBudget,
-		CostRatio: attempt.CostRatio, QuotaPerUnit: quotaPerUnit, PricingSnapshot: string(pricingSnapshot),
-	}, now)
-	if err != nil {
-		return err
-	}
 	// Tokenization or remote input inspection can outlive a pause/configuration
-	// change. Recheck at the dispatch boundary, releasing our unsent permit.
+	// change. Recheck at dispatch before committing the attempt.
 	if err := checkChannelLimitDispatchState(info); err != nil {
-		_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, time.Now())
 		return err
 	}
 	claimedSupplier := false
 	if !attempt.SupplierRequestClaimed {
 		if !MarkSupplierRequestSent(c, &model.Channel{Id: attempt.ChannelID, OwnerSupplierID: attempt.SupplierID}) {
-			_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, now)
 			return &model.ChannelLimitError{Reason: "supplier_attempt_already_sent"}
 		}
 		claimedSupplier = attempt.SupplierID != ""
 	}
-	if err := model.MarkChannelAttemptSent(attempt.ChannelID, attempt.ID, time.Now()); err != nil {
+	if err := model.DispatchChannelAttempt(model.ChannelAttemptReservation{
+		ID: attempt.ID, ChannelID: attempt.ChannelID, TPMApplicable: attempt.TPMApplicable,
+		TokenBudget: budget, CostBudgetNano: costBudget,
+		CostRatio: attempt.CostRatio, QuotaPerUnit: quotaPerUnit, PricingSnapshot: string(pricingSnapshot),
+		FollowUp: attempt.PriorPhysicalRequestSent,
+	}); err != nil {
 		if claimedSupplier {
 			ReleaseSupplierRequestSent(c, &model.Channel{Id: attempt.ChannelID, OwnerSupplierID: attempt.SupplierID})
 		}
-		_ = model.ReleaseChannelAttempt(attempt.ChannelID, attempt.ID, now)
 		return err
 	}
 	attempt.SupplierRequestClaimed = attempt.SupplierRequestClaimed || claimedSupplier
@@ -620,6 +689,7 @@ func FinishChannelLimitAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiE
 	}
 	var tokens, cost *int64
 	if billing := info.AnalyticsBilling; billing != nil {
+		// TPM records upstream-reported tokens only; a local estimate is not usage.
 		if billing.UsageSource != "" && billing.UsageSource != "local_estimate" {
 			input := billing.InputTokens
 			if billing.CacheUsageKnown {
@@ -640,30 +710,32 @@ func FinishChannelLimitAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiE
 		zero := int64(0)
 		cost = &zero
 	}
-	now := time.Now()
-	unknown := apiErr != nil && (apiErr.GetErrorCode() == types.ErrorCodeDoRequestFailed || apiErr.GetErrorCode() == types.ErrorCodeReadResponseBodyFailed || apiErr.GetErrorCode() == types.ErrorCodeChannelResponseTimeExceeded)
-	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
-		unknown = true
-	}
-	if info.StreamStatus != nil {
-		outcome := info.StreamStatus.OutcomeSnapshot()
-		if outcome.Response == relaycommon.ResponseOutcomeUnknown && (outcome.ExpectsTerminal || outcome.EndReason != relaycommon.StreamEndReasonDone && outcome.EndReason != relaycommon.StreamEndReasonEOF) {
-			unknown = true
-		}
+	settle := func(tokens, cost *int64) error {
+		return model.SettleChannelAttempt(model.ChannelAttemptSettlement{ID: attempt.ID, ChannelID: attempt.ChannelID, Version: 1, Tokens: tokens, CostUSDNano: cost}, time.Time{})
 	}
 	var err error
-	if unknown {
+	switch {
+	case cost != nil:
+		// The customer settlement computed this request's amount, so it ran at
+		// this cost even if the client then disconnected or a later step failed.
+		err = settle(tokens, cost)
+	case apiErr != nil && !attempt.PriorPhysicalRequestSent && channelLimitUpstreamRejected(c, attempt):
+		// The upstream rejected the request with no usage: nothing ran.
+		zero := int64(0)
+		err = settle(&zero, &zero)
+	case attempt.CostRatio == nil:
+		// No procurement price is configured, so no later evidence can price
+		// this request either. Settle it (the cost stays counted as unknown)
+		// rather than leaving it in reconciliation, also after a disconnect.
+		err = settle(tokens, nil)
+	default:
+		// The request reached the upstream but no amount was computed for it.
+		// Its cost is unknown and stays counted until a correction settles it.
 		observed := int64(0)
 		if tokens != nil {
 			observed = *tokens
 		}
-		if cost != nil {
-			err = model.MarkChannelAttemptUnknown(attempt.ChannelID, attempt.ID, observed, now, *cost)
-		} else {
-			err = model.MarkChannelAttemptUnknown(attempt.ChannelID, attempt.ID, observed, now)
-		}
-	} else {
-		err = model.SettleChannelAttempt(model.ChannelAttemptSettlement{ID: attempt.ID, ChannelID: attempt.ChannelID, Version: 1, Tokens: tokens, CostUSDNano: cost}, now)
+		err = model.MarkChannelAttemptUnknown(attempt.ChannelID, attempt.ID, observed, time.Time{})
 	}
 	if err == nil {
 		attempt.Finished = true
@@ -671,23 +743,207 @@ func FinishChannelLimitAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiE
 	return err
 }
 
+// channelAdmissionError exposes only the localized public message to clients.
+// Its cause remains available to host code for retry decisions.
+type channelAdmissionError struct {
+	message string
+	cause   error
+}
+
+func (e *channelAdmissionError) Error() string { return e.message }
+func (e *channelAdmissionError) Unwrap() error { return e.cause }
+
+// CheckChannelRPM checks a candidate before building a generation or submission.
+// The actual send still performs atomic admission against the current limits.
+func CheckChannelRPM(channelID int) error {
+	config, err := model.GetChannelLimitConfig(channelID)
+	if err != nil {
+		return err
+	}
+	return model.CheckChannelRPM(config, time.Time{})
+}
+
+func LocalChannelLimitError(err error) *types.NewAPIError {
+	var apiErr *types.NewAPIError
+	if !errors.As(err, &apiErr) || apiErr == nil || apiErr.GetErrorType() != types.ErrorTypeNewAPIError || apiErr.GetErrorCode() != "channel_limit_unavailable" {
+		return nil
+	}
+	if _, local := apiErr.Err.(*channelAdmissionError); !local {
+		return nil
+	}
+	return apiErr
+}
+
+// RememberAttemptFailure keeps the error from the attempt that was retried.
+// A later candidate may be declined locally without producing an upstream result.
+func (p *RetryParam) RememberAttemptFailure(apiErr *types.NewAPIError) {
+	p.priorAttemptError = apiErr
+	p.priorAttemptAddresses = common.UpstreamAddresses(p.Ctx)
+	p.Ctx.Set("channel_rpm_retry_inapplicable", true)
+}
+
+// ClientErrorAfterRefusal selects the error to present after accounting has
+// finished for the last candidate. An earlier provider error must be masked
+// using that provider's addresses.
+func (p *RetryParam) ClientErrorAfterRefusal(final *types.NewAPIError) (*types.NewAPIError, []string) {
+	if p == nil || LocalChannelLimitError(final) == nil || p.LocalRefusal == nil {
+		return final, nil
+	}
+	if p.priorAttemptError != nil {
+		return p.priorAttemptError, p.priorAttemptAddresses
+	}
+	return p.LocalRefusal, nil
+}
+
+// TryAnotherChannelAfterRefusal handles a candidate declined before dispatch.
+// A bound session may retain its preferred channel even if this call uses another one.
+func (p *RetryParam) TryAnotherChannelAfterRefusal(channelID int, locked bool, apiErr *types.NewAPIError) bool {
+	c := p.Ctx
+	PreserveChannelAffinityAfterLocalRefusal(c, channelID)
+	refusals := c.GetInt("channel_local_refusals") + 1
+	c.Set("channel_local_refusals", refusals)
+	var limited *model.ChannelLimitError
+	if errors.As(apiErr, &limited) && limited.Reason == "rpm_limited" && limited.RetryAt > 0 {
+		deadline := limited.RetryDeadline()
+		if earliest := c.GetTime("channel_rpm_retry_at"); earliest.IsZero() || deadline.Before(earliest) {
+			c.Set("channel_rpm_retry_at", deadline)
+		}
+	} else {
+		c.Set("channel_rpm_retry_inapplicable", true)
+	}
+	// A known RPM retry time applies only when every candidate was RPM-limited.
+	// Preserve a 503 over capacity refusals, and an untimed capacity refusal
+	// over RPM, regardless of the order in which candidates were visited.
+	var previous *model.ChannelLimitError
+	if p.LocalRefusal == nil || apiErr.StatusCode >= http.StatusInternalServerError ||
+		(errors.As(p.LocalRefusal, &previous) && previous.Reason == "rpm_limited") {
+		p.LocalRefusal = apiErr
+	}
+	_, pinned, _ := GetChannelConstraints(c).ResolvedPin()
+	return !locked && !pinned && RequestPolicy(c).SessionMode != "strict" && refusals < 512 && SchedulingRetryAllowed(c)
+}
+
+// WriteChannelRetryAfter is called only when rendering the final HTTP error.
+func WriteChannelRetryAfter(c *gin.Context, err error) {
+	apiErr := LocalChannelLimitError(err)
+	var limited *model.ChannelLimitError
+	if c.Writer.Written() || c.GetBool("channel_rpm_retry_inapplicable") || apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests ||
+		!errors.As(apiErr, &limited) || limited.Reason != "rpm_limited" || limited.RetryAt <= 0 {
+		return
+	}
+	deadline := limited.RetryDeadline()
+	if earliest := c.GetTime("channel_rpm_retry_at"); !earliest.IsZero() && earliest.Before(deadline) {
+		deadline = earliest
+	}
+	remaining := time.Until(deadline)
+	c.Header("Retry-After", strconv.FormatInt(max(1, int64((remaining+time.Second-1)/time.Second)), 10))
+}
+
+// channelLimitInfrastructureError hides a ledger or database failure from the
+// client. It is not a refusal by the channel, so callers do not try another
+// candidate: that would repeat the failing query for every channel.
+type channelLimitInfrastructureError struct {
+	message string
+	cause   error
+}
+
+func (e *channelLimitInfrastructureError) Error() string { return e.message }
+func (e *channelLimitInfrastructureError) Unwrap() error { return e.cause }
+
+// IsChannelLimitInfrastructureError reports an error produced by
+// ChannelLimitRelayError for a failure other than the channel's own refusal.
+func IsChannelLimitInfrastructureError(err error) bool {
+	var failure *channelLimitInfrastructureError
+	return errors.As(err, &failure)
+}
+
+// channelLimitRefusal reports whether err is this channel's own admission
+// decision, which another candidate channel may not share.
+func channelLimitRefusal(err error) bool {
+	var limited *model.ChannelLimitError
+	return errors.As(err, &limited) || errors.Is(err, model.ErrChannelAttemptDuplicate) || errors.Is(err, model.ErrChannelLimitAccounting)
+}
+
+func channelLimitCapacityReason(reason string) bool {
+	return reason == "rpm_limited" || reason == "tpm_limited" || reason == "daily_exhausted" || reason == "budget_reserved"
+}
+
+const channelLimitRefusalLogInterval = 10 * time.Second
+
+type channelLimitRefusalKey struct {
+	channelID int
+	reason    string
+}
+
+// Capacity refusals can occur for every request on a saturated channel.
+// Log each channel and reason at most once per interval.
+var channelLimitRefusalLog = struct {
+	sync.Mutex
+	last map[channelLimitRefusalKey]time.Time
+}{last: make(map[channelLimitRefusalKey]time.Time)}
+
+func shouldLogChannelLimitRefusal(channelID int, reason string) bool {
+	now := time.Now()
+	key := channelLimitRefusalKey{channelID: channelID, reason: reason}
+	channelLimitRefusalLog.Lock()
+	defer channelLimitRefusalLog.Unlock()
+	if last, found := channelLimitRefusalLog.last[key]; found && now.Sub(last) < channelLimitRefusalLogInterval {
+		return false
+	}
+	if len(channelLimitRefusalLog.last) >= 4096 {
+		clear(channelLimitRefusalLog.last)
+	}
+	channelLimitRefusalLog.last[key] = now
+	return true
+}
+
 // ChannelLimitRelayError preserves a machine-readable refusal without exposing
 // another supplier's identity, budget, or usage through the inference API.
+// The actual cause is written to the server log here.
 func ChannelLimitRelayError(err error, contexts ...*gin.Context) *types.NewAPIError {
-	status := http.StatusServiceUnavailable
-	var limited *model.ChannelLimitError
-	if errors.As(err, &limited) && (limited.Reason == "rpm_limited" || limited.Reason == "tpm_limited" || limited.Reason == "daily_exhausted" || limited.Reason == "budget_reserved") {
-		status = http.StatusTooManyRequests
-	}
 	var ctx *gin.Context
 	if len(contexts) > 0 {
 		ctx = contexts[0]
 	}
+	channelID := 0
+	if ctx != nil {
+		channelID = ctx.GetInt("channel_id")
+	}
+	var logCtx context.Context = context.Background()
+	if ctx != nil {
+		logCtx = ctx
+	}
+	i18nReady := i18n.Init() == nil
+	if !channelLimitRefusal(err) {
+		logger.LogError(logCtx, common.LogText("channel limit check failed: channel #%d: %s", channelID, err.Error()))
+		message := "The service is temporarily unavailable. Please try again later"
+		if i18nReady {
+			message = i18n.T(ctx, i18n.MsgRelayChannelLimitCheckFailed)
+		}
+		return types.NewErrorWithStatusCode(&channelLimitInfrastructureError{message: message, cause: err}, types.ErrorCode("channel_limit_unavailable"), http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+	}
+	status := http.StatusServiceUnavailable
+	reason := "accounting_unavailable"
+	if errors.Is(err, model.ErrChannelAttemptDuplicate) {
+		reason = "attempt_duplicate"
+	}
+	var limited *model.ChannelLimitError
+	if errors.As(err, &limited) {
+		reason = limited.Reason
+	}
+	if channelLimitCapacityReason(reason) {
+		status = http.StatusTooManyRequests
+		if shouldLogChannelLimitRefusal(channelID, reason) {
+			logger.LogInfo(logCtx, common.LogText("channel limit refused request: channel #%d, reason %s", channelID, reason))
+		}
+	} else {
+		logger.LogWarn(logCtx, common.LogText("channel limit refused request: channel #%d, reason %s", channelID, reason))
+	}
 	message := "Upstream channel capacity is currently unavailable"
-	if i18n.Init() == nil {
+	if i18nReady {
 		message = i18n.T(ctx, i18n.MsgRelayChannelLimitUnavailable)
 	}
-	return types.NewErrorWithStatusCode(err, types.ErrorCode("channel_limit_unavailable"), status, types.ErrOptionWithHideErrMsg(message))
+	return types.NewErrorWithStatusCode(&channelAdmissionError{message: message, cause: err}, types.ErrorCode("channel_limit_unavailable"), status)
 }
 
 // Channel tests consume upstream supply but never a consumer's wallet. Use the
@@ -699,14 +955,19 @@ func CaptureChannelTestLimitUsage(c *gin.Context, info *relaycommon.RelayInfo, u
 	summary := calculateTextQuotaSummary(c, info, effectiveBillingUsage(usage))
 	snapshot := &relaycommon.OverviewBillingSnapshot{InputTokens: int64(summary.PromptTokens), OutputTokens: int64(summary.CompletionTokens), UsageSource: "upstream", QuotaPerUnit: summary.QuotaPerUnit}
 	info.AnalyticsBilling = snapshot
+	// Like a relay settlement, an estimated quantity still prices the request;
+	// UsageSource keeps it apart from upstream-reported usage.
 	if usage.BillingUsage != nil && usage.BillingUsage.Estimated || common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens) {
 		snapshot.UsageSource = "local_estimate"
-		return
+	} else {
+		captureOverviewCacheUsage(snapshot, info, usage, false)
 	}
-	captureOverviewCacheUsage(snapshot, info, usage, false)
 	base := summary.BaseQuota.InexactFloat64()
-	if frozen := info.TieredBillingSnapshot; frozen != nil {
-		if tieredResult == nil || tieredResult.Clamp != nil {
+	if !summary.hasBillableUsage() {
+		base = 0
+	}
+	if frozen := info.TieredBillingSnapshot; frozen != nil && tieredResult != nil {
+		if tieredResult.Clamp != nil {
 			return
 		}
 		base, snapshot.QuotaPerUnit = info.PriceData.ApplyOtherRatiosToFloat(tieredResult.ActualQuotaBeforeGroup), frozen.QuotaPerUnit

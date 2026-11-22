@@ -37,23 +37,34 @@ func GeminiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 	grounding.observe(&geminiResponse)
 	grounding.commit(info)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
-	if !geminiResponseHasOutput(&geminiResponse) {
+	hasActualUsage := geminiResponseHasActualUsage(&geminiResponse)
+	if !geminiResponseHasOutput(&geminiResponse) && (!hasActualUsage || len(geminiResponse.Candidates) == 0) {
+		var newAPIError *types.NewAPIError
 		if geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
 			info.PerformanceBusinessRejection = true
 			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
-			return nil, types.NewOpenAIError(
+			newAPIError = types.NewOpenAIError(
 				errors.New("request blocked by Gemini API: "+*geminiResponse.PromptFeedback.BlockReason),
 				types.ErrorCodePromptBlocked,
 				http.StatusBadRequest,
 			)
+		} else {
+			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_candidates")
+			newAPIError = types.NewOpenAIError(
+				errors.New("empty response from Gemini API"),
+				types.ErrorCodeEmptyResponse,
+				http.StatusBadGateway,
+				types.ErrOptionWithSkipRetry(),
+			)
 		}
-		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "gemini_empty_candidates")
-		return nil, types.NewOpenAIError(
-			errors.New("empty response from Gemini API"),
-			types.ErrorCodeEmptyResponse,
-			http.StatusBadGateway,
-			types.ErrOptionWithSkipRetry(),
-		)
+		if !hasActualUsage {
+			return nil, newAPIError
+		}
+		// A blocked prompt that reports usage was processed upstream: the
+		// client gets the error and the request is charged by that usage.
+		usage := buildUsageFromGeminiResponse(c, info, &geminiResponse)
+		c.JSON(newAPIError.StatusCode, gin.H{"error": newAPIError.ToOpenAIError(common.UpstreamAddresses(c)...)})
+		return &usage, nil
 	}
 
 	usage := buildUsageFromGeminiResponse(c, info, &geminiResponse)

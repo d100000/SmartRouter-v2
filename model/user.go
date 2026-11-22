@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -634,6 +633,11 @@ func (user *User) prepareForInsert(tx *gorm.DB) error {
 	}
 	if user.Role == common.RoleSupplierUser {
 		user.MustChangePassword = true
+		if user.Password != "" {
+			if err := ValidateSupplierPassword(user.Password); err != nil {
+				return err
+			}
+		}
 	}
 	user.Email = NormalizeEmail(user.Email)
 	if err := ensureEmailAvailableWithTx(tx, user.Email, 0); err != nil {
@@ -830,21 +834,22 @@ func (user *User) Update(updatePassword bool) error {
 
 func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
-	passwordLength := utf8.RuneCountInString(user.Password)
+	current := User{}
+	if err = tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
 	if updatePassword {
+		if current.Role == common.RoleSupplierUser {
+			if err := ValidateSupplierPassword(user.Password); err != nil {
+				return err
+			}
+		}
 		user.Password, err = common.HashAccountPassword(user.Password)
 		if err != nil {
 			return err
 		}
 	}
 	newUser := *user
-	current := User{}
-	if err = tx.First(&current, user.Id).Error; err != nil {
-		return err
-	}
-	if updatePassword && current.Role == common.RoleSupplierUser && passwordLength < 15 {
-		return ErrSupplierPasswordLength
-	}
 	if newUser.Role != 0 && newUser.Role != current.Role && (newUser.Role == common.RoleSupplierUser || current.Role == common.RoleSupplierUser) {
 		return common.NewMessage("Invalid parameters")
 	}
@@ -912,8 +917,16 @@ func (user *User) Edit(updatePassword bool) error {
 
 func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
-	passwordLength := utf8.RuneCountInString(user.Password)
+	current := User{}
+	if err = tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
 	if updatePassword {
+		if current.Role == common.RoleSupplierUser {
+			if err := ValidateSupplierPassword(user.Password); err != nil {
+				return err
+			}
+		}
 		user.Password, err = common.HashAccountPassword(user.Password)
 		if err != nil {
 			return err
@@ -931,14 +944,7 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 		updates["password"] = newUser.Password
 	}
 
-	current := User{}
-	if err = tx.First(&current, user.Id).Error; err != nil {
-		return err
-	}
 	if updatePassword && current.Role == common.RoleSupplierUser {
-		if passwordLength < 15 {
-			return ErrSupplierPasswordLength
-		}
 		updates["must_change_password"] = true
 	}
 	authChanged := (updatePassword && current.Password != newUser.Password) || current.Group != newUser.Group
@@ -1248,6 +1254,15 @@ func ResetUserPasswordByEmail(email string, password string) error {
 		return err
 	}
 	if err = DB.Transaction(func(tx *gorm.DB) error {
+		var current User
+		if err := lockForUpdate(tx).Select("role").First(&current, user.Id).Error; err != nil {
+			return err
+		}
+		// Dedicated accounts use the authenticated administrator reset, which
+		// requires the supplier to replace the issued password after sign-in.
+		if current.Role == common.RoleSupplierUser {
+			return ErrEmailNotFound
+		}
 		if _, err := IncrementUserAuthVersionWithTx(tx, user.Id); err != nil {
 			return err
 		}
@@ -1396,21 +1411,16 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	}
 	if !db && common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
+	} else if err := increaseUserQuota(id, quota); err != nil {
+		return err
+	}
+	if common.RedisEnabled {
 		gopool.Go(func() {
-			if err := cacheIncrUserQuota(id, int64(quota)); err != nil {
+			if _, err := cacheApplyUserQuotaDelta(id, int64(quota)); err != nil {
 				common.SysLog(common.LogText("failed to increase user quota: %s", err.Error()))
 			}
 		})
-		return nil
 	}
-	if err := increaseUserQuota(id, quota); err != nil {
-		return err
-	}
-	gopool.Go(func() {
-		if err := cacheIncrUserQuota(id, int64(quota)); err != nil {
-			common.SysLog(common.LogText("failed to increase user quota: %s", err.Error()))
-		}
-	})
 	return nil
 }
 
@@ -1438,12 +1448,13 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota cannot be negative")
 	}
-	gopool.Go(func() {
-		err := cacheDecrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog(common.LogText("failed to decrease user quota: %s", err.Error()))
-		}
-	})
+	if common.RedisEnabled {
+		gopool.Go(func() {
+			if _, err := cacheApplyUserQuotaDelta(id, -int64(quota)); err != nil {
+				common.SysLog(common.LogText("failed to decrease user quota: %s", err.Error()))
+			}
+		})
+	}
 	if !db && common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
 		return nil

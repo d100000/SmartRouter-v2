@@ -10,6 +10,7 @@ const (
 	MsgAuthUserBanned                = "auth.user_banned"
 	MsgAuthSupplierConsumerForbidden = "auth.supplier_consumer_forbidden"
 	MsgRelayChannelLimitUnavailable  = "relay.channel_limit_unavailable"
+	MsgRelayChannelLimitCheckFailed  = "relay.channel_limit_check_failed"
 	MsgTokenGetInfoFailed            = "token.get_info_failed"
 	MsgTokenInvalid                  = "token.invalid"
 	MsgTokenNotProvided              = "token.not_provided"

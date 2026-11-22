@@ -73,10 +73,6 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 		{name: "finish only", body: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "whitespace only", body: "data: {\"choices\":[{\"delta\":{\"content\":\"   \"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "heartbeats only", body: ": ping\n\nevent: heartbeat\ndata: {\"type\":\"heartbeat\"}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
-		{name: "input usage only", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0,\"total_tokens\":17}}\n\ndata: [DONE]\n\n", actualUsage: true, code: types.ErrorCodeEmptyResponse},
-		{name: "canonical cache only", body: "data: {\"usage\":{\"billing_usage\":{\"source\":\"claude_messages\",\"semantic\":\"anthropic\",\"claude_usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":17}}}}\n\ndata: [DONE]\n\n", actualUsage: true, code: types.ErrorCodeEmptyResponse},
-		{name: "actual usage error", body: "data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0}}\n\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\n", actualUsage: true, code: types.ErrorCodeBadResponse},
-		{name: "json actual usage error", contentType: "application/json", body: `{"usage":{"prompt_tokens":17},"error":{"message":"upstream failed"}}`, actualUsage: true, code: types.ErrorCodeBadResponse},
 		{name: "zero usage", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "estimated canonical usage", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1325020,\"billing_usage\":{\"source\":\"oai_chat\",\"semantic\":\"openai\",\"estimated\":true,\"openai_usage\":{\"prompt_tokens\":1325020}}}}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
 		{name: "local usage source", body: "data: {\"usage\":{\"prompt_tokens\":1325020,\"usage_source\":\"local\"}}\n\ndata: [DONE]\n\n", code: types.ErrorCodeEmptyResponse},
@@ -85,7 +81,6 @@ func TestOaiStreamHandlerRejectsUnbillableFailures(t *testing.T) {
 		{name: "invalid event", body: "data: not-json\n\n", code: types.ErrorCodeBadResponseBody},
 		{name: "json error without type", contentType: "application/json", body: `{"error":{"message":"context too long","code":"context_length_exceeded"}}`, code: "context_length_exceeded", message: "context too long"},
 		{name: "json error incidental choices", contentType: "application/json", body: `{"error":{"message":"upstream refused"},"choices":[{"message":{"role":"assistant","content":"not delivered"}}]}`, code: types.ErrorCodeBadResponse, message: "upstream refused"},
-		{name: "JSON tool metadata without payload", contentType: "application/json", body: `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call1","type":"function","function":{}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":17}}`, actualUsage: true, code: types.ErrorCodeEmptyResponse},
 		{name: "invalid json response", contentType: "application/json", body: `{`, code: types.ErrorCodeBadResponseBody},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -213,7 +208,7 @@ func TestOaiStreamHandlerBoundsErrorDiagnostics(t *testing.T) {
 	assert.NotContains(t, info.StreamStatus.Summary(), "sk-secret-token")
 }
 
-func TestOaiStreamHandlerDoesNotChargeDiscardedExtensions(t *testing.T) {
+func TestOaiStreamHandlerChargesOutputDroppedByConversion(t *testing.T) {
 	for _, test := range []struct {
 		name           string
 		format         types.RelayFormat
@@ -226,16 +221,75 @@ func TestOaiStreamHandlerDoesNotChargeDiscardedExtensions(t *testing.T) {
 		{name: "Gemini conversion", format: types.RelayFormatGemini},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, response, info, recorder := setupChatBillingStream(t, io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot help\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")))
+			ctx, response, info, _ := setupChatBillingStream(t, io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot help\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")))
 			info.RelayFormat = test.format
 			info.ChannelSetting.ForceFormat = test.forceFormat
 			info.ChannelSetting.ThinkingToContent = test.thinkToContent
+			if test.format == types.RelayFormatClaude {
+				info.ClaudeConvertInfo = &relaycommon.ClaudeConvertInfo{LastMessagesType: relaycommon.LastMessageTypeNone}
+			}
 			usage, apiErr := OaiStreamHandler(ctx, info, response)
-			require.NotNil(t, apiErr)
-			assert.Nil(t, usage)
-			require.NotNil(t, info.StreamFailure)
-			assert.True(t, info.StreamFailure.NoCharge)
-			assert.NotContains(t, recorder.Body.String(), "I cannot help")
+			require.Nil(t, apiErr, "upstream generated the refusal, so it is charged")
+			require.NotNil(t, usage)
+			assert.Positive(t, usage.CompletionTokens)
+			assert.Nil(t, info.StreamFailure)
+		})
+	}
+}
+
+// Usage or output means the generation ran upstream and is charged; only a
+// response with neither is an uncharged empty response.
+func TestOaiStreamHandlerChargesUpstreamUsageOrOutput(t *testing.T) {
+	for _, test := range []struct {
+		name, contentType, body string
+		failure                 bool
+		completion              int
+		visible                 []string
+	}{
+		{name: "input usage only", body: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0,\"total_tokens\":17}}\n\ndata: [DONE]\n\n"},
+		{name: "canonical cache only", body: "data: {\"usage\":{\"billing_usage\":{\"source\":\"claude_messages\",\"semantic\":\"anthropic\",\"claude_usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":17}}}}\n\ndata: [DONE]\n\n"},
+		{name: "error after usage", body: "data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0}}\n\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\n", failure: true, visible: []string{"upstream failed"}},
+		{name: "JSON error with usage", contentType: "application/json", body: `{"usage":{"prompt_tokens":17},"error":{"message":"upstream failed"}}`, failure: true, visible: []string{"upstream failed"}},
+		{name: "JSON tool metadata with usage", contentType: "application/json", body: `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call1","type":"function","function":{}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":17}}`},
+		{name: "JSON hidden reasoning hit length", contentType: "application/json", completion: 512,
+			body:    `{"id":"chat_1","object":"chat.completion","model":"o4-mini","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":20,"completion_tokens":512,"total_tokens":532,"completion_tokens_details":{"reasoning_tokens":512}}}`,
+			visible: []string{`"finish_reason":"length"`, `"reasoning_tokens":512`}},
+		{name: "SSE hidden reasoning hit length", completion: 512,
+			body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":512,\"completion_tokens_details\":{\"reasoning_tokens\":512}}}\n\ndata: [DONE]\n\n"},
+		{name: "JSON OpenRouter message images", contentType: "application/json",
+			body:    `{"choices":[{"message":{"role":"assistant","content":"","images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]},"finish_reason":"stop"}]}`,
+			visible: []string{"iVBORw0KGgo="}},
+		{name: "SSE OpenRouter delta images",
+			body:    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"images\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\"}}]},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+			visible: []string{"iVBORw0KGgo="}},
+		{name: "JSON image_url content parts only", contentType: "application/json",
+			body:    `{"choices":[{"message":{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"https://cdn.example.com/out.png"}}]},"finish_reason":"stop"}]}`,
+			visible: []string{"https://cdn.example.com/out.png"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, response, info, recorder := setupChatBillingStream(t, io.NopCloser(strings.NewReader(test.body)))
+			if test.contentType != "" {
+				response.Header.Set("Content-Type", test.contentType)
+			}
+			usage, apiErr := OaiStreamHandler(ctx, info, response)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.True(t, streamHasUsage(usage), "settlement receives a billable quantity")
+			if test.completion > 0 {
+				assert.Equal(t, test.completion, usage.CompletionTokens)
+			}
+			for _, visible := range test.visible {
+				assert.Contains(t, recorder.Body.String(), visible)
+			}
+			if test.failure {
+				require.NotNil(t, info.StreamFailure)
+				assert.False(t, info.StreamFailure.NoCharge)
+				assert.True(t, info.StreamFailure.HasActualUsage)
+				assert.True(t, info.StreamStatus.ResponseFailed())
+				assert.NotContains(t, recorder.Body.String(), "[DONE]")
+			} else {
+				assert.Nil(t, info.StreamFailure)
+			}
 		})
 	}
 }

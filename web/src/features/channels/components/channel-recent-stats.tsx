@@ -68,7 +68,7 @@ export function ChannelRecentStatsProvider(props: {
 }) {
   const channelIds = useMemo(() => {
     if (!props.channels) return undefined
-    const ids = [
+    return [
       ...new Set(
         props.channels.flatMap((channel) =>
           isTagAggregateRow(channel)
@@ -79,9 +79,6 @@ export function ChannelRecentStatsProvider(props: {
     ]
       .filter((id) => Number.isSafeInteger(id) && id > 0)
       .sort((left, right) => left - right)
-    // The endpoint caps both IDs and CSV length. Oversized pages still make
-    // one request, using the endpoint's unfiltered snapshot fallback.
-    return ids.length <= 500 && ids.join(',').length <= 8192 ? ids : undefined
   }, [props.channels])
   const [now, setNow] = useState(Date.now)
   useEffect(() => {
@@ -93,7 +90,7 @@ export function ChannelRecentStatsProvider(props: {
       ? [...CHANNEL_RECENT_STATS_QUERY_KEY, channelIds]
       : CHANNEL_RECENT_STATS_QUERY_KEY,
     queryFn: ({ signal }) => getChannelRecentStats(signal, channelIds),
-    enabled: !props.channels || props.channels.length > 0,
+    enabled: channelIds === undefined || channelIds.length > 0,
     staleTime: 30_000,
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
@@ -126,6 +123,36 @@ export function ChannelRecentStatsProvider(props: {
     <RecentStatsContext.Provider value={value}>
       {props.children}
     </RecentStatsContext.Provider>
+  )
+}
+
+export function ChannelRPMCell({ channel }: { channel: Channel }) {
+  const { t, i18n } = useTranslation()
+  const stats = useContext(RecentStatsContext)
+  if (isTagAggregateRow(channel)) return null
+  const usage = stats.snapshot?.rpm_by_channel?.[channel.id]
+  if (!usage) return <span className='text-muted-foreground'>—</span>
+  if (!usage.supported) return <span>{t('Not applicable')}</span>
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const full = usage.limit != null && usage.used + usage.reserved >= usage.limit
+  return (
+    <span
+      className={cn(
+        'whitespace-nowrap tabular-nums',
+        full && 'text-destructive'
+      )}
+    >
+      {usage.observed ? formatNumber(usage.used, locale) : '—'}
+      {usage.reserved > 0 && (
+        <span title={t('Reserved requests')}>
+          {' + '}
+          {formatNumber(usage.reserved, locale)}
+          <span className='sr-only'> {t('Reserved requests')}</span>
+        </span>
+      )}{' '}
+      /{' '}
+      {usage.limit == null ? t('Unlimited') : formatNumber(usage.limit, locale)}
+    </span>
   )
 }
 

@@ -160,7 +160,7 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if channel != nil && service.RequestSucceeded(c) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}

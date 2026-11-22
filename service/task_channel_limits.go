@@ -15,12 +15,10 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/expr-lang/expr/ast"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 	"github.com/tidwall/gjson"
@@ -46,6 +44,9 @@ func ProtectTaskChannelError(info *relaycommon.RelayInfo, failure *taskdto.TaskE
 	}
 	copy := *failure
 	copy.Message, copy.Error = "Upstream request failed", errors.New("Upstream request failed")
+	if local := LocalChannelLimitError(failure.Error); local != nil {
+		copy.Message, copy.Error = local.Error(), local
+	}
 	copy.Data = nil
 	return &copy
 }
@@ -264,6 +265,10 @@ func ResolveTaskChannelConnection(task *model.Task) (*model.Channel, error) {
 	if err != nil {
 		return nil, err
 	}
+	if channel.CredentialUnavailable() {
+		// A credential this node cannot open must never poll upstream.
+		return nil, model.ErrChannelAttemptState
+	}
 	copy := *channel
 	copy.Key = TaskPollingKey(channel, task.PrivateData.Key, task.PrivateData.FundingAttempt)
 	copy.Keys, copy.ChannelInfo = nil, model.ChannelInfo{}
@@ -385,58 +390,77 @@ func ObserveTaskChannelSnapshot(snapshot *relaycommon.TaskChannelSnapshot, resul
 				observation.Tokens = common.GetPointer(*input + *output)
 			}
 		}
-		if snapshot.CostRatio != nil {
-			if *snapshot.CostRatio == 0 {
-				observation.CostUSDNano = common.GetPointer(int64(0))
-			} else if snapshot.Expression != nil && (len(facts) > 0 || status == "succeeded" && taskExpressionIsConstant(snapshot.Expression)) {
-				settlement, _, err := EvaluateTaskCompletionUsage(snapshot.Expression, facts)
-				if err == nil && settlement.Clamp == nil {
-					if cost, err := model.ProcurementCostUSDNano(settlement.ActualQuotaBeforeGroup, *snapshot.CostRatio, snapshot.QuotaPerUnit); err == nil {
-						observation.CostUSDNano = &cost
-					}
-				}
-			} else if status == "succeeded" && !snapshot.UsePrice && snapshot.Expression == nil && result.TotalTokens > 0 && int64(result.TotalTokens) <= int64(common.MaxQuota) {
-				base := float64(result.TotalTokens) * snapshot.ModelRatio
-				for _, ratio := range snapshot.OtherRatios {
-					base *= ratio
-				}
-				if cost, err := model.ProcurementCostUSDNano(base, *snapshot.CostRatio, snapshot.QuotaPerUnit); err == nil {
-					observation.CostUSDNano = &cost
-				}
-			} else if status == "succeeded" && snapshot.UsePrice {
-				base := snapshot.ModelPrice * snapshot.QuotaPerUnit
-				for _, ratio := range snapshot.OtherRatios {
-					base *= ratio
-				}
-				if cost, err := model.ProcurementCostUSDNano(base, *snapshot.CostRatio, snapshot.QuotaPerUnit); err == nil {
-					observation.CostUSDNano = &cost
-				}
-			}
+		observation.CostUSDNano = taskChannelProcurementCost(snapshot, status, result)
+		if status == "failed" && observation.Tokens == nil && snapshot.TPMApplicable {
+			observation.Tokens = common.GetPointer(int64(0))
 		}
 	}
 	snapshot.Observation = observation
 }
 
-// A successful fixed-amount expression needs no usage response. Reject every
-// data-dependent identifier, including dynamic u() calls and request/time
-// functions, before treating absent completion facts as sufficient evidence.
-func taskExpressionIsConstant(snapshot *billingexpr.BillingSnapshot) bool {
-	program, err := billingexpr.CompileFromCache(snapshot.ExprString)
-	if err != nil {
-		return false
+// taskChannelProcurementCost is the procurement amount of a task observation:
+// the amount the customer task settlement charges before the group ratio, at
+// the frozen submit price, times the channel cost ratio. A failed task costs
+// nothing unless the vendor reports usage for it. Nil means not yet known.
+func taskChannelProcurementCost(snapshot *relaycommon.TaskChannelSnapshot, status string, result *relaycommon.TaskInfo) *int64 {
+	if snapshot.CostRatio == nil {
+		return nil
 	}
-	return ast.Find(program.Node(), func(node ast.Node) bool {
-		identifier, ok := node.(*ast.IdentifierNode)
-		if !ok {
-			return false
+	if *snapshot.CostRatio == 0 {
+		return common.GetPointer(int64(0))
+	}
+	var facts map[string]any
+	tokens := 0
+	if result != nil {
+		facts = result.UsageFacts
+		tokens = result.TotalTokens
+		if tokens == 0 {
+			tokens = result.CompletionTokens
 		}
-		switch identifier.Value {
-		case "tier", "max", "min", "abs", "ceil", "floor", "round", "float", "int":
-			return false
+	}
+	otherRatios := func(base float64) float64 {
+		for _, ratio := range snapshot.OtherRatios {
+			base *= ratio
+		}
+		return base
+	}
+	var base float64
+	switch {
+	case snapshot.Expression != nil && (len(facts) > 0 || status == "succeeded"):
+		// The customer settlement evaluates the frozen expression on the submit
+		// facts merged with any completion facts, and keeps the reservation
+		// when evaluation fails.
+		settlement, _, err := EvaluateTaskCompletionUsage(snapshot.Expression, facts)
+		switch {
+		case err == nil && settlement.Clamp != nil:
+			return nil
+		case err == nil:
+			base = settlement.ActualQuotaBeforeGroup
+		case status == "succeeded":
+			base = snapshot.Expression.EstimatedQuotaBeforeGroup
 		default:
-			return true
+			base = 0
 		}
-	}) == nil
+	case status == "failed" && snapshot.Expression == nil && !snapshot.UsePrice && tokens > 0 && int64(tokens) <= int64(common.MaxQuota):
+		base = otherRatios(float64(tokens) * snapshot.ModelRatio)
+	case status == "failed":
+		base = 0
+	case status != "succeeded":
+		return nil
+	case snapshot.UsePrice:
+		base = otherRatios(snapshot.ModelPrice * snapshot.QuotaPerUnit)
+	case tokens > 0 && int64(tokens) <= int64(common.MaxQuota):
+		base = otherRatios(float64(tokens) * snapshot.ModelRatio)
+	default:
+		// Without token usage the customer keeps the per-request reservation,
+		// half the model ratio per call.
+		base = otherRatios(snapshot.ModelRatio / 2 * snapshot.QuotaPerUnit)
+	}
+	cost, err := model.ProcurementCostUSDNano(base, *snapshot.CostRatio, snapshot.QuotaPerUnit)
+	if err != nil {
+		return nil
+	}
+	return &cost
 }
 
 func ObserveTaskChannelResult(task *model.Task, result *relaycommon.TaskInfo, authoritative bool) {
@@ -463,17 +487,35 @@ func SettleTaskChannelSnapshot(ctx context.Context, snapshot *relaycommon.TaskCh
 		} else {
 			err = model.MarkChannelAttemptUnknown(snapshot.ChannelID, snapshot.AttemptID, observed, now)
 		}
-	} else if observation.ObservedAt > 0 && now.Unix()-observation.ObservedAt < 60 {
-		err = model.ConfirmChannelAttemptRunning(snapshot.ChannelID, snapshot.AttemptID, 0, time.Unix(observation.ObservedAt, 0))
-		if errors.Is(err, model.ErrChannelAttemptState) {
-			err = nil
+	} else if observation.ObservedAt > 0 {
+		if now.IsZero() {
+			now, err = model.ChannelLimitDatabaseTime(model.DB.WithContext(ctx))
+			if err != nil {
+				return err
+			}
 		}
+		// ObservedAt comes from this gateway's clock, now from the database.
+		// Tolerate a gateway running slightly ahead of the database.
+		if age := now.Unix() - observation.ObservedAt; age >= -taskObservationClockSkewSeconds && age < 60 {
+			err = model.ConfirmChannelAttemptRunning(snapshot.ChannelID, snapshot.AttemptID, 0, time.Unix(observation.ObservedAt, 0))
+			if errors.Is(err, model.ErrChannelAttemptState) {
+				err = nil
+			}
+		}
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// The attempt was pruned after its retention window; a correction
+		// that late cannot change any active limit or budget.
+		common.SysLog(common.LogText("task procurement correction skipped for pruned channel attempt %s (channel #%d)", snapshot.AttemptID, snapshot.ChannelID))
+		err = nil
 	}
 	if err != nil {
 		return err
 	}
 	return model.ApplyChannelTaskObservation(ctx, snapshot, version)
 }
+
+const taskObservationClockSkewSeconds = 5
 
 func FlushTaskChannelObservation(ctx context.Context, task *model.Task) error {
 	if task.PrivateData.ChannelAttempt == nil || !task.ProcurementPending {
@@ -489,7 +531,7 @@ func FlushTaskChannelObservation(ctx context.Context, task *model.Task) error {
 	if err != nil {
 		return err
 	}
-	if err := SettleTaskChannelSnapshot(ctx, committed.PrivateData.ChannelAttempt, committed.ProcurementVersion, time.Now()); err != nil {
+	if err := SettleTaskChannelSnapshot(ctx, committed.PrivateData.ChannelAttempt, committed.ProcurementVersion, time.Time{}); err != nil {
 		return err
 	}
 	result := model.DB.WithContext(ctx).Model(&model.Task{}).Where("id = ? AND procurement_version = ?", task.ID, task.ProcurementVersion).Update("procurement_pending", false)
@@ -517,7 +559,7 @@ func FinishTaskChannelSubmission(c *gin.Context, info *relaycommon.RelayInfo, ac
 	CompleteOverviewRelay(info)
 	snapshot := info.TaskChannelSnapshot
 	if snapshot == nil {
-		_ = model.MarkChannelAttemptUnknown(attempt.ChannelID, attempt.ID, 0, time.Now())
+		_ = model.MarkChannelAttemptUnknown(attempt.ChannelID, attempt.ID, 0, time.Time{})
 		return
 	}
 	if accepted {
@@ -528,9 +570,44 @@ func FinishTaskChannelSubmission(c *gin.Context, info *relaycommon.RelayInfo, ac
 			result = &relaycommon.TaskInfo{Status: string(model.TaskStatusSubmitted)}
 		}
 		ObserveTaskChannelSnapshot(snapshot, result, true)
+	} else if c.GetInt("task_submit_http_status") >= http.StatusMultipleChoices || c.GetBool("task_submit_rejected") {
+		// The vendor rejected the submission: no work runs and nothing is owed.
+		ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure)}, true)
+		_ = SettleTaskChannelSnapshot(context.WithoutCancel(c.Request.Context()), snapshot, 1, time.Time{})
 	} else {
 		ObserveTaskChannelSnapshot(snapshot, nil, false)
-		_ = SettleTaskChannelSnapshot(context.WithoutCancel(c.Request.Context()), snapshot, 1, time.Now())
+		_ = SettleTaskChannelSnapshot(context.WithoutCancel(c.Request.Context()), snapshot, 1, time.Time{})
+	}
+	attempt.Finished = true
+}
+
+// SettleUnpersistedTaskChannelAttempt settles an accepted submission that will
+// never get a task row (client cancellation after submit, a reservation or
+// insert failure), so no polling can settle it later. A terminal immediate
+// result settles with its cost. Otherwise the vendor keeps the job: the
+// attempt is marked unknown, holding the frozen submit price as its lower
+// bound, instead of being left to lapse without any record.
+func SettleUnpersistedTaskChannelAttempt(c *gin.Context, info *relaycommon.RelayInfo, immediate *relaycommon.TaskInfo) {
+	if info == nil || info.ChannelLimitAttempt == nil || !info.ChannelLimitAttempt.Sent {
+		return
+	}
+	attempt := info.ChannelLimitAttempt
+	ctx := context.WithoutCancel(c.Request.Context())
+	snapshot := info.TaskChannelSnapshot
+	var err error
+	switch {
+	case snapshot == nil:
+		err = model.MarkChannelAttemptUnknown(attempt.ChannelID, attempt.ID, 0, time.Time{})
+	case immediate != nil && !immediate.Unconfirmed && (model.TaskStatus(immediate.Status) == model.TaskStatusSuccess || model.TaskStatus(immediate.Status) == model.TaskStatusFailure):
+		ObserveTaskChannelSnapshot(snapshot, immediate, true)
+		err = SettleTaskChannelSnapshot(ctx, snapshot, 2, time.Time{})
+	default:
+		snapshot.Observation = relaycommon.TaskChannelObservation{Status: "unknown", ObservedAt: time.Now().Unix(),
+			CostUSDNano: taskChannelProcurementCost(snapshot, "succeeded", nil)}
+		err = SettleTaskChannelSnapshot(ctx, snapshot, 2, time.Time{})
+	}
+	if err != nil {
+		common.SysError(common.LogText("task procurement settlement without a task row failed: channel #%d, attempt %s: %s", attempt.ChannelID, attempt.ID, err.Error()))
 	}
 	attempt.Finished = true
 }

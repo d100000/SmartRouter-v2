@@ -1,8 +1,11 @@
 package model
 
 import (
+	"errors"
+
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"gorm.io/gorm"
 )
 
 type Midjourney struct {
@@ -37,6 +40,13 @@ type Midjourney struct {
 
 	TokenId          int `json:"-" gorm:"default:0"`
 	BillingChannelId int `json:"-" gorm:"default:0"`
+	// RefundedQuota is the quota a FAILURE refund returned to the wallet. A
+	// later SUCCESS charges it again exactly once.
+	RefundedQuota int `json:"-" gorm:"default:0;index"`
+	// RefundWithdrawalQuota is refunded quota whose refund claim was lost and
+	// whose withdrawal from the wallet failed. The Midjourney poller takes it
+	// back. Only atomic increments and claims write it.
+	RefundWithdrawalQuota int `json:"-" gorm:"default:0;index"`
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段
@@ -125,7 +135,30 @@ func HasUnfinishedMidjourneyTasks() bool {
 		Where("progress != ? OR procurement_reconcile = ? OR procurement_pending = ? OR (channel_attempt_data <> ? AND status NOT IN ?)", "100%", true, true, "", []string{"SUCCESS", "FAILURE"}).
 		Limit(1).
 		Pluck("id", &id).Error
+	if err == nil && id != 0 {
+		return true
+	}
+	err = DB.Model(&Midjourney{}).
+		Where("status = ? AND refunded_quota > ?", "SUCCESS", 0).
+		Or("refund_withdrawal_quota > ?", 0).
+		Limit(1).
+		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+// GetMidjourneyTasksWithPendingRefundBilling returns tasks whose refund
+// bookkeeping still owes the wallet a charge: a SUCCESS whose refund
+// re-charge failed, or a refund whose withdrawal failed after its claim was
+// lost.
+func GetMidjourneyTasksWithPendingRefundBilling(limit int) []*Midjourney {
+	var tasks []*Midjourney
+	err := DB.Where("status = ? AND refunded_quota > ?", "SUCCESS", 0).
+		Or("refund_withdrawal_quota > ?", 0).
+		Order("id").Limit(limit).Find(&tasks).Error
+	if err != nil {
+		return nil
+	}
+	return tasks
 }
 
 func GetByOnlyMJId(mjId string) *Midjourney {
@@ -180,7 +213,7 @@ func (midjourney *Midjourney) Insert() error {
 
 func (midjourney *Midjourney) Update() error {
 	var err error
-	err = DB.Save(midjourney).Error
+	err = DB.Omit("refund_withdrawal_quota").Save(midjourney).Error
 	return err
 }
 
@@ -203,17 +236,106 @@ func (midjourney *Midjourney) GetBillingChannelId() int {
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
 // Uses Model().Select("*").Updates() to avoid GORM Save()'s INSERT fallback.
 func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) {
-	query := DB.Model(midjourney).Where("status = ?", fromStatus)
+	// The refund marker guard makes a copy read before a refund or re-charge
+	// claim lose, so it cannot write the claimed quota fields back.
+	query := DB.Model(midjourney).Where("status = ? AND COALESCE(refunded_quota, 0) = ?", fromStatus, midjourney.RefundedQuota)
 	if midjourney.ChannelAttemptData != "" {
 		query = query.Where("COALESCE(procurement_version, 0) = ?", midjourney.ProcurementVersion)
 		midjourney.ProcurementVersion++
 		midjourney.ProcurementPending = true
 	}
-	result := query.Select("*").Updates(midjourney)
+	result := query.Select("*").Omit("refund_withdrawal_quota").Updates(midjourney)
 	if result.Error != nil {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+// ClaimRefund records a refund of quota that was already returned to the
+// wallet. It wins only while the task has not succeeded and still charges
+// exactly quota, so it cannot race a later SUCCESS or a second refund. The
+// procurement version moves so a copy read earlier loses its CAS.
+func (midjourney *Midjourney) ClaimRefund(quota int) (bool, error) {
+	if quota <= 0 {
+		return false, nil
+	}
+	result := DB.Model(&Midjourney{}).
+		Where("id = ? AND status <> ? AND quota = ?", midjourney.Id, "SUCCESS", quota).
+		Updates(map[string]any{
+			"quota":               0,
+			"refunded_quota":      gorm.Expr("COALESCE(refunded_quota, 0) + ?", quota),
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return false, result.Error
+	}
+	midjourney.Quota, midjourney.RefundedQuota = 0, midjourney.RefundedQuota+quota
+	midjourney.ProcurementVersion++
+	return true, nil
+}
+
+// ClaimRefundRecharge moves the refunded quota of a task that finished with
+// SUCCESS back into Quota. Only one caller wins for a given refund.
+func (midjourney *Midjourney) ClaimRefundRecharge(refunded int) (bool, error) {
+	if refunded <= 0 {
+		return false, nil
+	}
+	result := DB.Model(&Midjourney{}).
+		Where("id = ? AND status = ? AND refunded_quota = ?", midjourney.Id, "SUCCESS", refunded).
+		Updates(map[string]any{
+			"quota":               gorm.Expr("COALESCE(quota, 0) + ?", refunded),
+			"refunded_quota":      0,
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return false, result.Error
+	}
+	midjourney.Quota, midjourney.RefundedQuota = midjourney.Quota+refunded, 0
+	midjourney.ProcurementVersion++
+	return true, nil
+}
+
+// AddRefundWithdrawal records refunded quota that still has to be taken back
+// from the wallet.
+func (midjourney *Midjourney) AddRefundWithdrawal(quota int) error {
+	return DB.Model(&Midjourney{}).Where("id = ?", midjourney.Id).
+		UpdateColumn("refund_withdrawal_quota", gorm.Expr("COALESCE(refund_withdrawal_quota, 0) + ?", quota)).Error
+}
+
+// ClaimRefundWithdrawal takes the recorded withdrawal for one caller, which
+// then charges it or adds it back.
+func (midjourney *Midjourney) ClaimRefundWithdrawal(quota int) (bool, error) {
+	if quota <= 0 {
+		return false, nil
+	}
+	result := DB.Model(&Midjourney{}).Where("id = ? AND refund_withdrawal_quota = ?", midjourney.Id, quota).
+		UpdateColumn("refund_withdrawal_quota", 0)
+	if result.Error != nil || result.RowsAffected == 0 {
+		return false, result.Error
+	}
+	midjourney.RefundWithdrawalQuota = 0
+	return true, nil
+}
+
+// RevertRefundRecharge undoes a won ClaimRefundRecharge whose charge could
+// not be applied, so a later SUCCESS refresh retries it.
+func (midjourney *Midjourney) RevertRefundRecharge(refunded int) error {
+	result := DB.Model(&Midjourney{}).
+		Where("id = ? AND status = ? AND refunded_quota = ? AND quota >= ?", midjourney.Id, "SUCCESS", 0, refunded).
+		Updates(map[string]any{
+			"quota":               gorm.Expr("quota - ?", refunded),
+			"refunded_quota":      refunded,
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("Midjourney refund re-charge state changed")
+	}
+	midjourney.Quota, midjourney.RefundedQuota = midjourney.Quota-refunded, refunded
+	midjourney.ProcurementVersion++
+	return nil
 }
 
 func MjBulkUpdate(mjIds []string, params map[string]any) error {

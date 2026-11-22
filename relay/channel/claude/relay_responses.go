@@ -120,7 +120,7 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			maybeMarkClaudeRefusal(c, info, *claudeResponse.Delta.StopReason)
 		}
 		if claudeResponse.Type == "message_stop" {
-			if !hasOutput {
+			if !hasOutput && !claudeHasActualUsage(claudeInfo.Usage) {
 				streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 				sr.Stop(streamErr)
 				return
@@ -170,19 +170,26 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			}
 		}
 	})
-	if streamErr == nil && !hasOutput {
+	hasActualUsage := claudeHasActualUsage(claudeInfo.Usage)
+	if streamErr == nil && !hasOutput && !hasActualUsage {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if streamErr != nil {
+		billable := hasOutput || hasActualUsage
 		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: streamErr,
-			HasActualUsage: dto.HasOpenAIUsageTokens(claudeInfo.Usage), HasEffectiveOutput: hasOutput,
-			NoCharge: !hasOutput, ErrorDelivered: streamFailed}
+			HasActualUsage: hasActualUsage, HasEffectiveOutput: hasOutput,
+			NoCharge: !billable, ErrorDelivered: streamFailed}
 		info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), streamErr.ToOpenAIError().Type, streamErr.StatusCode)
-		if !hasOutput || !streamFailed {
+		if !billable {
 			return nil, streamErr
 		}
-	}
-	if streamFailed {
+		// Upstream already ran: tell the client when it has not been told yet,
+		// and settle by upstream usage or the local estimate of the output.
+		if !streamFailed {
+			failResponsesStream(streamErr)
+			info.StreamFailure.ErrorDelivered = streamFailed
+		}
+		completeClaudeStreamUsage(c, info, claudeInfo)
 		return claudeInfo.Usage, nil
 	}
 

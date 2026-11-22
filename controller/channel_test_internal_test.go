@@ -3,16 +3,20 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -196,6 +200,37 @@ func TestCopyChannelRejectsInvalidLegacyProxySettings(t *testing.T) {
 	assert.Equal(t, int64(1), channelCount)
 }
 
+// Copying a supplier or write-only channel would create a live channel
+// outside the supplier review and limit, or expose its credential.
+func TestCopyChannelRejectsProtectedChannels(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+	t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+	for _, origin := range []*model.Channel{
+		{Type: constant.ChannelTypeOpenAI, Name: "supplier channel", Key: "supplier-key", Models: "gpt-test", Group: "default", OwnerSupplierID: "supplier-a", SupplierValidated: true},
+		{Type: constant.ChannelTypeOpenAI, Name: "write-only channel", Key: "write-only-key", Models: "gpt-test", Group: "default", SecretsWriteOnly: true},
+	} {
+		t.Run(origin.Name, func(t *testing.T) {
+			require.NoError(t, db.Create(origin).Error)
+			var before int64
+			require.NoError(t, db.Model(&model.Channel{}).Count(&before).Error)
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Set("role", common.RoleRootUser)
+			ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", origin.Id)}}
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/copy", nil)
+			CopyChannel(ctx)
+
+			assert.Contains(t, recorder.Body.String(), `"success":false`)
+			assert.Contains(t, recorder.Body.String(), model.ErrSupplierChannelOperation.Error())
+			var after int64
+			require.NoError(t, db.Model(&model.Channel{}).Count(&after).Error)
+			assert.Equal(t, before, after)
+		})
+	}
+}
+
 func TestDeleteChannelResetsProxyCacheWhenPreReadFails(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.Log{}, &model.AuditLog{}))
@@ -376,6 +411,120 @@ func TestSelectChannelsForAutomaticTestAutoBanOnlyUsesEligibleChannels(t *testin
 	require.Len(t, selected, 2)
 	require.Equal(t, 1, selected[0].Id)
 	require.Equal(t, 3, selected[1].Id)
+}
+
+func TestAutomaticChannelTestSkipsLocalLimit(t *testing.T) {
+	db := modelManagementDB(t, "sqlite", "")
+	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+	t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+	require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.SystemTaskLock{}))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o-mini":1}`))
+	user := model.User{Username: "health-probe", Status: common.UserStatusEnabled, Group: "default", Quota: 100000, AffCode: "probe"}
+	require.NoError(t, db.Create(&user).Error)
+
+	originalDisable := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	t.Cleanup(func() { common.AutomaticDisableChannelEnabled = originalDisable })
+	service.InitHttpClient()
+	var upstreamRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamRequests.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(upstream.Close)
+	channel := model.Channel{
+		Name: "limited", Type: constant.ChannelTypeOpenAI, Key: "probe", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Models: "gpt-4o-mini", Group: "default",
+		AutoBan: common.GetPointer(1), ResponseTime: 123, TestTime: 456,
+	}
+	require.NoError(t, channel.Insert())
+	now := time.Now()
+	_, err := model.UpdateChannelLimits(channel.Id, 1, model.ChannelLimitSettings{RPM: 1, ReconcileSeconds: 300}, false, now)
+	require.NoError(t, err)
+	_, err = model.ReserveChannelAttempt(model.ChannelAttemptReservation{ID: "occupy-last-slot", ChannelID: channel.Id}, now)
+	require.NoError(t, err)
+	require.NoError(t, model.MarkChannelAttemptSent(channel.Id, "occupy-last-slot", now))
+
+	for _, protected := range []bool{false, true} {
+		channel.SecretsWriteOnly = protected
+		require.NoError(t, db.Model(&channel).Update("secrets_write_only", protected).Error)
+		summary := testChannelForHealthCheck(context.Background(), &channel, user.Id, true, 1)
+		assert.Equal(t, channelTestSummary{Skipped: 1}, summary)
+		assert.Zero(t, upstreamRequests.Load())
+		stored, err := model.GetChannelById(channel.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+		assert.Equal(t, 123, stored.ResponseTime)
+		assert.EqualValues(t, 456, stored.TestTime)
+	}
+}
+
+// Automatic disable judges a protected channel's health check by its real
+// failure: an upstream keyword disables it, a local failure does not, and only
+// the masked failure leaves testChannel.
+func TestHealthCheckOfProtectedChannelDecidesFromUnmaskedError(t *testing.T) {
+	db := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, i18n.Init())
+	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+	t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+	require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.SystemTaskLock{}))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o-mini":1}`))
+	user := model.User{Username: "health-mask", Status: common.UserStatusEnabled, Group: "default", Quota: 100000, AffCode: "mask"}
+	require.NoError(t, db.Create(&user).Error)
+	originalDisable, originalRanges := common.AutomaticDisableChannelEnabled, operation_setting.AutomaticDisableStatusCodeRanges
+	common.AutomaticDisableChannelEnabled = true
+	// A local failure answers 400; listing it shows the masked error is not used.
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{Start: 400, End: 401}}
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled, operation_setting.AutomaticDisableStatusCodeRanges = originalDisable, originalRanges
+	})
+	// Protected channels use the supplier client, which only dials HTTPS.
+	supplierClient := service.GetSupplierHTTPClient()
+	previousTransport := supplierClient.Transport
+	t.Cleanup(func() { supplierClient.Transport = previousTransport })
+	supplierClient.Transport = schedulingTokenTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"error":{"message":"Permission denied for this key","type":"permission_error"}}`))}, nil
+	})
+	baseURL := "https://upstream.example"
+
+	for _, tc := range []struct {
+		name         string
+		model        string
+		wantDisabled bool
+	}{
+		{name: "upstream keyword", model: "gpt-4o-mini", wantDisabled: true},
+		{name: "local failure", model: "unpriced-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := model.Channel{
+				Name: "protected " + tc.name, Type: constant.ChannelTypeOpenAI, Key: "probe", BaseURL: &baseURL, SecretsWriteOnly: true,
+				Status: common.ChannelStatusEnabled, Models: tc.model, Group: "default", AutoBan: common.GetPointer(1),
+			}
+			require.NoError(t, channel.Insert())
+
+			result := testChannel(context.Background(), &channel, user.Id, "", "", false)
+			require.NotNil(t, result.newAPIError)
+			assert.Equal(t, "Channel test failed", result.localErr.Error(), "callers see the masked failure only")
+			assert.NotContains(t, result.newAPIError.Error(), "Permission denied")
+
+			summary := testChannelForHealthCheck(context.Background(), &channel, user.Id, true, time.Hour.Milliseconds())
+			assert.Equal(t, 1, summary.Failed)
+			if !tc.wantDisabled {
+				assert.Zero(t, summary.Disabled)
+				stored, err := model.GetChannelById(channel.Id, false)
+				require.NoError(t, err)
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				return
+			}
+			assert.Equal(t, 1, summary.Disabled)
+			// The disable runs in the background like a relay failure's.
+			require.Eventually(t, func() bool {
+				stored, err := model.GetChannelById(channel.Id, false)
+				return err == nil && stored.Status == common.ChannelStatusAutoDisabled
+			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
 }
 
 func TestRunChannelTestWorkersHonorsConfiguredConcurrency(t *testing.T) {

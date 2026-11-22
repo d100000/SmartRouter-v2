@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/MoeForge/moego/ojson"
@@ -38,9 +39,15 @@ import (
 )
 
 type testResult struct {
-	context     *gin.Context
-	localErr    error
-	newAPIError *types.NewAPIError
+	context                 *gin.Context
+	localErr                error
+	newAPIError             *types.NewAPIError
+	channelAdmissionRefused bool
+	modelPriceUnavailable   bool
+	// The errors before protected channels mask them. Automatic disable and
+	// enable decide from these, never from the masked ones shown to callers.
+	unmaskedLocalErr    error
+	unmaskedNewAPIError *types.NewAPIError
 }
 
 func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
@@ -102,6 +109,11 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, fundingKeyIndex ...int) (testOutcome testResult) {
 	protectedCredentials := channel.OwnerSupplierID != "" || channel.SecretsWriteOnly
 	defer func() {
+		// Protected channels mask probe errors before returning to the caller.
+		// Keep the private admission outcome for health checks across that masking.
+		testOutcome.channelAdmissionRefused = service.LocalChannelLimitError(testOutcome.newAPIError) != nil
+		testOutcome.modelPriceUnavailable = testOutcome.newAPIError != nil && testOutcome.newAPIError.GetErrorCode() == types.ErrorCodeModelPriceError
+		testOutcome.unmaskedLocalErr, testOutcome.unmaskedNewAPIError = testOutcome.localErr, testOutcome.newAPIError
 		if protectedCredentials && !errors.Is(testOutcome.localErr, model.ErrChannelOutsideSchedule) && (testOutcome.localErr != nil || testOutcome.newAPIError != nil) {
 			testOutcome.localErr = common.NewMessage("Channel test failed")
 			status := http.StatusBadGateway
@@ -224,6 +236,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	c.Set("base_url", channel.GetBaseURL())
 	group, _ := model.GetUserGroup(testUserID, false)
 	c.Set("group", group)
+	if channel.OwnerSupplierID != "" {
+		if groups := channel.GetGroups(); len(groups) > 0 && ratio_setting.ContainsGroupRatio(groups[0]) {
+			group = groups[0]
+		}
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
+	}
 
 	selectedChannel := channel
 	if len(fundingKeyIndex) > 0 {
@@ -553,11 +571,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
-			if protectedCredentials {
-				service.CloseResponseBodyGracefully(httpResp)
-				return testResult{context: c, localErr: common.NewMessage("Channel test failed"), newAPIError: types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, httpResp.StatusCode)}
-			}
+			// A protected channel keeps the upstream error for automatic
+			// disable; the result masks it before anyone sees it.
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
+			if protectedCredentials {
+				return testResult{context: c, localErr: err, newAPIError: err}
+			}
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
 				channel.Id,
@@ -591,6 +610,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			newAPIError: types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
 		}
 	}
+	// The request ran upstream once usage is known: price its procurement now,
+	// so a response that later fails validation still settles its cost.
+	info.SetEstimatePromptTokens(usage.PromptTokens)
+	quota, tieredResult := settleTestQuota(info, priceData, usage)
+	service.CaptureChannelTestLimitUsage(c, info, usage, tieredResult)
 	result := w.Result()
 	respBody, err := readTestResponseBody(result.Body, isStream)
 	if err != nil {
@@ -607,10 +631,6 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
 		}
 	}
-	info.SetEstimatePromptTokens(usage.PromptTokens)
-
-	quota, tieredResult := settleTestQuota(info, priceData, usage)
-	service.CaptureChannelTestLimitUsage(c, info, usage, tieredResult)
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
 	consumedTime := float64(milliseconds) / 1000.0
@@ -1036,7 +1056,9 @@ func TestChannel(c *gin.Context) {
 	}
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
-	go channel.UpdateResponseTime(milliseconds)
+	// channel may be the shared cache entry; write from a private copy.
+	responseTimeChannel := *channel
+	go responseTimeChannel.UpdateResponseTime(milliseconds)
 	consumedTime := float64(milliseconds) / 1000.0
 	if result.newAPIError != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -1058,6 +1080,7 @@ func TestChannel(c *gin.Context) {
 // system task can persist a per-run result for history.
 type channelTestSummary struct {
 	Tested    int `json:"tested"`
+	Skipped   int `json:"skipped,omitempty"`
 	Succeeded int `json:"succeeded"`
 	Failed    int `json:"failed"`
 	Disabled  int `json:"disabled"`
@@ -1076,13 +1099,19 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	if ctx.Err() != nil || errors.Is(result.localErr, model.ErrChannelOutsideSchedule) {
 		return summary
 	}
+	// Decide from the unmasked errors: a protected channel shows a masked
+	// failure, whose classification says nothing about the real one.
+	newAPIError := result.unmaskedNewAPIError
+	if result.channelAdmissionRefused {
+		// Local admission time provides no evidence about upstream latency or health.
+		return channelTestSummary{Skipped: 1}
+	}
 
 	summary.Tested++
 
 	shouldBanChannel := false
-	newAPIError := result.newAPIError
 	if newAPIError != nil {
-		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+		shouldBanChannel = service.ShouldDisableChannel(newAPIError)
 	}
 
 	if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
@@ -1109,7 +1138,7 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 		summary.Disabled++
 	}
 
-	if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
+	if result.unmaskedLocalErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
 		service.EnableChannel(channel.Id, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.Name)
 		summary.Enabled++
 	}
@@ -1199,6 +1228,7 @@ func runChannelTestWorkers(
 	processed := 0
 	for result := range results {
 		summary.Tested += result.Tested
+		summary.Skipped += result.Skipped
 		summary.Succeeded += result.Succeeded
 		summary.Failed += result.Failed
 		summary.Disabled += result.Disabled

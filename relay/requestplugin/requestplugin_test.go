@@ -39,14 +39,18 @@ import (
 	"golang.org/x/image/webp"
 )
 
-// stagePlugin runs every stage as its instance config says: throw, allocate
-// without bound, reject at a stage, return the effects listed for the stage,
+// stagePlugin runs every stage as its instance config says: throw, retain
+// objects, reject at a stage, return the effects listed for the stage,
 // or echo what it saw.
 const stagePlugin = `export const meta = {apiVersion: 1, key: "rp-stages", name: "Stages", version: "1.2.3", author: {name: "Test"}};
 function run(ctx, req) {
   const c = ctx.config;
   if (c.throw === ctx.stage) throw new Error("secret plugin detail");
-  if (c.alloc === ctx.stage) { const kept = []; for (;;) kept.push([c]); }
+  if (c.alloc === ctx.stage) {
+    const kept = [];
+    for (let i = 0; i < 400000; i++) kept.push({i});
+    return {action: "continue"};
+  }
   if (c.reject === ctx.stage) return {action: "reject", code: "blocked.test", message: "Blocked here"};
   let effects = (c.effects && c.effects[ctx.stage]) || [];
   if (c.echo === ctx.stage) {
@@ -205,6 +209,11 @@ func TestStageGuardsAndFailures(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
+			if tc.class == jsplugin.TransformErrorMemory {
+				previous := constant.PluginMemoryLimitMB
+				constant.PluginMemoryLimitMB = 8
+				t.Cleanup(func() { constant.PluginMemoryLimitMB = previous })
+			}
 			setupPlugins(t, `[{"id":"rp","name":"Rp","plugin":"rp-stages","enabled":true,"global":true,"config":`+tc.config+`}]`)
 			body := []byte(`{"model":"gpt","messages":[]}`)
 			outcome := NewPlan().Run(context.Background(), Call{Stage: tc.stage, Body: body})

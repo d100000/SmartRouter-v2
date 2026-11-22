@@ -190,6 +190,39 @@ export async function getChannelRecentStats(
   signal?: AbortSignal,
   channelIds?: readonly number[]
 ): Promise<ChannelRecentStats> {
+  // Even 16-digit IDs fit the endpoint's 8192-character and 500-ID limits.
+  const batchSize = 480
+  const result = await fetchChannelRecentStats(
+    signal,
+    channelIds?.slice(0, batchSize)
+  )
+  for (
+    let offset = batchSize;
+    channelIds && offset < channelIds.length;
+    offset += batchSize
+  ) {
+    const batch = await fetchChannelRecentStats(
+      signal,
+      channelIds.slice(offset, offset + batchSize)
+    )
+    result.items.push(...batch.items)
+    if (batch.rpm_by_channel) {
+      Object.assign((result.rpm_by_channel ??= {}), batch.rpm_by_channel)
+    }
+    result.ready &&= batch.ready
+    result.refreshed_at = Math.min(result.refreshed_at, batch.refreshed_at)
+    result.collected_since = Math.max(
+      result.collected_since,
+      batch.collected_since
+    )
+  }
+  return result
+}
+
+async function fetchChannelRecentStats(
+  signal?: AbortSignal,
+  channelIds?: readonly number[]
+): Promise<ChannelRecentStats> {
   const response = await api.get<{
     success: boolean
     data: ChannelRecentStats

@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Link } from '@tanstack/react-router'
 import type { Row } from '@tanstack/react-table'
 import {
   Pencil,
@@ -216,6 +217,15 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         ariaLabel={t('Open menu')}
         contentClassName='w-48'
       >
+        {user.supplier_id && (
+          <DropdownMenuItem
+            render={
+              <Link to='/suppliers' search={{ supplier: user.supplier_id }} />
+            }
+          >
+            {t('Supplier settings')}
+          </DropdownMenuItem>
+        )}
         {isDisabled ? (
           <DropdownMenuItem onClick={() => handleManage('enable')}>
             {t('Enable')}

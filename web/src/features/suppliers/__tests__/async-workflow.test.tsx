@@ -314,7 +314,7 @@ describe('server-authorized supplier templates', () => {
     ])
     expect(templates[1].tpm_applicable).toBe(false)
   })
-  it('keeps the plugin template identity and disables inapplicable TPM when creating a media channel', () => {
+  it('keeps the plugin template identity and omits limit settings when creating a media channel', () => {
     withClient(
       <ChannelEditor
         templates={[
@@ -333,18 +333,15 @@ describe('server-authorized supplier templates', () => {
     expect(
       screen.getByRole('combobox', { name: 'Channel template' })
     ).toHaveTextContent('Video A')
-    expect(screen.getByLabelText('TPM')).toBeDisabled()
-    expect(screen.getByLabelText('TPM')).toHaveAttribute(
-      'placeholder',
-      'Not applicable'
-    )
+    expect(screen.queryByLabelText('TPM')).not.toBeInTheDocument()
     expect(
       screen.getByText(
         'Asynchronous models become available only after a test task is confirmed successful.'
       )
     ).toBeVisible()
   })
-  it('does not silently clear an existing TPM value when editing another limit on a media-only channel', async () => {
+  it('does not silently clear an existing TPM value when an administrator edits another limit on a media-only channel', async () => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'root', role: 100 })
     vi.spyOn(api, 'get').mockResolvedValue({
       data: {
         success: true,
@@ -354,7 +351,6 @@ describe('server-authorized supplier templates', () => {
             revision: 4,
             rpm: null,
             tpm: 600,
-            daily_usd: null,
             reconcile_seconds: 300,
             budget_ready: true,
             tpm_applicable: false,
@@ -365,7 +361,6 @@ describe('server-authorized supplier templates', () => {
             tpm_reserved: 0,
             daily_used_usd: null,
             daily_reserved_usd: null,
-            daily_remaining_usd: null,
             budget_day: '2026-11-08',
             reset_at: 0,
             reason: '',
@@ -381,7 +376,7 @@ describe('server-authorized supplier templates', () => {
       <ChannelLimitsDialog
         channelId={9}
         channelName='Video'
-        audience='supplier'
+        audience='admin'
         onClose={vi.fn()}
       />
     )
@@ -389,11 +384,11 @@ describe('server-authorized supplier templates', () => {
     await user.type(screen.getByLabelText('RPM'), '8')
     await user.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() =>
-      expect(put).toHaveBeenCalledWith('/api/supplier/channels/9/limits', {
+      expect(put).toHaveBeenCalledWith('/api/channel/9/limits', {
         revision: 4,
         rpm: 8,
         tpm: 600,
-        daily_usd: null,
+        reconcile_seconds: 300,
       })
     )
   })

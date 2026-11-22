@@ -1863,9 +1863,12 @@ func TestMidjourneyChannelProcurementLifecycle(t *testing.T) {
 			secret, err := model.EncryptSupplierSecret(supplier.ID, "original-private-key")
 			require.NoError(t, err)
 			draft := model.SupplierChannelDraft{SupplierID: supplier.ID, Type: constant.ChannelTypeMidjourney, Name: "MJ supplier", BaseURL: "https://8.8.8.8", Secret: secret, Models: "mj_imagine"}
-			channel, err := model.SaveSupplierChannelDraft(&draft, 77, 0, 0)
+			channel, err := model.SaveSupplierChannelDraft(&draft, 77, 0)
 			require.NoError(t, err)
-			require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, supplier.ID, channel.SupplierVersion, []string{"mj_imagine"}))
+			draft.Status, draft.TestedModels = model.SupplierDraftReady, draft.Models
+			require.NoError(t, db.Model(&draft).Updates(map[string]any{"status": draft.Status, "tested_models": draft.TestedModels}).Error)
+			require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, supplier.ID, channel.SupplierVersion,
+				model.SupplierChannelRevision(channel, &draft), []string{"mj_imagine"}, model.SupplierChannelRouting{Groups: []string{"default"}}))
 			require.NoError(t, db.First(channel, channel.Id).Error)
 			require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
 			_, err = model.UpdateChannelLimits(channel.Id, 1, model.ChannelLimitSettings{RPM: 1, TPM: 1, DailyUSDNano: model.ChannelLimitUSDScale, ReconcileSeconds: 300}, true, time.Now())
@@ -1965,25 +1968,23 @@ func TestMidjourneyChannelProcurementLifecycle(t *testing.T) {
 			require.NoError(t, db.First(&persistedTask, task.Id).Error)
 			assert.Equal(t, "Invalid [redacted]", persistedTask.FailReason)
 			assert.NotContains(t, persistedTask.Properties, "original-private-key")
-			assert.True(t, task.ProcurementReconcile, "a terminal task without purchase cost remains eligible for late cost correction")
-			assert.True(t, model.HasUnfinishedMidjourneyTasks())
-			phase = "done"
-			require.NoError(t, RefreshMidjourneyTask(context.Background(), task))
-			assert.Equal(t, "SUCCESS", task.Status)
+			// A failed task without vendor usage costs nothing: it settles at zero
+			// and releases its hold instead of waiting for a late correction.
 			assert.False(t, task.ProcurementReconcile)
+			require.NoError(t, FlushMidjourneyChannelObservation(context.Background(), task))
 			state, err = model.GetChannelLimitState(channel.Id, time.Now())
 			require.NoError(t, err)
-			assert.EqualValues(t, 100000000, state.DailyUsedNano)
+			assert.Zero(t, state.DailyUsedNano)
 			assert.Zero(t, state.DailyHeldNano)
+			assert.Zero(t, state.UnknownCosts)
 			assert.EqualValues(t, 1, state.RPMUsed)
-			require.NoError(t, FlushMidjourneyChannelObservation(context.Background(), task))
-			require.NoError(t, RefreshMidjourneyTask(context.Background(), task))
+			require.NoError(t, db.First(&attempt, "id = ?", snapshot.AttemptID).Error)
+			assert.True(t, attempt.Completed)
+			assert.True(t, attempt.CostActualKnown)
+			assert.Zero(t, attempt.ActualUSDNano)
 			assert.Equal(t, 1, submits)
-			assert.Equal(t, 5, polls)
 			require.NoError(t, db.First(&event, "id = ?", info.OverviewAttempt.EventID).Error)
-			assert.Equal(t, "succeeded", event.TaskStatus)
-			require.NotNil(t, event.ImageCount)
-			assert.EqualValues(t, 1, *event.ImageCount)
+			assert.Equal(t, "failed", event.TaskStatus)
 		})
 	}
 }
@@ -2016,4 +2017,87 @@ func TestMidjourneyProtectedQueryErrorDoesNotExposeCredential(t *testing.T) {
 			assert.NotContains(t, serverLog.String(), secret)
 		})
 	}
+}
+
+// A Midjourney task that the gateway failed locally after an hour and
+// refunded is charged again exactly once when the vendor later reports
+// SUCCESS, and a delivered result is never refunded by a later FAILURE.
+func TestMidjourneyTimeoutRefundLateSuccessChargesOnce(t *testing.T) {
+	truncate(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ChannelLimitConfig{}, &model.ChannelLimitAttempt{}, &model.ChannelDailyBudget{}, &model.ChannelLimitEvent{}))
+	const userID, tokenID, channelID, quota = 731, 731, 731, 20
+	const walletQuota, tokenRemain = 1_000, 500
+	seedUser(t, userID, walletQuota)
+	seedToken(t, tokenID, userID, "sk-mj-late", tokenRemain)
+	seedChannel(t, channelID)
+	seedChargedAccounting(t, userID, channelID, tokenID, quota, 1)
+
+	phase := "running"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch phase {
+		case "running":
+			_, _ = io.WriteString(w, `[{"id":"vendor-mj","status":"IN_PROGRESS","progress":"50%"}]`)
+		case "done":
+			_, _ = io.WriteString(w, `[{"id":"vendor-mj","status":"SUCCESS","progress":"100%","imageUrl":"https://cdn.example.com/mj.png"}]`)
+		case "failed":
+			_, _ = io.WriteString(w, `[{"id":"vendor-mj","status":"FAILURE","progress":"100%","failReason":"late failure"}]`)
+		}
+	}))
+	t.Cleanup(server.Close)
+	oldClient := httpClient
+	httpClient = server.Client()
+	t.Cleanup(func() { httpClient = oldClient })
+
+	connection, err := common.Marshal(relaycommon.ChannelMeta{ChannelId: channelID, ChannelType: constant.ChannelTypeMidjourney, ChannelBaseUrl: server.URL, ApiKey: "mj-secret"})
+	require.NoError(t, err)
+	task := &model.Midjourney{UserId: userID, ChannelId: channelID, MjId: "vendor-mj", Action: constant.MjActionImagine,
+		SubmitTime: time.Now().Add(-2 * time.Hour).UnixMilli(), Status: "IN_PROGRESS", Progress: "50%",
+		Quota: quota, TokenId: tokenID, BillingChannelId: channelID}
+	require.NoError(t, task.SetChannelAttempt(&relaycommon.TaskChannelSnapshot{ChannelID: channelID, Connection: string(connection)}))
+	require.NoError(t, task.Insert())
+	reload := func() *model.Midjourney {
+		stored := getMidjourneyTask(t, task.Id)
+		return &stored
+	}
+
+	require.NoError(t, RefreshMidjourneyTask(context.Background(), reload()))
+	stored := reload()
+	require.Equal(t, "FAILURE", stored.Status, "an hour without a result fails the task locally")
+	assert.Zero(t, stored.Quota)
+	assert.Equal(t, quota, stored.RefundedQuota)
+	assert.True(t, stored.ProcurementReconcile)
+	assert.Equal(t, walletQuota+quota, getUserQuota(t, userID))
+
+	// The vendor is still running: the refunded task stays failed.
+	require.NoError(t, RefreshMidjourneyTask(context.Background(), reload()))
+	assert.Equal(t, "FAILURE", reload().Status)
+
+	phase = "done"
+	stale := reload()
+	require.NoError(t, RefreshMidjourneyTask(context.Background(), reload()))
+	require.NoError(t, RefreshMidjourneyTask(context.Background(), stale))
+	stored = reload()
+	assert.Equal(t, "SUCCESS", stored.Status)
+	assert.Equal(t, quota, stored.Quota)
+	assert.Zero(t, stored.RefundedQuota)
+	assert.Equal(t, walletQuota, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, quota, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, int64(quota), getChannelUsedQuota(t, channelID))
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, model.LogTypeConsume, log.Type)
+	assert.Equal(t, quota, log.Quota)
+	assert.EqualValues(t, 2, countLogs(t))
+
+	phase = "failed"
+	require.NoError(t, model.DB.Model(&model.Midjourney{}).Where("id = ?", task.Id).Update("procurement_reconcile", true).Error)
+	require.NoError(t, RefreshMidjourneyTask(context.Background(), reload()))
+	stored = reload()
+	assert.Equal(t, "SUCCESS", stored.Status, "a delivered result is never revoked")
+	assert.Equal(t, quota, stored.Quota)
+	assert.Equal(t, walletQuota, getUserQuota(t, userID))
+	assert.EqualValues(t, 2, countLogs(t))
 }

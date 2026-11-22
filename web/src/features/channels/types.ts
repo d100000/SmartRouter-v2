@@ -65,6 +65,8 @@ export type ChannelBalanceDetail = z.infer<typeof channelBalanceDetailSchema>
 
 export const channelSchema = z.object({
   owner_supplier_id: z.string().optional(),
+  supplier_validation_status: z.string().optional(),
+  supplier_validated: z.boolean().optional(),
   secrets_write_only: z.boolean().optional(),
   supplier_id: z.string().nullish(),
   supplier_name: z.string().optional(),
@@ -158,6 +160,16 @@ export interface ChannelRecentHistoryBucket {
 }
 
 export interface ChannelRecentStats {
+  rpm_by_channel?: Record<
+    number,
+    {
+      limit: number | null
+      used: number
+      reserved: number
+      supported: boolean
+      observed: boolean
+    }
+  >
   ready: boolean
   refreshed_at: number
   window_seconds: number
@@ -385,6 +397,7 @@ export type ChannelSortOrder = 'asc' | 'desc'
 
 export interface GetChannelsParams {
   owner_supplier_id?: string
+  supplier_review?: boolean
   funding_status?: string
   p?: number
   page_size?: number
@@ -399,6 +412,7 @@ export interface GetChannelsParams {
 
 export interface SearchChannelsParams {
   owner_supplier_id?: string
+  supplier_review?: boolean
   funding_status?: string
   keyword?: string
   group?: string

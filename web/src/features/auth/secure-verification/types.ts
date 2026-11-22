@@ -26,7 +26,9 @@ export type VerificationMethod =
   | 'session'
 export type SecurityProofScope =
   | 'supplier.channel.credentials'
+  | 'supplier.channel.publish'
   | 'supplier.manage'
+  | 'supplier.provision'
   | 'channel.key.read'
   | 'passkey.register'
   | 'passkey.delete'
@@ -66,6 +68,22 @@ export type VerificationOperation =
   | {
       scope: 'supplier.manage'
       context: { supplier_id: string; version: number }
+    }
+  | {
+      scope: 'supplier.provision'
+      context: { supplier_id: string; version: number; username: string }
+    }
+  | {
+      scope: 'supplier.channel.publish'
+      context: {
+        channel_id: number
+        version: number
+        revision: string
+        models: string[]
+        groups: string[]
+        priority: number
+        weight: number
+      }
     }
   | { scope: 'channel.key.read'; context: { channel_id: number } }
   | {
@@ -109,7 +127,9 @@ export type VerificationOperation =
         SecurityProofScope,
         | 'channel.key.read'
         | 'supplier.channel.credentials'
+        | 'supplier.channel.publish'
         | 'supplier.manage'
+        | 'supplier.provision'
         | 'account.binding.bind'
         | 'account.binding.unbind'
         | 'access_token.generate'

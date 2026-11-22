@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,31 @@ func getAwsErrorStatusCode(err error) int {
 	}
 	// Default to 500 if we can't determine the status code
 	return http.StatusInternalServerError
+}
+
+// admitAwsInvoke admits an SDK send into the procurement ledger right before
+// it leaves. The SDK bypasses relay/channel.doRequest, so the exact request
+// body is offered here for token bounds instead.
+func admitAwsInvoke(c *gin.Context, info *relaycommon.RelayInfo, body []byte) *types.NewAPIError {
+	request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, "https://bedrock-runtime.invalid/model/invoke", bytes.NewReader(body))
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeDoRequestFailed)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if err := service.BeforeChannelUpstreamRequest(c, info, request); err != nil {
+		return service.ChannelLimitRelayError(err, c)
+	}
+	service.MarkOverviewUpstreamSent(info)
+	return nil
+}
+
+// observeAwsInvokeStatus records the HTTP status of a failed SDK send when the
+// SDK exposes one, so an upstream rejection settles at no cost.
+func observeAwsInvokeStatus(c *gin.Context, info *relaycommon.RelayInfo, err error) {
+	var httpErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &httpErr) {
+		service.ObserveChannelLimitUpstreamStatus(c, info, httpErr.HTTPStatusCode())
+	}
 }
 
 func newAwsInvokeContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -238,9 +264,13 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	service.MarkOverviewUpstreamSent(info)
-	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	awsReq := a.AwsReq.(*bedrockruntime.InvokeModelInput)
+	if admitErr := admitAwsInvoke(c, info, awsReq.Body); admitErr != nil {
+		return admitErr, nil
+	}
+	awsResp, err := a.AwsClient.InvokeModel(ctx, awsReq)
 	if err != nil {
+		observeAwsInvokeStatus(c, info, err)
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
 
@@ -269,9 +299,13 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	service.MarkOverviewUpstreamSent(info)
-	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
+	awsReq := a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput)
+	if admitErr := admitAwsInvoke(c, info, awsReq.Body); admitErr != nil {
+		return admitErr, nil
+	}
+	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, awsReq)
 	if err != nil {
+		observeAwsInvokeStatus(c, info, err)
 		return newAwsInvokeError(requestContext, err, "InvokeModelWithResponseStream"), nil
 	}
 	stream := awsResp.GetStream()
@@ -328,9 +362,13 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	service.MarkOverviewUpstreamSent(info)
-	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	awsReq := a.AwsReq.(*bedrockruntime.InvokeModelInput)
+	if admitErr := admitAwsInvoke(c, info, awsReq.Body); admitErr != nil {
+		return admitErr, nil
+	}
+	awsResp, err := a.AwsClient.InvokeModel(ctx, awsReq)
 	if err != nil {
+		observeAwsInvokeStatus(c, info, err)
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
 

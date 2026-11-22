@@ -67,15 +67,13 @@ export function SupplierLimitEvents(props: {
         cell: ({ row }) =>
           ({
             config_changed: t('Limit configuration changed'),
-            daily_exhausted: t('Daily budget exhausted'),
-            daily_restored: t('Daily budget restored'),
-            daily_reset: t('Daily budget reset'),
+            daily_reset: t('Daily cost reset'),
             tpm_estimated: t('TPM estimated'),
             usage_corrected: t('Usage corrected'),
             cost_corrected: t('Procurement cost corrected'),
           })[row.original.kind] ?? t('Unknown'),
       },
-      { accessorKey: 'budget_day', header: t('Budget date (Beijing time)') },
+      { accessorKey: 'budget_day', header: t('Cost date (Beijing time)') },
     ],
     [t]
   )

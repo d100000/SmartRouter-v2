@@ -105,7 +105,10 @@ func calculateAudioQuotaDecimal(info QuotaInfo) decimal.Decimal {
 	return quota
 }
 
-func captureAudioBillingSnapshot(info *relaycommon.RelayInfo, quotaInfo QuotaInfo, snapshot *relaycommon.OverviewBillingSnapshot, tieredApplied bool, result *billingexpr.TieredResult) {
+// captureAudioBillingSnapshot records the settlement's procurement base, the
+// amount charged before the group ratio. charged is false when the settlement
+// charged nothing because the upstream reported no usage.
+func captureAudioBillingSnapshot(info *relaycommon.RelayInfo, quotaInfo QuotaInfo, snapshot *relaycommon.OverviewBillingSnapshot, tieredApplied bool, result *billingexpr.TieredResult, charged bool) {
 	// Preserve confirmed direct debits if final settlement subsequently fails.
 	snapshot.RevenueQuota = info.AnalyticsRealtimeRevenueQuota
 	snapshot.QuotaPerUnit = quotaInfo.QuotaPerUnit
@@ -119,22 +122,26 @@ func captureAudioBillingSnapshot(info *relaycommon.RelayInfo, quotaInfo QuotaInf
 	if info.RealtimeMetered && info.TieredBillingSnapshot != nil && !tieredApplied {
 		return
 	}
-	if snapshot.UsageSource == "local_estimate" || info.QuotaClamp != nil || snapshot.InputTokens < 0 || snapshot.OutputTokens < 0 {
+	// Locally estimated usage still prices the request; UsageSource marks it.
+	if info.QuotaClamp != nil || snapshot.InputTokens < 0 || snapshot.OutputTokens < 0 {
 		return
 	}
 	var base float64
-	if tieredApplied {
+	switch {
+	case !charged:
+	case tieredApplied:
 		if result == nil {
 			return
 		}
 		base = info.PriceData.ApplyOtherRatiosToDecimal(decimal.NewFromFloat(result.ActualQuotaBeforeGroup)).InexactFloat64()
-	} else {
-		// Legacy audio callers do not pass their per-call price into the
-		// calculator. Preserve the existing charge without inventing a base.
-		if quotaInfo.UsePrice && quotaInfo.FrozenPrice == nil || quotaInfo.InputDetails.TextTokens+quotaInfo.InputDetails.AudioTokens+quotaInfo.InputDetails.ImageTokens+quotaInfo.OutputDetails.TextTokens+quotaInfo.OutputDetails.AudioTokens == 0 && !(info.RealtimeMetered && quotaInfo.UsePrice) {
-			return
-		}
+	default:
+		// The customer amount before the group ratio. Legacy audio callers do
+		// not pass the per-call price into the calculator, which then charges
+		// the customer nothing; the procurement side still pays that price.
 		quotaInfo.GroupRatio = 1
+		if quotaInfo.UsePrice && quotaInfo.FrozenPrice == nil {
+			quotaInfo.ModelPrice = info.PriceData.ModelPrice
+		}
 		base = calculateAudioQuotaDecimal(quotaInfo).InexactFloat64()
 	}
 	if base >= 0 && !math.IsNaN(base) && !math.IsInf(base, 0) {
@@ -321,7 +328,8 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	}
 
 	// record all the consume log even if quota is 0
-	if totalTokens == 0 && !unknownUsage && !(relayInfo.RealtimeMetered && (usePrice || tieredOk)) {
+	noUsageCharge := totalTokens == 0 && !unknownUsage && !(relayInfo.RealtimeMetered && (usePrice || tieredOk))
+	if noUsageCharge {
 		// in this case, must be some error happened
 		// we cannot just return, because we may have to return the pre-consumed quota
 		quota = 0
@@ -355,7 +363,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 			snapshot.CacheReadTokens = int64(*details.TextTokens)
 		}
 	}
-	captureAudioBillingSnapshot(relayInfo, quotaInfo, snapshot, tieredOk, tieredResult)
+	captureAudioBillingSnapshot(relayInfo, quotaInfo, snapshot, tieredOk, tieredResult, !noUsageCharge)
 	if unknownUsage {
 		snapshot.BaseQuota = nil
 		snapshot.UsageSource = ""
@@ -500,7 +508,8 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 	}
 
 	// record all the consume log even if quota is 0
-	if totalTokens == 0 && !fixedPriceBilling {
+	noUsageCharge := totalTokens == 0 && !fixedPriceBilling
+	if noUsageCharge {
 		// in this case, must be some error happened
 		// we cannot just return, because we may have to return the pre-consumed quota
 		quota = 0
@@ -521,7 +530,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 	} else if usage.UsageSource != "" {
 		snapshot.UsageSource = usage.UsageSource
 	}
-	captureAudioBillingSnapshot(relayInfo, quotaInfo, snapshot, tieredOk, tieredResult)
+	captureAudioBillingSnapshot(relayInfo, quotaInfo, snapshot, tieredOk, tieredResult, !noUsageCharge)
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, common.LogText("error settling billing: %s", err.Error()))
 	}

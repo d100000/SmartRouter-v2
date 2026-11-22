@@ -187,12 +187,13 @@ func TestRealtimeReplyMasksText(t *testing.T) {
 	session.ServerEvent("response.text.done", []byte(`{"type":"response.text.done","response_id":"resp_1","item_id":"item_1","output_index":0,"content_index":0,"text":"the secret is out"}`), nil, 0)
 	info := replyInfo(types.RelayFormatOpenAIRealtime, relayconstant.RelayModeRealtime)
 	settled := false
-	session.SettleResponse(realtimeDone(gin.H{"type": "text", "text": "the secret is out"}), nil, info, func() int {
+	allowed := session.SettleResponse(realtimeDone(gin.H{"type": "text", "text": "the secret is out"}), nil, info, func() int {
 		settled = true
 		require.Len(t, info.RequestPluginRecord, 1, "final reply findings must precede the consume log")
 		assert.Equal(t, 1, info.RequestPluginRecord[0].Masked)
 		return 0
 	})
+	assert.True(t, allowed)
 	require.True(t, settled)
 
 	var text strings.Builder
@@ -262,7 +263,8 @@ func TestRealtimeReplyStops(t *testing.T) {
 			assert.Equal(t, "resp_1", cancel.Get("response_id").Str)
 			// The upstream's error about the cancel is the session's own.
 			session.ServerEvent("error", []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"response_cancel_not_active","event_id":"`+cancel.Get("event_id").Str+`"}}`), nil, 0)
-			session.ServerEvent("response.done", realtimeDone(tc.done), &dto.RealtimeUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30}, 900)
+			allowed := session.SettleResponse(realtimeDone(tc.done), &dto.RealtimeUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30}, nil, func() int { return 900 })
+			assert.False(t, allowed)
 
 			require.Len(t, session.client, 4, "created, the released delta, the error, response.done: %v", session.client)
 			assert.Equal(t, tc.kept, gjson.Get(session.client[1], "delta").Str)

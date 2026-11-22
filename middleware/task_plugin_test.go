@@ -2305,6 +2305,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 									common.OptionMapRWMutex.Unlock()
 								})
 							}
+							require.NoError(t, service.SyncSchedulingConfig())
 							body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024","stream":%t}`, modelName, tc.stream))
 							contentType := "application/json"
 							if tc.multipart {

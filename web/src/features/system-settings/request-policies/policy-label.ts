@@ -52,6 +52,10 @@ export function policyLabel(t: TFunction, value: string): string {
       return t('Status matches the retry rules')
     case 'session_rule_matched':
       return t('Session rule matched')
+    case 'session_binding_temporarily_unavailable':
+      return t('Bound channel temporarily unavailable; binding kept')
+    case 'session_binding_recent_failure':
+      return t('Bound channel failed recently; binding kept')
     case 'channel_selected':
       return t('Channel selected')
     case 'request_completed':

@@ -162,7 +162,7 @@ func supplierTaskProbe(ctx context.Context, draft *model.SupplierChannelDraft, c
 	if err != nil {
 		return "failed"
 	}
-	result := model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND supplier_id = ? AND version = ? AND status = ?", draft.ChannelID, draft.SupplierID, draft.Version, "testing").Where("COALESCE(probe_task_ids, '') = ?", draft.ProbeTaskIDs).Update("probe_task_ids", string(encoded))
+	result := model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND supplier_id = ? AND version = ? AND status = ? AND test_token = ? AND lease_until > ?", draft.ChannelID, draft.SupplierID, draft.Version, model.SupplierDraftTesting, draft.TestToken, time.Now().Unix()).Where("COALESCE(probe_task_ids, '') = ?", draft.ProbeTaskIDs).Update("probe_task_ids", string(encoded))
 	if result.Error != nil || result.RowsAffected != 1 {
 		return "waiting"
 	}
@@ -192,6 +192,9 @@ func supplierTaskProbe(ctx context.Context, draft *model.SupplierChannelDraft, c
 		}
 	}
 	if err := task.InsertWithContext(context.WithoutCancel(ctx)); err != nil {
+		// The vendor accepted the probe but no task row will poll it: settle the
+		// procurement attempt now so it does not dangle.
+		service.SettleUnpersistedTaskChannelAttempt(c, info, submission.Immediate)
 		return "result_unknown"
 	}
 	if task.PrivateData.ChannelAttempt == nil {
@@ -244,7 +247,7 @@ func supplierMidjourneyProbe(ctx context.Context, draft *model.SupplierChannelDr
 		if err != nil {
 			return "failed"
 		}
-		write := model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND supplier_id = ? AND version = ? AND status = ?", draft.ChannelID, draft.SupplierID, draft.Version, "testing").Where("COALESCE(probe_task_ids, '') = ?", draft.ProbeTaskIDs).Update("probe_task_ids", string(encoded))
+		write := model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND supplier_id = ? AND version = ? AND status = ? AND test_token = ? AND lease_until > ?", draft.ChannelID, draft.SupplierID, draft.Version, model.SupplierDraftTesting, draft.TestToken, time.Now().Unix()).Where("COALESCE(probe_task_ids, '') = ?", draft.ProbeTaskIDs).Update("probe_task_ids", string(encoded))
 		if write.Error != nil || write.RowsAffected != 1 {
 			return "waiting"
 		}

@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
+import { useNavigate } from '@tanstack/react-router'
 import { Pencil } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
@@ -65,7 +66,6 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Textarea } from '@/components/ui/textarea'
-import { getSuppliers, supplyQueryKey } from '@/features/suppliers/api'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -118,6 +118,7 @@ export function UsersMutateDrawer({
   currentRow,
 }: UsersMutateDrawerProps) {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const isUpdate = !!currentRow
   const { triggerRefresh, requestVerification } = useUsers()
   const currentUser = useAuthStore((s) => s.auth.user)
@@ -178,19 +179,10 @@ export function UsersMutateDrawer({
     selectedRole === ROLE.SUPPLIER
       ? SUPPLIER_PASSWORD_MIN_LENGTH
       : ACCOUNT_PASSWORD_MIN_LENGTH
-  const suppliersQuery = useQuery({
-    queryKey: [...supplyQueryKey, currentUser?.id, 'admin', 'accounts'],
-    queryFn: ({ signal }) => getSuppliers(signal),
-    enabled: open && !isUpdate && selectedRole === ROLE.SUPPLIER,
-  })
   const canEditAdminPermissions = currentUser?.role === ROLE.SUPER_ADMIN
   const targetIsAdmin = (selectedRole ?? currentRow?.role ?? 0) >= ROLE.ADMIN
 
   const onSubmit = async (data: UserFormValues) => {
-    if (!isUpdate && data.role === ROLE.SUPPLIER && !data.supplier_id) {
-      form.setError('supplier_id', { message: t('Select a supplier') })
-      return
-    }
     if (
       data.role === ROLE.SUPPLIER &&
       (!isUpdate || data.password) &&
@@ -380,10 +372,17 @@ export function UsersMutateDrawer({
                             { value: '2', label: t('Channel Supplier') },
                             { value: '10', label: t('Admin') },
                           ]}
-                          onValueChange={(value) =>
-                            value !== null &&
-                            field.onChange(Number.parseInt(value))
-                          }
+                          onValueChange={(value) => {
+                            if (value === String(ROLE.SUPPLIER)) {
+                              onOpenChange(false)
+                              void navigate({
+                                to: '/suppliers',
+                                search: { add: true },
+                              })
+                            } else if (value !== null) {
+                              field.onChange(Number.parseInt(value))
+                            }
+                          }}
                           value={String(field.value)}
                         >
                           <FormControl>
@@ -405,55 +404,6 @@ export function UsersMutateDrawer({
                         </Select>
                         <FormDescription>
                           {t("Set the user's role (cannot be Root)")}
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                )}
-
-                {!isUpdate && selectedRole === ROLE.SUPPLIER && (
-                  <FormField
-                    control={form.control}
-                    name='supplier_id'
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t('Channel Supplier')}</FormLabel>
-                        <Select
-                          value={field.value || ''}
-                          onValueChange={(value) => field.onChange(value ?? '')}
-                          items={(suppliersQuery.data?.items ?? [])
-                            .filter((supplier) => !supplier.user_id)
-                            .map((supplier) => ({
-                              value: supplier.id,
-                              label: supplier.name,
-                            }))}
-                          disabled={suppliersQuery.isPending}
-                        >
-                          <FormControl>
-                            <SelectTrigger>
-                              <SelectValue
-                                placeholder={t('Select a supplier')}
-                              />
-                            </SelectTrigger>
-                          </FormControl>
-                          <SelectContent>
-                            {(suppliersQuery.data?.items ?? [])
-                              .filter((supplier) => !supplier.user_id)
-                              .map((supplier) => (
-                                <SelectItem
-                                  key={supplier.id}
-                                  value={supplier.id}
-                                >
-                                  {supplier.name}
-                                </SelectItem>
-                              ))}
-                          </SelectContent>
-                        </Select>
-                        <FormDescription>
-                          {t(
-                            'Create a supplier configuration before binding a dedicated account.'
-                          )}
                         </FormDescription>
                         <FormMessage />
                       </FormItem>

@@ -1,9 +1,11 @@
 package model
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"gorm.io/gorm"
 )
 
 var group2model2channels map[string]map[string][]int // enabled channel
@@ -28,6 +31,22 @@ var channelSyncLock sync.RWMutex
 // channelCacheReloadLock serializes full cache publication.
 var channelCacheReloadLock sync.Mutex
 
+// channelStatusGeneration numbers the status changes cached by
+// CacheUpdateChannelStatus. channelStatusChanges, guarded by channelSyncLock,
+// keeps the last one of each channel until a reload that read after it.
+var (
+	channelStatusGeneration atomic.Uint64
+	channelStatusChanges    = map[int]cachedStatusChange{}
+)
+
+type cachedStatusChange struct {
+	generation uint64
+	status     int
+	// info is the key-level state of a full entry update (per-key disables);
+	// nil for a status-only change.
+	info *ChannelInfo
+}
+
 // RoutingMetadataVersion changes after channel CRUD and cache publication.
 // Scheduling reconciles complete membership once per version, never from a
 // request-filtered candidate list or a full database scan on every request.
@@ -36,6 +55,42 @@ var routingMetadataVersion atomic.Uint64
 func RoutingMetadataVersion() uint64 { return routingMetadataVersion.Load() }
 
 func invalidateRoutingMetadata() { routingMetadataVersion.Add(1) }
+
+// routingMetadataFingerprint identifies the routing fields published by the
+// last full cache reload, so an unchanged periodic reload keeps the version.
+var routingMetadataFingerprint [sha256.Size]byte
+
+// routingFingerprint covers every channel and ability field that scheduling
+// membership reads. Rows are ordered so database order cannot change it.
+func routingFingerprint(channels []*Channel, abilities []*Ability, accounts []SupplierAccount) [sha256.Size]byte {
+	hash := sha256.New()
+	sorted := slices.Clone(channels)
+	slices.SortFunc(sorted, func(a, b *Channel) int { return a.Id - b.Id })
+	for _, channel := range sorted {
+		fmt.Fprintf(hash, "c|%d|%q|%d|%q|%q|%d|%d|%q|%d\n", channel.Id, channel.Name, channel.Status, channel.Group, channel.Models,
+			channel.GetPriority(), channel.GetWeight(), channel.OwnerSupplierID, channel.SupplierPriority)
+	}
+	rows := make([]string, 0, len(abilities))
+	for _, ability := range abilities {
+		priority := int64(0)
+		if ability.Priority != nil {
+			priority = *ability.Priority
+		}
+		rows = append(rows, fmt.Sprintf("a|%q|%q|%d|%t|%d|%d\n", ability.Group, ability.Model, ability.ChannelId, ability.Enabled, priority, ability.Weight))
+	}
+	slices.Sort(rows)
+	for _, row := range rows {
+		hash.Write([]byte(row))
+	}
+	// Supplier pools route by account priority, weight and capacity.
+	slices.SortFunc(accounts, func(a, b SupplierAccount) int { return strings.Compare(a.SupplierID, b.SupplierID) })
+	for _, account := range accounts {
+		fmt.Fprintf(hash, "s|%q|%t|%d|%d|%d|%d\n", account.SupplierID, account.SupplyEnabled, account.PoolPriority, account.PoolWeight, account.PoolCapacity, account.Revision)
+	}
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], hash.Sum(nil))
+	return fingerprint
+}
 
 // GetSatisfiedChannelCandidates returns every enabled matching channel across
 // priorities. Copies keep scheduling snapshots independent of cache updates.
@@ -57,51 +112,85 @@ func GetSatisfiedChannelCandidates(group, modelName string, filters []dto.Channe
 		return channels, nil
 	}
 	// Abilities are authoritative for uncached routing. Channel group/model
-	// metadata alone must never revive a disabled or absent ability.
-	var abilities []Ability
-	if err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, modelName, true).Find(&abilities).Error; err != nil {
-		return nil, err
+	// metadata alone must never revive a disabled or absent ability. Like the
+	// memory cache, retry with the routing name when the exact name finds none.
+	names := []string{modelName}
+	if normalized := ratio_setting.RoutingMatchModelName(modelName); normalized != "" && normalized != modelName {
+		names = append(names, normalized)
 	}
-	if len(abilities) == 0 {
-		return nil, nil
-	}
-	ids := make([]int, 0, len(abilities))
-	byID := make(map[int]Ability, len(abilities))
-	for _, ability := range abilities {
-		ids = append(ids, ability.ChannelId)
-		byID[ability.ChannelId] = ability
-	}
-	var all []*Channel
-	if err := DB.Where("id IN ?", ids).Find(&all).Error; err != nil {
-		return nil, err
-	}
-	for _, channel := range all {
-		if channel.Status != common.ChannelStatusEnabled {
+	for _, abilityModel := range names {
+		var abilities []Ability
+		if err := DB.Where(map[string]any{"group": group, "model": abilityModel, "enabled": true}).Find(&abilities).Error; err != nil {
+			return nil, err
+		}
+		if len(abilities) == 0 {
 			continue
 		}
-		if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
-			ability := byID[channel.Id]
-			channel.Priority, channel.Weight = ability.Priority, &ability.Weight
-			channels = append(channels, channel)
+		ids := make([]int, 0, len(abilities))
+		byID := make(map[int]Ability, len(abilities))
+		for _, ability := range abilities {
+			ids = append(ids, ability.ChannelId)
+			byID[ability.ChannelId] = ability
+		}
+		var all []*Channel
+		if err := DB.Where("id IN ?", ids).Find(&all).Error; err != nil {
+			return nil, err
+		}
+		for _, channel := range all {
+			if channel.Status != common.ChannelStatusEnabled || !channel.HasPublishedConfiguration() || channel.credentialUnavailable {
+				continue
+			}
+			if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
+				ability := byID[channel.Id]
+				channel.Priority, channel.Weight = ability.Priority, &ability.Weight
+				channels = append(channels, channel)
+			}
+		}
+		if len(channels) > 0 {
+			break
 		}
 	}
 	return channels, nil
 }
 
 func InitChannelCache() {
-	defer invalidateRoutingMetadata()
+	_ = ReloadChannelCache()
+}
+
+// ReloadChannelCache preserves the previous routing cache on a failed read and
+// reports the failure so node synchronization can retry its revision.
+func ReloadChannelCache() error {
 	channelCacheReloadLock.Lock()
 	defer channelCacheReloadLock.Unlock()
 	if !common.MemoryCacheEnabled {
+		defer invalidateRoutingMetadata()
 		InvalidatePricingCache()
 		rebuildTaskAliasView()
-		return
+		return nil
 	}
 	newChannelId2channel := make(map[int]*Channel)
 	newChannel2advancedCustomConfig := make(map[int]*kitdto.AdvancedCustomConfig)
 	var channels []*Channel
-	DB.Find(&channels)
+	// A status change cached after this point may be missing from the rows read.
+	readGeneration := channelStatusGeneration.Load()
+	// A failed read must not publish an empty cache: keep serving the last
+	// complete one until a later reload succeeds.
+	if err := DB.Find(&channels).Error; err != nil {
+		common.SysError(common.LogText("failed to sync channels from database, keeping the previous cache: %s", err.Error()))
+		return err
+	}
 	for _, channel := range channels {
+		if channel.credentialUnavailable {
+			// Only this channel stops routing on this node; the stored
+			// credential and status stay as they are.
+			common.SysError(common.LogText("channel #%d credential cannot be decrypted on this node, disabling it in the channel cache", channel.Id))
+			channel.Status = common.ChannelStatusManuallyDisabled
+		}
+		// The cache keeps write-only credentials sealed. A channel that
+		// cannot be sealed must leave routing before the routes are built.
+		if err := channel.sealSupplierCredential(); err != nil {
+			channel.Key, channel.Keys, channel.Status = "", nil, common.ChannelStatusManuallyDisabled
+		}
 		channel.compiledAvailability = channel.availabilityPlan()
 		newChannelId2channel[channel.Id] = channel
 		if channel.Type == constant.ChannelTypeAdvancedCustom {
@@ -111,27 +200,41 @@ func InitChannelCache() {
 		}
 	}
 	var abilities []*Ability
-	DB.Find(&abilities)
-	groups := make(map[string]bool)
+	if err := DB.Find(&abilities).Error; err != nil {
+		common.SysError(common.LogText("failed to sync abilities from database, keeping the previous cache: %s", err.Error()))
+		return err
+	}
+	var accounts []SupplierAccount
+	suppliersKnown := true
+	if slices.ContainsFunc(channels, func(channel *Channel) bool { return channel.OwnerSupplierID != "" }) {
+		suppliersKnown = DB.Find(&accounts).Error == nil
+	}
+	fingerprint := routingFingerprint(channels, abilities, accounts)
+	type abilityKey struct {
+		group, model string
+		channel      int
+	}
+	enabled := make(map[abilityKey]bool, len(abilities))
 	for _, ability := range abilities {
-		groups[ability.Group] = true
+		if ability.Enabled {
+			enabled[abilityKey{ability.Group, ability.Model, ability.ChannelId}] = true
+		}
 	}
 	newGroup2model2channels := make(map[string]map[string][]int)
-	for group := range groups {
-		newGroup2model2channels[group] = make(map[string][]int)
-	}
 	for _, channel := range channels {
-		if channel.Status != common.ChannelStatusEnabled {
-			continue // skip disabled channels
+		if channel.Status != common.ChannelStatusEnabled || !channel.HasPublishedConfiguration() {
+			continue
 		}
-		groups := strings.SplitSeq(channel.Group, ",")
-		for group := range groups {
-			models := channel.GetModels()
-			for _, model := range models {
-				if _, ok := newGroup2model2channels[group][model]; !ok {
-					newGroup2model2channels[group][model] = make([]int, 0)
+		models := channel.GetModels()
+		for _, group := range channel.GetGroups() {
+			for _, modelName := range models {
+				if !enabled[abilityKey{group, modelName, channel.Id}] {
+					continue
 				}
-				newGroup2model2channels[group][model] = append(newGroup2model2channels[group][model], channel.Id)
+				if newGroup2model2channels[group] == nil {
+					newGroup2model2channels[group] = make(map[string][]int)
+				}
+				newGroup2model2channels[group][modelName] = append(newGroup2model2channels[group][modelName], channel.Id)
 			}
 		}
 	}
@@ -147,27 +250,54 @@ func InitChannelCache() {
 	}
 
 	channelSyncLock.Lock()
+	// A disable cached after the read above may be missing from the rows: keep
+	// it, so this reload cannot route to the channel again. A later enable is
+	// left to the next reload.
+	for id, change := range channelStatusChanges {
+		if change.generation <= readGeneration {
+			delete(channelStatusChanges, id)
+			continue
+		}
+		channel := newChannelId2channel[id]
+		if channel == nil {
+			continue
+		}
+		if change.info != nil {
+			channel.ChannelInfo = *change.info
+		}
+		if change.status == common.ChannelStatusEnabled {
+			continue
+		}
+		channel.Status = change.status
+		for _, model2channels := range newGroup2model2channels {
+			for model, ids := range model2channels {
+				model2channels[model] = slices.DeleteFunc(ids, func(channelID int) bool { return channelID == id })
+			}
+		}
+	}
 	group2model2channels = newGroup2model2channels
 	//channelsIDM = newChannelId2channel
 	for i, channel := range newChannelId2channel {
-		if channel.ChannelInfo.IsMultiKey {
+		// Sealed keys stay sealed in the cache; a request opens its own copy.
+		if channel.ChannelInfo.IsMultiKey && !strings.HasPrefix(channel.Key, supplierSecretPrefix) {
 			channel.Keys = channel.GetKeys()
-			if channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
-				if oldChannel, ok := channelsIDM[i]; ok {
-					// 存在旧的渠道，如果是多key且轮询，保留轮询索引信息
-					if oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
-						channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
-					}
+		}
+		if channel.ChannelInfo.IsMultiKey && channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+			if oldChannel, ok := channelsIDM[i]; ok {
+				// 存在旧的渠道，如果是多key且轮询，保留轮询索引信息
+				if oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+					channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
 				}
 			}
-		}
-		if err := channel.sealSupplierCredential(); err != nil {
-			channel.Key, channel.Keys, channel.Status = "", nil, common.ChannelStatusManuallyDisabled
 		}
 	}
 	channelsIDM = newChannelId2channel
 	channel2advancedCustomConfig = newChannel2advancedCustomConfig
 	channelSyncLock.Unlock()
+	if !suppliersKnown || fingerprint != routingMetadataFingerprint {
+		routingMetadataFingerprint = fingerprint
+		invalidateRoutingMetadata()
+	}
 	// Lock ordering: InvalidatePricingCache acquires updatePricingLock, and
 	// GetPricing (holding updatePricingLock) nests channelSyncLock.RLock via
 	// loadPricingAdvancedCustomConfigs. channelSyncLock MUST be released before
@@ -175,6 +305,7 @@ func InitChannelCache() {
 	InvalidatePricingCache()
 	rebuildTaskAliasView()
 	common.SysLog(common.LogText("channels synced from database"))
+	return nil
 }
 
 func SyncChannelCache(frequency int) {
@@ -285,7 +416,7 @@ func CacheGetChannelForRouting(id int) (*Channel, error) {
 	defer channelSyncLock.RUnlock()
 	channel := channelsIDM[id]
 	if channel == nil {
-		return nil, fmt.Errorf("channel %d no longer exists", id)
+		return nil, fmt.Errorf("channel %d no longer exists: %w", id, gorm.ErrRecordNotFound)
 	}
 	copy := *channel
 	return &copy, nil
@@ -309,6 +440,21 @@ func CacheGetChannelInfo(id int) (*ChannelInfo, error) {
 	return &c.ChannelInfo, nil
 }
 
+// advanceCachedPollingIndex replaces the polling cursor of the cached channel
+// with advance(cursor). The caller holds the channel's polling lock, and the
+// cache lock keeps readers copying the entry from seeing a torn update. It
+// reports false when the channel is no longer cached.
+func advanceCachedPollingIndex(id int, advance func(cursor int) int) bool {
+	channelSyncLock.Lock()
+	defer channelSyncLock.Unlock()
+	cached, ok := channelsIDM[id]
+	if !ok {
+		return false
+	}
+	cached.ChannelInfo.MultiKeyPollingIndex = advance(cached.ChannelInfo.MultiKeyPollingIndex)
+	return true
+}
+
 func CacheUpdateChannelStatus(id int, status int) {
 	defer invalidateRoutingMetadata()
 	if !common.MemoryCacheEnabled {
@@ -316,6 +462,7 @@ func CacheUpdateChannelStatus(id int, status int) {
 	}
 	channelSyncLock.Lock()
 	defer channelSyncLock.Unlock()
+	channelStatusChanges[id] = cachedStatusChange{generation: channelStatusGeneration.Add(1), status: status}
 	if channel, ok := channelsIDM[id]; ok {
 		channel.Status = status
 	}
@@ -354,9 +501,18 @@ func CacheUpdateChannel(channel *Channel) {
 	}
 	copy := *channel
 	copy.compiledAvailability = channel.availabilityPlan()
-	if err := copy.sealSupplierCredential(); err != nil {
+	if err := copy.sealSupplierCredential(); err != nil || copy.credentialUnavailable {
 		copy.Key, copy.Keys, copy.Status = "", nil, common.ChannelStatusManuallyDisabled
 	}
+	if oldChannel, ok := channelsIDM[channel.Id]; ok && copy.ChannelInfo.IsMultiKey && copy.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling &&
+		oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+		// The cursor lives only in the cache; a row loaded from the database
+		// carries a stale one.
+		copy.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
+	}
+	// A reload that read its rows before this update must not drop it.
+	info := copy.ChannelInfo
+	channelStatusChanges[channel.Id] = cachedStatusChange{generation: channelStatusGeneration.Add(1), status: copy.Status, info: &info}
 	channelsIDM[channel.Id] = &copy
 	if channel2advancedCustomConfig == nil {
 		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)

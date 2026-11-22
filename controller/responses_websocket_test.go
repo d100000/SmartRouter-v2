@@ -33,6 +33,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
@@ -467,8 +468,10 @@ func newMeteredWSBillingTest(t *testing.T, realtime bool, expression string, han
 		require.NoError(t, model.DB.Delete(channel).Error)
 	})
 	engine := gin.New()
-	engine.GET("/v1/realtime", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) {
+	engine.GET("/v1/realtime", middleware.TokenAuth(), func(c *gin.Context) {
 		defer close(fixture.done)
+		c.Next()
+	}, middleware.Distribute(), func(c *gin.Context) {
 		c.Set(common.RequestIdKey, "realtime-billing")
 		Relay(c, types.RelayFormatOpenAIRealtime)
 	})
@@ -579,6 +582,93 @@ func readResponsesWSTestEvent(t *testing.T, client *websocket.Conn) map[string]a
 	var event map[string]any
 	require.NoError(t, common.Unmarshal(data, &event))
 	return event
+}
+
+func TestWebSocketAffinityRequiresDeliveredCompletion(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	previous := *setting
+	t.Cleanup(func() { *setting = previous })
+	setting.Enabled, setting.SessionMode = true, "prefer"
+	setting.Rules = []operation_setting.ChannelAffinityRule{{
+		Name: "ws-affinity-test", IncludeRuleName: true, ModelRegex: []string{"^ws-billing$"},
+		KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "context_int", Key: "id"}},
+	}}
+	// The affinity cache lives for the process; each billing fixture's Redis
+	// client lives for just one connection. Initialize it with the test's
+	// ordinary in-memory cache before opening those connections.
+	service.GetChannelAffinityCacheStats()
+	for _, tc := range []struct {
+		name     string
+		realtime bool
+		recover  bool
+	}{
+		{"responses failed then completed", false, true},
+		{"realtime failed then completed", true, true},
+		{"realtime closed after failure", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failure, success := "response.failed", "response.completed"
+			create := `{"type":"response.create","model":"ws-billing","input":"hello"}`
+			if tc.realtime {
+				failure, success, create = "response.done", "response.done", `{"type":"response.create"}`
+			}
+			fixture := newMeteredWSBillingTest(t, tc.realtime, `tier("base", p*2)`, func(ws *websocket.Conn, _ *http.Request) {
+				if tc.realtime {
+					require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`)))
+					_, _, err := ws.ReadMessage()
+					require.NoError(t, err)
+					require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null,"input_audio_transcription":null}}`)))
+				}
+				for i, terminal := range []string{failure, success} {
+					_, _, err := ws.ReadMessage()
+					if err != nil {
+						return
+					}
+					id, status := fmt.Sprintf("resp_%d", i), "failed"
+					if i == 1 {
+						status = "completed"
+					}
+					for _, event := range []string{
+						fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id),
+						fmt.Sprintf(`{"type":"response.output_text.delta","response_id":%q,"delta":"partial"}`, id),
+						fmt.Sprintf(`{"type":%q,"response":{"id":%q,"status":%q,"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11,"input_token_details":{"text_tokens":10},"output_token_details":{"text_tokens":1}}}}`, terminal, id, status),
+					} {
+						require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(event)))
+					}
+				}
+				_, _, _ = ws.ReadMessage()
+			})
+			lookup := func() (int, bool) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+				c.Set("id", fixture.user.Id)
+				return service.GetPreferredChannelByAffinity(c, "ws-billing", "default")
+			}
+			client := fixture.client
+			if tc.realtime {
+				require.Equal(t, "session.created", readResponsesWSTestEvent(t, client)["type"])
+			}
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
+			for _, kind := range []string{"response.created", "response.output_text.delta", failure} {
+				require.Equal(t, kind, readResponsesWSTestEvent(t, client)["type"])
+				_, found := lookup()
+				require.False(t, found)
+			}
+			if tc.recover {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
+				for _, kind := range []string{"response.created", "response.output_text.delta", success} {
+					require.Equal(t, kind, readResponsesWSTestEvent(t, client)["type"])
+				}
+			}
+			fixture.closeAndWait(t)
+			bound, found := lookup()
+			require.Equal(t, tc.recover, found)
+			if tc.recover {
+				assert.Equal(t, fixture.channel.Id, bound)
+			}
+			assert.EqualValues(t, 1, fixture.connections.Load())
+		})
+	}
 }
 
 func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, expectedQuotas []int) {
@@ -955,10 +1045,13 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 			delta       bool
 			failed      bool
 			ignored     bool
+			// actualUsage marks a terminal whose reported usage is billable
+			// even though no output reached the client.
+			actualUsage bool
 		}{
 			{name: "failed-null-fixed", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"response.failed","response":{"id":"first","status":"failed","usage":null,"error":{"code":"server_error","message":"sensitive upstream detail"}}}`, failed: true},
 			{name: "failed-missing-fixed", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"response.failed","response":{"id":"first","status":"failed"}}`, failed: true},
-			{name: "failed-actual-usage", expression: `tier("input", p * 2)`, terminal: `{"type":"response.failed","response":{"id":"first","status":"failed","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, failed: true},
+			{name: "failed-actual-usage", expression: `tier("input", p * 2)`, terminal: `{"type":"response.failed","response":{"id":"first","status":"failed","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, failed: true, actualUsage: true},
 			{name: "failed-estimated-output", expression: `tier("output", c * 2000)`, terminal: `{"type":"response.failed","response":{"id":"first","status":"failed","usage":null}}`, delta: true, failed: true},
 			{name: "error-after-created", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"error","status":500,"error":{"type":"server_error","code":"server_error","message":"Internal server error"}}`, sseTerminal: `{"type":"error","code":"server_error","message":"Internal server error","param":null,"sequence_number":2}`, failed: true},
 			{name: "business-error-after-created", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Input too long"}}`, sseTerminal: `{"type":"error","code":"context_length_exceeded","message":"Input too long","param":null,"sequence_number":2}`, failed: true, ignored: true},
@@ -966,9 +1059,10 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 			{name: "completed-zero-fixed", expression: `tier("request", fixed(0.002))`, delta: true, terminal: `{"type":"response.completed","response":{"id":"first","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
 		} {
 			t.Run(transport+"/"+tc.name, func(t *testing.T) {
-				// Empty HTTP stream failures refund the reservation and produce an
-				// error log. WebSocket settlement is outside the HTTP retry change.
-				uncharged := transport == "http-sse" && tc.failed && !tc.delta
+				// HTTP stream failures without output or reported usage refund the
+				// reservation and produce an error log. WebSocket settlement is
+				// outside the HTTP retry change.
+				uncharged := transport == "http-sse" && tc.failed && !tc.delta && !tc.actualUsage
 				events := []string{`{"type":"response.created","response":{"id":"first","status":"in_progress"}}`}
 				if tc.delta {
 					events = append(events, `{"type":"response.output_text.delta","delta":"hello"}`)
@@ -1903,8 +1997,8 @@ func TestRealtimeRejectedManualCommitAndClearDoNotSuppressVAD(t *testing.T) {
 	assertResponsesWSAccounting(t, fixture, []int{10})
 }
 
-func TestRealtimeDisconnectKeepsUnknownGeneration(t *testing.T) {
-	fixture := newMeteredWSBillingTest(t, true, `tier("base",p*2)`, func(ws *websocket.Conn, _ *http.Request) {
+func TestRealtimeDisconnectChargesSentGeneration(t *testing.T) {
+	fixture := newMeteredWSBillingTest(t, true, `tier("base", p * 2 + 20)`, func(ws *websocket.Conn, _ *http.Request) {
 		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`)))
 		_, _, err := ws.ReadMessage()
 		require.NoError(t, err)
@@ -1914,6 +2008,9 @@ func TestRealtimeDisconnectKeepsUnknownGeneration(t *testing.T) {
 		require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"interrupted"}}`)))
 	})
 	require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	// A procurement price lets the ledger record the cost the customer was charged.
+	fixture.channel.CostRatio = common.GetPointer(0.5)
+	require.NoError(t, fixture.channel.Update())
 	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
 	event := readResponsesWSTestEvent(t, fixture.client)
 	require.Equal(t, "response.created", event["type"], "%+v", event)
@@ -1921,10 +2018,88 @@ func TestRealtimeDisconnectKeepsUnknownGeneration(t *testing.T) {
 	var attempts []model.ChannelLimitAttempt
 	require.NoError(t, model.DB.Where("channel_id = ?", fixture.channel.Id).Find(&attempts).Error)
 	require.Len(t, attempts, 1)
-	assert.False(t, attempts[0].Completed)
-	assert.False(t, attempts[0].Released)
-	assert.Positive(t, attempts[0].ReconcileUntilMS)
-	assertResponsesWSAccounting(t, fixture, nil)
+	assert.True(t, attempts[0].Completed, "a charged generation settles its procurement attempt")
+	assert.True(t, attempts[0].CostActualKnown)
+	// The generation was already sent upstream: it is charged at its frozen
+	// reservation basis (fixed 20 USD/M => 20 * 500000 / 1e6 = 10 quota).
+	assertResponsesWSAccounting(t, fixture, []int{10})
+}
+
+// A generation that ran upstream is charged by what ran: audio and text output
+// delivered before a disconnect, a cancelled response with valid usage, and a
+// completed response whose usage fails the strict modality checks.
+func TestRealtimeSentGenerationSettlement(t *testing.T) {
+	silence := base64.StdEncoding.EncodeToString(make([]byte, 48000))
+	for _, tc := range []struct {
+		name         string
+		frames       []string
+		wantQuota    int
+		wantSettle   map[string]any
+		wantNoSettle bool
+	}{
+		{
+			name: "disconnect after audio and text output",
+			frames: []string{
+				`{"type":"response.output_audio.delta","response_id":"x","delta":"` + silence + `"}`,
+				`{"type":"response.output_text.delta","response_id":"x","delta":"hello"}`,
+			},
+			// 48000 bytes of 24 kHz pcm16 is 1 s => floor(1/60*200/0.24) = 13 audio tokens
+			// at ao*4, plus 1 estimated text token at c*2: (13*4 + 1*2) * 500000 / 1e6 = 27.
+			wantQuota:  27,
+			wantSettle: map[string]any{"reason": "session_ended_before_response_done", "audio_output_bytes": float64(48000), "audio_output_seconds": float64(1), "estimated_audio_output_tokens": float64(13), "estimated_text_output_tokens": float64(1)},
+		},
+		{
+			name:         "cancelled response with valid usage",
+			frames:       []string{`{"type":"response.done","response":{"id":"x","status":"cancelled","usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10,"input_token_details":{"text_tokens":10}}}}`},
+			wantQuota:    10, // 10 input tokens * 2 USD/M * 500000 / 1e6
+			wantNoSettle: true,
+		},
+		{
+			name:       "completed response with inconsistent usage",
+			frames:     []string{`{"type":"response.done","response":{"id":"x","status":"completed","usage":{"input_tokens":10,"output_tokens":0,"total_tokens":99}}}`},
+			wantQuota:  10, // fallback to the 10 input tokens * 2 USD/M * 500000 / 1e6
+			wantSettle: map[string]any{"reason": "inconsistent_usage", "usage_inconsistent": true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newMeteredWSBillingTest(t, true, `tier("base", p * 2 + c * 2 + ao * 4)`, func(ws *websocket.Conn, _ *http.Request) {
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"turn_detection":null}}`)))
+				_, _, err := ws.ReadMessage()
+				require.NoError(t, err)
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.updated","session":{"turn_detection":null,"input_audio_transcription":null}}`)))
+				_, _, err = ws.ReadMessage()
+				require.NoError(t, err)
+				require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"x"}}`)))
+				for _, frame := range tc.frames {
+					require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(frame)))
+				}
+				_, _, _ = ws.ReadMessage()
+			})
+			require.Equal(t, "session.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+			require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
+			require.Equal(t, "response.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+			for range tc.frames {
+				readResponsesWSTestEvent(t, fixture.client)
+			}
+			fixture.closeAndWait(t)
+			assertResponsesWSAccounting(t, fixture, []int{tc.wantQuota})
+			var consumed model.Log
+			require.NoError(t, model.LOG_DB.Where("type = ?", model.LogTypeConsume).First(&consumed).Error)
+			var other map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(consumed.Other, &other))
+			adminInfo, ok := other["admin_info"].(map[string]any)
+			require.True(t, ok)
+			if tc.wantNoSettle {
+				assert.NotContains(t, adminInfo, "realtime_settlement")
+				return
+			}
+			settlement, ok := adminInfo["realtime_settlement"].(map[string]any)
+			require.True(t, ok, "%s", consumed.Other)
+			for key, value := range tc.wantSettle {
+				assert.Equal(t, value, settlement[key], key)
+			}
+		})
+	}
 }
 
 func TestRealtimeMissingUsageRetainsFrozenReservation(t *testing.T) {

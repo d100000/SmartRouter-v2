@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"net/http"
 	"slices"
 	"sync"
 	"time"
@@ -165,6 +166,21 @@ func MarkRequestPolicySuccess(c *gin.Context, stream *relaycommon.StreamStatus) 
 	state.AddEvent(PolicyEvent{ChannelID: channelID, Decision: decision})
 }
 
+// RequestSucceeded reports the final outcome of a request for session binding.
+// Once an attempt was dispatched, only a recorded successful completion counts:
+// a stream that already sent its status line can still fail. WebSocket
+// handlers record affinity per delivered generation on the open connection.
+func RequestSucceeded(c *gin.Context) bool {
+	if c == nil || c.Writer == nil || c.Writer.Status() >= http.StatusBadRequest || IsRelayWebSocketRequest(c) {
+		return false
+	}
+	state := RequestPolicy(c)
+	if state.Attempts == 0 {
+		return true
+	}
+	return state.OutcomeRecorded && state.Successful
+}
+
 // Rules explicitly inherit the global default or override it. Rules without a
 // mode retain their legacy retry behavior until an administrator changes them.
 func EffectiveSessionMode(setting *operation_setting.ChannelAffinitySetting, rule operation_setting.ChannelAffinityRule) (mode, source string) {
@@ -201,7 +217,9 @@ func RecordRequestPolicyTermination(c *gin.Context, apiErr *types.NewAPIError) {
 		reason := SchedulingRetryStopReason(c)
 		if reason == "" {
 			switch {
-			case len(c.GetStringSlice("use_channel")) > common.RetryTimes:
+			case LocalChannelLimitError(apiErr) != nil && c.GetInt("channel_local_refusals") > 0:
+				reason = "local_rejection"
+			case len(c.GetStringSlice("use_channel"))-c.GetInt("channel_local_refusals") > common.RetryTimes:
 				reason = "attempt_budget_exhausted"
 			case apiErr.GetErrorCode() == types.ErrorCodeGetChannelFailed:
 				reason = "channel_unavailable"

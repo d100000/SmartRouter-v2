@@ -28,7 +28,14 @@ import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { MultiSelect } from '@/components/multi-select'
+import { PasswordInput } from '@/components/password-input'
+import { PasswordStrength } from '@/components/password-strength'
 import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   Form,
   FormControl,
@@ -51,10 +58,14 @@ import {
   useSecureVerification,
 } from '@/features/auth/secure-verification'
 import { getUpstreamSuppliers } from '@/features/channels/upstream-metadata-api'
+import { SUPPLIER_PASSWORD_MIN_LENGTH } from '@/lib/password-policy'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getSupplierTemplates, saveSupplier, supplyQueryKey } from '../api'
-import { supplierAccountSchema as schema } from '../lib/forms'
+import {
+  supplierAccountCredentialsSchema,
+  supplierAccountSchema as schema,
+} from '../lib/forms'
 import type { SupplierAccount } from '../types'
 
 type Values = z.infer<typeof schema>
@@ -67,11 +78,14 @@ export function SupplierEditor(props: {
   const queryClient = useQueryClient()
   const verification = useSecureVerification()
   const supplier = props.supplier
+  const provisioning = !supplier?.user_id
+  const [advanced, setAdvanced] = useState(false)
   const userId = useAuthStore((state) => state.auth.user?.id)
   const catalog = useQuery({
     meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'templates'],
     queryFn: ({ signal }) => getSupplierTemplates(signal),
+    enabled: advanced,
   })
   const templates = (catalog.data ?? []).map((template) => ({
     value: template.id,
@@ -96,13 +110,15 @@ export function SupplierEditor(props: {
     resolver: zodResolver(schema),
     defaultValues: {
       name: supplier?.name ?? '',
-      user_id: supplier?.user_id ? String(supplier.user_id) : '',
+      username: '',
+      password: '',
       allowed_types:
         supplier?.allowed_templates ??
         supplier?.allowed_types.map(String) ??
         [],
       allowed_models: supplier?.allowed_models ?? [],
-      group: supplier?.group ?? 'default',
+      allow_all_templates: supplier?.allow_all_templates ?? !supplier,
+      allow_all_models: supplier?.allow_all_models ?? !supplier,
       max_channels: String(supplier?.max_channels ?? 20),
       cost_ratio:
         supplier?.cost_ratio == null ? '' : String(supplier.cost_ratio),
@@ -118,25 +134,41 @@ export function SupplierEditor(props: {
       supply_enabled: supplier?.supply_enabled ?? true,
     },
   })
+  const allowAllTemplates = form.watch('allow_all_templates')
+  const allowAllModels = form.watch('allow_all_models')
   const mutation = useMutation({
-    mutationFn: async (values: Values) => {
-      const proof = await verification.requestVerification({
-        scope: 'supplier.manage',
-        context: {
-          supplier_id: targetId ?? '',
-          version: supplier?.revision ?? 0,
-        },
-        title: t('Verify supplier settings'),
-      })
+    mutationFn: async () => {
+      const values = form.getValues()
+      const context = {
+        supplier_id: targetId ?? '',
+        version: supplier?.revision ?? 0,
+      }
+      const title = t('Verify supplier settings')
+      const proof = await verification.requestVerification(
+        provisioning
+          ? {
+              scope: 'supplier.provision',
+              context: { ...context, username: values.username.trim() },
+              title,
+            }
+          : { scope: 'supplier.manage', context, title }
+      )
       if (!proof) return false
+      const templateIds = values.allow_all_templates ? [] : values.allowed_types
       await saveSupplier(
         targetId,
         {
-          ...values,
+          name: values.name.trim(),
           revision: supplier?.revision ?? 0,
-          user_id: Number(values.user_id) || 0,
-          allowed_templates: values.allowed_types,
-          allowed_types: values.allowed_types
+          ...(provisioning
+            ? { username: values.username.trim(), password: values.password }
+            : {}),
+          supply_enabled: values.supply_enabled,
+          allow_all_templates: values.allow_all_templates,
+          allow_all_models: values.allow_all_models,
+          allowed_models: values.allow_all_models ? [] : values.allowed_models,
+          allowed_templates: templateIds,
+          allowed_types: templateIds
             .filter((id) => /^\d+$/.test(id))
             .map(Number),
           max_channels: Number(values.max_channels),
@@ -156,14 +188,13 @@ export function SupplierEditor(props: {
       if (saved) {
         toast.success(t('Saved successfully'))
         void queryClient.invalidateQueries({ queryKey: supplyQueryKey })
+        void queryClient.invalidateQueries({ queryKey: ['users'] })
         props.onClose()
       }
     },
+    onSettled: () => form.setValue('password', ''),
   })
   const fields = [
-    { name: 'name', label: t('Supplier name') },
-    { name: 'user_id', label: t('Dedicated user ID (optional)') },
-    { name: 'group', label: t('Group') },
     { name: 'max_channels', label: t('Maximum channels') },
     { name: 'cost_ratio', label: t('Procurement cost ratio') },
     { name: 'pool_priority', label: t('Platform pool priority') },
@@ -181,24 +212,36 @@ export function SupplierEditor(props: {
       label: `${t('Trusted input and context token ceiling')} · ${t('Optional')}`,
     },
   ] as const
+  let title = t('Add supplier')
+  if (supplier) {
+    title = provisioning ? t('Open supplier account') : t('Edit supplier')
+  }
   return (
     <>
       <Dialog
         open={!verification.isActive}
         onOpenChange={(open) => !open && !mutation.isPending && props.onClose()}
-        title={supplier ? t('Edit supplier') : t('Add supplier')}
-        description={t(
-          'Create the supplier configuration, then create a dedicated supplier user in Users.'
-        )}
+        title={title}
       >
-        {catalog.isPending && <LoadingState />}
-        {catalog.isError && (
-          <ErrorState onRetry={() => void catalog.refetch()} />
-        )}
         <Form {...form}>
           <form
             className='space-y-4'
-            onSubmit={form.handleSubmit((values) => mutation.mutate(values))}
+            onSubmit={form.handleSubmit((values) => {
+              if (provisioning) {
+                const result =
+                  supplierAccountCredentialsSchema.safeParse(values)
+                if (!result.success) {
+                  for (const issue of result.error.issues) {
+                    const field = issue.path[0]
+                    if (field === 'username' || field === 'password') {
+                      form.setError(field, { message: issue.message })
+                    }
+                  }
+                  return
+                }
+              }
+              mutation.mutate()
+            })}
           >
             {!supplier && (
               <div className='space-y-2'>
@@ -239,91 +282,180 @@ export function SupplierEditor(props: {
                 </p>
               </div>
             )}
-            <div className='grid gap-4 sm:grid-cols-2'>
-              {fields.map((item) => (
+            <FormField
+              control={form.control}
+              name='name'
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('Supplier name')}</FormLabel>
+                  <FormControl>
+                    <Input {...field} disabled={mutation.isPending} />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            {provisioning && (
+              <>
                 <FormField
-                  key={item.name}
                   control={form.control}
-                  name={item.name}
+                  name='username'
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>{item.label}</FormLabel>
+                      <FormLabel>{t('Username')}</FormLabel>
                       <FormControl>
                         <Input
                           {...field}
-                          disabled={
-                            mutation.isPending ||
-                            (item.name === 'user_id' &&
-                              Boolean(supplier?.user_id))
-                          }
+                          autoComplete='off'
+                          disabled={mutation.isPending}
                         />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-              ))}
-            </div>
-            <p className='text-muted-foreground text-xs'>
-              {t(
-                'The output ceiling must match the actual model capability. It does not truncate requests.'
-              )}
-            </p>
-            <FormField
-              control={form.control}
-              name='allowed_types'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Allowed channel templates')}</FormLabel>
-                  <FormControl>
-                    <MultiSelect
-                      aria-label={t('Allowed channel templates')}
-                      options={templates}
-                      selected={field.value}
-                      onChange={field.onChange}
-                      disabled={mutation.isPending}
+                <FormField
+                  control={form.control}
+                  name='password'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Password')}</FormLabel>
+                      <FormControl>
+                        <PasswordInput
+                          {...field}
+                          autoComplete='new-password'
+                          disabled={mutation.isPending}
+                        />
+                      </FormControl>
+                      <PasswordStrength
+                        value={field.value}
+                        minLength={SUPPLIER_PASSWORD_MIN_LENGTH}
+                      />
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </>
+            )}
+            <Collapsible open={advanced} onOpenChange={setAdvanced}>
+              <CollapsibleTrigger
+                render={<Button type='button' variant='outline' />}
+              >
+                {t('Advanced Settings')}
+              </CollapsibleTrigger>
+              <CollapsibleContent className='mt-4 space-y-4'>
+                {catalog.isPending && <LoadingState />}
+                {catalog.isError && (
+                  <ErrorState onRetry={() => void catalog.refetch()} />
+                )}
+                <div className='grid gap-4 sm:grid-cols-2'>
+                  {fields.map((item) => (
+                    <FormField
+                      key={item.name}
+                      control={form.control}
+                      name={item.name}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{item.label}</FormLabel>
+                          <FormControl>
+                            <Input {...field} disabled={mutation.isPending} />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
                     />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name='allowed_models'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Allowed models')}</FormLabel>
-                  <FormControl>
-                    <MultiSelect
-                      aria-label={t('Allowed models')}
-                      options={[]}
-                      selected={field.value}
-                      onChange={field.onChange}
-                      allowCreate
-                      disabled={mutation.isPending}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name='supply_enabled'
-              render={({ field }) => (
-                <FormItem className='flex items-center justify-between'>
-                  <FormLabel>{t('Supply enabled')}</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                      disabled={mutation.isPending}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+                  ))}
+                </div>
+                <p className='text-muted-foreground text-xs'>
+                  {t(
+                    'The output ceiling must match the actual model capability. It does not truncate requests.'
+                  )}
+                </p>
+                {(
+                  [
+                    ['allow_all_templates', t('Allow all supported templates')],
+                    ['allow_all_models', t('Allow all supported models')],
+                  ] as const
+                ).map(([name, label]) => (
+                  <FormField
+                    key={name}
+                    control={form.control}
+                    name={name}
+                    render={({ field }) => (
+                      <FormItem className='flex items-center justify-between'>
+                        <FormLabel>{label}</FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                            disabled={mutation.isPending}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                ))}
+                {!allowAllTemplates && (
+                  <FormField
+                    control={form.control}
+                    name='allowed_types'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Allowed channel templates')}</FormLabel>
+                        <FormControl>
+                          <MultiSelect
+                            aria-label={t('Allowed channel templates')}
+                            options={templates}
+                            selected={field.value}
+                            onChange={field.onChange}
+                            disabled={mutation.isPending}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                {!allowAllModels && (
+                  <FormField
+                    control={form.control}
+                    name='allowed_models'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Allowed models')}</FormLabel>
+                        <FormControl>
+                          <MultiSelect
+                            aria-label={t('Allowed models')}
+                            options={[]}
+                            selected={field.value}
+                            onChange={field.onChange}
+                            allowCreate
+                            disabled={mutation.isPending}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                <FormField
+                  control={form.control}
+                  name='supply_enabled'
+                  render={({ field }) => (
+                    <FormItem className='flex items-center justify-between'>
+                      <FormLabel>{t('Supply enabled')}</FormLabel>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                          disabled={mutation.isPending}
+                        />
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
+              </CollapsibleContent>
+            </Collapsible>
             <div className='flex justify-end gap-2'>
               <Button
                 type='button'
@@ -333,10 +465,7 @@ export function SupplierEditor(props: {
               >
                 {t('Cancel')}
               </Button>
-              <Button
-                type='submit'
-                disabled={mutation.isPending || !catalog.data?.length}
-              >
+              <Button type='submit' disabled={mutation.isPending}>
                 {mutation.isPending ? t('Saving...') : t('Save')}
               </Button>
             </div>

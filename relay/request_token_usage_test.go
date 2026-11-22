@@ -165,12 +165,13 @@ func TestResponseUsageWithoutPrecount(t *testing.T) {
 					}
 					service.CaptureChannelTestLimitUsage(c, info, usage, nil)
 					require.NotNil(t, info.AnalyticsBilling)
+					// An estimate still prices the request that ran; its source
+					// stays distinguishable from upstream-reported usage.
+					assert.NotNil(t, info.AnalyticsBilling.BaseQuota)
 					if tc.input == 0 || tc.output == 0 {
 						assert.Equal(t, "local_estimate", info.AnalyticsBilling.UsageSource)
-						assert.Nil(t, info.AnalyticsBilling.BaseQuota, "estimated output must not settle actual supplier cost")
 					} else {
 						assert.Equal(t, "upstream", info.AnalyticsBilling.UsageSource)
-						assert.NotNil(t, info.AnalyticsBilling.BaseQuota)
 					}
 				}
 				if native, ok := usage.BillingUsage.CanonicalUsage(); ok {

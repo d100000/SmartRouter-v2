@@ -36,10 +36,16 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+	// A failed response that reports usage ran upstream: it is passed through
+	// as upstream sent it and charged by that usage.
+	hasActualUsage := streamHasActualUsage(responsesResponse.Usage)
+	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" && !hasActualUsage {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
-	if !responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: &responsesResponse}, responseBody) {
+	// A background response is accepted upstream before it runs; it carries
+	// neither output nor usage yet and is returned exactly as upstream sent it.
+	if !hasActualUsage && !responsesResponseAccepted(&responsesResponse) &&
+		!responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: &responsesResponse}, responseBody) {
 		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 
@@ -150,7 +156,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 		initialization = nil
 		if streamResponse.Response != nil {
-			hasActualUsage = hasActualUsage || dto.HasOpenAIUsageTokens(streamResponse.Response.Usage)
+			hasActualUsage = hasActualUsage || streamHasActualUsage(streamResponse.Response.Usage)
 		}
 		hasOutput = hasOutput || responsesEventHasOutput(&streamResponse, common.StringToByteSlice(data))
 		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
@@ -167,7 +173,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Stop(streamErr)
 			return
 		}
-		if !hasOutput && (streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" || streamResponse.Type == "response.incomplete") {
+		if !hasOutput && !hasActualUsage && (streamResponse.Type == "response.completed" || streamResponse.Type == "response.done" || streamResponse.Type == "response.incomplete") {
 			streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 			protocolFailure = true
 			sr.Stop(streamErr)
@@ -192,7 +198,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		info.StreamStatus.ResponseOutcome() == "") {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(info.StreamStatus.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if streamErr == nil && !hasOutput {
+	if streamErr == nil && !hasOutput && !hasActualUsage {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		protocolFailure = true
 	}
@@ -204,7 +210,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			// Keep the original completion/cancellation outcome for health metrics.
 			sanitizeStreamError(c, streamErr)
 			info.StreamFailure = &relaycommon.StreamFailureInfo{Error: streamErr, HasActualUsage: hasActualUsage,
-				HasEffectiveOutput: hasOutput, NoCharge: !hasOutput}
+				HasEffectiveOutput: hasOutput, NoCharge: !hasOutput && !hasActualUsage}
 			if !info.StreamStatus.HasErrors() {
 				info.StreamStatus.RecordError(streamErr.Error())
 			}
@@ -217,6 +223,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	}
 	return accumulator.Finish(), nil
+}
+
+// responsesResponseAccepted reports a background response that upstream
+// accepted for later execution.
+func responsesResponseAccepted(response *dto.OpenAIResponsesResponse) bool {
+	var status string
+	_ = common.Unmarshal(response.Status, &status)
+	return status == "queued" || status == "in_progress"
 }
 
 func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {

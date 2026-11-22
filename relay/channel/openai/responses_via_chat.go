@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -49,7 +50,10 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if !ok {
 		return nil, types.NewOpenAIError(fmt.Errorf("expected OpenAI responses response, got %T", convertResult.Value), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	if !responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: responsesResp}, nil) {
+	var frame openAIStreamFrame
+	_ = common.Unmarshal(body, &frame)
+	if !streamHasActualUsage(frame.Usage) && !frame.hasJSONOutput() &&
+		!responsesEventHasOutput(&dto.ResponsesStreamResponse{Response: responsesResp}, nil) {
 		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	output := ""
@@ -166,6 +170,11 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 
 		info.ObserveResponseModel(chunk.Model)
+		// Output the conversion drops (images, audio, refusals) still ran upstream.
+		var frame openAIStreamFrame
+		var droppedText strings.Builder
+		_ = common.UnmarshalJsonStr(data, &frame)
+		hasOutput = frame.appendAdditionalOutput(&droppedText) || strings.TrimSpace(droppedText.String()) != "" || hasOutput
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &chunk)
 		if err != nil {
 			if failResponsesStream(err) {
@@ -194,11 +203,15 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	if streamErr != nil {
 		markOpenAIStreamFailure(c, info, streamErr, streamHasActualUsage(state.Usage()), hasOutput)
 		info.StreamFailure.ErrorDelivered = errorDelivered
-		return nil, streamErr
+		if info.StreamFailure.NoCharge {
+			return nil, streamErr
+		}
+		// Upstream already ran: settle by its usage or the delivered output.
+		return service.CompleteTextUsage(c, info, state.Usage(), state.UsageText()), nil
 	}
 
 	usage := state.Usage()
-	if upstreamFailure == nil && !hasOutput {
+	if upstreamFailure == nil && !hasOutput && !streamHasActualUsage(usage) {
 		upstreamFailure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if upstreamFailure != nil {

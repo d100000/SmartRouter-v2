@@ -45,7 +45,8 @@ import {
 } from '@/stores/system-config-store'
 
 import { SuppliersAdmin } from '../admin'
-import { saveSupplier, saveSupplyChannel, copySupplyChannel } from '../api'
+import { saveSupplier, saveSupplyChannel } from '../api'
+import { AdminSupplierChannelEditor } from '../components/admin-channel-editor'
 import { ChannelEditor } from '../components/channel-editor'
 import { ChannelLimitsDialog } from '../components/channel-limits-dialog'
 import { SupplyChannelList } from '../components/channel-list'
@@ -82,17 +83,16 @@ const limits: ChannelLimits = {
     revision: 4,
     rpm: null,
     tpm: 600,
-    daily_usd: '10.000000001',
     reconcile_seconds: 300,
     budget_ready: true,
   },
   usage: {
     rpm_used: 12,
+    rpm_reserved: 3,
     tpm_used: 200,
     tpm_reserved: 30,
     daily_used_usd: '5.1',
     daily_reserved_usd: '1.2',
-    daily_remaining_usd: '3.700000001',
     budget_day: '2026-11-08',
     reset_at: 1794153600,
     reason: '',
@@ -120,7 +120,7 @@ function withClient(element: React.ReactNode) {
   )
 }
 
-it('opens the add supplier form from the admin list with real dialog and template controls', async () => {
+it('opens the add supplier form with account fields and optional restrictions', async () => {
   useAuthStore.getState().auth.setUser({ id: 1, role: 100, username: 'root' })
   vi.spyOn(api, 'get').mockImplementation(async (path) => {
     if (path === '/api/suppliers/templates') {
@@ -155,10 +155,17 @@ it('opens the add supplier form from the admin list with real dialog and templat
     await screen.findByRole('dialog', { name: 'Add supplier' })
   ).toBeVisible()
   expect(screen.getByLabelText('Supplier name')).toHaveValue('')
-  expect(screen.getByRole('combobox', { name: 'Allowed models' })).toBeVisible()
-  await user.click(screen.getByLabelText('Allowed channel templates'))
-  await user.click(await screen.findByRole('option', { name: 'OpenAI' }))
-  await user.keyboard('{Escape}')
+  expect(screen.getByLabelText('Username')).toBeVisible()
+  expect(screen.getByLabelText('Password', { selector: 'input' })).toBeVisible()
+  expect(screen.queryByLabelText('Group')).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Allowed models')).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Advanced Settings' }))
+  expect(
+    await screen.findByRole('switch', { name: 'Allow all supported templates' })
+  ).toBeChecked()
+  expect(
+    await screen.findByRole('switch', { name: 'Allow all supported models' })
+  ).toBeChecked()
   await user.click(await screen.findByRole('button', { name: 'Cancel' }))
   await waitFor(() =>
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
@@ -180,7 +187,7 @@ it('creates a supplier only after verification and keeps the form when verificat
         data: {
           success: true,
           data: {
-            scope: 'supplier.manage',
+            scope: 'supplier.provision',
             methods: [{ method: 'password', available: true }],
             oauth_providers: [],
             password_encryption_enabled: false,
@@ -198,7 +205,7 @@ it('creates a supplier only after verification and keeps the form when verificat
           ? {
               proof_token: 'supplier-proof',
               method: 'password',
-              scope: 'supplier.manage',
+              scope: 'supplier.provision',
               expires_at: Math.floor(Date.now() / 1000) + 300,
             }
           : {},
@@ -208,11 +215,11 @@ it('creates a supplier only after verification and keeps the form when verificat
   const user = userEvent.setup()
   withClient(<SupplierEditor onClose={onClose} />)
   await user.type(await screen.findByLabelText('Supplier name'), 'Supplier A')
-  await user.click(screen.getByLabelText('Allowed channel templates'))
-  await user.click(await screen.findByRole('option', { name: 'OpenAI' }))
-  await user.keyboard('{Escape}')
-  await user.type(screen.getByLabelText('Allowed models'), 'model-a')
-  await user.click(await screen.findByRole('option', { name: 'Add "model-a"' }))
+  await user.type(screen.getByLabelText('Username'), 'supplier-a')
+  await user.type(
+    screen.getByLabelText('Password', { selector: 'input' }),
+    'first-password-test'
+  )
   await user.click(await screen.findByRole('button', { name: 'Save' }))
   expect(
     await screen.findByLabelText('Password', { selector: 'input' })
@@ -223,6 +230,10 @@ it('creates a supplier only after verification and keeps the form when verificat
     'Supplier A'
   )
   expect(onClose).not.toHaveBeenCalled()
+  await user.type(
+    screen.getByLabelText('Password', { selector: 'input' }),
+    'first-password-test'
+  )
   await user.click(await screen.findByRole('button', { name: 'Save' }))
   await user.type(
     await screen.findByLabelText('Password', { selector: 'input' }),
@@ -233,8 +244,8 @@ it('creates a supplier only after verification and keeps the form when verificat
   expect(post).toHaveBeenCalledWith(
     '/api/verify',
     expect.objectContaining({
-      scope: 'supplier.manage',
-      context: { supplier_id: '', version: 0 },
+      scope: 'supplier.provision',
+      context: { supplier_id: '', version: 0, username: 'supplier-a' },
     }),
     expect.anything()
   )
@@ -242,9 +253,12 @@ it('creates a supplier only after verification and keeps the form when verificat
     '/api/suppliers/',
     expect.objectContaining({
       name: 'Supplier A',
-      allowed_templates: ['1'],
-      allowed_models: ['model-a'],
-      user_id: 0,
+      username: 'supplier-a',
+      password: 'first-password-test',
+      allow_all_templates: true,
+      allow_all_models: true,
+      allowed_templates: [],
+      allowed_models: [],
       cost_ratio: null,
     }),
     expect.objectContaining({
@@ -278,6 +292,11 @@ it.each(['/api/suppliers/templates', '/api/upstream-supplier'])(
     const user = userEvent.setup()
     withClient(<SupplierEditor onClose={vi.fn()} />)
     await user.type(screen.getByLabelText('Supplier name'), 'Unsaved supplier')
+    if (failedPath === '/api/suppliers/templates') {
+      await user.click(
+        screen.getByRole('button', { name: 'Advanced Settings' })
+      )
+    }
     await act(async () => {
       fail = false
       failRequest(
@@ -320,14 +339,16 @@ it('edits an existing supplier channel without reading or resubmitting its crede
   expect(await screen.findByLabelText('Replacement upstream key')).toHaveValue(
     ''
   )
-  expect(screen.getByLabelText('Channel template')).toBeDisabled()
-  await user.clear(screen.getByLabelText('Supplier internal priority'))
-  await user.type(screen.getByLabelText('Supplier internal priority'), '5')
+  expect(
+    screen.queryByLabelText('Supplier internal priority')
+  ).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('TPM')).not.toBeInTheDocument()
+  await user.type(screen.getByLabelText('Remark'), 'New note')
   await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
   expect(put).toHaveBeenCalledWith(
     '/api/supplier/channels/9',
-    expect.objectContaining({ priority: 5, version: 2, key: undefined }),
+    expect.objectContaining({ remark: 'New note', version: 2, key: undefined }),
     undefined
   )
   expect(get).not.toHaveBeenCalled()
@@ -376,7 +397,9 @@ it('preserves channel edits when a background refresh fails and allows retry', a
       templates={[{ id: '1', name: 'OpenAI', type: 1, models: ['model-a'] }]}
     />
   )
-  await user.click((await screen.findAllByRole('button', { name: 'Edit' }))[0])
+  await user.click(
+    (await screen.findAllByRole('button', { name: 'Submit update' }))[0]
+  )
   await user.type(screen.getByLabelText('Name'), ' draft')
   await user.type(
     screen.getByLabelText('Replacement upstream key'),
@@ -454,31 +477,23 @@ it('retains supply log filters after HTTP 500 and can recover with corrected fil
 })
 
 describe('supplier limits contract', () => {
-  it('keeps independent unlimited limits and decimal amounts without resetting counters', () => {
-    expect(
-      limitsPayload({ rpm: '', tpm: '600', daily_usd: '10.000000001' }, 4)
-    ).toEqual({ revision: 4, rpm: null, tpm: 600, daily_usd: '10.000000001' })
-    expect(limitsPayload({ rpm: '8', tpm: ' ', daily_usd: '' }, 4)).toEqual({
+  it('keeps independent unlimited RPM and TPM limits and never sends a daily budget', () => {
+    expect(limitsPayload({ rpm: '', tpm: '600' }, 4)).toEqual({
+      revision: 4,
+      rpm: null,
+      tpm: 600,
+    })
+    expect(limitsPayload({ rpm: '8', tpm: ' ' }, 4)).toEqual({
       revision: 4,
       rpm: 8,
       tpm: null,
-      daily_usd: null,
     })
-    expect(limitsFormValues(limits.config)).toEqual({
-      rpm: '',
-      tpm: '600',
-      daily_usd: '10.000000001',
-    })
+    expect(limitsFormValues(limits.config)).toEqual({ rpm: '', tpm: '600' })
     for (const invalid of ['0', '-1', '1.5', '9007199254740992']) {
       expect(
-        channelLimitsSchema.safeParse({ rpm: invalid, tpm: '', daily_usd: '' })
-          .success
+        channelLimitsSchema.safeParse({ rpm: invalid, tpm: '' }).success
       ).toBe(false)
     }
-    expect(
-      channelLimitsSchema.safeParse({ rpm: '', tpm: '', daily_usd: '0' })
-        .success
-    ).toBe(false)
   })
   it('renders a viewer limit dialog with no save action and safe endpoint only', async () => {
     const get = vi
@@ -494,6 +509,9 @@ describe('supplier limits contract', () => {
       />
     )
     expect(await screen.findByLabelText('RPM')).toBeDisabled()
+    expect(
+      screen.getByText('Reserved requests').nextElementSibling
+    ).toHaveTextContent('3')
     expect(screen.getByLabelText('TPM')).toHaveValue('600')
     expect(
       screen.queryByLabelText('TPM reconciliation window (seconds)')
@@ -507,14 +525,61 @@ describe('supplier limits contract', () => {
     )
     expect(put).not.toHaveBeenCalled()
   })
-  it('submits supplier edits with the revision and nullable limits only', async () => {
+  it('shows recorded daily cost without a daily limit field when the day is complete', async () => {
     vi.spyOn(api, 'get').mockResolvedValue({
       data: { success: true, data: limits },
     })
-    const put = vi
-      .spyOn(api, 'put')
-      .mockResolvedValue({ data: { success: true, data: limits } })
-    const user = userEvent.setup()
+    withClient(
+      <ChannelLimitsDialog
+        channelId={9}
+        channelName='Channel A'
+        audience='viewer'
+        onClose={vi.fn()}
+      />
+    )
+    expect(
+      (await screen.findByText('Daily procurement cost')).nextElementSibling
+    ).toHaveTextContent('5.1')
+    expect(
+      screen.getByText('Reserved cost').nextElementSibling
+    ).toHaveTextContent('1.2')
+    expect(screen.queryByLabelText('Daily limit (USD)')).not.toBeInTheDocument()
+    expect(screen.queryByText('Remaining budget')).not.toBeInTheDocument()
+  })
+  it('marks daily cost unknown when the day has incomplete cost records', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          ...limits,
+          usage: {
+            ...limits.usage,
+            daily_used_usd: null,
+            daily_reserved_usd: null,
+          },
+        },
+      },
+    })
+    withClient(
+      <ChannelLimitsDialog
+        channelId={9}
+        channelName='Channel A'
+        audience='viewer'
+        onClose={vi.fn()}
+      />
+    )
+    expect(
+      (await screen.findByText('Daily procurement cost')).nextElementSibling
+    ).toHaveTextContent('Unknown')
+    expect(
+      screen.getByText('Reserved cost').nextElementSibling
+    ).toHaveTextContent('Unknown')
+  })
+  it('renders supplier limits read-only using the scoped endpoint', async () => {
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: limits },
+    })
+    const put = vi.spyOn(api, 'put')
     withClient(
       <ChannelLimitsDialog
         channelId={9}
@@ -523,16 +588,15 @@ describe('supplier limits contract', () => {
         onClose={vi.fn()}
       />
     )
-    await user.clear(await screen.findByLabelText('TPM'))
-    await user.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() =>
-      expect(put).toHaveBeenCalledWith('/api/supplier/channels/9/limits', {
-        revision: 4,
-        rpm: null,
-        tpm: null,
-        daily_usd: '10.000000001',
-      })
+    expect(await screen.findByLabelText('TPM')).toBeDisabled()
+    expect(
+      screen.queryByRole('button', { name: 'Save' })
+    ).not.toBeInTheDocument()
+    expect(get).toHaveBeenCalledWith(
+      '/api/supplier/channels/9/limits',
+      expect.anything()
     )
+    expect(put).not.toHaveBeenCalled()
   })
 })
 it('viewer channels never expose write or key actions, and supplier channels use their own endpoint', async () => {
@@ -543,7 +607,7 @@ it('viewer channels never expose write or key actions, and supplier channels use
   expect(
     (await screen.findAllByText('Supplier A channel')).length
   ).toBeGreaterThan(0)
-  for (const action of ['Edit', 'Pause', 'Test', 'Add Channel']) {
+  for (const action of ['Submit update', 'Pause', 'Test', 'Add Channel']) {
     expect(
       screen.queryByRole('button', { name: action })
     ).not.toBeInTheDocument()
@@ -552,7 +616,7 @@ it('viewer channels never expose write or key actions, and supplier channels use
   view.unmount()
   withClient(<SupplyChannelList mode='supplier' templates={[]} />)
   expect(
-    (await screen.findAllByRole('button', { name: 'Edit' })).length
+    (await screen.findAllByRole('button', { name: 'Submit update' })).length
   ).toBeGreaterThan(0)
   expect(get).toHaveBeenCalledWith('/api/supplier/channels/', expect.anything())
 })
@@ -684,7 +748,6 @@ it('removes upstream credentials and proof headers from cached request errors', 
       key: secret,
       models: ['a'],
       remark: '',
-      priority: 0,
     },
     'proof'
   ).catch((failure: unknown) => failure)
@@ -694,7 +757,7 @@ it('removes upstream credentials and proof headers from cached request errors', 
   expect(JSON.stringify(result)).not.toContain(secret)
 })
 
-it('keeps budget events unavailable to viewers and loads supplier-only events on demand', async () => {
+it('keeps cost details unavailable to viewers and loads supplier-only cost records on demand', async () => {
   const get = vi.spyOn(api, 'get').mockImplementation(async (path) => ({
     data: {
       success: true,
@@ -714,7 +777,7 @@ it('keeps budget events unavailable to viewers and loads supplier-only events on
   )
   await screen.findByLabelText('RPM')
   expect(
-    screen.queryByRole('button', { name: 'Budget details' })
+    screen.queryByRole('button', { name: 'Cost details' })
   ).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Limit history' })
@@ -728,10 +791,8 @@ it('keeps budget events unavailable to viewers and loads supplier-only events on
       onClose={vi.fn()}
     />
   )
-  await user.click(
-    await screen.findByRole('button', { name: 'Budget details' })
-  )
-  expect(await screen.findByText('No budget events')).toBeVisible()
+  await user.click(await screen.findByRole('button', { name: 'Cost details' }))
+  expect(await screen.findByText('No cost records')).toBeVisible()
   expect(get).toHaveBeenCalledWith(
     '/api/supplier/channels/9/budget-events',
     expect.objectContaining({
@@ -763,8 +824,6 @@ it('creates a supplier channel for an administrator through its explicit owner r
     key: 'write-once',
     models: ['a'],
     remark: '',
-    priority: 0,
-    limits: { rpm: null, tpm: 50, daily_usd: '10' },
   }
   await saveSupplyChannel(undefined, payload, 'proof', 'admin', 'supplier-a')
   expect(post).toHaveBeenCalledWith(
@@ -773,23 +832,6 @@ it('creates a supplier channel for an administrator through its explicit owner r
     expect.objectContaining({ singleUseAuthorization: true })
   )
 })
-it('copies a supplier channel without fetching or resubmitting its upstream key', async () => {
-  const get = vi.spyOn(api, 'get')
-  const post = vi
-    .spyOn(api, 'post')
-    .mockResolvedValue({ data: { success: true, data: { id: 10 } } })
-  await copySupplyChannel(channel, 'Copy A', 'proof')
-  expect(get).not.toHaveBeenCalled()
-  expect(post).toHaveBeenCalledWith(
-    '/api/supplier/channels/9/copy',
-    { name: 'Copy A', version: 2 },
-    expect.objectContaining({
-      headers: { 'X-Security-Proof': 'proof' },
-      singleUseAuthorization: true,
-    })
-  )
-})
-
 it('keeps the metrics compact on narrow screens and shows unknown token coverage explicitly', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({
     data: {
@@ -831,14 +873,14 @@ it('keeps the metrics compact on narrow screens and shows unknown token coverage
 it.each([
   { status: 'available', validation_status: 'failed', expected: 'Available' },
   {
-    status: 'cost_config_missing',
+    status: 'rpm_limited',
     validation_status: 'pending',
-    expected: 'Waiting for cost configuration',
+    expected: 'RPM limit reached',
   },
   {
-    status: 'daily_exhausted',
+    status: 'tpm_limited',
     validation_status: 'validated',
-    expected: 'Daily budget exhausted',
+    expected: 'TPM limit reached',
   },
 ])(
   'shows the effective supply restriction independently of candidate validation: $status',
@@ -880,7 +922,126 @@ it('keeps administrator limit settings read-only without channel write permissio
   expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
 })
 
-it('discards an unused draft only after confirmation using its current version', async () => {
+it('requires administrator confirmation to close the currently displayed draft', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, role: 100, username: 'root' })
+  let draft = {
+    ...channel,
+    validation_status: 'failed',
+    has_validated_config: false,
+  }
+  vi.spyOn(api, 'get').mockImplementation(async () => ({
+    data: { success: true, data: draft },
+  }))
+  const post = vi.spyOn(api, 'post').mockImplementation(async () => {
+    draft = { ...draft, validation_status: 'closed' }
+    return { data: { success: true, data: {} } }
+  })
+  const user = userEvent.setup()
+  withClient(<AdminSupplierChannelEditor channelId={9} onClose={vi.fn()} />)
+  await user.click(await screen.findByRole('button', { name: 'Close draft' }))
+  expect(post).not.toHaveBeenCalled()
+  const confirm = await screen.findByRole('alertdialog')
+  await user.click(within(confirm).getByRole('button', { name: 'Close draft' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith('/api/suppliers/channels/9/close', {
+      version: 2,
+    })
+  )
+  expect(await screen.findByText('Draft closed')).toBeVisible()
+})
+
+it('publishes a tested supplier draft with the administrator’s group and weight bound to verification', async () => {
+  useAuthStore.getState().auth.setUser({ id: 1, role: 100, username: 'root' })
+  vi.spyOn(api, 'get').mockImplementation(async (path) => {
+    if (path === '/api/group/') {
+      return { data: { success: true, data: ['default', 'premium'] } }
+    }
+    if (path === '/api/verify/methods') {
+      return {
+        data: {
+          success: true,
+          data: {
+            scope: 'supplier.channel.publish',
+            methods: [{ method: 'password', available: true }],
+            oauth_providers: [],
+            password_encryption_enabled: false,
+          },
+        },
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          ...channel,
+          validation_status: 'ready_for_review',
+          has_validated_config: false,
+          publication_revision: 'server-revision',
+          tested_models: ['model-a'],
+        },
+      },
+    }
+  })
+  const post = vi.spyOn(api, 'post').mockImplementation(async (path) => ({
+    data: {
+      success: true,
+      data:
+        path === '/api/verify'
+          ? {
+              scope: 'supplier.channel.publish',
+              proof_token: 'publish-proof',
+              expires_at: Math.floor(Date.now() / 1000) + 300,
+              method: 'password',
+            }
+          : {},
+    },
+  }))
+  const user = userEvent.setup()
+  withClient(<AdminSupplierChannelEditor channelId={9} onClose={vi.fn()} />)
+  await user.click(
+    await screen.findByRole('button', { name: 'Review and publish' })
+  )
+  await user.click(screen.getByLabelText('Groups'))
+  await user.click(await screen.findByRole('option', { name: 'premium' }))
+  await user.keyboard('{Escape}')
+  await user.clear(screen.getByLabelText('Weight'))
+  await user.type(screen.getByLabelText('Weight'), '9')
+  await user.click(screen.getByRole('button', { name: 'Publish' }))
+  expect(post).not.toHaveBeenCalled()
+  await user.type(
+    await screen.findByLabelText('Password', { selector: 'input' }),
+    'test-password'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  const payload = {
+    revision: 'server-revision',
+    version: 2,
+    models: ['model-a'],
+    groups: ['premium'],
+    priority: 1,
+    weight: 9,
+  }
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/suppliers/channels/9/publish',
+      payload,
+      expect.objectContaining({
+        headers: { 'X-Security-Proof': 'publish-proof' },
+        singleUseAuthorization: true,
+      })
+    )
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/verify',
+    expect.objectContaining({
+      scope: 'supplier.channel.publish',
+      context: { channel_id: 9, ...payload },
+    }),
+    expect.anything()
+  )
+})
+
+it('shows passed tests as awaiting publication and gives suppliers only the submit and test actions', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({
     data: {
       success: true,
@@ -888,8 +1049,7 @@ it('discards an unused draft only after confirmation using its current version',
         items: [
           {
             ...channel,
-            status: 'pending',
-            validation_status: 'failed',
+            validation_status: 'ready_for_review',
             has_validated_config: false,
           },
         ],
@@ -897,57 +1057,29 @@ it('discards an unused draft only after confirmation using its current version',
       },
     },
   })
-  const remove = vi
-    .spyOn(api, 'delete')
-    .mockResolvedValue({ data: { success: true } })
-  const user = userEvent.setup()
   withClient(<SupplyChannelList mode='supplier' templates={[]} />)
-  await user.click(
-    (await screen.findAllByRole('button', { name: 'Discard draft' }))[0]
-  )
-  expect(remove).not.toHaveBeenCalled()
-  await user.click(screen.getByRole('button', { name: 'Discard' }))
-  await waitFor(() =>
-    expect(remove).toHaveBeenCalledWith('/api/supplier/channels/9', {
-      data: { version: 2 },
-    })
-  )
-})
-
-it('keeps validated supply copyable while a replacement fails and does not offer draft deletion', async () => {
-  vi.spyOn(api, 'get').mockResolvedValue({
-    data: {
-      success: true,
-      data: {
-        items: [
-          {
-            ...channel,
-            validation_status: 'failed',
-            has_validated_config: true,
-          },
-        ],
-        total: 1,
-      },
-    },
-  })
-  withClient(<SupplyChannelList mode='supplier' templates={[]} />)
-  for (const copy of await screen.findAllByRole('button', {
-    name: 'Copy Channel',
-  })) {
-    expect(copy).toBeEnabled()
-  }
   expect(
-    screen.queryByRole('button', { name: 'Discard draft' })
-  ).not.toBeInTheDocument()
+    await screen.findByRole('button', { name: 'Submit update' })
+  ).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Test' })).toBeEnabled()
+  expect(screen.getByText('Test passed, awaiting publication')).toBeVisible()
+  expect(screen.getByText('Not published')).toBeVisible()
+  for (const action of ['Copy Channel', 'Pause', 'Close draft', 'Publish']) {
+    expect(
+      screen.queryByRole('button', { name: action })
+    ).not.toBeInTheDocument()
+  }
 })
 
 it('accepts optional output ceilings and zero procurement cost while enforcing API form bounds', () => {
   const account = {
     name: 'A',
-    user_id: '',
-    allowed_types: ['1'],
-    allowed_models: ['a'],
-    group: 'default',
+    username: '',
+    password: '',
+    allowed_types: [],
+    allowed_models: [],
+    allow_all_templates: true,
+    allow_all_models: true,
     max_channels: '20',
     cost_ratio: '0',
     pool_priority: '0',
@@ -967,11 +1099,9 @@ it('accepts optional output ceilings and zero procurement cost while enforcing A
     priority: '1000',
     rpm: '',
     tpm: '',
-    daily_usd: '',
   }
   expect(supplierChannelSchema.safeParse(values).success).toBe(true)
   for (const invalid of [
-    { priority: '1001' },
     { remark: 'x'.repeat(256) },
     { base_url: 'https://example.com/?key=secret' },
     { base_url: 'https://user:password@example.com' },
@@ -982,7 +1112,7 @@ it('accepts optional output ceilings and zero procurement cost while enforcing A
   }
 })
 
-it('shows independent supply restrictions together so midnight recovery cannot imply availability', async () => {
+it('shows independent supply restrictions together so a cleared limit cannot imply availability', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({
     data: {
       success: true,
@@ -990,11 +1120,11 @@ it('shows independent supply restrictions together so midnight recovery cannot i
         items: [
           {
             ...channel,
-            status: 'daily_exhausted',
+            status: 'rpm_limited',
             blocking_reasons: [
               'manual_paused',
               'authorization_removed',
-              'daily_exhausted',
+              'rpm_limited',
             ],
           },
         ],
@@ -1006,7 +1136,7 @@ it('shows independent supply restrictions together so midnight recovery cannot i
   for (const label of [
     'Paused by an administrator',
     'Channel authorization withdrawn',
-    'Daily budget exhausted',
+    'RPM limit reached',
   ]) {
     expect((await screen.findAllByText(label)).length).toBeGreaterThan(0)
   }
@@ -1047,7 +1177,6 @@ it('allows only administrators to set a finite TPM reconciliation window', async
       revision: 4,
       rpm: null,
       tpm: 600,
-      daily_usd: '10.000000001',
       reconcile_seconds: 600,
     })
   )

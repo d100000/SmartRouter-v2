@@ -21,6 +21,7 @@ export interface SupplierTemplate {
   name: string
   type: number
   models: string[]
+  allows_custom_models?: boolean
   protocols?: SupplyProtocol[]
   tpm_applicable?: boolean
 }
@@ -47,6 +48,8 @@ export interface SupplierAccount {
   user_id: number
   username?: string
   supply_enabled: boolean
+  allow_all_templates?: boolean
+  allow_all_models?: boolean
   login_enabled: boolean
   allowed_types: number[]
   allowed_templates?: string[]
@@ -82,6 +85,11 @@ export interface SupplyChannel {
   supplier_name: string
   has_key: boolean
   has_validated_config?: boolean
+  tested_models?: string[]
+  live_models?: string[]
+  publication_revision?: string
+  test_only?: boolean
+  channel_weight?: number
   validation_status: string
   group?: string
   weight?: number
@@ -94,18 +102,19 @@ export interface ChannelLimitConfig {
   revision: number
   rpm: number | null
   tpm: number | null
-  daily_usd: string | null
   reconcile_seconds: number
   budget_ready: boolean
+  rpm_supported?: boolean
   tpm_applicable?: boolean
 }
 export interface ChannelLimitUsage {
   rpm_used: number
+  rpm_reserved?: number
+  rpm_retry_at_ms?: number
   tpm_used: number
   tpm_reserved: number
   daily_used_usd: string | null
   daily_reserved_usd: string | null
-  daily_remaining_usd: string | null
   budget_day: string
   reset_at: number
   reason: string
@@ -116,7 +125,7 @@ export interface ChannelLimits {
 }
 export type ChannelLimitUpdate = Pick<
   ChannelLimitConfig,
-  'revision' | 'rpm' | 'tpm' | 'daily_usd'
+  'revision' | 'rpm' | 'tpm'
 > & { reconcile_seconds?: number }
 export interface SupplyChannelUpdate {
   name: string
@@ -125,9 +134,15 @@ export interface SupplyChannelUpdate {
   key?: string
   models: string[]
   remark: string
-  priority: number
   version?: number
-  limits?: Omit<ChannelLimitUpdate, 'revision'>
+}
+export interface SupplierChannelPublication {
+  version: number
+  revision: string
+  models: string[]
+  groups: string[]
+  priority: number
+  weight: number
 }
 export interface SupplyTrend extends SupplyMetrics {
   timestamp: number
@@ -257,8 +272,8 @@ export interface PageData<T> {
 export type SupplierMode = 'supplier' | 'viewer'
 export type SupplierAccountUpdate = Omit<
   SupplierAccount,
-  'id' | 'username' | 'login_enabled'
-> & { name: string }
+  'id' | 'user_id' | 'username' | 'login_enabled' | 'group'
+> & { username?: string; password?: string }
 
 export interface SupplierBudgetEvent {
   id: string

@@ -28,6 +28,7 @@ import type {
   SupplierBudgetEvent,
   SupplierLimitEvent,
   SupplierAccountUpdate,
+  SupplierChannelPublication,
   SupplierMode,
   SupplierSelf,
   SupplierTemplate,
@@ -113,33 +114,61 @@ export async function saveSupplyChannel(
     throw new AuthOperationError(safeError.message, safeError.code)
   }
 }
-export async function setSupplyChannelPaused(
-  channel: SupplyChannel,
-  paused: boolean
-): Promise<SupplyChannel> {
-  const result = await api.post<Response<SupplyChannel>>(
-    `/api/supplier/channels/${channel.id}/status`,
-    { paused, version: channel.version }
-  )
-  return requireServerSuccess(result.data).data
-}
-export async function discardSupplyChannel(
-  channel: SupplyChannel
-): Promise<void> {
+export async function updateSupplierChannelRouting(
+  channelId: number,
+  payload: Omit<SupplierChannelPublication, 'version' | 'models'>
+) {
   requireServerSuccess(
     (
-      await api.delete<Response<unknown>>(
-        `/api/supplier/channels/${channel.id}`,
-        { data: { version: channel.version } }
+      await api.put<Response<unknown>>(
+        `/api/suppliers/channels/${channelId}/routing`,
+        payload
       )
     ).data
   )
 }
-export async function testSupplyChannel(channel: SupplyChannel): Promise<void> {
+export async function publishSupplierChannel(
+  channelId: number,
+  payload: SupplierChannelPublication,
+  proofToken: string
+) {
+  try {
+    requireServerSuccess(
+      (
+        await api.post<Response<unknown>>(
+          `/api/suppliers/channels/${channelId}/publish`,
+          payload,
+          {
+            headers: { 'X-Security-Proof': proofToken },
+            singleUseAuthorization: true,
+          }
+        )
+      ).data
+    )
+  } catch (error) {
+    const safeError = AuthOperationError.from(error)
+    throw new AuthOperationError(safeError.message, safeError.code)
+  }
+}
+export async function closeSupplierChannelDraft(channel: SupplyChannel) {
   requireServerSuccess(
     (
       await api.post<Response<unknown>>(
-        `/api/supplier/channels/${channel.id}/test`,
+        `/api/suppliers/channels/${channel.id}/close`,
+        { version: channel.version }
+      )
+    ).data
+  )
+}
+export async function testSupplyChannel(
+  channel: SupplyChannel,
+  audience: 'admin' | 'supplier' = 'supplier'
+): Promise<void> {
+  const prefix = audience === 'admin' ? '/api/suppliers' : '/api/supplier'
+  requireServerSuccess(
+    (
+      await api.post<Response<unknown>>(
+        `${prefix}/channels/${channel.id}/test`,
         { version: channel.version }
       )
     ).data
@@ -163,15 +192,12 @@ export async function getChannelLimits(
 }
 export async function saveChannelLimits(
   channelId: number,
-  audience: 'supplier' | 'admin',
   payload: ChannelLimitUpdate
 ): Promise<ChannelLimits> {
-  const prefix =
-    audience === 'admin' ? '/api/channel' : '/api/supplier/channels'
   return requireServerSuccess(
     (
       await api.put<Response<ChannelLimits>>(
-        `${prefix}/${channelId}/limits`,
+        `/api/channel/${channelId}/limits`,
         payload
       )
     ).data
@@ -233,39 +259,25 @@ export async function saveSupplier(
         singleUseAuthorization: true as const,
       }
     : undefined
-  const {
-    name,
-    revision,
-    user_id,
-    supply_enabled,
-    allowed_types,
-    allowed_templates,
-    allowed_models,
-    group,
-    max_channels,
-    max_output_tokens,
-    max_input_tokens,
-    cost_ratio,
-    pool_priority,
-    pool_weight,
-    pool_capacity,
-  } = payload
   const body = {
-    name,
-    revision,
-    user_id,
-    supply_enabled,
-    allowed_types,
-    allowed_templates,
-    allowed_models,
-    group,
-    max_channels,
-    max_output_tokens,
-    max_input_tokens,
-    cost_ratio,
-    pool_priority,
-    pool_weight,
-    pool_capacity,
+    name: payload.name,
+    revision: payload.revision,
+    supply_enabled: payload.supply_enabled,
+    allowed_types: payload.allowed_types,
+    allowed_templates: payload.allowed_templates,
+    allowed_models: payload.allowed_models,
+    allow_all_templates: payload.allow_all_templates,
+    allow_all_models: payload.allow_all_models,
+    max_channels: payload.max_channels,
+    max_output_tokens: payload.max_output_tokens,
+    max_input_tokens: payload.max_input_tokens,
+    cost_ratio: payload.cost_ratio,
+    pool_priority: payload.pool_priority,
+    pool_weight: payload.pool_weight,
+    pool_capacity: payload.pool_capacity,
+    ...(payload.password === undefined
+      ? {}
+      : { username: payload.username, password: payload.password }),
   }
   try {
     const result = id
@@ -306,14 +318,14 @@ export async function exportSupplyLogs(
   return result.data
 }
 
-export async function getReadOnlyChannel(
+export async function getAdminSupplyChannel(
   channelId: number,
   signal?: AbortSignal
 ): Promise<SupplyChannel> {
   return requireServerSuccess(
     (
       await api.get<Response<SupplyChannel>>(
-        `/api/channel/read-only/${channelId}`,
+        `/api/suppliers/channels/${channelId}`,
         { signal, disableDuplicate: true }
       )
     ).data
@@ -333,30 +345,6 @@ export async function getSupplierBudgetEvents(
       )
     ).data
   ).data
-}
-
-export async function copySupplyChannel(
-  channel: SupplyChannel,
-  name: string,
-  proofToken: string
-): Promise<void> {
-  try {
-    requireServerSuccess(
-      (
-        await api.post<Response<{ id: number }>>(
-          `/api/supplier/channels/${channel.id}/copy`,
-          { version: channel.version, name },
-          {
-            headers: { 'X-Security-Proof': proofToken },
-            singleUseAuthorization: true,
-          }
-        )
-      ).data
-    )
-  } catch (error) {
-    const safeError = AuthOperationError.from(error)
-    throw new AuthOperationError(safeError.message, safeError.code)
-  }
 }
 
 export async function getSupplierLimitEvents(

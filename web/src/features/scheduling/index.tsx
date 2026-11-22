@@ -29,6 +29,7 @@ import { ErrorState } from '@/components/error-state'
 import { SectionPageLayout } from '@/components/layout'
 import { LoadingState } from '@/components/loading-state'
 import { GroupSelector, ModelSelector } from '@/components/model-group-selector'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -109,9 +110,17 @@ export function Scheduling() {
       model: string
       config: SchedulingConfig
     }) => saveSchedulingConfig(input.group, input.model, input.config),
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: ['scheduling'] })
       setConfigure(false)
+      if (result.syncPending) {
+        toast.warning(
+          t(
+            'Routing configuration saved. It takes effect after the routing snapshot reloads.'
+          )
+        )
+        return
+      }
       toast.success(t('Routing configuration saved'))
     },
   })
@@ -195,6 +204,15 @@ export function Scheduling() {
           )}
           {data && canRead && !query.isError && (
             <>
+              {data.config_status?.stale && (
+                <Alert variant='destructive'>
+                  <AlertDescription>
+                    {t(
+                      'The latest routing configuration failed to load. Routing continues with the last valid configuration while it retries.'
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
               <div className='grid min-w-0 grid-cols-1 items-center gap-3 rounded-lg border p-3 sm:flex sm:flex-wrap'>
                 <GroupSelector
                   showLabelOnMobile
@@ -286,7 +304,7 @@ export function Scheduling() {
                     )}
                     <span className='text-muted-foreground'>
                       {t(
-                        'Scores refresh every minute; errors and capacity update in real time.'
+                        'Scores update with each routing decision; errors and capacity update in real time.'
                       )}
                     </span>
                     {!data.active && data.config.enabled && (
@@ -325,6 +343,7 @@ export function Scheduling() {
                       {data.channels.length > 0 ? (
                         <ChannelTable
                           channels={data.channels}
+                          refreshedAt={data.refreshed_at}
                           onRecover={(channel) => {
                             recoverMutation.reset()
                             setRecover(channel)

@@ -399,6 +399,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (outcome *Task
 	// 9. 发送请求
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
+		if local := service.LocalChannelLimitError(err); local != nil {
+			return nil, service.TaskErrorWrapperLocal(local, string(local.GetErrorCode()), local.StatusCode)
+		}
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError, common.UpstreamAddresses(c)...)
 	}
 	if resp == nil {
@@ -589,7 +592,9 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		// The shared poller owns CAS, procurement corrections and customer
 		// settlement. A result fetch must use exactly that path even when the
 		// visible task status was already terminal before this late result.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		// The client's fetch is not the background poller: its upstream
+		// errors must not count toward failing the task.
+		ctx, cancel := context.WithTimeout(service.WithClientTaskPoll(context.Background()), 2*time.Minute)
 		defer cancel()
 		if err := service.PollTaskChannelOnce(ctx, task); err != nil {
 			return nil
@@ -633,13 +638,17 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	snap := task.Snapshot()
 	status := model.TaskStatus(ti.Status)
 	finished := status == model.TaskStatusSuccess || status == model.TaskStatusFailure
-	if finished && snap.Status != model.TaskStatusSuccess && snap.Status != model.TaskStatusFailure {
-		// Finishing a task settles or refunds it. Let the poller record the
-		// final status, as it does for every other task, so that happens once.
+	wasFinished := snap.Status == model.TaskStatusSuccess || snap.Status == model.TaskStatusFailure
+	lateSuccess := snap.Status == model.TaskStatusFailure && status == model.TaskStatusSuccess
+	if (finished && !wasFinished) || lateSuccess {
+		// Finishing a task settles or refunds it, and a refunded FAILURE that
+		// succeeds later is charged again. Let the poller record the final
+		// status, as it does for every other task, so that happens once. The
+		// client's fetch must not count its upstream errors as poll failures.
 		upstreamID := task.GetUpstreamTaskID()
-		_ = service.UpdateVideoTasks(context.Background(), task.Platform,
+		_ = service.UpdateVideoTasks(service.WithClientTaskPoll(context.Background()), task.Platform,
 			map[int][]string{task.ChannelId: {upstreamID}}, map[string]*model.Task{upstreamID: task})
-	} else {
+	} else if !wasFinished {
 		// 将上游最新状态更新到 task
 		if ti.Status != "" {
 			task.Status = status

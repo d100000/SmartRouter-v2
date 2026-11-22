@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -82,6 +83,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError *types.NewAPIError
 		relayInfo   *relaycommon.RelayInfo
 		ws          *websocket.Conn
+		retryParam  *service.RetryParam
 	)
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
@@ -108,15 +110,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
+			var previousAddresses []string
+			newAPIError, previousAddresses = retryParam.ClientErrorAfterRefusal(newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			if relayInfo != nil && relayInfo.StreamFailure != nil && relayInfo.StreamFailure.ErrorDelivered {
 				return
 			}
+			if relayFormat != types.RelayFormatOpenAIRealtime {
+				service.WriteChannelRetryAfter(c, newAPIError)
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
-			upstreamURLs := common.UpstreamAddresses(c)
+			upstreamURLs := append(common.UpstreamAddresses(c), previousAddresses...)
 			if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() &&
 				strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
-				writeRelayStreamError(c, relayFormat, newAPIError)
+				writeRelayStreamError(c, relayFormat, newAPIError, previousAddresses...)
 				return
 			}
 			if relayFormat != types.RelayFormatOpenAIRealtime {
@@ -177,11 +184,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		recovered := recover()
-		resultErr := newAPIError
+		resultErr, schedulingErr := newAPIError, newAPIError
 		if recovered != nil {
 			resultErr = types.NewError(fmt.Errorf("relay panic: %v", recovered), types.ErrorCodeBadResponse)
+			schedulingErr = hostPanicSchedulingError("relay", recovered)
 		}
-		service.FinishSchedulingAttempt(c, relayInfo, resultErr)
+		service.FinishSchedulingAttempt(c, relayInfo, schedulingErr)
 		service.FinishOverviewAttempt(c, relayInfo, resultErr)
 		if err := service.FinishChannelLimitAttempt(c, relayInfo, resultErr); err != nil {
 			common.SysError("channel limit settlement failed: " + err.Error())
@@ -208,7 +216,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = relay.RefundFailedRequestBilling(c, relayInfo, newAPIError)
 	}()
 
-	retryParam := &service.RetryParam{
+	retryParam = &service.RetryParam{
 		Ctx:         c,
 		TokenGroup:  relayInfo.TokenGroup,
 		ModelName:   relayInfo.OriginModelName,
@@ -228,9 +236,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
-			if relayInfo.LastError != nil && relayInfo.LastError.GetErrorCode() == types.ErrorCode("channel_limit_unavailable") {
-				newAPIError = relayInfo.LastError
-			}
 			if relayInfo.StreamRetryCount > 0 && relayInfo.LastError != nil {
 				// No fallback route must not hide the original upstream failure.
 				newAPIError = relayInfo.LastError
@@ -256,17 +261,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		c.Request.Body = io.NopCloser(bodyStorage)
 		relayInfo.InitChannelMeta(c)
 		if err := service.PrepareChannelLimitAttempt(relayInfo, channel); err != nil {
-			newAPIError = service.ChannelLimitRelayError(err)
+			newAPIError = service.ChannelLimitRelayError(err, c)
 			service.FinishSchedulingAttempt(c, relayInfo, newAPIError)
 			relayInfo.LastError = newAPIError
-			c.Set("channel_local_refusals", c.GetInt("channel_local_refusals")+1)
-			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned || service.RequestPolicy(c).SessionMode == "strict" {
-				break
+			if service.LocalChannelLimitError(newAPIError) != nil && retryParam.TryAnotherChannelAfterRefusal(channel.Id, false, newAPIError) {
+				continue
 			}
-			if c.GetInt("channel_local_refusals") >= 512 {
-				break
-			}
-			continue
+			break
 		}
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			service.StartSchedulingAttempt(c, relayInfo)
@@ -301,16 +302,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.LastError = nil
 			return
 		}
-		if relayInfo.ChannelLimitAttempt != nil && !relayInfo.ChannelLimitAttempt.Sent && !relayInfo.ChannelLimitAttempt.PriorPhysicalRequestSent && newAPIError.GetErrorCode() == types.ErrorCode("channel_limit_unavailable") {
+		if relayInfo.ChannelLimitAttempt != nil && !relayInfo.ChannelLimitAttempt.Sent && !relayInfo.ChannelLimitAttempt.PriorPhysicalRequestSent && service.LocalChannelLimitError(newAPIError) != nil {
 			relayInfo.LastError = newAPIError
-			c.Set("channel_local_refusals", c.GetInt("channel_local_refusals")+1)
-			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned || service.RequestPolicy(c).SessionMode == "strict" {
-				break
+			if retryParam.TryAnotherChannelAfterRefusal(channel.Id, false, newAPIError) {
+				continue
 			}
-			if c.GetInt("channel_local_refusals") >= 512 {
-				break
-			}
-			continue
+			break
+		}
+		if service.IsChannelLimitInfrastructureError(newAPIError) {
+			// A ledger failure is neither a channel failure nor worth retrying elsewhere.
+			relayInfo.LastError = newAPIError
+			break
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
@@ -330,6 +332,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if decision.Action != "retry" {
 			break
 		}
+		retryParam.RememberAttemptFailure(newAPIError)
 		service.PrepareUnsentPluginCredentialRetry(c, relayInfo, newAPIError)
 		if relayInfo.StreamFailure != nil && relayInfo.StreamFailure.RetryableOverload {
 			relayInfo.BeginStreamRetry()
@@ -345,7 +348,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 }
 
-func writeRelayStreamError(c *gin.Context, format types.RelayFormat, apiError *types.NewAPIError) {
+func writeRelayStreamError(c *gin.Context, format types.RelayFormat, apiError *types.NewAPIError, previousAddresses ...string) {
 	// 心跳提交响应头后，最终错误继续通过同一个流返回。
 	status, _ := common.GetContextKeyType[*relaycommon.StreamStatus](c, constant.ContextKeyResponseStreamStatus)
 	if status == nil {
@@ -353,7 +356,7 @@ func writeRelayStreamError(c *gin.Context, format types.RelayFormat, apiError *t
 		common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, status)
 	}
 	status.MarkFailed(string(apiError.GetErrorCode()), string(apiError.GetErrorType()), apiError.StatusCode)
-	upstreamURLs := common.UpstreamAddresses(c)
+	upstreamURLs := append(common.UpstreamAddresses(c), previousAddresses...)
 	if format == types.RelayFormatClaude {
 		_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiError.ToClaudeError(upstreamURLs...)})
 		return
@@ -411,17 +414,23 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			return nil, types.NewError(lookupErr, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
 		if reserveErr := service.ReserveSchedulingChannel(c, channel, info.UsingGroup, info.OriginModelName); reserveErr != nil {
+			if errors.Is(reserveErr, scheduler.ErrNoEligibleChannel) {
+				return nil, types.NewErrorWithStatusCode(reserveErr, types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			}
 			return nil, types.NewError(reserveErr, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
 		service.RequestPolicy(c).BeginAttempt(channel, info.UsingGroup)
 		return channel, nil
 	}
 	channel, selectGroup, selectErr := service.SelectChannelForRequest(c, info.OriginModelName, retryParam)
-	if selectErr != nil {
-		return nil, types.NewError(errors.New(i18n.T(c, i18n.MsgRelayRetryGetChannelFailed, map[string]any{"Group": selectGroup, "Model": info.OriginModelName, "Error": selectErr.Message})), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	if selectErr != nil && !selectErr.NoAvailableChannel {
+		return nil, types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayRetryGetChannelFailed, map[string]any{"Group": selectGroup, "Model": info.OriginModelName, "Error": selectErr.Message})), types.ErrorCodeGetChannelFailed, selectErr.StatusCode, types.ErrOptionWithSkipRetry())
 	}
 	if channel == nil {
-		return nil, types.NewError(errors.New(i18n.T(c, i18n.MsgRelayRetryNoAvailableChannel, map[string]any{"Group": selectGroup, "Model": info.OriginModelName})), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		if retryParam.LocalRefusal != nil {
+			return nil, retryParam.LocalRefusal
+		}
+		return nil, types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgRelayRetryNoAvailableChannel, map[string]any{"Group": selectGroup, "Model": info.OriginModelName})), types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
 	}
 
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
@@ -441,14 +450,14 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 func RelayMidjourney(c *gin.Context) {
 	defer service.EndSchedulingRequest(c)
 	service.ObserveSchedulingResponse(c)
+	var reportErr *types.NewAPIError
 	policy := service.RequestPolicy(c)
 	defer func() {
 		if policy.Attempts > 0 && !policy.Successful {
-			service.RecordRequestPolicyTermination(c, types.NewErrorWithStatusCode(errors.New("Midjourney submission failed"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway, types.ErrOptionWithSkipRetry()))
+			service.RecordRequestPolicyTermination(c, reportErr)
 		}
 	}()
 	var relayInfo *relaycommon.RelayInfo
-	var reportErr *types.NewAPIError
 	// Registered first so that it runs last: the request plugins' report
 	// hooks receive a submission once the client has the response.
 	defer func() {
@@ -469,7 +478,9 @@ func RelayMidjourney(c *gin.Context) {
 	defer func() {
 		recovered := recover()
 		var apiErr *types.NewAPIError
-		if mjErr != nil {
+		if reportErr != nil && service.LocalChannelLimitError(reportErr) != nil {
+			apiErr = reportErr
+		} else if mjErr != nil {
 			status := http.StatusBadGateway
 			if mjErr.Code == 4 || mjErr.Code == 24 {
 				status = http.StatusBadRequest
@@ -477,7 +488,7 @@ func RelayMidjourney(c *gin.Context) {
 			apiErr = types.NewOpenAIError(errors.New(mjErr.Description), types.ErrorCodeBadResponseStatusCode, status)
 		}
 		if recovered != nil {
-			apiErr = types.NewError(fmt.Errorf("submission panic: %v", recovered), types.ErrorCodeBadResponse)
+			apiErr = hostPanicSchedulingError("submission", recovered)
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, apiErr)
 		if recovered != nil {
@@ -492,9 +503,45 @@ func RelayMidjourney(c *gin.Context) {
 	case relayconstant.RelayModeMidjourneyTaskImageSeed:
 		mjErr = relay.RelayMidjourneyTaskImageSeed(c)
 	default:
-		if reportErr = midjourneyRequestPlugins(c, relayInfo); reportErr != nil {
+		modelName := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
+		_, steps, record, ingressErr := requestplugin.SubmitIngress(c, types.RelayFormatMjProxy, modelName)
+		relayInfo.SetRequestPluginIngress(steps, record)
+		reportErr = ingressErr
+		if reportErr != nil {
+			service.RecordRelayErrorLog(c, 0, reportErr, relayInfo)
+		}
+		retry := &service.RetryParam{Ctx: c, ModelName: modelName, TokenGroup: relayInfo.TokenGroup, RequestPath: c.Request.URL.Path}
+		for reportErr == nil {
+			relayInfo.SetRequestPluginIngress(steps, record)
+			relayInfo.InitChannelMeta(c)
+			mjErr, reportErr = midjourneySubmissionAttempt(c, relayInfo)
+			if service.LocalChannelLimitError(reportErr) == nil {
+				break
+			}
+			service.AppendUsedChannel(c, relayInfo.ChannelId)
+			service.FinishSchedulingAttempt(c, relayInfo, reportErr)
+			if !retry.TryAnotherChannelAfterRefusal(relayInfo.ChannelId, relayInfo.LockedChannel != nil, reportErr) {
+				break
+			}
+			next, _, selectErr := service.SelectChannelForRequest(c, modelName, retry)
+			if selectErr != nil {
+				if !selectErr.NoAvailableChannel {
+					message := selectErr.Message
+					if selectErr.MessageID != "" {
+						message = i18n.T(c, selectErr.MessageID, selectErr.Params)
+					}
+					reportErr = types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeGetChannelFailed, selectErr.StatusCode)
+				}
+				break
+			}
+			reportErr = middleware.SetupContextForSelectedChannel(c, next, modelName)
+		}
+		if reportErr != nil {
+			reportErr, _ = retry.ClientErrorAfterRefusal(reportErr)
+			service.RecordRequestPolicyTermination(c, reportErr)
+			service.WriteChannelRetryAfter(c, reportErr)
 			code := constant.MjRequestError
-			if reportErr.StatusCode >= http.StatusInternalServerError {
+			if reportErr.StatusCode >= http.StatusInternalServerError || service.LocalChannelLimitError(reportErr) != nil {
 				code = constant.MjErrorUnknown
 			}
 			c.JSON(reportErr.StatusCode, gin.H{
@@ -503,11 +550,6 @@ func RelayMidjourney(c *gin.Context) {
 				"code":        code,
 			})
 			return
-		}
-		if relayInfo.RelayMode == relayconstant.RelayModeSwapFace {
-			mjErr = relay.RelaySwapFace(c, relayInfo)
-		} else {
-			mjErr = relay.RelayMidjourneySubmit(c, relayInfo)
 		}
 	}
 	//err = relayMidjourneySubmit(c, relayMode)
@@ -530,25 +572,40 @@ func RelayMidjourney(c *gin.Context) {
 	}
 }
 
-// midjourneyRequestPlugins runs the request plugins of a Midjourney
-// submission on its client body before the body is read: the request's
-// ingress, then the late ingress of its channel. A Midjourney submission
-// has one attempt, so the late record stays with the request's. A stop is
-// written to the error log.
-func midjourneyRequestPlugins(c *gin.Context, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
-	_, steps, record, apiErr := requestplugin.SubmitIngress(c, types.RelayFormatMjProxy, common.GetContextKeyString(c, constant.ContextKeyOriginalModel))
-	relayInfo.SetRequestPluginIngress(steps, record)
-	channelID := 0
-	if apiErr == nil {
-		relayInfo.InitChannelMeta(c)
-		channelID = relayInfo.ChannelId
-		_, apiErr = requestplugin.TaskAttempt(c, relayInfo)
-		relayInfo.SetRequestPluginIngress(relayInfo.RequestPluginSteps, relayInfo.RequestPluginRecord)
+// Independent submissions can skip a full candidate before its request plugins
+// or pricing run. A follow-up first resolves the channel that owns its task.
+func midjourneySubmissionAttempt(c *gin.Context, info *relaycommon.RelayInfo) (*taskdto.MidjourneyResponse, *types.NewAPIError) {
+	info.LastError = nil
+	switch info.RelayMode {
+	case relayconstant.RelayModeSwapFace, relayconstant.RelayModeMidjourneyImagine, relayconstant.RelayModeMidjourneyDescribe,
+		relayconstant.RelayModeMidjourneyEdits, relayconstant.RelayModeMidjourneyShorten, relayconstant.RelayModeMidjourneyBlend, relayconstant.RelayModeMidjourneyUpload:
+		if err := service.CheckChannelRPM(info.ChannelId); err != nil {
+			return nil, service.ChannelLimitRelayError(err, c)
+		}
 	}
+	_, apiErr := requestplugin.TaskAttempt(c, info)
+	info.SetRequestPluginIngress(info.RequestPluginSteps, info.RequestPluginRecord)
 	if apiErr != nil {
-		service.RecordRelayErrorLog(c, channelID, apiErr, relayInfo)
+		service.RecordRelayErrorLog(c, info.ChannelId, apiErr, info)
+		return nil, apiErr
 	}
-	return apiErr
+	var response *taskdto.MidjourneyResponse
+	if info.RelayMode == relayconstant.RelayModeSwapFace {
+		response = relay.RelaySwapFace(c, info)
+	} else {
+		response = relay.RelayMidjourneySubmit(c, info)
+	}
+	if service.IsChannelLimitInfrastructureError(info.LastError) {
+		return response, info.LastError
+	}
+	return response, service.LocalChannelLimitError(info.LastError)
+}
+
+// hostPanicSchedulingError reports a gateway panic to the scheduler as a
+// local failure it ignores: a bug in this process says nothing about the
+// channel's health and must not count toward its cooldown.
+func hostPanicSchedulingError(stage string, recovered any) *types.NewAPIError {
+	return types.NewError(fmt.Errorf("%s panic: %v", stage, recovered), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 }
 
 func RelayNotImplemented(c *gin.Context) {
@@ -677,6 +734,9 @@ func taskReportError(taskErr *taskdto.TaskError) *types.NewAPIError {
 		return nil
 	}
 	err := taskErr.Error
+	if local := service.LocalChannelLimitError(err); local != nil {
+		return local
+	}
 	if err == nil {
 		err = errors.New(taskErr.Message)
 	}
@@ -705,14 +765,14 @@ func executeTaskSubmissionWith(
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
 	var result *relay.TaskSubmitResult
-	var taskErr *taskdto.TaskError
+	var taskErr, priorAttemptError *taskdto.TaskError
 	durable := false
 	stage := "start"
 	defer func() {
 		recovered := recover()
 		apiErr := taskSubmissionAPIError(taskErr)
 		if recovered != nil {
-			apiErr = types.NewError(fmt.Errorf("submission panic: %v", recovered), types.ErrorCodeBadResponse)
+			apiErr = hostPanicSchedulingError("submission", recovered)
 		}
 		service.FinishSchedulingAttempt(c, relayInfo, apiErr)
 		// A relayed native stream must settle even if its task was not stored.
@@ -769,7 +829,7 @@ func executeTaskSubmissionWith(
 		Retry:       common.GetPointer(0),
 	}
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for retryParam.GetRetry() <= common.RetryTimes {
 		stage = "select_channel"
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
@@ -796,7 +856,11 @@ func executeTaskSubmissionWith(
 			channel, channelErr = getChannel(c, relayInfo, retryParam)
 			if channelErr != nil {
 				logger.LogError(c, channelErr.Error())
-				taskErr = service.TaskErrorWrapperLocal(channelErr.Err, "get_channel_failed", channelErr.StatusCode)
+				if service.LocalChannelLimitError(channelErr) != nil {
+					taskErr = service.TaskErrorWrapperLocal(channelErr, string(channelErr.GetErrorCode()), channelErr.StatusCode)
+				} else {
+					taskErr = service.TaskErrorWrapperLocal(channelErr.Err, "get_channel_failed", channelErr.StatusCode)
+				}
 				break
 			}
 		}
@@ -818,15 +882,19 @@ func executeTaskSubmissionWith(
 		stage = "submit"
 		relayInfo.InitChannelMeta(c)
 		if err := service.PrepareChannelLimitAttempt(relayInfo, channel); err != nil {
-			taskErr = service.TaskErrorWrapperLocal(err, "channel_limit_unavailable", http.StatusServiceUnavailable)
-			break
+			apiErr := service.ChannelLimitRelayError(err, c)
+			taskErr = service.TaskErrorWrapperLocal(apiErr, string(apiErr.GetErrorCode()), apiErr.StatusCode)
+		} else {
+			service.PrepareOverviewAttempt(c, relayInfo, channel)
+			service.StartSchedulingAttempt(c, relayInfo)
+			result, taskErr = submit(c, relayInfo)
 		}
-		service.PrepareOverviewAttempt(c, relayInfo, channel)
-		service.StartSchedulingAttempt(c, relayInfo)
-		result, taskErr = submit(c, relayInfo)
 		service.FinishSchedulingAttempt(c, relayInfo, taskSubmissionAPIError(taskErr))
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
+			if taskErr == nil && result != nil {
+				service.SettleUnpersistedTaskChannelAttempt(c, relayInfo, result.Immediate)
+			}
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
 			break
 		}
@@ -837,6 +905,24 @@ func executeTaskSubmissionWith(
 
 		taskAPIError := taskSubmissionAPIError(taskErr)
 		relayInfo.LastError = taskAPIError
+		if service.IsChannelLimitInfrastructureError(taskErr.Error) {
+			// A ledger failure is neither a channel failure nor worth retrying elsewhere.
+			var limitErr *types.NewAPIError
+			if errors.As(taskErr.Error, &limitErr) {
+				taskErr = service.TaskErrorWrapperLocal(limitErr, string(limitErr.GetErrorCode()), limitErr.StatusCode)
+			}
+			diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, false)
+			break
+		}
+		if service.LocalChannelLimitError(taskErr.Error) != nil && !taskErr.NoRetry &&
+			(relayInfo.ChannelLimitAttempt == nil || !relayInfo.ChannelLimitAttempt.Sent && !relayInfo.ChannelLimitAttempt.PriorPhysicalRequestSent) {
+			willRetry := retryParam.TryAnotherChannelAfterRefusal(channel.Id, relayInfo.LockedChannel != nil, taskAPIError)
+			diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)
+			if willRetry {
+				continue
+			}
+			break
+		}
 		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
 		if reason := service.SchedulingRetryStopReason(c); reason != "" {
 			decision = service.PolicyDecision{Action: "stop", Reason: reason, Source: "scheduler"}
@@ -859,6 +945,8 @@ func executeTaskSubmissionWith(
 		if !willRetry {
 			break
 		}
+		priorAttemptError = taskErr
+		retryParam.IncreaseRetry()
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
@@ -868,15 +956,26 @@ func executeTaskSubmissionWith(
 	}
 
 	if taskErr != nil {
+		if service.LocalChannelLimitError(taskErr.Error) != nil && retryParam.LocalRefusal != nil {
+			if priorAttemptError != nil {
+				service.RecordRequestPolicyTermination(c, retryParam.LocalRefusal)
+				taskErr = priorAttemptError
+			} else {
+				refused := retryParam.LocalRefusal
+				taskErr = service.TaskErrorWrapperLocal(refused, string(refused.GetErrorCode()), refused.StatusCode)
+			}
+		}
 		diagnostics.failed(stage, "task_error", taskErr, false)
 		return nil, taskErr
 	}
 	if result == nil {
+		service.SettleUnpersistedTaskChannelAttempt(c, relayInfo, nil)
 		taskErr = service.TaskErrorWrapperLocal(errors.New("task submission returned no result"), "task_submit_failed", http.StatusInternalServerError)
 		diagnostics.failed("submit", "missing_result", taskErr, false)
 		return nil, taskErr
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
+		service.SettleUnpersistedTaskChannelAttempt(c, relayInfo, result.Immediate)
 		diagnostics.cancelled("before_reserve", retryParam.GetRetry()+1)
 		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
 	}
@@ -892,6 +991,7 @@ func executeTaskSubmissionWith(
 		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {
 			common.SysError(common.LogText("reserve adjusted task billing error: %s", reserveErr.Error()))
 			if !c.Writer.Written() {
+				service.SettleUnpersistedTaskChannelAttempt(c, relayInfo, result.Immediate)
 				taskErr = service.TaskErrorWrapperLocal(errors.New("insufficient quota for adjusted task cost"), string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
 				diagnostics.failed("reserve", "insufficient_quota", taskErr, false)
 				return nil, taskErr
@@ -901,6 +1001,7 @@ func executeTaskSubmissionWith(
 		}
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
+		service.SettleUnpersistedTaskChannelAttempt(c, relayInfo, result.Immediate)
 		diagnostics.cancelled("before_insert", retryParam.GetRetry()+1)
 		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
 	}
@@ -985,6 +1086,7 @@ func executeTaskSubmissionWith(
 	diagnostics.insertStart(task)
 	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
 		common.SysError(common.LogText("insert task error: %s", insertErr.Error()))
+		service.SettleUnpersistedTaskChannelAttempt(c, relayInfo, result.Immediate)
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		// The client of a relayed event stream already holds the vendor's
@@ -1089,6 +1191,7 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 }
 
 func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+	service.WriteChannelRetryAfter(c, taskErr.Error)
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	newTaskPluginSubmitDiagnostics(c).presentError(taskErr)
 	// The client of a relayed event stream already has the vendor's events,
@@ -1104,7 +1207,7 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
 
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
 func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
-	if taskErr.StatusCode == http.StatusTooManyRequests {
+	if taskErr.StatusCode == http.StatusTooManyRequests && service.LocalChannelLimitError(taskErr.Error) == nil {
 		taskErr.Message = i18n.T(c, i18n.MsgRelayGroupUpstreamSaturated)
 	}
 	c.JSON(taskErr.StatusCode, taskErr)
@@ -1117,6 +1220,9 @@ func taskSubmissionAPIError(taskErr *taskdto.TaskError) *types.NewAPIError {
 		return nil
 	}
 	err := taskErr.Error
+	if local := service.LocalChannelLimitError(err); local != nil {
+		return local
+	}
 	if err == nil {
 		err = errors.New(taskErr.Message)
 	}

@@ -638,6 +638,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	if c.Request.Body != nil {
 		_ = c.Request.Body.Close()
 	}
+	service.ObserveChannelLimitUpstreamStatus(c, info, resp.StatusCode)
 	service.ObserveUpstreamResponse(c, info, resp)
 	return resp, nil
 }

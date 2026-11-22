@@ -24,6 +24,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
@@ -135,15 +136,22 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			apiErr = frame.streamError(c, "")
 		}
 		hasActualUsage := streamHasActualUsage(frame.Usage)
-		hasOutput := frame.hasJSONOutput(info)
-		if apiErr == nil && !hasOutput {
+		if apiErr == nil && !hasActualUsage && !frame.hasJSONOutput() {
 			apiErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		}
 		if apiErr != nil {
-			// A JSON error envelope does not deliver its incidental choices.
-			// Usage alone never makes an empty response billable.
+			// A JSON error envelope does not deliver its incidental choices, but
+			// usage it reports ran upstream and is charged with the error.
 			markOpenAIStreamFailure(c, info, apiErr, hasActualUsage, false)
-			return nil, apiErr
+			if !hasActualUsage {
+				return nil, apiErr
+			}
+			usage := frame.Usage
+			service.FillMissingPromptTokens(info, usage)
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			applyUsagePostProcessing(info, usage, body)
+			writeUpstreamFailureBody(c, info, apiErr)
+			return usage, nil
 		}
 		service.CloseResponseBodyGracefully(resp)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -213,10 +221,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			sr.Stop(streamErr)
 			return
 		}
-		if info.RelayFormat == types.RelayFormatOpenAI && !info.ChannelSetting.ForceFormat && !info.ChannelSetting.ThinkingToContent {
-			lastHasOutput = frame.appendAdditionalOutput(&responseTextBuilder)
-			hasNonTextOutput = lastHasOutput || hasNonTextOutput
-		}
+		// Output the conversion drops still ran upstream and stays billable.
+		lastHasOutput = frame.appendAdditionalOutput(&responseTextBuilder)
+		hasNonTextOutput = lastHasOutput || hasNonTextOutput
 		lastHasOutput = lastHasOutput || strings.TrimSpace(responseTextBuilder.String()[textStart:]) != ""
 	})
 
@@ -240,7 +247,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if streamErr == nil && !hasOutput {
+	if streamErr == nil && !hasOutput && !hasActualUsage {
 		streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if streamErr != nil {
@@ -306,9 +313,12 @@ type openAIStreamFrame struct {
 		Text    string          `json:"text"`
 		Message json.RawMessage `json:"message"`
 		Delta   struct {
-			Refusal      string                `json:"refusal"`
-			FunctionCall *dto.FunctionResponse `json:"function_call"`
-			Audio        struct {
+			Images           json.RawMessage       `json:"images"`
+			Content          json.RawMessage       `json:"content"`
+			ReasoningDetails json.RawMessage       `json:"reasoning_details"`
+			Refusal          string                `json:"refusal"`
+			FunctionCall     *dto.FunctionResponse `json:"function_call"`
+			Audio            struct {
 				Data       string `json:"data"`
 				Transcript string `json:"transcript"`
 			} `json:"audio"`
@@ -393,11 +403,35 @@ func (frame *openAIStreamFrame) appendAdditionalOutput(text *strings.Builder) bo
 			text.WriteString(tool.Custom.Name)
 			text.WriteString(tool.Custom.Input)
 		}
+		if chatOutputHasMedia(gjson.ParseBytes(choice.Delta.Images), gjson.ParseBytes(choice.Delta.Content), gjson.ParseBytes(choice.Delta.ReasoningDetails)) {
+			hasOutput = true
+		}
 	}
 	return hasOutput
 }
 
-func (frame *openAIStreamFrame) hasJSONOutput(info *relaycommon.RelayInfo) bool {
+// chatOutputHasMedia reports chat output that carries no plain text: OpenRouter
+// message images, image/audio content parts and opaque reasoning details.
+func chatOutputHasMedia(images, content, reasoningDetails gjson.Result) bool {
+	for _, image := range images.Array() {
+		if strings.TrimSpace(image.Get("image_url.url").String()+image.Get("image_url").String()+image.Get("url").String()+image.Get("b64_json").String()) != "" {
+			return true
+		}
+	}
+	for _, part := range content.Array() {
+		kind := part.Get("type").String()
+		if !strings.Contains(kind, "image") && !strings.Contains(kind, "audio") {
+			continue
+		}
+		if strings.TrimSpace(part.Get("image_url.url").String()+part.Get("image_url").String()+part.Get("url").String()+
+			part.Get("b64_json").String()+part.Get("data").String()+part.Get("audio.data").String()+part.Get("input_audio.data").String()) != "" {
+			return true
+		}
+	}
+	return len(reasoningDetails.Array()) > 0
+}
+
+func (frame *openAIStreamFrame) hasJSONOutput() bool {
 	for _, choice := range frame.Choices {
 		var message dto.Message
 		var extra struct {
@@ -424,8 +458,9 @@ func (frame *openAIStreamFrame) hasJSONOutput(info *relaycommon.RelayInfo) bool 
 				return true
 			}
 		}
-		if info.RelayFormat != types.RelayFormatOpenAI || info.ChannelSetting.ForceFormat || info.ChannelSetting.ThinkingToContent {
-			continue
+		raw := gjson.ParseBytes(choice.Message)
+		if chatOutputHasMedia(raw.Get("images"), raw.Get("content"), raw.Get("reasoning_details")) {
+			return true
 		}
 		if strings.TrimSpace(extra.Refusal+extra.Audio.Data+extra.Audio.Transcript) != "" || extra.FunctionCall != nil && strings.TrimSpace(extra.FunctionCall.Name+extra.FunctionCall.Arguments) != "" {
 			return true
@@ -486,7 +521,7 @@ func markOpenAIStreamFailure(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 	sanitizeStreamError(c, apiErr)
 	info.StreamFailure = &relaycommon.StreamFailureInfo{
 		Error: apiErr, HasActualUsage: actualUsage, HasEffectiveOutput: hasOutput,
-		NoCharge: !hasOutput,
+		NoCharge: !hasOutput && !actualUsage,
 	}
 	if info.StreamStatus == nil {
 		info.StreamStatus = relaycommon.NewStreamStatus()
@@ -497,6 +532,25 @@ func markOpenAIStreamFailure(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 		info.StreamStatus.RecordError(apiErr.Error())
 	}
 	logger.LogError(c, common.LogText("stream request failed: code=%s, no_charge=%t, actual_usage=%t, effective_output=%t, message=%s", apiErr.GetErrorCode(), info.StreamFailure.NoCharge, actualUsage, hasOutput, apiErr.Error()))
+}
+
+// writeUpstreamFailureBody renders an upstream failure that is still charged
+// because upstream reported usage or produced output for it.
+func writeUpstreamFailureBody(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
+	apiErr.SetMessage(common.MessageWithRequestId(apiErr.Error(), c.GetString(common.RequestIdKey)))
+	if c.Writer.Written() {
+		if info.RelayFormat == types.RelayFormatClaude {
+			_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiErr.ToClaudeError(common.UpstreamAddresses(c)...)})
+		} else {
+			_ = helper.ObjectData(c, gin.H{"error": apiErr.ToOpenAIError(common.UpstreamAddresses(c)...)})
+		}
+		return
+	}
+	if info.RelayFormat == types.RelayFormatClaude {
+		c.JSON(apiErr.StatusCode, gin.H{"type": "error", "error": apiErr.ToClaudeError(common.UpstreamAddresses(c)...)})
+		return
+	}
+	c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError(common.UpstreamAddresses(c)...)})
 }
 
 // observeStreamChoices collects billable function call names and records the
@@ -594,11 +648,13 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		}
 	}
 	// Embeddings and other non-generation responses also use this handler.
-	// Only generation requires output before any local usage estimate or charge.
+	// A generation with neither upstream usage nor output did not run and is
+	// not charged; usage alone (hidden reasoning, length stop) is passed through
+	// as upstream sent it and charged by that usage.
 	if info.RelayMode == relayconstant.RelayModeChatCompletions || info.RelayMode == relayconstant.RelayModeCompletions {
 		var frame openAIStreamFrame
 		_ = common.Unmarshal(responseBody, &frame)
-		if !frame.hasJSONOutput(info) {
+		if !streamHasActualUsage(frame.Usage) && !frame.hasJSONOutput() {
 			return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 		}
 	}

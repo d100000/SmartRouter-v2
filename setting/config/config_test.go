@@ -2,7 +2,22 @@ package config
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestUpdateConfigFromMapReplacesRules(t *testing.T) {
+	type rule struct {
+		Name      string   `json:"name"`
+		PathRegex []string `json:"path_regex"`
+	}
+	cfg := struct {
+		Rules []rule `json:"rules"`
+	}{Rules: []rule{{Name: "responses only", PathRegex: []string{"/v1/responses"}}}}
+	require.NoError(t, UpdateConfigFromMap(&cfg, map[string]string{"rules": `[{"name":"all paths"}]`}))
+	assert.Equal(t, []rule{{Name: "all paths"}}, cfg.Rules)
+}
 
 type testConfigWithMap struct {
 	Modes map[string]string `json:"modes"`

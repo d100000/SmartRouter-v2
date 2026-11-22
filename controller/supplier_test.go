@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -8,20 +9,239 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestSupplierOnboardingUploadReviewAndClose(t *testing.T) {
+	admin, _ := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.PublishUserAuthCache(admin.Id))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.UpstreamSupplier{}, &model.SupplierAccount{}, &model.SupplierChannelDraft{}, &model.OverviewAttemptEvent{}, &model.SystemTask{}, &model.ChannelFundingIncident{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(model.DB))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(model.DB))
+	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))+`"}`)
+	t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+	previousSecure, previousPasswordLogin, previousCache := common.SessionCookieSecure, common.PasswordLoginEnabled, common.MemoryCacheEnabled
+	common.SessionCookieSecure, common.PasswordLoginEnabled, common.MemoryCacheEnabled = true, true, false
+	t.Cleanup(func() {
+		common.SessionCookieSecure, common.PasswordLoginEnabled, common.MemoryCacheEnabled = previousSecure, previousPasswordLogin, previousCache
+	})
+	previousRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o-mini":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios)) })
+	previousGroups := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"vip":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousGroups)) })
+	upstream := service.GetSupplierHTTPClient()
+	previousTransport := upstream.Transport
+	t.Cleanup(func() { upstream.Transport = previousTransport })
+	upstream.Transport = schedulingTokenTransport(func(request *http.Request) (*http.Response, error) {
+		assert.Equal(t, "Bearer upstream-test-secret", request.Header.Get("Authorization"))
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"id":"chatcmpl-supplier","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`))}, nil
+	})
+
+	api := gin.New()
+	api.POST("/api/user/login", Login)
+	api.POST("/api/verify", middleware.UserAuth(), UniversalVerify)
+	api.PUT("/api/user/self", middleware.UserAuth(), UpdateSelf)
+	api.GET("/api/user/", middleware.AdminAuth(), GetAllUsers)
+	api.POST("/api/suppliers/", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelSensitiveWrite), SaveSupplierAccount)
+	api.GET("/api/supplier/self", middleware.SupplierAuth(), GetSupplierSelf)
+	api.POST("/api/supplier/channels", middleware.SupplierAuth(), SaveSupplierChannel)
+	api.POST("/api/supplier/channels/:id/test", middleware.SupplierAuth(), TestSupplierChannel)
+	api.GET("/api/suppliers/channels/:id", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelRead), GetSupplierChannel)
+	api.POST("/api/suppliers/channels/:id/publish", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelSensitiveWrite), PublishSupplierChannel)
+	api.PUT("/api/suppliers/channels/:id/routing", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelWrite), UpdateSupplierChannelRouting)
+	api.POST("/api/suppliers/channels/:id/close", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelSensitiveWrite), CloseSupplierChannel)
+	api.GET("/api/channel/", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelRead), GetAllChannels)
+	api.POST("/api/channel/:id/status", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelOperate), UpdateChannelStatus)
+	request := func(method, path, token, proof string, input any) (*httptest.ResponseRecorder, securityEnrollmentResponse) {
+		t.Helper()
+		data, err := common.Marshal(input)
+		require.NoError(t, err)
+		req := httptest.NewRequest(method, "https://example.com"+path, bytes.NewReader(data))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if proof != "" {
+			req.Header.Set("X-Security-Proof", proof)
+		}
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, req)
+		var output securityEnrollmentResponse
+		if response.Code != http.StatusNotFound {
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &output), response.Body.String())
+		}
+		return response, output
+	}
+	ok := func(method, path, token, proof string, input any) map[string]any {
+		t.Helper()
+		response, output := request(method, path, token, proof, input)
+		require.True(t, output.Success, "%s %s: %s", method, path, response.Body.String())
+		var data map[string]any
+		if common.GetJsonType(output.Data) == "object" {
+			require.NoError(t, common.Unmarshal(output.Data, &data))
+		}
+		return data
+	}
+	login := func(username, password string) string {
+		t.Helper()
+		data := ok(http.MethodPost, "/api/user/login", "", "", gin.H{"username": username, "password": password})
+		token, _ := data["access_token"].(string)
+		require.NotEmpty(t, token)
+		return token
+	}
+	verify := func(token, password, scope string, details any) string {
+		t.Helper()
+		input := gin.H{"method": "password", "password": password, "scope": scope}
+		if details != nil {
+			input["context"] = details
+		}
+		data := ok(http.MethodPost, "/api/verify", token, "", input)
+		proof, _ := data["proof_token"].(string)
+		require.NotEmpty(t, proof)
+		return proof
+	}
+
+	const initialPassword = "supplier-temporary-2026!"
+	const supplierPassword = "supplier-updated-2026!"
+	const username = "supplier-flow"
+	adminToken := login(admin.Username, "enrollment-password")
+	provision := verify(adminToken, "enrollment-password", service.VerificationScopeSupplierProvision, service.SupplierProvisionContext{Username: username})
+	supplier := ok(http.MethodPost, "/api/suppliers/", adminToken, provision, gin.H{"name": "Workflow supplier", "username": username, "password": initialPassword, "max_channels": 1})
+	assert.Positive(t, supplier["user_id"])
+	users := ok(http.MethodGet, "/api/user/", adminToken, "", nil)
+	assert.Contains(t, fmt.Sprint(users["items"]), username)
+	token := login(username, initialPassword)
+	_, uninitialized := request(http.MethodGet, "/api/supplier/self", token, "", nil)
+	assert.Equal(t, "AUTH_PASSWORD_CHANGE_REQUIRED", uninitialized.Code)
+	passwordProof := verify(token, initialPassword, service.VerificationScopePasswordChange, nil)
+	ok(http.MethodPut, "/api/user/self", token, passwordProof, gin.H{"password": supplierPassword, "original_password": initialPassword})
+	token = login(username, supplierPassword)
+	ok(http.MethodGet, "/api/supplier/self", token, "", nil)
+
+	payload := gin.H{"name": "Discarded draft", "template_id": "1", "base_url": "https://1.1.1.1", "key": "upstream-test-secret", "models": []string{"supplier-unpriced-model"}}
+	upload := func() map[string]any {
+		t.Helper()
+		proof := verify(token, supplierPassword, service.VerificationScopeSupplierChannelCredentials, service.SupplierChannelCredentialsContext{})
+		return ok(http.MethodPost, "/api/supplier/channels", token, proof, payload)
+	}
+	discarded := upload()
+	ok(http.MethodPost, fmt.Sprintf("/api/supplier/channels/%.0f/test", discarded["id"]), token, "", gin.H{"version": discarded["version"]})
+	require.Eventually(t, func() bool {
+		var draft model.SupplierChannelDraft
+		return model.DB.Select("status").First(&draft, "channel_id = ?", int(discarded["id"].(float64))).Error == nil &&
+			draft.Status == model.SupplierDraftPriceMissing
+	}, 12*time.Second, 25*time.Millisecond, "submitted but unpriced model should report missing platform pricing")
+	discardedPath := fmt.Sprintf("/api/suppliers/channels/%.0f/close", discarded["id"])
+	refused, _ := request(http.MethodPost, discardedPath, token, "", gin.H{"version": discarded["version"]})
+	assert.Equal(t, http.StatusForbidden, refused.Code)
+	ok(http.MethodPost, discardedPath, adminToken, "", gin.H{"version": discarded["version"]})
+	payload["name"] = "Reviewed channel"
+	payload["models"] = []string{"gpt-4o-mini"}
+	submitted := upload()
+	id := int(submitted["id"].(float64))
+	version := int64(submitted["version"].(float64))
+	detailPath := fmt.Sprintf("/api/suppliers/channels/%d", id)
+	statusPath := fmt.Sprintf("/api/channel/%d/status", id)
+	request(http.MethodPost, statusPath, adminToken, "", gin.H{"status": common.ChannelStatusEnabled})
+	channel, err := model.GetChannelById(id, false)
+	require.NoError(t, err)
+	assert.NotEqual(t, common.ChannelStatusEnabled, channel.Status)
+	require.NoError(t, model.DB.Model(channel).UpdateColumn("tag", "supplier-draft-test").Error)
+	require.NoError(t, model.EnableChannelByTag("supplier-draft-test"))
+	_, _, err = model.FixAbility()
+	require.NoError(t, err)
+	var draftAbilities int64
+	require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", id).Count(&draftAbilities).Error)
+	assert.Zero(t, draftAbilities)
+	ok(http.MethodPost, fmt.Sprintf("/api/supplier/channels/%d/test", id), token, "", gin.H{"version": version})
+	require.Eventually(t, func() bool {
+		var draft model.SupplierChannelDraft
+		return model.DB.Select("status").First(&draft, "channel_id = ?", id).Error == nil && draft.Status == model.SupplierDraftReady
+	}, 12*time.Second, 25*time.Millisecond, "successful probe must enter review")
+	candidates, err := model.GetSatisfiedChannelCandidates("default", "gpt-4o-mini", nil)
+	require.NoError(t, err)
+	assert.Empty(t, candidates, "a test must not activate a channel")
+	review := ok(http.MethodGet, "/api/channel/?supplier_review=true", adminToken, "", nil)
+	assert.EqualValues(t, 1, review["total"])
+	detail := ok(http.MethodGet, detailPath, adminToken, "", nil)
+	revision, _ := detail["publication_revision"].(string)
+	require.NotEmpty(t, revision)
+	publication := service.SupplierChannelPublishContext{ChannelID: id, Version: version, Revision: revision, Models: []string{"gpt-4o-mini"}, Groups: []string{"default"}, Weight: 9}
+	proof := verify(adminToken, "enrollment-password", service.VerificationScopeSupplierChannelPublish, publication)
+	publish := gin.H{"version": version, "revision": revision, "models": publication.Models, "groups": publication.Groups, "priority": publication.Priority, "weight": publication.Weight}
+	published := ok(http.MethodPost, detailPath+"/publish", adminToken, proof, publish)
+	candidates, err = model.GetSatisfiedChannelCandidates("default", "gpt-4o-mini", nil)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, id, candidates[0].Id)
+	assert.EqualValues(t, 9, candidates[0].GetWeight())
+	_, replay := request(http.MethodPost, detailPath+"/publish", adminToken, proof, publish)
+	assert.Equal(t, "SECURITY_PROOF_CONSUMED", replay.Code)
+	routing := gin.H{"revision": published["publication_revision"], "groups": []string{"vip"}, "priority": 0, "weight": 11}
+	ok(http.MethodPut, detailPath+"/routing", adminToken, "", routing)
+	candidates, err = model.GetSatisfiedChannelCandidates("default", "gpt-4o-mini", nil)
+	require.NoError(t, err)
+	assert.Empty(t, candidates)
+	candidates, err = model.GetSatisfiedChannelCandidates("vip", "gpt-4o-mini", nil)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.EqualValues(t, 11, candidates[0].GetWeight())
+	request(http.MethodPost, statusPath, adminToken, "", gin.H{"status": common.ChannelStatusManuallyDisabled})
+	candidates, err = model.GetSatisfiedChannelCandidates("vip", "gpt-4o-mini", nil)
+	require.NoError(t, err)
+	assert.Empty(t, candidates)
+}
+
+func TestChannelRPMListMatchesAdmissionWindow(t *testing.T) {
+	for _, dialect := range []struct{ name, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.name, func(t *testing.T) {
+			dsn := os.Getenv(dialect.env)
+			if dialect.env != "" && dsn == "" {
+				t.Skipf("%s is not configured", dialect.env)
+			}
+			db := modelManagementDB(t, dialect.name, dsn)
+			channel := model.Channel{Name: "RPM list sample", Type: constant.ChannelTypeOpenAI}
+			require.NoError(t, db.Create(&channel).Error)
+			now := time.Now()
+			require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, now))
+			_, err := model.UpdateChannelLimits(channel.Id, 1, model.ChannelLimitSettings{RPM: 3, ReconcileSeconds: 300}, false, now)
+			require.NoError(t, err)
+			for _, attempt := range []model.ChannelLimitAttempt{
+				{ID: "sent", SentAtMS: now.UnixMilli(), Completed: true},
+				{ID: "reserved", CreatedAtMS: now.UnixMilli()},
+				{ID: "released", CreatedAtMS: now.UnixMilli(), Released: true},
+				{ID: "expired", SentAtMS: now.Add(-time.Minute).UnixMilli(), Completed: true},
+			} {
+				attempt.ChannelID = channel.Id
+				require.NoError(t, db.Create(&attempt).Error)
+			}
+			page, err := channelRPMForPage(t.Context(), []int{channel.Id}, now)
+			require.NoError(t, err)
+			require.NotNil(t, page[channel.Id])
+			assert.Equal(t, channelRPMUsage{Limit: common.GetPointer(int64(3)), Used: 1, Reserved: 1, Observed: true, Supported: true}, *page[channel.Id])
+		})
+	}
+}
 
 func TestSupplierAsyncFactsRemainOwnerScoped(t *testing.T) {
 	_, _ = setupSecurityEnrollmentTest(t)
@@ -96,6 +316,127 @@ func TestSupplierPluginAuthorizationCannotExpandFromChannelType(t *testing.T) {
 	assert.False(t, account.Allows(constant.ChannelTypeOpenAI, []string{"test"}))
 }
 
+func TestSupplierProvisioningWithDedicatedAccount(t *testing.T) {
+	admin, identity := setupSecurityEnrollmentTest(t)
+	db := model.DB
+	require.NoError(t, db.Model(admin).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.PublishUserAuthCache(admin.Id))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.SupplierAccount{}, &model.SystemTask{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(db))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(db))
+	secureCookies := common.SessionCookieSecure
+	common.SessionCookieSecure = true
+	t.Cleanup(func() { common.SessionCookieSecure = secureCookies })
+
+	const username, password = "supplier-login", "a dedicated passphrase"
+	const commonPassword = "123456789012345"
+	submit := func(scheme, id, proof string, fields map[string]any) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := common.Marshal(fields)
+		require.NoError(t, err)
+		method := http.MethodPost
+		if id != "" {
+			method = http.MethodPut
+		}
+		return securityEnrollmentRequest(method, scheme+"://console.example/api/suppliers/"+id, string(body), proof, identity, func(c *gin.Context) {
+			c.Set("role", common.RoleRootUser)
+			c.Params = gin.Params{{Key: "id", Value: id}}
+			SaveSupplierAccount(c)
+		})
+	}
+	provisionProof := func(id string, revision int64, login string) string {
+		t.Helper()
+		payload, err := common.Marshal(service.SupplierProvisionContext{SupplierID: id, Version: revision, Username: login})
+		require.NoError(t, err)
+		return issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeSupplierProvision, Context: payload}, service.VerificationMethodPassword)
+	}
+	fields := map[string]any{"name": "Supplier Co", "username": username, "password": password}
+	proof := provisionProof("", 0, username)
+	insecure := submit("http", "", proof, fields)
+	assert.Contains(t, insecure.Body.String(), "Supplier credentials require HTTPS")
+	weak := submit("https", "", proof, map[string]any{"name": "Supplier Co", "username": username, "password": commonPassword})
+	assert.Contains(t, weak.Body.String(), model.ErrSupplierPasswordTooCommon.Error())
+	assert.Contains(t, submit("https", "", "", fields).Body.String(), "SECURITY_PROOF_REQUIRED")
+	assert.Contains(t, submit("https", "", provisionProof("", 0, "wrong-login"), fields).Body.String(), "SECURITY_PROOF_CONTEXT_MISMATCH")
+
+	response := submit("https", "", proof, fields)
+	var result struct {
+		Success bool
+		Data    struct {
+			ID     string `json:"id"`
+			UserID int    `json:"user_id"`
+		}
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.True(t, result.Success, response.Body.String())
+	require.NotEmpty(t, result.Data.ID)
+	require.Positive(t, result.Data.UserID)
+	assert.NotContains(t, response.Body.String(), password)
+	assert.Contains(t, submit("https", "", proof, fields).Body.String(), "SECURITY_PROOF_CONSUMED")
+
+	var user model.User
+	require.NoError(t, db.First(&user, result.Data.UserID).Error)
+	assert.Equal(t, username, user.Username)
+	assert.Equal(t, common.RoleSupplierUser, user.Role)
+	assert.True(t, user.MustChangePassword)
+	assert.Equal(t, result.Data.ID, user.GetSupplierID())
+	assert.True(t, common.ValidatePasswordAndHash(password, user.Password))
+	supplierSession, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "supplier-provisioning-test")
+	require.NoError(t, err)
+	supplierIdentity, err := service.ParseAccessToken(supplierSession.AccessToken)
+	require.NoError(t, err)
+	assert.ErrorIs(t, model.ChangeUserPassword(supplierIdentity, &model.User{Password: commonPassword, OriginalPassword: password}, false), model.ErrSupplierPasswordTooCommon)
+	assert.ErrorIs(t, (&model.User{Id: user.Id, Password: commonPassword}).Edit(true), model.ErrSupplierPasswordTooCommon)
+	require.NoError(t, db.Model(&user).Update("email", "supplier@example.com").Error)
+	assert.ErrorIs(t, model.ResetUserPasswordByEmail("supplier@example.com", "an unapproved passphrase"), model.ErrEmailNotFound)
+
+	account, err := model.GetSupplierAccount(result.Data.ID)
+	require.NoError(t, err)
+	assert.True(t, account.SupplyEnabled)
+	assert.True(t, account.Allows(constant.ChannelTypeOpenAI, []string{"new-upstream-model"}))
+	assert.False(t, account.Allows(constant.ChannelTypeTaskPlugin, []string{"new-upstream-model"}))
+
+	catalog := supplierTestRequest(http.MethodGet, "/api/supplier/self", "", account.SupplierID, 0, GetSupplierSelf)
+	var self struct {
+		Success bool
+		Data    struct {
+			Templates []service.SupplierTemplate
+		}
+	}
+	require.NoError(t, common.Unmarshal(catalog.Body.Bytes(), &self))
+	require.True(t, self.Success, catalog.Body.String())
+	require.True(t, slices.ContainsFunc(self.Data.Templates, func(template service.SupplierTemplate) bool {
+		return template.Type == constant.ChannelTypeOpenAI && template.AllowsCustomModels
+	}))
+
+	duplicate := submit("https", "", provisionProof("", 0, username), fields)
+	assert.Contains(t, duplicate.Body.String(), "Username already exists or has been deleted")
+	for _, table := range []any{&model.UpstreamSupplier{}, &model.SupplierAccount{}} {
+		var count int64
+		require.NoError(t, db.Model(table).Count(&count).Error)
+		assert.EqualValues(t, 1, count, "the duplicate account must roll back both supplier writes")
+	}
+
+	legacy := model.UpstreamSupplier{ID: "legacy", Name: "Existing"}
+	require.NoError(t, db.Create(&legacy).Error)
+	legacyAccount := model.SupplierAccount{
+		SupplierID: legacy.ID, SupplyEnabled: true, Group: "old-default", MaxChannels: 10, PoolWeight: 1,
+		AllowedTypes: "[1]", AllowedModels: "allowed",
+	}
+	require.NoError(t, model.SaveSupplierAccount(&legacyAccount, 0))
+	channel := model.Channel{OwnerSupplierID: legacy.ID, Group: "admin-selected", Name: "already live"}
+	require.NoError(t, db.Create(&channel).Error)
+	legacyUpdate := submit("https", legacy.ID, provisionProof(legacy.ID, legacyAccount.Revision, "legacy-login"),
+		map[string]any{"revision": legacyAccount.Revision, "username": "legacy-login", "password": password})
+	require.Contains(t, legacyUpdate.Body.String(), `"success":true`)
+	updatedAccount, err := model.GetSupplierAccount(legacy.ID)
+	require.NoError(t, err)
+	assert.True(t, updatedAccount.Allows(constant.ChannelTypeOpenAI, []string{"allowed"}))
+	assert.False(t, updatedAccount.Allows(constant.ChannelTypeOpenAI, []string{"not-allowed"}))
+	require.NoError(t, db.First(&channel, channel.Id).Error)
+	assert.Equal(t, "admin-selected", channel.Group)
+}
+
 func TestSupplierAsyncValidationWaitsForActualCompletion(t *testing.T) {
 	user, _ := setupSecurityEnrollmentTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.SupplierAccount{}, &model.SupplierChannelDraft{}, &model.Task{}, &model.OverviewAttemptEvent{}))
@@ -117,7 +458,7 @@ func TestSupplierAsyncValidationWaitsForActualCompletion(t *testing.T) {
 	secret, err := model.EncryptSupplierSecret(account.SupplierID, "probe-private-key")
 	require.NoError(t, err)
 	draft := model.SupplierChannelDraft{SupplierID: account.SupplierID, Type: constant.ChannelTypeTaskPlugin, TemplateID: "plugin:kling", Name: "async probe", BaseURL: "https://1.1.1.1", Secret: secret, Models: "kling-v3"}
-	channel, err := model.SaveSupplierChannelDraft(&draft, user.Id, 0, 0)
+	channel, err := model.SaveSupplierChannelDraft(&draft, user.Id, 0)
 	require.NoError(t, err)
 	require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
 	require.NoError(t, model.DB.Model(channel).Update("supplier_paused", true).Error)
@@ -142,7 +483,7 @@ func TestSupplierAsyncValidationWaitsForActualCompletion(t *testing.T) {
 	for iteration := range 2 {
 		validateSupplierChannelDraft(channel.Id, account.SupplierID, draft.Version, user.Id)
 		require.NoError(t, model.DB.First(&draft, "channel_id = ?", channel.Id).Error)
-		assert.Equal(t, "waiting", draft.Status)
+		assert.Equal(t, "waiting", draft.ValidationStatus())
 		stored, err := model.GetChannelById(channel.Id, false)
 		require.NoError(t, err)
 		assert.False(t, stored.SupplierValidated, "acceptance does not prove generation capability")
@@ -150,12 +491,12 @@ func TestSupplierAsyncValidationWaitsForActualCompletion(t *testing.T) {
 		if iteration == 0 {
 			// A worker can hold an old empty probe map when its lease expires.
 			// Reclaiming the same version must not submit the paid task twice.
-			require.NoError(t, model.DB.Model(&draft).Update("status", "testing").Error)
+			require.NoError(t, model.DB.Model(&draft).Updates(map[string]any{"status": model.SupplierDraftTesting, "test_token": "replacement-worker", "lease_until": time.Now().Add(time.Minute).Unix()}).Error)
 			candidate := *channel
 			candidate.Key, candidate.BaseURL, candidate.Models = "probe-private-key", &draft.BaseURL, draft.Models
 			_ = supplierTaskProbe(context.Background(), &staleDraft, &candidate, user.Id, "kling-v3", 0)
 			assert.Equal(t, 1, submits)
-			require.NoError(t, model.DB.Model(&draft).Update("status", "waiting").Error)
+			require.NoError(t, model.DB.Model(&draft).Update("status", model.SupplierDraftWaiting).Error)
 		}
 	}
 	assert.Equal(t, 1, submits, "repeated validation resumes the accepted task")
@@ -163,10 +504,11 @@ func TestSupplierAsyncValidationWaitsForActualCompletion(t *testing.T) {
 	completed = true
 	validateSupplierChannelDraft(channel.Id, account.SupplierID, draft.Version, user.Id)
 	require.NoError(t, model.DB.First(&draft, "channel_id = ?", channel.Id).Error)
-	assert.Equal(t, "validated", draft.Status)
+	assert.Equal(t, model.SupplierDraftReady, draft.Status)
+	assert.Equal(t, "kling-v3", draft.TestedModels)
 	stored, err := model.GetChannelById(channel.Id, false)
 	require.NoError(t, err)
-	assert.True(t, stored.SupplierValidated)
+	assert.False(t, stored.SupplierValidated, "a passed test must leave the draft unpublished")
 	assert.True(t, stored.SupplierPaused, "validation cannot clear a supplier pause")
 	assert.Equal(t, 1, submits)
 	var task model.Task
@@ -200,19 +542,19 @@ func TestSupplierPendingConnectionSurvivesMetadataEdits(t *testing.T) {
 	secret, err := model.EncryptSupplierSecret(account.SupplierID, "pending-private-key")
 	require.NoError(t, err)
 	draft := model.SupplierChannelDraft{ChannelID: channel.Id, SupplierID: account.SupplierID, Type: 1, TemplateID: "1", BaseURL: "https://1.1.1.1/pending", Models: "model-a", Name: "pending", Secret: secret, ProbeTaskIDs: `{"model-a:0":"existing-paid-probe"}`}
-	updated, err := model.SaveSupplierChannelDraft(&draft, user.Id, 1, 0)
+	updated, err := model.SaveSupplierChannelDraft(&draft, user.Id, 1)
 	require.NoError(t, err)
 	require.NoError(t, model.DB.Model(&draft).Update("status", "waiting").Error)
 	draft.Status = "waiting"
 	view := supplierChannelDTO(updated, &draft, "Pending owner")
 	assert.Equal(t, draft.BaseURL, view.BaseURL)
 	assert.True(t, view.HasValidatedConfig)
-	body := fmt.Sprintf(`{"name":"renamed","template_id":"1","base_url":%q,"models":["model-a"],"priority":7,"version":%d}`, draft.BaseURL, updated.SupplierVersion)
+	body := fmt.Sprintf(`{"name":"renamed","template_id":"1","base_url":%q,"models":["model-a"],"version":%d}`, draft.BaseURL, updated.SupplierVersion)
 	response := supplierTestRequest(http.MethodPut, "/channel", body, account.SupplierID, channel.Id, func(c *gin.Context) { c.Request.TLS = &tls.ConnectionState{}; SaveSupplierChannel(c) })
 	assert.Contains(t, response.Body.String(), `"success":true`)
 	assert.NotContains(t, response.Body.String(), "private-key")
 	require.NoError(t, model.DB.First(&draft, "channel_id = ?", channel.Id).Error)
-	assert.Equal(t, "waiting", draft.Status)
+	assert.Equal(t, "waiting", draft.ValidationStatus())
 	assert.EqualValues(t, 3, draft.Version)
 	assert.Equal(t, `{"model-a:0":"existing-paid-probe"}`, draft.ProbeTaskIDs)
 	decrypted, err := model.DecryptSupplierSecret(account.SupplierID, draft.Secret)
@@ -222,7 +564,8 @@ func TestSupplierPendingConnectionSurvivesMetadataEdits(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "live-private-key", live.Key)
 	assert.Equal(t, "https://1.1.1.1/live", live.GetBaseURL())
-	assert.Equal(t, "renamed", live.Name)
+	assert.Equal(t, "renamed", draft.Name)
+	assert.Equal(t, "live", live.Name)
 }
 
 func TestSupplierConnectionChangesRequireValidatedEditor(t *testing.T) {
@@ -280,8 +623,10 @@ func TestSupplierConnectionChangesRequireValidatedEditor(t *testing.T) {
 	_, err = model.BatchDeleteChannels([]int{channel.Id})
 	assert.ErrorIs(t, err, model.ErrSupplierChannelOperation)
 	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("status", common.ChannelStatusManuallyDisabled).Error)
-	_, err = model.DeleteDisabledChannel()
-	assert.ErrorIs(t, err, model.ErrSupplierChannelOperation)
+	require.NoError(t, model.DB.Create(&model.Channel{Name: "disabled platform channel", Status: common.ChannelStatusManuallyDisabled}).Error)
+	deleted, err := model.DeleteDisabledChannel()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, deleted, "disabled supplier channels must not block platform-channel cleanup")
 	_, err = model.DeleteChannelByStatus(common.ChannelStatusManuallyDisabled)
 	assert.ErrorIs(t, err, model.ErrSupplierChannelOperation)
 	stored, err = model.GetChannelById(channel.Id, true)
@@ -306,7 +651,7 @@ func TestSupplierDraftValidationCanProbeNewPausedChannel(t *testing.T) {
 	secret, err := model.EncryptSupplierSecret(account.SupplierID, "draft-secret")
 	require.NoError(t, err)
 	draft := model.SupplierChannelDraft{SupplierID: account.SupplierID, Type: 1, Name: "new", BaseURL: "https://1.1.1.1/v1", Secret: secret, Models: "gpt-4o-mini"}
-	channel, err := model.SaveSupplierChannelDraft(&draft, user.Id, 0, 0)
+	channel, err := model.SaveSupplierChannelDraft(&draft, user.Id, 0)
 	require.NoError(t, err)
 	require.NoError(t, model.EnsureChannelLimitTracking(channel.Id, true, time.Now()))
 	require.NoError(t, model.DB.Model(channel).Update("supplier_paused", true).Error)
@@ -328,28 +673,26 @@ func TestSupplierDraftValidationCanProbeNewPausedChannel(t *testing.T) {
 	assert.True(t, stored.SupplierPaused)
 	require.NoError(t, model.DB.First(&draft, "channel_id = ?", channel.Id).Error)
 	assert.Equal(t, "failed", draft.Status)
-	// A completed version and a copied channel must both schedule a real probe.
-	require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, account.SupplierID, draft.Version, []string{"gpt-4o-mini"}))
-	for _, copyChannel := range []bool{false, true} {
-		id, version := channel.Id, draft.Version
-		if copyChannel {
-			id, err = model.CopySupplierChannel(channel.Id, account.SupplierID, draft.Version, user.Id, "copy")
-			require.NoError(t, err)
-			version = 1
-		}
-		status, err := model.QueueSupplierChannelValidation(id, account.SupplierID, version)
-		require.NoError(t, err)
-		assert.Equal(t, "pending", status)
-		before := sent
-		validateSupplierChannelDraft(id, account.SupplierID, version, user.Id)
-		assert.Equal(t, before+1, sent)
-		_, err = model.QueueSupplierChannelValidation(id, account.SupplierID, version+1)
-		assert.Error(t, err)
-		stored, err := model.GetChannelById(id, false)
-		require.NoError(t, err)
-		assert.True(t, stored.SupplierValidated, "a failed re-test must retain the working version")
-		assert.True(t, stored.SupplierPaused)
-	}
+	// A published version still schedules a real diagnostic probe.
+	draft.Status, draft.TestedModels = model.SupplierDraftReady, draft.Models
+	require.NoError(t, model.DB.Save(&draft).Error)
+	routing := model.SupplierChannelRouting{Groups: []string{"default"}}
+	require.NoError(t, model.PublishSupplierChannelDraft(channel.Id, account.SupplierID, draft.Version,
+		model.SupplierChannelRevision(stored, &draft), []string{"gpt-4o-mini"}, routing))
+	status, err := model.QueueSupplierChannelValidation(channel.Id, account.SupplierID, draft.Version)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", status)
+	validateSupplierChannelDraft(channel.Id, account.SupplierID, draft.Version, user.Id)
+	assert.Equal(t, 2, sent)
+	_, err = model.QueueSupplierChannelValidation(channel.Id, account.SupplierID, draft.Version+1)
+	assert.Error(t, err)
+	stored, err = model.GetChannelById(channel.Id, false)
+	require.NoError(t, err)
+	assert.True(t, stored.SupplierValidated, "a failed re-test must retain the working version")
+	assert.True(t, stored.SupplierPaused)
+	require.NoError(t, model.DB.First(&draft, "channel_id = ?", channel.Id).Error)
+	assert.True(t, draft.TestOnly)
+	assert.Equal(t, "failed", draft.Status)
 
 	t.Run("image model validation uses its image endpoint", func(t *testing.T) {
 		previousPrices := ratio_setting.ModelPrice2JSONString()
@@ -358,7 +701,7 @@ func TestSupplierDraftValidationCanProbeNewPausedChannel(t *testing.T) {
 		account.AllowedModels = "gpt-4o-mini,dall-e-3"
 		require.NoError(t, model.SaveSupplierAccount(&account, account.Revision))
 		imageDraft := model.SupplierChannelDraft{SupplierID: account.SupplierID, Type: 1, Name: "image", BaseURL: "https://1.1.1.1", Secret: secret, Models: "dall-e-3"}
-		imageChannel, err := model.SaveSupplierChannelDraft(&imageDraft, user.Id, 0, 0)
+		imageChannel, err := model.SaveSupplierChannelDraft(&imageDraft, user.Id, 0)
 		require.NoError(t, err)
 		require.NoError(t, model.EnsureChannelLimitTracking(imageChannel.Id, true, time.Now()))
 		require.NoError(t, model.DB.Model(&imageDraft).Update("status", "pending").Error)
@@ -557,6 +900,12 @@ func TestSupplierIsolationReadModelsAndLimitUpdates(t *testing.T) {
 	assert.Contains(t, viewer.Body.String(), "supplier-a")
 	assert.Contains(t, viewer.Body.String(), "supplier-b")
 	assert.NotContains(t, viewer.Body.String(), "never-return")
+	saveLimits := func(id int, body string) *httptest.ResponseRecorder {
+		return supplierTestRequest("PUT", "/limits", body, "", id, func(c *gin.Context) {
+			c.Set("role", common.RoleRootUser)
+			UpdateSupplierChannelLimits(c)
+		})
+	}
 	for _, test := range []struct {
 		body     string
 		success  bool
@@ -568,16 +917,60 @@ func TestSupplierIsolationReadModelsAndLimitUpdates(t *testing.T) {
 		{`{"revision":3,"supplier_id":"supplier-b"}`, false, 0, 100},
 		{`{"revision":2,"tpm":null}`, false, 0, 100},
 	} {
-		response := supplierTestRequest("PUT", "/limits", test.body, "supplier-a", channels[0].Id, UpdateSupplierChannelLimits)
+		response := saveLimits(channels[0].Id, test.body)
 		assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, test.success))
 		state, err := model.GetChannelLimitState(channels[0].Id, now)
 		require.NoError(t, err)
 		assert.Equal(t, test.rpm, state.Config.RPM)
 		assert.Equal(t, test.tpm, state.Config.TPM)
 	}
-	response := supplierTestRequest("PUT", "/limits", `{"revision":1,"rpm":1}`, "supplier-a", channels[1].Id, UpdateSupplierChannelLimits)
-	assert.Contains(t, response.Body.String(), `"success":false`)
-	t.Run("channel and nested limit updates are atomic", func(t *testing.T) {
+	response := supplierTestRequest("PUT", "/limits", `{"revision":3,"rpm":1}`, "supplier-a", channels[0].Id, UpdateSupplierChannelLimits)
+	assert.Contains(t, response.Body.String(), "Unauthorized, insufficient privileges")
+	t.Run("legacy channel can enable RPM after its observation window warms", func(t *testing.T) {
+		channel := &channels[1]
+		require.NoError(t, model.DB.Delete(&model.ChannelLimitConfig{}, "channel_id = ?", channel.Id).Error)
+		body := `{"revision":1,"rpm":12}`
+		response := saveLimits(channel.Id, body)
+		require.Contains(t, response.Body.String(), `"success":false`)
+		config, err := model.GetChannelLimitConfig(channel.Id)
+		require.NoError(t, err)
+		require.Positive(t, config.ObservedSince, response.Body.String())
+		assert.Zero(t, config.RPM)
+		require.NoError(t, model.DB.Model(&config).Update("observed_since", time.Now().Add(-time.Minute).UnixMilli()).Error)
+		response = saveLimits(channel.Id, body)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		config, err = model.GetChannelLimitConfig(channel.Id)
+		require.NoError(t, err)
+		assert.EqualValues(t, 12, config.RPM)
+		t.Run("limit edit preserves concurrent procurement settlement", func(t *testing.T) {
+			if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+				t.Skip("SQLite serializes both writes on the database")
+			}
+			const id = "settled-during-limit-save"
+			cost := int64(250)
+			require.NoError(t, model.DispatchChannelAttempt(model.ChannelAttemptReservation{ID: id, ChannelID: channel.Id, CostBudgetNano: &cost}))
+			// Commit the send's settlement on a second connection between the
+			// editor's initial settings read and its admission-row lock.
+			pending := true
+			updates := model.DB.Callback().Update()
+			const callback = "test:settle_before_supplier_limit_edit"
+			require.NoError(t, updates.Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+				if pending && tx.Statement.Table == "channel_limit_configs" {
+					pending = false
+					tx.AddError(model.SettleChannelAttempt(model.ChannelAttemptSettlement{ID: id, ChannelID: channel.Id, Version: 1, CostUSDNano: &cost}, time.Time{}))
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, updates.Remove(callback)) })
+			response := saveLimits(channel.Id, `{"revision":2,"rpm":15}`)
+			require.Contains(t, response.Body.String(), `"success":true`)
+			require.False(t, pending)
+			state, err := model.GetChannelLimitState(channel.Id, time.Time{})
+			require.NoError(t, err)
+			assert.Equal(t, cost, state.DailyUsedNano)
+			assert.Zero(t, state.DailyHeldNano)
+		})
+	})
+	t.Run("upload payload cannot change routing or channel limits", func(t *testing.T) {
 		before, err := model.GetChannelById(channels[0].Id, true)
 		require.NoError(t, err)
 		for _, limits := range []string{`{"revision":3,"tpm":0}`, `{"revision":1,"tpm":200}`} {
@@ -606,31 +999,32 @@ func TestSupplierIsolationReadModelsAndLimitUpdates(t *testing.T) {
 		secret, err := model.EncryptSupplierSecret("supplier-a", "replacement-secret")
 		require.NoError(t, err)
 		draft := model.SupplierChannelDraft{ChannelID: channels[0].Id, SupplierID: "supplier-a", Type: 1, Name: "revised", BaseURL: "https://example.com", Secret: secret, Models: "test-model"}
-		updated, err := model.SaveSupplierChannelDraft(&draft, 1, 1, 50)
+		updated, err := model.SaveSupplierChannelDraft(&draft, 1, 1)
 		require.NoError(t, err)
 		before, err := model.GetChannelById(updated.Id, true)
 		require.NoError(t, err)
 		assert.Equal(t, "never-return-upstream-secret", before.Key)
-		assert.Error(t, model.PublishSupplierChannelDraft(updated.Id, "supplier-a", 1, []string{"test-model"}))
+		routing := model.SupplierChannelRouting{Groups: []string{"default"}, Priority: 50, Weight: 2}
+		models := []string{"test-model"}
+		assert.Error(t, model.PublishSupplierChannelDraft(updated.Id, "supplier-a", draft.Version, model.SupplierChannelRevision(before, &draft), models, routing))
+		draft.Status, draft.TestedModels = model.SupplierDraftReady, draft.Models
+		require.NoError(t, model.DB.Save(&draft).Error)
+		revision := model.SupplierChannelRevision(before, &draft)
+		assert.Error(t, model.PublishSupplierChannelDraft(updated.Id, "supplier-a", 1, revision, models, routing))
 		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", updated.Id).Updates(map[string]any{"supplier_paused": true, "status": common.ChannelStatusManuallyDisabled}).Error)
-		require.NoError(t, model.PublishSupplierChannelDraft(updated.Id, "supplier-a", updated.SupplierVersion, []string{"test-model"}))
+		assert.Error(t, model.PublishSupplierChannelDraft(updated.Id, "supplier-a", updated.SupplierVersion, revision, models, routing))
+		paused, err := model.GetChannelById(updated.Id, false)
+		require.NoError(t, err)
+		require.NoError(t, model.PublishSupplierChannelDraft(updated.Id, "supplier-a", updated.SupplierVersion, model.SupplierChannelRevision(paused, &draft), models, routing))
 		after, err := model.GetChannelById(updated.Id, true)
 		require.NoError(t, err)
 		assert.True(t, after.SupplierPaused)
 		assert.Equal(t, common.ChannelStatusManuallyDisabled, after.Status)
 		assert.Equal(t, "replacement-secret", after.Key)
 		assert.False(t, model.SupplierChannelAvailable(after))
-		copiedID, err := model.CopySupplierChannel(updated.Id, "supplier-a", updated.SupplierVersion, 1, "copy")
-		require.NoError(t, err)
-		copied, err := model.GetChannelById(copiedID, true)
-		require.NoError(t, err)
-		assert.Equal(t, "supplier-a", copied.OwnerSupplierID)
-		assert.True(t, copied.SecretsWriteOnly)
-		assert.True(t, copied.SupplierPaused)
-		copiedLimits, err := model.GetChannelLimitState(copiedID, now)
-		require.NoError(t, err)
-		assert.EqualValues(t, 100, copiedLimits.Config.TPM)
-		assert.Zero(t, copiedLimits.DailyUsedNano)
+		assert.True(t, after.SecretsWriteOnly)
+		assert.EqualValues(t, 50, after.SupplierPriority)
+		assert.EqualValues(t, 2, after.GetWeight())
 		account, err := model.GetSupplierAccount("supplier-a")
 		require.NoError(t, err)
 		ratio := 0.5
@@ -736,7 +1130,7 @@ func TestSupplierCredentialTransportRequiresVerifiedHTTPS(t *testing.T) {
 
 func TestSupplierChannelOwnerFilterBeforePagination(t *testing.T) {
 	_, _ = setupSecurityEnrollmentTest(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ChannelFundingIncident{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ChannelFundingIncident{}, &model.SupplierChannelDraft{}))
 	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(model.DB))
 	for i, owner := range []string{"supplier-a", "supplier-b", ""} {
 		channel := model.Channel{Name: fmt.Sprintf("scope-%d", i), Type: 1, OwnerSupplierID: owner, Models: "test-model", Group: "default", Tag: common.GetPointer("shared-tag"), Status: common.ChannelStatusEnabled}

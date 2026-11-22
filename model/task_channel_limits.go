@@ -28,7 +28,7 @@ func (task *Task) updateChannelTaskWithStatus(from TaskStatus) (bool, error) {
 		task.ProcurementVersion, task.ProcurementPending = current.ProcurementVersion, true
 		task.ProcurementUnknown = task.PrivateData.ChannelAttempt.NeedsReconciliation()
 		task.ProcurementNextPoll = time.Now().Add(time.Minute).Unix()
-		if err := tx.Model(task).Where("status = ?", from).Select("*").Updates(task).Error; err != nil {
+		if err := tx.Model(task).Where("status = ?", from).Select("*").Omit("refund_withdrawal_quota").Updates(task).Error; err != nil {
 			return err
 		}
 		won = true
@@ -73,7 +73,8 @@ func ApplyChannelTaskObservation(ctx context.Context, snapshot *relaycommon.Task
 			if observation.Credits != nil {
 				changes["credits"], changes["credit_usage_source"] = observation.Credits, "upstream_usage"
 			}
-			if observation.CostUSDNano != nil {
+			// An unknown outcome may carry a lower bound; it is not a known cost.
+			if observation.CostUSDNano != nil && observation.Status != "unknown" {
 				cost := float64(*observation.CostUSDNano) / float64(ChannelLimitUSDScale) * snapshot.QuotaPerUnit
 				changes["cost_known"], changes["cost_quota"] = true, cost
 				if previous.Status == "completed" {

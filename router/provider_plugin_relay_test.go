@@ -40,6 +40,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -153,6 +154,7 @@ func newRelayHarness(t *testing.T) *relayHarness {
 	require.NoError(t, model.DB.Create(&token).Error)
 	engine := gin.New()
 	SetRelayRouter(engine)
+	SetTaskRouter(engine)
 	SetTaskPluginProtocolRouter(engine)
 	harness := &relayHarness{upstream: newFakeUpstream(t), userID: user.Id, tokenID: token.Id}
 	harness.gateway = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +203,8 @@ func (h *relayHarness) post(t *testing.T, path, body string) relayOutcome {
 
 func (h *relayHarness) send(t *testing.T, path, contentType, body string) relayOutcome {
 	t.Helper()
+	// Test setup can replace every channel between requests. Publish that fixture first.
+	require.NoError(t, service.SyncSchedulingConfig())
 	var before model.Token
 	require.NoError(t, model.DB.First(&before, h.tokenID).Error)
 	var lastLog int
@@ -224,6 +228,204 @@ func (h *relayHarness) send(t *testing.T, path, contentType, body string) relayO
 	outcome.quota = before.RemainQuota - after.RemainQuota
 	_ = model.LOG_DB.Where("id > ? AND type = ?", lastLog, model.LogTypeConsume).Order("id DESC").First(&outcome.log).Error
 	return outcome
+}
+
+func TestChannelRPMRefusalsDoNotSpendRelayRetries(t *testing.T) {
+	previous := common.RetryTimes
+	common.RetryTimes = 0
+	t.Cleanup(func() { common.RetryTimes = previous })
+
+	for _, tc := range []struct {
+		name, modelName, path, body, errorField string
+		channelType                             int
+	}{
+		{"chat", relayTestModel, "/v1/chat/completions", relayTestBody, "error.code", constant.ChannelTypeOpenAI},
+		{"task", relayTestModel, "/v1/tasks/rpm-task", `{"model":"` + relayTestModel + `"}`, "code", constant.ChannelTypeTaskPlugin},
+		{"midjourney", "mj_imagine", "/mj/submit/imagine", `{"prompt":"a cat"}`, "type", constant.ChannelTypeMidjourney},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRelayHarness(t)
+			first, second := h.newChannel(tc.channelType, "first"), h.newChannel(tc.channelType, "second")
+			switch tc.channelType {
+			case constant.ChannelTypeTaskPlugin:
+				registerRelayPlugin(t, `export const meta = {apiVersion: 1, key: "rpm-task", name: "Task", version: "1.0.0", author: {name:"Test"}, models: ["`+relayTestModel+`"], fetchMode: "per_task"};
+export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/submit", body: ctx.requestBody}; }
+export function parseSubmitResponse() {return {taskId: "vendor-id"};}
+export function buildQueryRequest(ctx) {return {url: ctx.baseUrl + "/query"};}
+export function parseTaskResult() {return {status:"SUCCESS"};}`)
+				for _, ch := range []*model.Channel{first, second} {
+					ch.SetSetting(dto.ChannelSettings{TaskPluginKey: "rpm-task"})
+				}
+			case constant.ChannelTypeMidjourney:
+				require.NoError(t, model.DB.AutoMigrate(&model.Midjourney{}))
+				h.upstream.respond = respondWith(http.StatusOK, "application/json", `{"code":1,"description":"ok","result":"1234"}`)
+			}
+			first.Models, second.Models = tc.modelName, tc.modelName
+			first.Priority = common.GetPointer(int64(10))
+			h.install(t, first)
+			require.NoError(t, second.Insert())
+			model.InitChannelCache()
+			settings := model.ChannelLimitSettings{RPM: 1, ReconcileSeconds: model.ChannelLimitDefaultReconcile}
+			start := time.Now().Add(-25 * time.Second)
+			_, err := model.UpdateChannelLimits(first.Id, 1, settings, false, start)
+			require.NoError(t, err)
+			_, err = model.ReserveChannelAttempt(model.ChannelAttemptReservation{ChannelID: first.Id, ID: "first-send"}, start)
+			require.NoError(t, err)
+			require.NoError(t, model.MarkChannelAttemptSent(first.Id, "first-send", start))
+			_, err = model.UpdateChannelLimits(second.Id, 1, settings, false, time.Now())
+			require.NoError(t, err)
+
+			admitted := h.post(t, tc.path, tc.body)
+			require.Equal(t, http.StatusOK, admitted.status, admitted.body)
+			require.Len(t, h.upstream.captured(), 1)
+			assert.Empty(t, admitted.header.Get("Retry-After"))
+			h.upstream.reset()
+
+			denied := h.post(t, tc.path, tc.body)
+			require.Equal(t, http.StatusTooManyRequests, denied.status, denied.body)
+			assert.Equal(t, "channel_limit_unavailable", gjson.Get(denied.body, tc.errorField).Str, denied.body)
+			assert.Empty(t, h.upstream.captured())
+			assert.Zero(t, denied.quota)
+			retrySeconds, err := strconv.Atoi(denied.header.Get("Retry-After"))
+			require.NoError(t, err)
+			// The higher-priority candidate frees a slot first, even though
+			// the lower-priority candidate was refused last.
+			assert.InDelta(t, time.Until(start.Add(time.Minute)).Seconds(), retrySeconds, 1.1)
+			if tc.channelType == constant.ChannelTypeOpenAI {
+				settings.RPM = 2
+				_, err = model.UpdateChannelLimits(second.Id, 2, settings, false, time.Now())
+				require.NoError(t, err)
+				h.upstream.respond = respondWith(http.StatusTooManyRequests, "application/json", `{"error":{"code":"channel_limit_unavailable","type":"upstream_error","message":"vendor limit"}}`)
+				vendorError := h.post(t, tc.path, tc.body)
+				assert.Equal(t, http.StatusTooManyRequests, vendorError.status, vendorError.body)
+				assert.Empty(t, vendorError.header.Get("Retry-After"), "an upstream error with the same code must not inherit a local retry time")
+				assert.Len(t, h.upstream.captured(), 1)
+			}
+			if tc.channelType == constant.ChannelTypeTaskPlugin {
+				common.RetryTimes = 1
+				t.Cleanup(func() { common.RetryTimes = 0 })
+				settings.RPM = 2
+				_, err = model.UpdateChannelLimits(first.Id, 2, settings, false, time.Now())
+				require.NoError(t, err)
+				h.upstream.respond = respondWith(http.StatusBadGateway, "text/plain", "task vendor unavailable")
+				result := h.post(t, tc.path, tc.body)
+				assert.Equal(t, http.StatusBadGateway, result.status, result.body)
+				assert.Equal(t, "fail_to_fetch_task", gjson.Get(result.body, "code").Str)
+				assert.Contains(t, result.body, "task vendor unavailable")
+				assert.Empty(t, result.header.Get("Retry-After"))
+				assert.Len(t, h.upstream.captured(), 1)
+			}
+		})
+	}
+	// RPM can be the first candidate's failure or the last one's.
+	// Either order must preserve an upstream response or an untimed local cause.
+	for _, other := range []struct {
+		name   string
+		limits model.ChannelLimitSettings
+		status int
+		sends  int
+	}{
+		{"unknown cost", model.ChannelLimitSettings{DailyUSDNano: 1000}, http.StatusServiceUnavailable, 0},
+		{"token limit", model.ChannelLimitSettings{TPM: 1}, http.StatusTooManyRequests, 0},
+		{"provider failure", model.ChannelLimitSettings{}, http.StatusBadGateway, 1},
+	} {
+		for _, rpmFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rpm_first_%t", other.name, rpmFirst), func(t *testing.T) {
+				h := newRelayHarness(t)
+				common.RetryTimes = 1
+				t.Cleanup(func() { common.RetryTimes = 0 })
+				rpmChannel, otherChannel := h.newChannel(constant.ChannelTypeOpenAI, "full"), h.newChannel(constant.ChannelTypeOpenAI, "other")
+				rpmChannel.BaseURL = common.GetPointer(strings.Replace(h.upstream.URL, "127.0.0.1", "localhost", 1))
+				if rpmFirst {
+					rpmChannel.Priority = common.GetPointer(int64(10))
+				} else {
+					otherChannel.Priority = common.GetPointer(int64(10))
+				}
+				h.install(t, rpmChannel)
+				require.NoError(t, otherChannel.Insert())
+				model.InitChannelCache()
+				limits := model.ChannelLimitSettings{RPM: 1, ReconcileSeconds: model.ChannelLimitDefaultReconcile}
+				_, err := model.UpdateChannelLimits(rpmChannel.Id, 1, limits, false, time.Now())
+				require.NoError(t, err)
+				require.NoError(t, model.DispatchChannelAttempt(model.ChannelAttemptReservation{ChannelID: rpmChannel.Id, ID: "occupied"}))
+				limits = other.limits
+				limits.ReconcileSeconds = model.ChannelLimitDefaultReconcile
+				_, err = model.UpdateChannelLimits(otherChannel.Id, 1, limits, false, time.Now())
+				require.NoError(t, err)
+				h.upstream.respond = respondWith(http.StatusBadGateway, "application/json", `{"error":{"type":"provider_error","code":"upstream_failed","message":"vendor unavailable at `+h.upstream.URL+`/private"}}`)
+
+				result := h.post(t, "/v1/chat/completions", relayTestBody)
+				assert.Equal(t, other.status, result.status, result.body)
+				assert.Len(t, h.upstream.captured(), other.sends)
+				assert.Empty(t, result.header.Get("Retry-After"))
+				assert.Zero(t, result.quota)
+				if other.sends > 0 {
+					assert.Equal(t, "upstream_failed", gjson.Get(result.body, "error.code").Str, result.body)
+					assert.NotContains(t, result.body, h.upstream.URL)
+				}
+			})
+		}
+	}
+	t.Run("responses websocket", func(t *testing.T) {
+		h := newRelayHarness(t)
+		var calls atomic.Int32
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ws, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+			if !assert.NoError(t, err) {
+				return
+			}
+			defer ws.Close()
+			for {
+				if _, _, err = ws.ReadMessage(); err != nil {
+					return
+				}
+				calls.Add(1)
+				if err = ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"test","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}`)); err != nil {
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+		first, second := h.newChannel(constant.ChannelTypeOpenAI, "first"), h.newChannel(constant.ChannelTypeOpenAI, "second")
+		first.Priority = common.GetPointer(int64(10))
+		second.BaseURL = &wsServer.URL
+		for _, ch := range []*model.Channel{first, second} {
+			ch.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
+		}
+		h.install(t, first)
+		require.NoError(t, second.Insert())
+		model.InitChannelCache()
+		require.NoError(t, service.SyncSchedulingConfig())
+		settings := model.ChannelLimitSettings{RPM: 1, ReconcileSeconds: model.ChannelLimitDefaultReconcile}
+		_, err := model.UpdateChannelLimits(first.Id, 1, settings, false, time.Now())
+		require.NoError(t, err)
+		require.NoError(t, model.DispatchChannelAttempt(model.ChannelAttemptReservation{ChannelID: first.Id, ID: "prior"}))
+		_, err = model.UpdateChannelLimits(second.Id, 1, settings, false, time.Now())
+		require.NoError(t, err)
+
+		client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(h.gateway.URL, "http")+"/v1/responses", http.Header{"Authorization": {"Bearer " + relayTestToken}})
+		require.NoError(t, err)
+		defer func() { _ = client.Close(); h.waitIdle(t) }()
+		const create = `{"type":"response.create","model":"` + relayTestModel + `","input":"hello"}`
+		require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		_, data, err := client.ReadMessage()
+		require.NoError(t, err)
+		require.Equal(t, "response.completed", gjson.GetBytes(data, "type").Str, string(data))
+
+		// The successful first create binds the socket to its channel.
+		// Even with another slot now available, a second create must stay there.
+		settings.RPM = 2
+		_, err = model.UpdateChannelLimits(first.Id, 2, settings, false, time.Now())
+		require.NoError(t, err)
+		require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(create)))
+		_, data, err = client.ReadMessage()
+		require.NoError(t, err)
+		assert.EqualValues(t, http.StatusTooManyRequests, gjson.GetBytes(data, "status").Int(), string(data))
+		assert.Equal(t, "channel_limit_unavailable", gjson.GetBytes(data, "error.code").Str)
+		assert.Empty(t, h.upstream.captured(), "a saturated candidate must be excluded before dialing")
+		assert.EqualValues(t, 1, calls.Load())
+	})
 }
 
 func TestRestrictedTokenValidatesRequiredModelBeforeModelAccess(t *testing.T) {

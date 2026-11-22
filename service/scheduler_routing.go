@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
@@ -21,25 +22,31 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"gorm.io/gorm"
 )
 
 const schedulerContextKey = "scheduling_request"
 const unsentCredentialRetryChannelKey = "unsent_credential_retry_channel"
 
 type schedulingRequest struct {
-	mu                        sync.Mutex
-	id                        string
-	requests                  map[scheduler.Key]*scheduler.Request
-	poolEngine                *scheduler.Engine
-	poolRequests              map[scheduler.Key]*scheduler.Request
-	poolRequest               *scheduler.Request
-	poolAttempt               *scheduler.Attempt
-	sentSuppliers             map[string]bool
-	coldPriorities            map[scheduler.Key]int64
-	currentRequest            *scheduler.Request
-	attempt                   *scheduler.Attempt
-	confirmed                 bool
-	started                   bool
+	mu                 sync.Mutex
+	id                 string
+	requests           map[scheduler.Key]*scheduler.Request
+	poolEngine         *scheduler.Engine
+	poolRequests       map[scheduler.Key]*scheduler.Request
+	poolRequest        *scheduler.Request
+	poolAttempt        *scheduler.Attempt
+	capacityBlocks     []scheduler.Key
+	capacityUnresolved bool
+	sentSuppliers      map[string]bool
+	coldPriorities     map[scheduler.Key]int64
+	currentRequest     *scheduler.Request
+	attempt            *scheduler.Attempt
+	confirmed          bool
+	started            bool
+	// dispatched counts attempts actually sent upstream. Only after one does
+	// selection rank candidates as a retry; a local refusal is not a retry.
+	dispatched                int
 	stream                    bool
 	ttft                      *time.Duration
 	pending                   []byte
@@ -81,32 +88,42 @@ func schedulerRequestForGroup(c *gin.Context, group, modelName string) (*schedul
 }
 
 func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, filters []dto.ChannelFilter) (*model.Channel, error) {
-	if err := SyncSchedulingConfig(scheduler.Key{Group: group, Model: modelName}); err != nil {
+	return selectSchedulingCandidates(c, scheduler.Key{Group: group, Model: modelName}, retry, filters, nil)
+}
+
+// allowed restricts normal routing to healthy alternatives for a preferred
+// binding. Supplier pool and channel reservations still run in their usual order.
+func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, filters []dto.ChannelFilter, allowed map[int]bool) (selected *model.Channel, selectionErr error) {
+	state := schedulingState(c)
+	var request *scheduler.Request
+	defer func() { state.observeCapacity(request, selected != nil, selectionErr) }()
+	if err := ensureSchedulingConfig(false); err != nil {
 		return nil, err
 	}
-	channels, err := model.GetSatisfiedChannelCandidates(group, modelName, filters)
+	channels, err := model.GetSatisfiedChannelCandidates(key.Group, key.Model, filters)
 	if err != nil || len(channels) == 0 {
 		return nil, err
 	}
-	state, request := schedulerRequestForGroup(c, group, modelName)
+	registerSchedulingKey(key, 0)
+	withSuppliers := slices.ContainsFunc(channels, func(channel *model.Channel) bool { return channel.OwnerSupplierID != "" })
+	if allowed != nil {
+		channels = slices.DeleteFunc(channels, func(channel *model.Channel) bool { return !allowed[channel.Id] })
+		if len(channels) == 0 {
+			return nil, nil
+		}
+	}
+	_, request = schedulerRequestForGroup(c, key.Group, key.Model)
 	credentialRetryChannel := c.GetInt(unsentCredentialRetryChannelKey)
 	c.Set(unsentCredentialRetryChannelKey, 0)
 	state.mu.Lock()
-	if state.attempt != nil && !state.started {
-		// Plugin preparation can reject a provisional candidate. Release its
-		// lease before choosing again, including when candidates share capacity.
-		// Undispatched reservations never count as attempts or health failures.
-		scheduler.Default.FinishAttempt(state.attempt, scheduler.Outcome{})
-		state.attempt, state.currentRequest = nil, nil
-		if state.poolAttempt != nil {
-			state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
-			state.poolAttempt, state.poolRequest = nil, nil
-		}
-	}
+	// Plugin preparation can reject a provisional candidate. Release its
+	// lease before choosing again, including when candidates share capacity.
+	state.releaseUnstartedLease()
+	retried := state.dispatched > 0
 	state.mu.Unlock()
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
-	if slices.ContainsFunc(channels, func(channel *model.Channel) bool { return channel.OwnerSupplierID != "" }) {
-		return selectSupplierPoolChannel(c, state, request, channels, stream, retry > 0)
+	if withSuppliers {
+		return selectSupplierPoolChannel(c, state, request, channels, stream, retried)
 	}
 	active := scheduler.Default.IsActive(request.Key)
 	priorities := make([]int64, 0, len(channels))
@@ -135,7 +152,7 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 	}
 	var attempt *scheduler.Attempt
 	if active {
-		attempt, err = scheduler.Default.SelectAndReserve(request, candidates, stream, retry > 0 || len(c.GetStringSlice("use_channel")) > 0)
+		attempt, err = scheduler.Default.SelectAndReserve(request, candidates, stream, retried)
 	} else {
 		slices.Sort(priorities)
 		slices.Reverse(priorities)
@@ -179,10 +196,69 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 	return byID[attempt.Candidate.ID], nil
 }
 
+// releaseUnstartedLease returns a reservation that was never dispatched.
+// Undispatched reservations never count as attempts or health failures.
+// The caller holds state.mu.
+func (state *schedulingRequest) releaseUnstartedLease() {
+	if state.attempt == nil || state.started {
+		return
+	}
+	scheduler.Default.FinishAttempt(state.attempt, scheduler.Outcome{})
+	state.attempt, state.currentRequest = nil, nil
+	if state.poolAttempt != nil {
+		state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
+		state.poolAttempt, state.poolRequest = nil, nil
+	}
+}
+
+// Accumulate pressure across tiers, groups and supplier pools. A route
+// through another group turns earlier full pools into successful bypasses.
+func (state *schedulingRequest) observeCapacity(request *scheduler.Request, admitted bool, selectionErr error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if request != nil {
+		channelBlocked := request.TakeCapacityBlock()
+		poolBlocked := state.poolRequests[request.Key].TakeCapacityBlock()
+		if channelBlocked || poolBlocked {
+			state.capacityUnresolved = true
+			// A preferred binding may visit its group before auto routing
+			// tries earlier groups and then comes back to it.
+			if i := slices.Index(state.capacityBlocks, request.Key); i >= 0 {
+				state.capacityBlocks = slices.Delete(state.capacityBlocks, i, i+1)
+			}
+			state.capacityBlocks = append(state.capacityBlocks, request.Key)
+		}
+	}
+	if selectionErr != nil && !errors.Is(selectionErr, scheduler.ErrNoEligibleChannel) {
+		state.capacityBlocks = nil
+		state.capacityUnresolved = false
+		return
+	}
+	if admitted {
+		state.capacityUnresolved = false
+	}
+}
+
 // ReserveSchedulingChannel applies the same availability/capacity gates to
 // fixed channels and strict session bindings without choosing a substitute.
-func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, modelName string) error {
-	if err := SyncSchedulingConfig(); err != nil {
+func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, modelName string) (reservationErr error) {
+	state := schedulingState(c)
+	var request *scheduler.Request
+	defer func() { state.observeCapacity(request, reservationErr == nil, reservationErr) }()
+	// Callers wrap this error for API clients; never expose database or
+	// configuration details through it.
+	defer func() { reservationErr = clientSafeSchedulingError(c, reservationErr) }()
+	defer func() {
+		// A Realtime connection only carries generations, and each generation
+		// reserves capacity on its own context. Admitting the socket checks
+		// availability and capacity but must not hold a slot while it idles.
+		if reservationErr == nil && c.Request != nil && c.Request.URL.Path == "/v1/realtime" && IsRelayWebSocketRequest(c) {
+			state.mu.Lock()
+			state.releaseUnstartedLease()
+			state.mu.Unlock()
+		}
+	}()
+	if err := ensureSchedulingConfig(false); err != nil {
 		return err
 	}
 	if channel == nil || channel.Status != common.ChannelStatusEnabled {
@@ -223,23 +299,28 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 			}
 		}
 	}
-	if err := SyncSchedulingConfig(scheduler.Key{Group: group, Model: modelName}); err != nil {
-		return err
-	}
-	state, request := schedulerRequestForGroup(c, group, modelName)
+	registerSchedulingKey(scheduler.Key{Group: group, Model: modelName}, channel.Id)
+	_, request = schedulerRequestForGroup(c, group, modelName)
+	state.mu.Lock()
 	if state.attempt != nil && state.currentRequest == request && state.attempt.Candidate.ID == channel.Id && !state.started {
+		state.mu.Unlock()
 		return nil
 	}
-	if state.attempt != nil {
-		scheduler.Default.FinishAttempt(state.attempt, scheduler.Outcome{})
+	previous, previousPool, previousPoolEngine := state.attempt, state.poolAttempt, state.poolEngine
+	state.attempt, state.poolAttempt, state.poolRequest = nil, nil, nil
+	state.mu.Unlock()
+	if previous != nil {
+		scheduler.Default.FinishAttempt(previous, scheduler.Outcome{})
 	}
-	if state.poolAttempt != nil {
-		state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
-		state.poolAttempt, state.poolRequest = nil, nil
+	if previousPool != nil {
+		previousPoolEngine.FinishAttempt(previousPool, scheduler.Outcome{})
 	}
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
 	if channel.OwnerSupplierID != "" {
 		pool, err := supplierRoutingPoolForChannel(channel)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return scheduler.ErrNoEligibleChannel
+		}
 		if err != nil {
 			return err
 		}
@@ -248,13 +329,18 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 		if err != nil {
 			return err
 		}
+		state.mu.Lock()
 		state.poolAttempt, state.poolRequest = poolAttempt, poolRequest
+		state.mu.Unlock()
 	}
 	attempt, err := scheduler.Default.ReserveCandidate(request, SchedulerCandidate(channel), stream)
 	if err != nil {
-		if state.poolAttempt != nil {
-			state.poolEngine.FinishAttempt(state.poolAttempt, scheduler.Outcome{})
-			state.poolAttempt, state.poolRequest = nil, nil
+		state.mu.Lock()
+		poolAttempt, poolEngine := state.poolAttempt, state.poolEngine
+		state.poolAttempt, state.poolRequest = nil, nil
+		state.mu.Unlock()
+		if poolAttempt != nil {
+			poolEngine.FinishAttempt(poolAttempt, scheduler.Outcome{})
 		}
 		return err
 	}
@@ -293,6 +379,7 @@ func StartSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo) {
 	state.stream = info.IsStream
 	state.lastOutcome = ""
 	scheduler.Default.StartAttempt(state.attempt, info.IsStream)
+	state.dispatched++
 	if state.poolAttempt != nil {
 		state.poolEngine.TouchRequest(state.poolRequest)
 		state.poolEngine.StartAttempt(state.poolAttempt, info.IsStream)
@@ -359,8 +446,8 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 		state.lastOutcome = classification
 		outcome.Success = classification == perfmetrics.OutcomeSuccess
 		outcome.ChannelFailure = classification == perfmetrics.OutcomeFailure
-		if outcome.ChannelFailure && c.Request.Context().Err() == nil && apiErr != nil {
-			outcome.CooldownFailure = apiErr.GetErrorCode() == types.ErrorCodeDoRequestFailed || apiErr.StatusCode == 429 || apiErr.StatusCode == 502 || apiErr.StatusCode == 503 || apiErr.StatusCode == 504
+		if outcome.ChannelFailure {
+			outcome.CooldownFailure = availabilityFailure(info, apiErr)
 		}
 		outcome.TTFT = state.ttft
 		if classification != perfmetrics.OutcomeIgnored && !state.confirmed {
@@ -379,6 +466,66 @@ func FinishSchedulingAttempt(c *gin.Context, info *relaycommon.RelayInfo, apiErr
 	state.attempt, state.started = nil, false
 }
 
+// availabilityFailure narrows a classified channel failure to evidence of
+// transient upstream unavailability. A retained stream can carry the actual
+// protocol error even though its handler returned nil after writing output.
+func availabilityFailure(info *relaycommon.RelayInfo, apiErr *types.NewAPIError) bool {
+	var stream relaycommon.StreamOutcome
+	if info != nil {
+		stream = info.StreamStatus.OutcomeSnapshot()
+		if apiErr == nil && info.StreamFailure != nil {
+			apiErr = info.StreamFailure.Error
+		}
+	}
+	code, kind, status := stream.ErrorCode, stream.ErrorType, stream.ErrorStatus
+	if apiErr != nil {
+		// Interpret the original error even if a host wrapper changed its status.
+		for {
+			inner, ok := errors.AsType[*types.NewAPIError](apiErr.Unwrap())
+			if !ok || inner == apiErr {
+				break
+			}
+			apiErr = inner
+		}
+		switch RelayErrorSource(apiErr) {
+		case "local", "channel":
+			return false
+		case "transport":
+			return true
+		}
+		code, kind, status = string(apiErr.GetErrorCode()), apiErr.ToOpenAIError().Type, apiErr.StatusCode
+	} else if stream.Response != relaycommon.ResponseOutcomeFailed {
+		if info != nil && info.StreamStatus != nil && errors.Is(info.StreamStatus.EndError, context.DeadlineExceeded) {
+			return true
+		}
+		switch stream.EndReason {
+		case relaycommon.StreamEndReasonTimeout, relaycommon.StreamEndReasonScannerErr:
+			return true
+		case relaycommon.StreamEndReasonEOF:
+			return stream.ExpectsTerminal && stream.Response == relaycommon.ResponseOutcomeUnknown
+		}
+		return false
+	}
+	// Some adapters synthesize a 502 for any SSE error envelope. A specific
+	// credential or configuration code takes precedence over that status.
+	for _, value := range []string{code, kind} {
+		switch strings.ToLower(value) {
+		case "invalid_api_key", "api_key_invalid", "api_key_expired", "api_key_service_blocked",
+			"invalid_authentication", "authentication_error", "unauthenticated", "permission_denied",
+			"permission_error", "authorization_error", "access_denied", "model_not_found", "insufficient_quota":
+			return false
+		}
+	}
+	for _, value := range []string{code, kind} {
+		switch strings.ToLower(value) {
+		case "server_error", "internal_error", "service_unavailable", "overloaded_error", "server_is_overloaded",
+			"rate_limit_exceeded", "rate_limit_error", "resource_exhausted":
+			return true
+		}
+	}
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status/100 == 5
+}
+
 func EndSchedulingRequest(c *gin.Context) {
 	value, ok := c.Get(schedulerContextKey)
 	if !ok {
@@ -387,6 +534,21 @@ func EndSchedulingRequest(c *gin.Context) {
 	state := value.(*schedulingRequest)
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	// All routes have now been tried. Attribute a terminal rejection once,
+	// to the last dimension where capacity prevented a reservation.
+	blocked := state.capacityBlocks
+	state.capacityBlocks = nil
+	if !state.capacityUnresolved {
+		for _, key := range blocked {
+			scheduler.Default.RecordCapacityOutcome(key, false)
+		}
+	} else if len(blocked) > 0 && ((c.Writer != nil && c.Writer.Status() == http.StatusServiceUnavailable) || IsRelayWebSocketRequest(c)) {
+		key := blocked[len(blocked)-1]
+		if scheduler.Default.RecordCapacityOutcome(key, true) {
+			logger.LogWarn(c, common.LogText("scheduling capacity exhausted: group=%s model=%s", key.Group, key.Model))
+		}
+	}
+	state.capacityUnresolved = false
 	for _, request := range state.requests {
 		scheduler.Default.EndRequest(request)
 	}
@@ -537,6 +699,12 @@ func observeSchedulingOutput(c *gin.Context, body []byte, status int) {
 	if useful && state.ttft == nil {
 		latency := time.Since(state.attempt.StartedAt)
 		state.ttft = &latency
+		// A recovery probe is resolved by its first useful output; the rest
+		// of the stream no longer holds the channel's half-open gate.
+		scheduler.Default.ObserveFirstOutput(state.attempt)
+		if state.poolAttempt != nil {
+			state.poolEngine.ObserveFirstOutput(state.poolAttempt)
+		}
 	}
 }
 

@@ -30,6 +30,9 @@ type Candidate struct {
 	Capacity      int       `json:"capacity"`
 	CapacityKey   string    `json:"capacity_key,omitempty"`
 	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
+	// probeBlocked marks a half-open channel whose single probe is in flight.
+	probeBlocked bool
+	wideGuard    bool
 }
 
 type Config struct {
@@ -39,8 +42,10 @@ type Config struct {
 	DefaultCapacity int     `json:"default_capacity"`
 }
 
+// DefaultConfig leaves concurrency unlimited. Load still lowers the weight of
+// busy channels; only explicit capacities refuse new requests.
 func DefaultConfig() Config {
-	return Config{Enabled: true, SuccessTarget: 0.95, LatencyTargetMS: 3000, DefaultCapacity: 100}
+	return Config{Enabled: true, SuccessTarget: 0.95, LatencyTargetMS: 3000}
 }
 
 type Override struct {
@@ -60,6 +65,11 @@ type Request struct {
 	ended      bool
 	attempted  map[int]bool
 	attempts   map[*Attempt]bool
+	// The host combines both engines' capacity observations after each
+	// selection. Only it knows whether other groups ultimately served it.
+	capacityBlocked atomic.Bool
+	// cooldownSkipped holds channels already counted as skipped for cooling.
+	cooldownSkipped map[int]bool
 }
 
 // Attempt holds a capacity reservation until FinishAttempt or EndRequest.
@@ -74,6 +84,10 @@ type Attempt struct {
 	started       bool
 	finished      bool
 	learningEpoch uint64
+	// probe is the single request admitted to a half-open channel.
+	probe              bool
+	wideProbe          bool
+	cooldownGeneration uint64
 }
 
 type Outcome struct {
@@ -96,28 +110,39 @@ type Window struct {
 }
 
 type ChannelSnapshot struct {
-	ChannelID            int        `json:"channel_id"`
-	Name                 string     `json:"name"`
-	Status               int        `json:"status"`
-	RouteState           string     `json:"route_state"`
-	TrafficShare         float64    `json:"traffic_share"`
-	EffectiveWeight      float64    `json:"effective_weight"`
-	ConfiguredWeight     float64    `json:"configured_weight"`
-	Priority             int64      `json:"priority"`
-	Dispatches30m        int64      `json:"dispatches_30m"`
-	SuccessRate30m       *float64   `json:"success_rate_30m"`
-	SuccessRate5m        *float64   `json:"success_rate_5m"`
-	InFlight             int        `json:"in_flight"`
-	Capacity             int        `json:"capacity"`
-	CapacityKey          string     `json:"capacity_key"`
-	HealthAttainment     *float64   `json:"health_attainment"`
-	HealthScore          float64    `json:"health_score"`
-	HealthBaseline       float64    `json:"health_baseline"`
-	RecoveryLimit        float64    `json:"recovery_limit"`
-	RampSuccesses        int64      `json:"ramp_successes"`
-	RampProgress         float64    `json:"ramp_progress"`
-	RampLimited          bool       `json:"ramp_limited"`
-	CooldownUntil        *time.Time `json:"cooldown_until,omitempty"`
+	ChannelID        int        `json:"channel_id"`
+	Name             string     `json:"name"`
+	Status           int        `json:"status"`
+	RouteState       string     `json:"route_state"`
+	TrafficShare     float64    `json:"traffic_share"`
+	EffectiveWeight  float64    `json:"effective_weight"`
+	ConfiguredWeight float64    `json:"configured_weight"`
+	Priority         int64      `json:"priority"`
+	Dispatches30m    int64      `json:"dispatches_30m"`
+	SuccessRate30m   *float64   `json:"success_rate_30m"`
+	SuccessRate5m    *float64   `json:"success_rate_5m"`
+	InFlight         int        `json:"in_flight"`
+	Capacity         int        `json:"capacity"`
+	CapacityKey      string     `json:"capacity_key"`
+	HealthAttainment *float64   `json:"health_attainment"`
+	HealthScore      float64    `json:"health_score"`
+	HealthBaseline   float64    `json:"health_baseline"`
+	RecoveryLimit    float64    `json:"recovery_limit"`
+	RampSuccesses    int64      `json:"ramp_successes"`
+	RampProgress     float64    `json:"ramp_progress"`
+	RampLimited      bool       `json:"ramp_limited"`
+	CooldownUntil    *time.Time `json:"cooldown_until,omitempty"`
+	// The active cooldown cycle or one that ended in the last 30 minutes.
+	// A cycle starts with the first cooldown
+	// and continues through failed probes; CooldownSeconds is the current
+	// cooldown's length and CooldownSkipped counts requests that bypassed it.
+	CooldownStartedAt    *time.Time `json:"cooldown_started_at,omitempty"`
+	CooldownSeconds      int        `json:"cooldown_seconds,omitempty"`
+	CooldownLevel        int        `json:"cooldown_level,omitempty"`
+	CooldownChannelWide  bool       `json:"cooldown_channel_wide,omitempty"`
+	CooldownSkipped      int64      `json:"cooldown_skipped"`
+	CooldownProbes       int64      `json:"cooldown_probes"`
+	CooldownProbeResult  string     `json:"cooldown_probe_result,omitempty"`
 	AvgTTFTMS5m          *float64   `json:"avg_ttft_ms_5m"`
 	QualityScore         float64    `json:"quality_score"`
 	SelectionProbability float64    `json:"selection_probability"`
@@ -142,6 +167,13 @@ type Summary struct {
 	DegradedChannels int      `json:"degraded_channels"`
 	InFlight         int      `json:"in_flight"`
 	TopTrafficShare  float64  `json:"top_traffic_share"`
+	// CapacitySkips30m counts selections that bypassed a full candidate;
+	// CapacityExhausted30m counts selections that found every candidate full.
+	CapacitySkips30m     int64 `json:"capacity_skips_30m"`
+	CapacityExhausted30m int64 `json:"capacity_exhausted_30m"`
+	// CooldownSuppressed30m counts cooldowns withheld because the channel was
+	// the last one able to serve its group and model.
+	CooldownSuppressed30m int64 `json:"cooldown_suppressed_30m"`
 }
 
 type TrendPoint struct {
@@ -176,6 +208,8 @@ type Engine struct {
 	channelMetadata     map[int]Candidate
 	channelObservations channelObservations
 	recentChannelStats  atomic.Pointer[RecentChannelStats]
+	channelCooldowns    map[int]*channelCooldown
+	lastSweep           time.Time
 }
 
 var Default = New()

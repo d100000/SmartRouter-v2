@@ -28,6 +28,22 @@ type schedulingDashboard struct {
 	StartedAt           int64                    `json:"started_at"`
 	ActivationThreshold int                      `json:"activation_threshold"`
 	Config              service.SchedulingConfig `json:"config"`
+	// ConfigStatus reports a configuration or metadata load failure while
+	// routing continues on the last published snapshot.
+	ConfigStatus service.SchedulingConfigStatus `json:"config_status"`
+}
+
+// syncSchedulingForAdmin publishes the latest configuration when possible. A
+// failed load is reported through the dashboard status instead of hiding the
+// routing state that is still in effect; only an instance that has never
+// published a snapshot answers 503.
+func syncSchedulingForAdmin(c *gin.Context) bool {
+	if err := service.SyncSchedulingConfig(); err != nil && !service.GetSchedulingConfigStatus().Published {
+		common.SysError(common.LogText("scheduling configuration is unavailable: %s", err.Error()))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "Scheduling configuration is unavailable"})
+		return false
+	}
+	return true
 }
 
 func GetScheduling(c *gin.Context) {
@@ -40,8 +56,7 @@ func GetScheduling(c *gin.Context) {
 		}
 		stream = value
 	}
-	if err := service.SyncSchedulingConfig(); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": err.Error()})
+	if !syncSchedulingForAdmin(c) {
 		return
 	}
 	channels, err := model.GetAllChannels(0, -1, false, true)
@@ -129,6 +144,7 @@ func GetScheduling(c *gin.Context) {
 		Groups:   groups, Models: models, Group: group, Model: modelName,
 		Stream: stream, RefreshedAt: time.Now().Unix(), StartedAt: schedulingStartedAt,
 		ActivationThreshold: 50, Config: service.GetSchedulingConfig(key),
+		ConfigStatus: service.GetSchedulingConfigStatus(),
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
 }
@@ -166,12 +182,15 @@ func UpdateSchedulingConfig(c *gin.Context) {
 			return
 		}
 	}
-	if err := service.SaveSchedulingConfig(config); err != nil {
+	saved, syncErr, err := service.SaveSchedulingConfig(config)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "Unable to save scheduling configuration"})
 		return
 	}
-	model.RecordLog(c.GetInt("id"), model.LogTypeManage, common.NewMessage("Updated scheduling configuration: group={{group}} model={{model}} enabled={{enabled}} channel_overrides={{overrides}}", map[string]any{"group": config.Group, "model": config.Model, "enabled": config.Enabled, "overrides": len(config.ChannelOverrides)}))
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": config})
+	model.RecordLog(c.GetInt("id"), model.LogTypeManage, common.NewMessage("Updated scheduling configuration: group={{group}} model={{model}} enabled={{enabled}} channel_overrides={{overrides}}", map[string]any{"group": saved.Group, "model": saved.Model, "enabled": saved.Enabled, "overrides": len(saved.ChannelOverrides)}))
+	// The value is persisted either way. A pending sync keeps the previous
+	// routing snapshot until the background reload succeeds.
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": saved, "sync_pending": syncErr != nil})
 }
 
 func RecoverSchedulingChannel(c *gin.Context) {
@@ -185,8 +204,7 @@ func RecoverSchedulingChannel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "group, model and channel_id are required"})
 		return
 	}
-	if err := service.SyncSchedulingConfig(); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": err.Error()})
+	if !syncSchedulingForAdmin(c) {
 		return
 	}
 	channel, err := model.GetChannelById(request.ChannelID, false)

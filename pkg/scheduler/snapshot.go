@@ -40,7 +40,7 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 			result.Phase = "dynamic"
 		}
 	}
-	evaluated := e.evaluate(key, s, candidates, now, stream, nil)
+	evaluated, _ := e.evaluate(key, s, candidates, now, stream, nil)
 	byID := make(map[int]evaluatedCandidate, len(evaluated))
 	for _, item := range evaluated {
 		byID[item.candidate.ID] = item
@@ -60,7 +60,7 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 		if !ch.registered {
 			// Historical/disabled rows remain visible without creating capacity
 			// members from a dashboard or a stale request candidate list.
-			resolved = configuredCandidate(s, ch, resolved)
+			resolved = e.configuredCandidate(s, ch, resolved, now)
 		}
 		e.refreshScore(ch, s.config, now)
 		pool := e.pools[resolved.CapacityKey]
@@ -86,6 +86,23 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 			until := resolved.CooldownUntil
 			row.CooldownUntil = &until
 		}
+		cooldown := &ch.cooldown.availabilityCircuit
+		if wide := e.channelCooldowns[resolved.ID]; wide != nil {
+			if resolved.wideGuard && (!cooldown.halfOpen || !wide.until.Before(cooldown.until)) ||
+				!cooldown.halfOpen && !wide.halfOpen && wide.endedAt.After(cooldown.endedAt) && now.Sub(wide.endedAt) < longWindow && e.hasAlternative(s, resolved.ID, now) {
+				cooldown = &wide.availabilityCircuit
+			}
+		}
+		if cooldown.halfOpen || !cooldown.endedAt.IsZero() && now.Sub(cooldown.endedAt) < longWindow {
+			started := cooldown.startedAt
+			row.CooldownStartedAt = &started
+			row.CooldownSeconds = int(cooldown.duration / time.Second)
+			row.CooldownLevel = cooldown.level
+			row.CooldownSkipped = cooldown.skipped
+			row.CooldownProbes = cooldown.probes
+			row.CooldownProbeResult = cooldown.probeResult
+			row.CooldownChannelWide = cooldown != &ch.cooldown.availabilityCircuit
+		}
 		for second, count := range ch.dispatches {
 			if second >= cutoff {
 				row.Dispatches30m += count
@@ -106,6 +123,10 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 			row.CanRecover = false
 		case resolved.CooldownUntil.After(now):
 			row.RouteState = "cooling"
+			row.CanRecover = false
+		// A half-open circuit waived as the last viable route routes normally.
+		case ch.cooldown.halfOpen && e.hasAlternative(s, candidate.ID, now) || resolved.wideGuard:
+			row.RouteState = "probing"
 			row.CanRecover = false
 		case resolved.Excluded:
 			row.RouteState = "ineligible"
@@ -150,6 +171,21 @@ func (e *Engine) Snapshot(key Key, candidates []Candidate, stream bool) Snapshot
 	for second, count := range s.requests {
 		if second >= cutoff {
 			result.Summary.Requests30m += count
+		}
+	}
+	for second, count := range s.capacitySkips {
+		if second >= cutoff {
+			result.Summary.CapacitySkips30m += count
+		}
+	}
+	for second, count := range s.capacityExhausted {
+		if second >= cutoff {
+			result.Summary.CapacityExhausted30m += count
+		}
+	}
+	for second, count := range s.cooldownSuppressed {
+		if second >= cutoff {
+			result.Summary.CooldownSuppressed30m += count
 		}
 	}
 	result.Summary.InFlight = s.inFlight

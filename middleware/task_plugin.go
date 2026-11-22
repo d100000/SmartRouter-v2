@@ -1650,7 +1650,9 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
-	if requestplugin.Stopped(taskErr) {
+	if limit := service.LocalChannelLimitError(taskErr.Error); limit != nil {
+		sanitized.Code, sanitized.Message = string(limit.GetErrorCode()), limit.Error()
+	} else if requestplugin.Stopped(taskErr) {
 		// A request plugin's stop keeps its code and message, as on chat
 		// routes.
 		sanitized.Code, sanitized.Message, sanitized.Retryable = taskErr.Code, taskErr.Message, false

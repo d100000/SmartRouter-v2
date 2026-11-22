@@ -44,13 +44,22 @@ type BatchTaskPollingAdaptor interface {
 
 // TaskPollingKey retains the submission credential even while it is disabled.
 // Legacy multi-key tasks without a snapshot use one current key, never the
-// newline-joined credential list as an Authorization header.
+// newline-joined credential list as an Authorization header. A sealed
+// supplier secret is opened first and never sent upstream; when it cannot be
+// opened on this node the result is empty and the caller must not poll.
 func TaskPollingKey(channel *model.Channel, saved string, identity *hosttypes.ChannelFundingAttempt) string {
 	if saved != "" {
 		return saved
 	}
+	if channel.CredentialUnavailable() {
+		return ""
+	}
 	if !channel.ChannelInfo.IsMultiKey {
-		return channel.Key
+		key, _, err := channel.GetNextEnabledKey()
+		if err != nil {
+			return ""
+		}
+		return key
 	}
 	keys := channel.GetKeys()
 	if identity != nil {
@@ -85,6 +94,44 @@ type BatchTaskResult struct {
 	StartTime  int64
 	FinishTime int64
 	Data       any
+}
+
+type clientTaskPollKey struct{}
+
+// WithClientTaskPoll marks a poll that a client's own task fetch triggers.
+// Its upstream errors belong to the client request, not to the background
+// poller: they neither count toward TASK_POLL_MAX_FAILURES nor fail the task.
+func WithClientTaskPoll(ctx context.Context) context.Context {
+	return context.WithValue(ctx, clientTaskPollKey{}, true)
+}
+
+func isClientTaskPoll(ctx context.Context) bool {
+	client, _ := ctx.Value(clientTaskPollKey{}).(bool)
+	return client
+}
+
+// keepsFinalTaskStatus reports whether a poll result must not replace the
+// stored status: a delivered SUCCESS is never revoked and a finished task
+// never resumes. Only a FAILURE may still become SUCCESS when the vendor
+// finishes late, which charges the task again.
+func keepsFinalTaskStatus(from, parsed model.TaskStatus) bool {
+	if from != model.TaskStatusSuccess && from != model.TaskStatusFailure {
+		return false
+	}
+	return parsed != from && !(from == model.TaskStatusFailure && parsed == model.TaskStatusSuccess)
+}
+
+// recordFinalTaskObservation keeps a finished task's status and result and
+// persists only the channel procurement observation of the poll.
+func recordFinalTaskObservation(ctx context.Context, task *model.Task, fromStatus model.TaskStatus, result *relaycommon.TaskInfo) error {
+	ObserveTaskChannelResult(task, result, true)
+	if task.PrivateData.ChannelAttempt == nil {
+		return nil
+	}
+	if _, err := task.UpdateWithStatus(fromStatus); err != nil {
+		return err
+	}
+	return FlushTaskChannelObservation(ctx, task)
 }
 
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
@@ -199,6 +246,7 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 	common.SysLog(common.LogText("task progress polling started"))
 	sweepTimedOutTasks(ctx)
+	RetryPendingTaskRefundBilling(ctx)
 	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
@@ -440,6 +488,12 @@ func pollCredentialBatch(ctx context.Context, adaptor BatchTaskPollingAdaptor, c
 			}
 			continue
 		}
+		if keepsFinalTaskStatus(snap.Status, parsedStatus) {
+			if err := recordFinalTaskObservation(ctx, task, snap.Status, &responseItem.TaskInfo); err != nil {
+				common.SysLog(common.LogText("UpdateSunoTask task error: %s", err.Error()))
+			}
+			continue
+		}
 		if isNonTerminalPollStatus(parsedStatus) {
 			task.PrivateData.PollFailures = 0
 		}
@@ -494,9 +548,7 @@ func pollCredentialBatch(ctx context.Context, adaptor BatchTaskPollingAdaptor, c
 			continue
 		}
 		_ = FlushTaskChannelObservation(ctx, task)
-		if terminalTransition && snap.Status != model.TaskStatusFailure && snap.Status != model.TaskStatusSuccess {
-			finalizeTerminalTask(ctx, adaptor, task, &responseItem.TaskInfo)
-		}
+		settleWonTaskTransition(ctx, adaptor, task, snap.Status, &responseItem.TaskInfo)
 	}
 	return nil
 }
@@ -584,6 +636,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	} else {
 		copy := *ch
 		copy.Key = TaskPollingKey(ch, task.PrivateData.Key, task.PrivateData.FundingAttempt)
+		// Keyless channels are valid; refuse only a credential this node cannot open.
+		if ch.CredentialUnavailable() && task.PrivateData.Key == "" {
+			err = model.ErrChannelAttemptState
+		}
 		ch = &copy
 	}
 	if err != nil {
@@ -670,6 +726,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if classifyPollHTTP(resp.StatusCode) == pollClassOtherClient && isNonTerminalPollStatus(parsedStatus) {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
 	}
+	if keepsFinalTaskStatus(snap.Status, parsedStatus) {
+		task.Data = snap.Data
+		return recordFinalTaskObservation(ctx, task, snap.Status, taskResult)
+	}
 
 	task.Data = redactVideoResponseBody(responseBody)
 	if len(taskResult.PluginState) > 0 {
@@ -680,7 +740,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	now := time.Now().Unix()
-	shouldFinalizeBilling := false
 
 	task.Status = parsedStatus
 	switch parsedStatus {
@@ -708,7 +767,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			// No URL from adaptor — construct proxy URL using public task ID
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 		}
-		shouldFinalizeBilling = true
 	case model.TaskStatusFailure:
 		if protectedTask(task) {
 			task.Data = nil
@@ -723,7 +781,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		task.FailReason = taskResult.Reason
 		logger.LogInfo(ctx, common.LogText("Task %s failed: %s", task.TaskID, task.FailReason))
 		taskResult.Progress = taskcommon.ProgressComplete
-		shouldFinalizeBilling = true
 	}
 	if taskResult.Progress != "" {
 		task.Progress = taskResult.Progress
@@ -731,18 +788,17 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	ObserveTaskChannelResult(task, taskResult, true)
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	won := false
 	if isDone && snap.Status != task.Status {
 		task.PrivateData.PerformanceOutputTokens = taskResult.PerformanceOutputTokens
-		won, err := task.UpdateWithStatus(snap.Status)
+		won, err = task.UpdateWithStatus(snap.Status)
 		if err != nil {
 			logger.LogError(ctx, common.LogText("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
-			shouldFinalizeBilling = false
 		} else if !won {
 			logger.LogWarn(ctx, common.LogText("Task %s CAS lost or no-op update, skip billing", task.TaskID))
-			shouldFinalizeBilling = false
 		}
 	} else if !snap.Equal(task.Snapshot()) || task.PrivateData.ChannelAttempt != nil {
-		if _, err := task.UpdateWithStatus(snap.Status); err != nil {
+		if won, err = task.UpdateWithStatus(snap.Status); err != nil {
 			logger.LogError(ctx, common.LogText("Failed to update task %s: %s", task.TaskID, err.Error()))
 		}
 	} else {
@@ -751,11 +807,33 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	_ = FlushTaskChannelObservation(ctx, task)
-	if shouldFinalizeBilling && snap.Status != model.TaskStatusFailure && snap.Status != model.TaskStatusSuccess {
-		finalizeTerminalTask(ctx, adaptor, task, taskResult)
+	if won {
+		settleWonTaskTransition(ctx, adaptor, task, snap.Status, taskResult)
 	}
 
 	return nil
+}
+
+// settleWonTaskTransition runs the billing that a won status write owes.
+// fromStatus is the status the write replaced. A task reaching its final
+// state settles or refunds once. A FAILURE that later becomes SUCCESS first
+// charges back what its refund returned and then settles exactly as a normal
+// SUCCESS; a SUCCESS still holding a refund whose re-charge failed retries it.
+func settleWonTaskTransition(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, taskResult *relaycommon.TaskInfo) {
+	switch {
+	case task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure:
+		return
+	case task.Status == model.TaskStatusSuccess && (fromStatus == model.TaskStatusFailure || task.RefundedQuota > 0):
+		if task.PrivateData.ChannelAttempt != nil && task.PrivateData.ChannelAttempt.IsChannelTest {
+			return
+		}
+		if task.RefundedQuota > 0 && !RechargeRefundedTaskQuota(ctx, task) {
+			return
+		}
+		settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
+	case fromStatus != model.TaskStatusSuccess && fromStatus != model.TaskStatusFailure:
+		finalizeTerminalTask(ctx, adaptor, task, taskResult)
+	}
 }
 
 // The terminal CAS already persisted its pending performance sample atomically.
@@ -918,6 +996,9 @@ func unrecognizedPollDetail(reason string, body []byte) string {
 }
 
 func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, class string, statusCode int, detail string) error {
+	if isClientTaskPoll(ctx) {
+		return nil
+	}
 	if protectedTask(task) {
 		detail = "Upstream request failed"
 	}
@@ -957,9 +1038,15 @@ func recordPollFailureForTasks(ctx context.Context, adaptor TaskPollingAdaptor, 
 }
 
 func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, reason string) error {
-	if snapshot := task.PrivateData.ChannelAttempt; snapshot != nil && snapshot.Observation.Authoritative && snapshot.Observation.CompletedAt != nil {
+	if isClientTaskPoll(ctx) {
+		return nil
+	}
+	snapshot := task.PrivateData.ChannelAttempt
+	if fromStatus == model.TaskStatusSuccess || fromStatus == model.TaskStatusFailure ||
+		(snapshot != nil && snapshot.Observation.Authoritative && snapshot.Observation.CompletedAt != nil) {
 		// Result retention or credentials may expire while the host is still
-		// reconciling usage. A failed query cannot revoke confirmed completion.
+		// reconciling usage. A failed query cannot revoke a finished task or
+		// confirmed completion; only the poll bookkeeping is persisted.
 		won, err := task.UpdateWithStatus(fromStatus)
 		if err != nil || !won {
 			return err
@@ -982,9 +1069,7 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		return nil
 	}
 	_ = FlushTaskChannelObservation(ctx, task)
-	if fromStatus != model.TaskStatusFailure && fromStatus != model.TaskStatusSuccess {
-		finalizeTerminalTask(ctx, adaptor, task, relaycommon.FailTaskInfo(reason))
-	}
+	finalizeTerminalTask(ctx, adaptor, task, relaycommon.FailTaskInfo(reason))
 	return nil
 }
 

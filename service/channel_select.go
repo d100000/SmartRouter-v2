@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,7 +16,9 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // ChannelAvailabilityError is a local admission rejection, never an upstream
@@ -64,13 +67,25 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 }
 
 type RetryParam struct {
-	Ctx          *gin.Context
-	TokenGroup   string
-	ModelName    string
-	RequestPath  string
-	Retry        *int
-	resetNextTry bool
+	Ctx                   *gin.Context
+	TokenGroup            string
+	ModelName             string
+	RequestPath           string
+	Retry                 *int
+	LocalRefusal          *types.NewAPIError
+	priorAttemptError     *types.NewAPIError
+	priorAttemptAddresses []string
+	resetNextTry          bool
 }
+
+// A cross-group transition belongs to the request: Distribute may select the
+// initial channel with a different RetryParam from the relay controller.
+type pendingAutoGroupRetry struct {
+	nextGroup int
+	retry     int
+}
+
+const ginKeyPendingAutoGroupRetry = "pending_auto_group_retry"
 
 func (p *RetryParam) GetRetry() int {
 	if p.Retry == nil {
@@ -84,6 +99,17 @@ func (p *RetryParam) SetRetry(retry int) {
 }
 
 func (p *RetryParam) IncreaseRetry() {
+	if p.Ctx != nil {
+		next, _ := p.Ctx.Get(ginKeyPendingAutoGroupRetry)
+		if transition, ok := next.(pendingAutoGroupRetry); ok {
+			common.SetContextKey(p.Ctx, constant.ContextKeyAutoGroupIndex, transition.nextGroup)
+			p.Ctx.Set(ginKeyPendingAutoGroupRetry, nil)
+			p.Ctx.Set(ginKeyChannelAffinityRetryOffset, 0)
+			p.SetRetry(0)
+			p.resetNextTry = false
+			return
+		}
+	}
 	if p.resetNextTry {
 		p.resetNextTry = false
 		return
@@ -142,9 +168,16 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	affinityRetryOffset := param.Ctx.GetInt(ginKeyChannelAffinityRetryOffset)
 
 	if param.TokenGroup == "auto" {
+		// Re-entering selection without IncreaseRetry is a local refusal. Keep
+		// the current group and its priority budget until an upstream retry.
+		next, _ := param.Ctx.Get(ginKeyPendingAutoGroupRetry)
+		if transition, ok := next.(pendingAutoGroupRetry); ok {
+			param.SetRetry(transition.retry)
+			param.Ctx.Set(ginKeyPendingAutoGroupRetry, nil)
+		}
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
 		if len(autoGroups) == 0 {
-			return nil, selectGroup, errors.New("auto groups is not enabled")
+			return nil, selectGroup, errAutoGroupsDisabled
 		}
 
 		// startGroupIndex: the group index to start searching from
@@ -198,24 +231,10 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			selectGroup = autoGroup
 			logger.LogDebug(param.Ctx, "Auto selected group: %s", autoGroup)
 
-			// Prepare state for next retry
-			// 为下一次重试准备状态
+			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i)
 			if crossGroupRetry && groupRetry >= common.RetryTimes {
-				// Current group has exhausted all retries, prepare to switch to next group
-				// This request still uses current group, but next retry will use next group
-				// 当前分组已用完所有重试次数，准备切换到下一个分组
-				// 本次请求仍使用当前分组，但下次重试将使用下一个分组
-				logger.LogDebug(param.Ctx, "Current group %s retries exhausted (groupRetry=%d >= RetryTimes=%d), preparing switch to next group for next retry", autoGroup, groupRetry, common.RetryTimes)
-				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i+1)
-				// Reset retry counter so outer loop can continue for next group
-				// 重置重试计数器，以便外层循环可以为下一个分组继续
+				param.Ctx.Set(ginKeyPendingAutoGroupRetry, pendingAutoGroupRetry{nextGroup: i + 1, retry: groupRetry})
 				param.SetRetry(0)
-				param.ResetRetryNextTry()
-				param.Ctx.Set(ginKeyChannelAffinityRetryOffset, 0)
-			} else {
-				// Stay in current group, save current state
-				// 保持在当前分组，保存当前状态
-				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i)
 			}
 			break
 		}
@@ -302,6 +321,31 @@ func pinnedTaskPluginIdentities(c *gin.Context, expected string) ([]int, []strin
 	return channelTypes, []string{expected}
 }
 
+var errAutoGroupsDisabled = errors.New("auto groups is not enabled")
+
+// channelSelectionUnavailable is the client-facing reason for an internal
+// selection failure; the actual error is logged server-side only.
+const channelSelectionUnavailable = "channel_selection_unavailable"
+
+var errChannelSelectionUnavailable = errors.New(channelSelectionUnavailable)
+
+// clientSafeSchedulingError keeps database and configuration errors away from
+// API clients. Local admission refusals and routing sentinels pass through.
+func clientSafeSchedulingError(c *gin.Context, err error) error {
+	if err == nil || errors.Is(err, scheduler.ErrNoEligibleChannel) || errors.Is(err, errChannelSelectionUnavailable) || errors.Is(err, errAutoGroupsDisabled) {
+		return err
+	}
+	if _, ok := errors.AsType[*types.NewAPIError](err); ok {
+		return err
+	}
+	logger.LogError(c, common.LogText("channel selection failed: %s", err.Error()))
+	return errChannelSelectionUnavailable
+}
+
+func schedulingSelectError(c *gin.Context, err error) *ChannelSelectError {
+	return &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: clientSafeSchedulingError(c, err).Error()}
+}
+
 // ChannelSelectError explains why SelectChannelForRequest found no channel.
 // Callers render it for their transport: the HTTP distributor localizes
 // MessageID with its own helpers and the Responses WebSocket relay wraps it in
@@ -328,11 +372,13 @@ type ChannelSelectError struct {
 // filters. The group the channel was chosen from is returned for auto-group
 // callers. The caller still applies SetupContextForSelectedChannel.
 func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Channel, string, *ChannelSelectError) {
-	if len(c.GetStringSlice("use_channel"))-c.GetInt("channel_local_refusals") > common.RetryTimes || !SchedulingRetryAllowed(c) {
+	selectedCount := len(c.GetStringSlice("use_channel"))
+	localRefusals := c.GetInt("channel_local_refusals")
+	if selectedCount-localRefusals > common.RetryTimes || !SchedulingRetryAllowed(c) {
 		return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: "request retry budget exhausted or response already started"}
 	}
-	if err := SyncSchedulingConfig(); err != nil {
-		return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: err.Error()}
+	if err := ensureSchedulingConfig(false); err != nil {
+		return nil, "", schedulingSelectError(c, err)
 	}
 	constraints := GetChannelConstraints(c)
 	if pin, found, overridden := constraints.ResolvedPin(); found {
@@ -363,78 +409,44 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			}
 		}
 		if err := ReserveSchedulingChannel(c, channel, retry.TokenGroup, modelName); err != nil {
-			return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: err.Error()}
+			return nil, "", schedulingSelectError(c, err)
 		}
 		return channel, "", nil
 	}
 
 	usingGroup := retry.TokenGroup
-	var channel *model.Channel
-	var selectGroup string
-	if retry.GetRetry() == 0 {
-		if preferredChannelID, found := GetPreferredChannelByAffinity(c, modelName, usingGroup); found {
-			affinityUsable := false
-			preferred, err := model.CacheGetChannel(preferredChannelID)
-			affinitySatisfied := false
-			if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled && supplierChannelEligible(c, preferred) {
-				affinitySatisfied, _ = model.ChannelSatisfiesFilters(preferred, modelName, constraints.Filters)
-			}
-			if affinitySatisfied {
-				if usingGroup == "auto" {
-					userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-					for _, g := range GetRequestAutoGroups(c, userGroup) {
-						if model.IsChannelEnabledForGroupModel(g, modelName, preferred.Id) {
-							selectGroup = g
-							common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
-							channel = preferred
-							affinityUsable = true
-							break
-						}
-					}
-				} else if model.IsChannelEnabledForGroupModel(usingGroup, modelName, preferred.Id) {
-					channel = preferred
-					selectGroup = usingGroup
-					affinityUsable = true
-				}
-			}
-			if !affinityUsable && !ShouldKeepChannelAffinityOnChannelDisabled() {
-				ClearCurrentChannelAffinityCache(c)
-			}
-			if !affinityUsable && RequestPolicy(c).SessionMode == "strict" {
-				return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: "strict_session_binding_unavailable"}
-			}
-			if affinityUsable {
-				if RequestPolicy(c).SessionMode != "strict" && scheduler.Default.IsActive(scheduler.Key{Group: selectGroup, Model: modelName}) {
-					channel = nil
-				} else {
-					MarkChannelAffinityUsed(c, selectGroup, preferred.Id)
-				}
-			}
+	// A local admission refusal can re-enter selection with retry still zero.
+	if retry.GetRetry() == 0 && (selectedCount == 0 || (selectedCount == localRefusals && c.GetBool(ginKeyChannelAffinityPreserved))) {
+		channel, group, selectErr := reserveAffinityChannel(c, modelName, usingGroup, constraints.Filters)
+		if channel != nil || selectErr != nil {
+			return channel, group, selectErr
 		}
 	}
+	if localRefusals > 0 && selectedCount == localRefusals {
+		// A binding refused before dispatch consumed no upstream retry slot.
+		c.Set(ginKeyChannelAffinityRetryOffset, 0)
+	}
 
-	if channel == nil {
-		var err error
-		channel, selectGroup, err = CacheGetRandomSatisfiedChannel(retry)
-		if err != nil {
-			showGroup := usingGroup
-			if usingGroup == "auto" {
-				showGroup = fmt.Sprintf("auto(%s)", selectGroup)
-			}
-			return nil, selectGroup, &ChannelSelectError{
-				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorGetChannelFailed,
-				Params: map[string]any{"Group": showGroup, "Model": modelName, "Error": err.Error()},
-			}
+	channel, selectGroup, err := CacheGetRandomSatisfiedChannel(retry)
+	if err != nil {
+		showGroup := usingGroup
+		if usingGroup == "auto" {
+			showGroup = fmt.Sprintf("auto(%s)", selectGroup)
 		}
-		if channel == nil {
-			return nil, selectGroup, &ChannelSelectError{
-				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
-				Params: map[string]any{"Group": usingGroup, "Model": modelName}, NoAvailableChannel: true,
-			}
+		reason := clientSafeSchedulingError(c, err).Error()
+		return nil, selectGroup, &ChannelSelectError{
+			StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorGetChannelFailed,
+			Params: map[string]any{"Group": showGroup, "Model": modelName, "Error": reason}, Message: reason,
+		}
+	}
+	if channel == nil {
+		return nil, selectGroup, &ChannelSelectError{
+			StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
+			Params: map[string]any{"Group": usingGroup, "Model": modelName}, NoAvailableChannel: true,
 		}
 	}
 	if err := ReserveSchedulingChannel(c, channel, selectGroup, modelName); err != nil {
-		return nil, selectGroup, &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: err.Error()}
+		return nil, selectGroup, schedulingSelectError(c, err)
 	}
 	if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
 		return nil, selectGroup, &ChannelSelectError{
@@ -444,6 +456,93 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		}
 	}
 	return channel, selectGroup, nil
+}
+
+// reserveAffinityChannel returns an admitted binding, or nil to allow ordinary
+// selection. Only a successful reservation counts as using the binding.
+func reserveAffinityChannel(c *gin.Context, modelName, usingGroup string, filters []dto.ChannelFilter) (*model.Channel, string, *ChannelSelectError) {
+	id, found := GetPreferredChannelByAffinity(c, modelName, usingGroup)
+	if !found {
+		return nil, "", nil
+	}
+	if slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(id)) {
+		return nil, "", nil
+	}
+	preferred, err := model.CacheGetChannelForRouting(id)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, "", schedulingSelectError(c, err)
+	}
+	disabled := preferred == nil || preferred.Status != common.ChannelStatusEnabled
+	var selectedGroup string
+	matches, _ := model.ChannelSatisfiesFilters(preferred, modelName, filters)
+	if !disabled && matches && supplierChannelEligible(c, preferred) {
+		groups := []string{usingGroup}
+		if usingGroup == "auto" {
+			groups = GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+		}
+		for _, group := range groups {
+			if model.IsChannelEnabledForGroupModel(group, modelName, id) {
+				selectedGroup = group
+				break
+			}
+		}
+	}
+	strict := RequestPolicy(c).SessionMode == "strict"
+	if selectedGroup == "" {
+		// A request's path, allowed groups, time window or available supplier
+		// may change on its next request without disabling the channel.
+		switch {
+		case !disabled:
+			PreserveChannelAffinity(c, id, "session_binding_temporarily_unavailable")
+		case !ShouldKeepChannelAffinityOnChannelDisabled():
+			ClearCurrentChannelAffinityCache(c)
+		case !operation_setting.GetChannelAffinitySetting().SwitchOnSuccess:
+			c.Set(ginKeyChannelAffinityPreserved, true)
+		}
+		if strict {
+			return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: "strict_session_binding_unavailable"}
+		}
+		return nil, "", nil
+	}
+	if !strict {
+		key := scheduler.Key{Group: selectedGroup, Model: modelName}
+		if healthy := scheduler.Default.HealthyBindingAlternatives(key, id); len(healthy) > 0 {
+			alternative, err := selectSchedulingCandidates(c, key, 0, filters, healthy)
+			if err != nil {
+				return nil, selectedGroup, schedulingSelectError(c, err)
+			}
+			if alternative != nil {
+				// Recheck the host's current status after the pool selection,
+				// as ordinary routing does before handing the lease to the relay.
+				if err := ReserveSchedulingChannel(c, alternative, selectedGroup, modelName); err == nil {
+					PreserveChannelAffinity(c, id, "session_binding_recent_failure")
+					if usingGroup == "auto" {
+						common.SetContextKey(c, constant.ContextKeyAutoGroup, selectedGroup)
+					}
+					return alternative, selectedGroup, nil
+				}
+			}
+		}
+	}
+	if err := ReserveSchedulingChannel(c, preferred, selectedGroup, modelName); err != nil {
+		unavailable := errors.Is(err, scheduler.ErrNoEligibleChannel)
+		if apiErr, ok := errors.AsType[*types.NewAPIError](err); ok {
+			unavailable = apiErr.GetErrorCode() == "supplier_unavailable" || apiErr.GetErrorCode() == types.ErrorCode(dto.FilterAvailability)
+		}
+		if !strict && unavailable {
+			// A full or cooling channel keeps its binding; this request alone
+			// is served elsewhere and the session returns once it is admitted.
+			PreserveChannelAffinity(c, id, "session_binding_temporarily_unavailable")
+			return nil, "", nil
+		}
+		return nil, selectedGroup, schedulingSelectError(c, err)
+	}
+	if usingGroup == "auto" {
+		common.SetContextKey(c, constant.ContextKeyAutoGroup, selectedGroup)
+	}
+	c.Set(ginKeyChannelAffinityPreserved, false)
+	MarkChannelAffinityUsed(c, selectedGroup, id)
+	return preferred, selectedGroup, nil
 }
 
 // Origin-task pins report a fixed code so task polling can tell a retired

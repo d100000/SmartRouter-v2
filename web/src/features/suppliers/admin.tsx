@@ -29,7 +29,7 @@ import { ErrorState } from '@/components/error-state'
 import { SectionPageLayout } from '@/components/layout'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   SecureVerificationDialog,
@@ -55,7 +55,10 @@ import { SupplierEditor } from './components/supplier-editor'
 import { supplierChannelTemplates } from './lib/templates'
 import type { SupplierAccount } from './types'
 
-export function SuppliersAdmin() {
+export function SuppliersAdmin(props: {
+  create?: boolean
+  supplierId?: string
+}) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const user = useAuthStore((s) => s.auth.user)
@@ -69,7 +72,9 @@ export function SuppliersAdmin() {
   const [search, setSearch] = useState('')
   const [channelSupplier, setChannelSupplier] =
     useState<SupplierAccount | null>(null)
-  const [editing, setEditing] = useState<SupplierAccount | 'new' | null>(null)
+  const [editing, setEditing] = useState<SupplierAccount | 'new' | null>(
+    props.create && canManage ? 'new' : null
+  )
   const query = useQuery({
     meta: { errorRedirect: false },
     queryKey: [...supplyQueryKey, userId, 'admin', 'accounts'],
@@ -126,7 +131,22 @@ export function SuppliersAdmin() {
       {
         accessorKey: 'username',
         header: t('Dedicated account'),
-        cell: ({ row }) => row.original.username || t('Not bound'),
+        cell: ({ row }) =>
+          row.original.username ? (
+            <Link
+              to='/users'
+              search={{ filter: row.original.username, role: ['2'] }}
+              className={buttonVariants({
+                variant: 'link',
+                size: 'sm',
+                className: 'px-0',
+              })}
+            >
+              {row.original.username}
+            </Link>
+          ) : (
+            t('Not bound')
+          ),
       },
       {
         accessorKey: 'supply_enabled',
@@ -147,12 +167,18 @@ export function SuppliersAdmin() {
         ),
       },
       { accessorKey: 'max_channels', header: t('Maximum channels') },
-      { accessorKey: 'group', header: t('Group') },
       {
         id: 'actions',
         header: t('Actions'),
         cell: ({ row }) => (
           <div className='flex flex-wrap gap-1'>
+            <Link
+              to='/channels'
+              search={{ supplier: [row.original.id] }}
+              className={buttonVariants({ variant: 'outline', size: 'sm' })}
+            >
+              {t('Channels')}
+            </Link>
             <Button
               variant='outline'
               size='sm'
@@ -167,7 +193,7 @@ export function SuppliersAdmin() {
               disabled={!canManage || mutation.isPending}
               onClick={() => setEditing(row.original)}
             >
-              {t('Edit')}
+              {row.original.user_id ? t('Edit') : t('Open supplier account')}
             </Button>
             <Button
               variant='ghost'
@@ -201,12 +227,14 @@ export function SuppliersAdmin() {
   )
   const filteredSuppliers = useMemo(() => {
     const keyword = search.trim().toLocaleLowerCase()
-    return (query.data?.items ?? []).filter((supplier) =>
-      `${supplier.name} ${supplier.username ?? ''}`
-        .toLocaleLowerCase()
-        .includes(keyword)
+    return (query.data?.items ?? []).filter(
+      (supplier) =>
+        (!props.supplierId || supplier.id === props.supplierId) &&
+        `${supplier.name} ${supplier.username ?? ''}`
+          .toLocaleLowerCase()
+          .includes(keyword)
     )
-  }, [query.data?.items, search])
+  }, [query.data?.items, search, props.supplierId])
   const { table } = useDataTable({
     data: filteredSuppliers,
     columns,

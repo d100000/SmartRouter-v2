@@ -25,7 +25,13 @@ import type {
   SchedulingSnapshot,
 } from './types'
 
-type Response<T> = { success: boolean; message?: string; data: T }
+type Response<T> = {
+  success: boolean
+  message?: string
+  data: T
+  /** The value is saved but this instance has not applied it yet. */
+  sync_pending?: boolean
+}
 
 export async function getScheduling(
   filter: SchedulingFilter,
@@ -43,13 +49,15 @@ export async function saveSchedulingConfig(
   group: string,
   model: string,
   config: SchedulingConfig
-): Promise<void> {
+): Promise<{ syncPending: boolean }> {
   const response = await api.post<Response<unknown>>('/api/scheduling/config', {
     group,
     model,
     ...config,
   })
-  requireServerSuccess(response.data)
+  return {
+    syncPending: requireServerSuccess(response.data).sync_pending === true,
+  }
 }
 
 export async function recoverSchedulingChannel(

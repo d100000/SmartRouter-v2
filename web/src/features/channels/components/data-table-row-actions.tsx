@@ -99,13 +99,27 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const protectedConnection = Boolean(
     channel.owner_supplier_id || channel.secrets_write_only
   )
-  const isEnabled = isChannelEnabled(channel)
+  const supplierNeedsPublishing = Boolean(
+    channel.owner_supplier_id && channel.supplier_validated === false
+  )
+  const isEnabled = isChannelEnabled(channel) && !supplierNeedsPublishing
+  const statusActionLabel = supplierNeedsPublishing
+    ? t('Review supplier channel')
+    : t(isEnabled ? 'Disable' : 'Enable')
+
   const isMultiKey = isMultiKeyChannel(channel)
   const canEditSensitive = hasPermission(
     currentUser,
     ADMIN_PERMISSION_RESOURCES.CHANNEL,
     ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
   )
+  const canOperateSupplier =
+    !channel.owner_supplier_id ||
+    hasPermission(
+      currentUser,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.OPERATE
+    )
 
   const handleEdit = () => {
     if (channel.owner_supplier_id) {
@@ -117,12 +131,20 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   }
 
   const handleTest = () => {
+    if (channel.owner_supplier_id) {
+      setSupplierEditorOpen(true)
+      return
+    }
     setCurrentRow(channel)
     setOpen('test-channel')
   }
 
   const handleDirectTest = async (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation()
+    if (channel.owner_supplier_id) {
+      setSupplierEditorOpen(true)
+      return
+    }
     setIsTesting(true)
     try {
       await handleTestChannel(channel.id, { channelName: channel.name }, () => {
@@ -162,6 +184,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
     e?: React.MouseEvent<HTMLButtonElement>
   ) => {
     e?.stopPropagation()
+    if (supplierNeedsPublishing) {
+      setSupplierEditorOpen(true)
+      return
+    }
     setIsTogglingStatus(true)
     try {
       await handleToggleChannelStatus(channel.id, channel.status, queryClient)
@@ -190,9 +216,6 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
                   e.stopPropagation()
                   handleEdit()
                 }}
-                disabled={
-                  Boolean(channel.owner_supplier_id) && !canEditSensitive
-                }
                 aria-label={t('Edit')}
               />
             }
@@ -252,8 +275,11 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
               variant='ghost'
               size='icon-sm'
               onClick={handleToggleStatus}
-              disabled={isTogglingStatus}
-              aria-label={isEnabled ? t('Disable') : t('Enable')}
+              disabled={
+                isTogglingStatus ||
+                (!supplierNeedsPublishing && !canOperateSupplier)
+              }
+              aria-label={statusActionLabel}
               className={
                 isEnabled
                   ? 'text-destructive hover:text-destructive'
@@ -264,9 +290,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         >
           {statusIcon}
         </TooltipTrigger>
-        <TooltipContent>
-          {isEnabled ? t('Disable') : t('Enable')}
-        </TooltipContent>
+        <TooltipContent>{statusActionLabel}</TooltipContent>
       </Tooltip>
 
       <DropdownMenu>
@@ -283,10 +307,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         </DropdownMenuTrigger>
         <DropdownMenuContent align='end' className='w-48'>
           {layout === 'card' && (
-            <DropdownMenuItem
-              disabled={Boolean(channel.owner_supplier_id) && !canEditSensitive}
-              onClick={handleEdit}
-            >
+            <DropdownMenuItem onClick={handleEdit}>
               {t('Edit')}
               <DropdownMenuShortcut>
                 <Pencil size={16} />
@@ -379,8 +400,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
           {/* Copy Channel */}
           <DropdownMenuItem
-            disabled={!canEditSensitive}
-            onClick={canEditSensitive ? handleCopy : undefined}
+            disabled={!canEditSensitive || protectedConnection}
+            onClick={
+              canEditSensitive && !protectedConnection ? handleCopy : undefined
+            }
           >
             {t('Copy Channel')}
             <DropdownMenuShortcut>

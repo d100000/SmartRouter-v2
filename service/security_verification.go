@@ -2,11 +2,13 @@ package service
 
 import (
 	"crypto/hmac"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -24,7 +26,9 @@ const (
 	VerificationMethodSession                   = "session"
 	VerificationScopeChannelKeyRead             = "channel.key.read"
 	VerificationScopeSupplierChannelCredentials = "supplier.channel.credentials"
+	VerificationScopeSupplierChannelPublish     = "supplier.channel.publish"
 	VerificationScopeSupplierManage             = "supplier.manage"
+	VerificationScopeSupplierProvision          = "supplier.provision"
 	VerificationScopePasskeyRegister            = "passkey.register"
 	VerificationScopePasskeyDelete              = "passkey.delete"
 	VerificationScopeTwoFASetup                 = "2fa.setup"
@@ -83,6 +87,22 @@ type SupplierChannelCredentialsContext struct {
 type SupplierManageContext struct {
 	SupplierID string `json:"supplier_id"`
 	Version    int64  `json:"version"`
+}
+
+type SupplierProvisionContext struct {
+	SupplierID string `json:"supplier_id"`
+	Version    int64  `json:"version"`
+	Username   string `json:"username"`
+}
+
+type SupplierChannelPublishContext struct {
+	ChannelID int      `json:"channel_id"`
+	Version   int64    `json:"version"`
+	Revision  string   `json:"revision"`
+	Models    []string `json:"models"`
+	Groups    []string `json:"groups"`
+	Priority  int64    `json:"priority"`
+	Weight    uint     `json:"weight"`
 }
 
 type AccountBindingContext struct {
@@ -187,6 +207,26 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 		var context SupplierManageContext
 		if len(fields) != 2 || fields["supplier_id"] == nil || fields["version"] == nil || common.Unmarshal(operation.Context, &context) != nil ||
 			len(context.SupplierID) > 36 || context.SupplierID != strings.TrimSpace(context.SupplierID) || context.Version < 0 || context.SupplierID == "" && context.Version != 0 {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
+	case VerificationScopeSupplierProvision:
+		var context SupplierProvisionContext
+		if len(fields) != 3 || fields["supplier_id"] == nil || fields["version"] == nil || fields["username"] == nil ||
+			common.Unmarshal(operation.Context, &context) != nil || len(context.SupplierID) > 36 ||
+			context.SupplierID != strings.TrimSpace(context.SupplierID) || context.Version < 0 || context.SupplierID == "" && context.Version != 0 ||
+			context.Username == "" || context.Username != strings.TrimSpace(context.Username) || utf8.RuneCountInString(context.Username) > 20 {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
+	case VerificationScopeSupplierChannelPublish:
+		var context SupplierChannelPublishContext
+		if len(fields) != 7 || fields["priority"] == nil || fields["weight"] == nil || common.Unmarshal(operation.Context, &context) != nil ||
+			context.ChannelID <= 0 || context.Version <= 0 || len(context.Revision) != 64 ||
+			len(context.Models) == 0 || len(context.Models) > 100 || len(context.Groups) == 0 || len(context.Groups) > 64 {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		if _, err := hex.DecodeString(context.Revision); err != nil {
 			return VerificationBinding{}, ErrVerificationContextInvalid
 		}
 		normalized = context
@@ -353,6 +393,7 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		}
 	case VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
 		VerificationScopeSupplierChannelCredentials, VerificationScopeSupplierManage,
+		VerificationScopeSupplierChannelPublish, VerificationScopeSupplierProvision,
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenUpdate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
@@ -412,6 +453,15 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 	if scope == VerificationScopeSupplierManage && state.Role < common.RoleAdminUser {
 		return nil, ErrVerificationForbidden
 	}
+	if scope == VerificationScopeSupplierProvision || scope == VerificationScopeSupplierChannelPublish {
+		if state.Role < common.RoleAdminUser || !authz.Can(identity.UserID, state.Role, authz.ChannelSensitiveWrite) {
+			return nil, ErrVerificationForbidden
+		}
+		if scope == VerificationScopeSupplierChannelPublish &&
+			(!authz.Can(identity.UserID, state.Role, authz.ChannelWrite) || !authz.Can(identity.UserID, state.Role, authz.ChannelOperate)) {
+			return nil, ErrVerificationForbidden
+		}
+	}
 	if scope == VerificationScopeSupplierChannelCredentials {
 		if state.Role != common.RoleSupplierUser && !authz.Can(identity.UserID, state.Role, authz.ChannelSensitiveWrite) {
 			return nil, ErrVerificationForbidden
@@ -433,6 +483,7 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 			switch scope {
 			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 				VerificationScopeSupplierChannelCredentials, VerificationScopeSupplierManage,
+				VerificationScopeSupplierChannelPublish, VerificationScopeSupplierProvision,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 				VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
 				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:

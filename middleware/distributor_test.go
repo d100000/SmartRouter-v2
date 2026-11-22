@@ -15,8 +15,12 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/scheduler"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -501,4 +505,188 @@ func TestSharedEndpointRebindsToBoundNewAPIExtension(t *testing.T) {
 	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
 	assert.Equal(t, "alpha", c.GetString("task_plugin_key"), "the first bound candidate executes regardless of the earlier pin")
 	assert.Equal(t, "alpha", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).Plugin.Meta.Key)
+}
+
+// The session binding moves only after its channel actually failed upstream
+// and another channel then served the whole request. Temporary capacity
+// bypasses and streams that failed after their headers keep the binding.
+func TestDistributeSessionBindingWriteBack(t *testing.T) {
+	const modelName = "distribute-binding-model"
+	const boundID, otherID = 6101, 6102
+	previousDB, previousCache, previousRetry := model.DB, common.MemoryCacheEnabled, common.RetryTimes
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	require.NoError(t, model.AutoMigrateUpstreamCredentialSchema(db))
+	require.NoError(t, model.AutoMigrateChannelLimitSchema(db))
+	model.DB, common.MemoryCacheEnabled, common.RetryTimes = db, true, 1
+	previousEngine := scheduler.Default
+	scheduler.Default = scheduler.New()
+	common.OptionMapRWMutex.Lock()
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	previousScheduling := common.OptionMap["SchedulingConfig"]
+	common.OptionMap["SchedulingConfig"] = `[{"group":"default","model":"` + modelName + `","enabled":true,"target_success_rate":0.95,"target_ttft_ms":3000,"default_capacity":2,"channel_overrides":[]}]`
+	common.OptionMapRWMutex.Unlock()
+	affinity := operation_setting.GetChannelAffinitySetting()
+	previousAffinity := *affinity
+	*affinity = operation_setting.ChannelAffinitySetting{
+		Enabled: true, DefaultTTLSeconds: 3600, SwitchOnSuccess: true,
+		Rules: []operation_setting.ChannelAffinityRule{{
+			Name: t.Name(), ModelRegex: []string{".*"}, SessionMode: "prefer",
+			KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+		}},
+	}
+	t.Cleanup(func() {
+		*affinity = previousAffinity
+		scheduler.Default = previousEngine
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap["SchedulingConfig"] = previousScheduling
+		common.OptionMapRWMutex.Unlock()
+		model.DB, common.MemoryCacheEnabled, common.RetryTimes = previousDB, previousCache, previousRetry
+		if sqlDB, err := db.DB(); err == nil {
+			require.NoError(t, sqlDB.Close())
+		}
+	})
+	priority, weight := int64(0), uint(100)
+	for _, id := range []int{boundID, otherID} {
+		require.NoError(t, db.Create(&model.Channel{Id: id, Type: constant.ChannelTypeOpenAI, Key: fmt.Sprintf("key-%d", id), Status: common.ChannelStatusEnabled,
+			Name: fmt.Sprintf("channel-%d", id), Weight: &weight, Models: modelName, Group: "default", Priority: &priority}).Error)
+		require.NoError(t, db.Create(&model.Ability{Group: "default", Model: modelName, ChannelId: id, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	}
+	model.InitChannelCache()
+
+	// outcome describes what the relay did for the channel Distribute chose.
+	type outcome int
+	const (
+		succeeded outcome = iota
+		streamFailedAfterHeaders
+		failedThenRetrySucceeded
+		delayedSuccess
+	)
+	var finishOtherRequest func()
+	send := func(session string, result outcome) int {
+		selected := 0
+		router := gin.New()
+		router.POST("/v1/chat/completions", func(c *gin.Context) {
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+		}, Distribute(), func(c *gin.Context) {
+			selected = c.GetInt("channel_id")
+			channel := &model.Channel{Id: selected}
+			policy := service.RequestPolicy(c)
+			policy.BeginAttempt(channel, "default")
+			switch result {
+			case succeeded:
+				service.MarkRequestPolicySuccess(c, nil)
+			case delayedSuccess:
+				finishOtherRequest()
+				service.MarkRequestPolicySuccess(c, nil)
+			case streamFailedAfterHeaders:
+				status := relaycommon.NewStreamStatus()
+				status.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("upstream stream broke"))
+				service.MarkRequestPolicySuccess(c, status)
+			case failedThenRetrySucceeded:
+				retry := otherID
+				if selected == otherID {
+					retry = boundID
+				}
+				c.Set("channel_id", retry)
+				policy.BeginAttempt(&model.Channel{Id: retry}, "default")
+				service.MarkRequestPolicySuccess(c, nil)
+			}
+			c.String(http.StatusOK, "data: {}\n\n")
+		})
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+modelName+`"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Session", t.Name()+session)
+		router.ServeHTTP(httptest.NewRecorder(), request)
+		return selected
+	}
+	occupyBound := func() func() {
+		busy, _ := gin.CreateTestContext(httptest.NewRecorder())
+		busy.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		channel, err := model.CacheGetChannelForRouting(boundID)
+		require.NoError(t, err)
+		require.NoError(t, service.ReserveSchedulingChannel(busy, channel, "default", modelName))
+		return func() { service.EndSchedulingRequest(busy) }
+	}
+	// Selection among equal new channels is random; a real failure on the
+	// other channel moves the session to the requested one deterministically.
+	bindTo := func(t *testing.T, session string, id int) {
+		if send(session, succeeded) != id {
+			send(session, failedThenRetrySucceeded)
+		}
+		require.Equal(t, id, send(session, succeeded))
+	}
+
+	t.Run("capacity bypass keeps the binding", func(t *testing.T) {
+		bindTo(t, "capacity", boundID)
+		releaseFirst, releaseSecond := occupyBound(), occupyBound()
+		for range 3 {
+			assert.Equal(t, otherID, send("capacity", succeeded), "a full bound channel serves elsewhere")
+		}
+		releaseFirst()
+		releaseSecond()
+		assert.Equal(t, boundID, send("capacity", succeeded), "the session returns once its channel is admitted")
+	})
+	t.Run("stream failure after headers does not bind", func(t *testing.T) {
+		require.NotZero(t, send("broken-stream", streamFailedAfterHeaders))
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		c.Request.Header.Set("X-Session", t.Name()[:strings.Index(t.Name(), "/")]+"broken-stream")
+		_, found := service.GetPreferredChannelByAffinity(c, modelName, "default")
+		assert.False(t, found, "a stream that failed after its headers must not create a binding")
+	})
+	t.Run("recent availability failure is bypassed without rebinding", func(t *testing.T) {
+		bindTo(t, "health-gate", boundID)
+		// The injected failure must not leak into later subtests.
+		t.Cleanup(func() { scheduler.Default = scheduler.New() })
+		key := scheduler.Key{Group: "default", Model: modelName}
+		for id, outcome := range map[int]scheduler.Outcome{boundID: {ChannelFailure: true, CooldownFailure: true}, otherID: {Success: true}} {
+			request := scheduler.Default.BeginRequest(key, fmt.Sprintf("health-gate-%d", id), false)
+			attempt, err := scheduler.Default.ReserveCandidate(request, scheduler.Candidate{ID: id, Status: common.ChannelStatusEnabled}, true)
+			require.NoError(t, err)
+			scheduler.Default.StartAttempt(attempt)
+			scheduler.Default.FinishAttempt(attempt, outcome)
+			scheduler.Default.EndRequest(request)
+		}
+		assert.Equal(t, otherID, send("health-gate", succeeded), "a recently failing bound channel yields to a healthy one")
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		c.Request.Header.Set("X-Session", t.Name()[:strings.Index(t.Name(), "/")]+"health-gate")
+		bound, found := service.GetPreferredChannelByAffinity(c, modelName, "default")
+		require.True(t, found)
+		assert.Equal(t, boundID, bound, "the binding is kept")
+	})
+	t.Run("real failure rebinds and never reverts", func(t *testing.T) {
+		bindTo(t, "rebind", boundID)
+		assert.Equal(t, boundID, send("rebind", failedThenRetrySucceeded))
+		for range 3 {
+			assert.Equal(t, otherID, send("rebind", succeeded), "the session stays on the channel that served it")
+		}
+	})
+	t.Run("first binding uses successful retry even with switching disabled", func(t *testing.T) {
+		affinity.SwitchOnSuccess = false
+		t.Cleanup(func() { affinity.SwitchOnSuccess = true })
+		first := send("new-session-retry", failedThenRetrySucceeded)
+		require.Contains(t, []int{boundID, otherID}, first)
+		success := boundID
+		if first == boundID {
+			success = otherID
+		}
+		require.Equal(t, success, send("new-session-retry", succeeded))
+		require.Equal(t, success, send("new-session-retry", failedThenRetrySucceeded))
+		assert.Equal(t, success, send("new-session-retry", succeeded), "an existing binding respects the switch")
+	})
+	t.Run("a late success cannot undo another requests switch", func(t *testing.T) {
+		const session = "overlapping-requests"
+		bindTo(t, session, boundID)
+		finishOtherRequest = func() {
+			require.Equal(t, boundID, send(session, failedThenRetrySucceeded))
+			require.Equal(t, otherID, send(session, succeeded))
+		}
+		require.Equal(t, boundID, send(session, delayedSuccess))
+		assert.Equal(t, otherID, send(session, succeeded), "the in-flight request to A must not overwrite B")
+	})
 }

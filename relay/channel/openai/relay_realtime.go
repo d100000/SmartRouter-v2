@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -25,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/tokenkit"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
@@ -41,7 +43,27 @@ type realtimeGeneration struct {
 	eventID, clientEventID, responseID string
 	audioBytes                         int64
 	billed                             bool
+	// sent marks a generation upstream accepted for execution. Once sent it
+	// is charged even when the session ends before response.done.
+	sent                 bool
+	promptEstimate       int
+	outputBytesPerSecond int64
+	outputText           strings.Builder
+	transcript           strings.Builder
 }
+
+// deliveredOutput reports whether any output of the generation reached the
+// client.
+func (generation *realtimeGeneration) deliveredOutput() bool {
+	return generation.audioBytes > 0 || generation.outputText.Len() > 0 || generation.transcript.Len() > 0
+}
+
+// markSent records that the response.create reached upstream.
+func (generation *realtimeGeneration) markSent(controls realtimeTurnControl) {
+	generation.sent = true
+	generation.outputBytesPerSecond = controls.outputBytesPerSecond
+}
+
 type realtimeTurnControl struct {
 	enabled, create, interrupt bool
 	idle                       time.Duration
@@ -174,6 +196,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				finishRealtimeGeneration(generation, nil, "", types.NewError(err, types.ErrorCodeDoRequestFailed))
 				return nil, &dto.RealtimeUsage{}
 			}
+			generation.markSent(controls)
 			pending = append(pending, generation)
 		case frame := <-incoming:
 			if frame.err != nil {
@@ -233,6 +256,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					finishRealtimeGeneration(generation, nil, "", types.NewError(err, types.ErrorCodeDoRequestFailed))
 					return nil, &dto.RealtimeUsage{}
 				}
+				generation.markSent(controls)
 				pending = append(pending, generation)
 				idle = nil
 				timer.Stop()
@@ -284,6 +308,9 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 			}
 			event := gjson.ParseBytes(frame.body)
 			kind := event.Get("type").String()
+			if generation := transcriber.jobs[frame.jobID]; generation != nil && strings.HasSuffix(kind, ".delta") {
+				generation.transcript.WriteString(event.Get("delta").String())
+			}
 			if strings.HasSuffix(kind, ".completed") || strings.HasSuffix(kind, ".failed") {
 				status := "completed"
 				if strings.HasSuffix(kind, ".failed") {
@@ -313,6 +340,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 			}
 			event := gjson.ParseBytes(frame.body)
 			eventType := event.Get("type").String()
+			deliveredCompletion := false
 			switch eventType {
 			case "session.created":
 				var err error
@@ -377,6 +405,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						finishRealtimeGeneration(generation, nil, "", types.NewError(err, types.ErrorCodeDoRequestFailed))
 						return nil, &dto.RealtimeUsage{}
 					} else {
+						generation.markSent(controls)
 						pending = append(pending, generation)
 					}
 				}
@@ -397,6 +426,14 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						generation.audioBytes += int64(len(data))
 					}
 				}
+			case "response.text.delta", "response.output_text.delta", "response.function_call_arguments.delta":
+				if generation := active[event.Get("response_id").String()]; generation != nil {
+					generation.outputText.WriteString(event.Get("delta").String())
+				}
+			case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+				if generation := active[event.Get("response_id").String()]; generation != nil {
+					generation.transcript.WriteString(event.Get("delta").String())
+				}
 			case "response.done":
 				id := event.Get("response.id").String()
 				if seenCompletions[id] {
@@ -413,15 +450,25 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					delete(seenCompletions, completionOrder[0])
 					completionOrder = completionOrder[1:]
 				}
+				deliveredCompletion = event.Get("response.status").String() == "completed" &&
+					event.Get("response.error").Type == gjson.Null && event.Get("response.status_details.error").Type == gjson.Null
 				usage := ParseRealtimeUsage(event.Get("response.usage"))
+				if usage == nil && event.Get("response.usage").Exists() && event.Get("response.usage").Type != gjson.Null {
+					// Inconsistent usage still proves the generation ran: settle by
+					// its usable totals instead of refunding it.
+					usage = realtimeFallbackUsage(event.Get("response.usage"))
+					generation.info.RealtimeSettlement = &relaycommon.RealtimeSettlement{Reason: "inconsistent_usage", UsageInconsistent: true}
+					logger.LogWarn(generation.context, common.LogText("realtime response usage is inconsistent, settling by its usable totals: response_id=%s usable=%t", id, usage != nil))
+				}
 				if plugins != nil {
-					plugins.SettleResponse(service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey), usage, generation.info, func() int {
+					allowed := plugins.SettleResponse(service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey), usage, generation.info, func() int {
 						finishRealtimeGeneration(generation, usage, event.Get("response.status").String(), nil)
 						if consumed, ok := common.GetContextKeyType[*model.RecordConsumeLogParams](generation.context, constant.ContextKeyConsumeLog); ok && consumed != nil {
 							return consumed.Quota
 						}
 						return 0
 					})
+					deliveredCompletion = deliveredCompletion && allowed
 				} else {
 					finishRealtimeGeneration(generation, usage, event.Get("response.status").String(), nil)
 				}
@@ -459,6 +506,8 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						continue
 					}
 					pending = append(pending[:index], pending[index+1:]...)
+					// Upstream refused the response.create before running it.
+					generation.sent = false
 					finishRealtimeGeneration(generation, nil, "failed", nil)
 					frame.body, _ = sjson.SetBytes(frame.body, "error.event_id", generation.clientEventID)
 					break
@@ -482,6 +531,9 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				}
 			} else if err := writeRealtimeFrame(client, service.RedactUpstreamWebSocketCredential(frame.body, info.ApiKey)); err != nil {
 				return nil, &dto.RealtimeUsage{}
+			}
+			if deliveredCompletion {
+				service.RecordChannelAffinity(c, info.ChannelId)
 			}
 		}
 	}
@@ -808,6 +860,7 @@ func prepareRealtimeGeneration(parent *gin.Context, connection *relaycommon.Rela
 		if prompt != nil {
 			estimated = int(*prompt)
 		}
+		generation.promptEstimate = estimated
 		price, err := helper.ModelPriceHelper(c, info, estimated, &types.TokenCountMeta{})
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest)
@@ -920,11 +973,30 @@ func finishRealtimeGeneration(generation *realtimeGeneration, usage *dto.Realtim
 		// Duration-based ASR was settled independently of text-token usage.
 	} else if usage != nil {
 		service.PostWssConsumeQuota(c, info, info.OriginModelName, usage, nil)
+	} else if generation.sent && (status != "failed" || generation.deliveredOutput()) {
+		// The generation ran upstream but its usage is unusable or never
+		// arrived (disconnect, timeout, write or protocol failure): charge the
+		// reserved input plus a local estimate of the output delivered so far.
+		// A failed generation without usage or delivered output is an upstream
+		// error for that request and falls through to the refund below.
+		estimate := realtimeEstimatedUsage(generation)
+		if info.RealtimeSettlement != nil {
+			estimate.settlement.UsageInconsistent = info.RealtimeSettlement.UsageInconsistent
+		}
+		if status == "" {
+			estimate.settlement.Reason = "session_ended_before_response_done"
+		}
+		info.RealtimeSettlement = estimate.settlement
+		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+		logger.LogWarn(c, common.LogText("realtime generation settled by local estimate: reason=%s status=%s input=%d text_output=%d audio_output=%d audio_bytes=%d",
+			estimate.settlement.Reason, status, estimate.settlement.ReservedInput, estimate.settlement.EstimatedText, estimate.settlement.EstimatedAudio, estimate.settlement.AudioOutputBytes))
+		service.PostWssConsumeQuota(c, info, info.OriginModelName, estimate.usage, nil)
 	} else if status == "completed" || status == "incomplete" {
 		// A delivered response with unusable usage retains the frozen customer
 		// reservation. Procurement and text-token actuals remain unknown.
 		service.PostWssConsumeQuota(c, info, info.OriginModelName, nil, nil)
 	} else if info.Billing != nil {
+		// Only a generation that never ran upstream is refunded.
 		info.Billing.Refund(c)
 	}
 	service.FinishSchedulingAttempt(c, info, apiErr)
@@ -934,4 +1006,70 @@ func finishRealtimeGeneration(generation *realtimeGeneration, usage *dto.Realtim
 	}
 	service.CompleteOverviewRelay(info)
 	service.EndSchedulingRequest(c)
+}
+
+// realtimeFallbackUsage keeps the usable totals of usage that failed the
+// strict consistency checks. Modality details are clamped to the totals;
+// input not attributed to a modality is charged as text input.
+func realtimeFallbackUsage(value gjson.Result) *dto.RealtimeUsage {
+	count := func(path string, limit int) int {
+		field := value.Get(path)
+		if field.Type != gjson.Number || field.Num < 0 || math.Trunc(field.Num) != field.Num {
+			return 0
+		}
+		return int(min(field.Num, float64(limit)))
+	}
+	input, output := count("input_tokens", common.MaxQuota), count("output_tokens", common.MaxQuota)
+	if input > common.MaxQuota-output {
+		output = common.MaxQuota - input
+	}
+	if input == 0 && output == 0 {
+		return nil
+	}
+	usage := &dto.RealtimeUsage{InputTokens: input, OutputTokens: output, TotalTokens: input + output}
+	details := &usage.InputTokenDetails
+	details.AudioTokens = count("input_token_details.audio_tokens", input)
+	details.ImageTokens = count("input_token_details.image_tokens", input-details.AudioTokens)
+	details.TextTokens = input - details.AudioTokens - details.ImageTokens
+	details.CachedTokens = count("input_token_details.cached_tokens", input)
+	usage.OutputTokenDetails.AudioTokens = count("output_token_details.audio_tokens", output)
+	usage.OutputTokenDetails.TextTokens = output - usage.OutputTokenDetails.AudioTokens
+	return usage
+}
+
+type realtimeEstimate struct {
+	usage      *dto.RealtimeUsage
+	settlement *relaycommon.RealtimeSettlement
+}
+
+// realtimeEstimatedUsage prices a generation without usable upstream usage as
+// its reserved input plus the output delivered so far. Text is counted with
+// the token estimator. Audio uses the realtime output-audio token rate of
+// service.CountAudioTokenOutput (200 tokens per 0.24 minute) applied to the
+// delivered duration; the bytes and seconds are logged for audit.
+func realtimeEstimatedUsage(generation *realtimeGeneration) realtimeEstimate {
+	info := generation.info
+	text := generation.outputText.String()
+	if generation.audioBytes == 0 {
+		// A transcript accompanies audio output; it is billed as text only
+		// when no audio payload was observed.
+		text += generation.transcript.String()
+	}
+	settlement := &relaycommon.RealtimeSettlement{Reason: "unusable_usage", ReservedInput: max(generation.promptEstimate, 0), AudioOutputBytes: generation.audioBytes}
+	if strings.TrimSpace(text) != "" {
+		settlement.EstimatedText = tokenkit.Estimate(info.UpstreamModelName, text)
+	}
+	if generation.audioBytes > 0 && generation.outputBytesPerSecond > 0 {
+		settlement.AudioOutputSeconds = float64(generation.audioBytes) / float64(generation.outputBytesPerSecond)
+		settlement.EstimatedAudio = service.AudioOutputTokensForSeconds(settlement.AudioOutputSeconds)
+	}
+	input := min(settlement.ReservedInput, common.MaxQuota)
+	audio := min(settlement.EstimatedAudio, common.MaxQuota-input)
+	textOutput := min(settlement.EstimatedText, common.MaxQuota-input-audio)
+	usage := &dto.RealtimeUsage{
+		InputTokens: input, OutputTokens: textOutput + audio, TotalTokens: input + textOutput + audio,
+		InputTokenDetails:  dto.InputTokenDetails{TextTokens: input},
+		OutputTokenDetails: dto.OutputTokenDetails{TextTokens: textOutput, AudioTokens: audio},
+	}
+	return realtimeEstimate{usage: usage, settlement: settlement}
 }

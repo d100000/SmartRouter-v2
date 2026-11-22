@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -576,9 +577,10 @@ func TestUpdateVideoTasksSlowChannelDoesNotBlockOtherChannels(t *testing.T) {
 	fastFirst := seedPollingTask(t, fastChannelID, "task_public_fast_1", "upstream_fast_parallel_1")
 	fastSecond := seedPollingTask(t, fastChannelID, "task_public_fast_2", "upstream_fast_parallel_2")
 
+	slowID, fastFirstID, fastSecondID := slowTask.GetUpstreamTaskID(), fastFirst.GetUpstreamTaskID(), fastSecond.GetUpstreamTaskID()
 	adaptor := &taskPollingFetchAdaptor{
 		fetched:      make(chan string, 4),
-		blockTaskID:  slowTask.GetUpstreamTaskID(),
+		blockTaskID:  slowID,
 		blockStarted: make(chan struct{}),
 		releaseBlock: make(chan struct{}),
 	}
@@ -588,25 +590,29 @@ func TestUpdateVideoTasksSlowChannelDoesNotBlockOtherChannels(t *testing.T) {
 			close(adaptor.releaseBlock)
 		})
 	}
-	t.Cleanup(releaseBlockedTask)
 	previousFactory := GetTaskAdaptorFunc
 	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
-	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
-
-	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		releaseBlockedTask()
+		<-done
+		GetTaskAdaptorFunc = previousFactory
+	})
+	var pollErr error
 	gopool.Go(func() {
-		errCh <- UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), map[int][]string{
+		defer close(done)
+		pollErr = UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), map[int][]string{
 			slowChannelID: {
-				slowTask.GetUpstreamTaskID(),
+				slowID,
 			},
 			fastChannelID: {
-				fastFirst.GetUpstreamTaskID(),
-				fastSecond.GetUpstreamTaskID(),
+				fastFirstID,
+				fastSecondID,
 			},
 		}, map[string]*model.Task{
-			slowTask.GetUpstreamTaskID():   slowTask,
-			fastFirst.GetUpstreamTaskID():  fastFirst,
-			fastSecond.GetUpstreamTaskID(): fastSecond,
+			slowID:       slowTask,
+			fastFirstID:  fastFirst,
+			fastSecondID: fastSecond,
 		})
 	})
 
@@ -616,19 +622,22 @@ func TestUpdateVideoTasksSlowChannelDoesNotBlockOtherChannels(t *testing.T) {
 		t.Fatal("slow channel did not start blocking")
 	}
 
-	require.Eventually(t, func() bool {
-		fetchedTaskIDs := adaptor.fetchedTaskIDs()
-		return len(fetchedTaskIDs) == 2 &&
-			fetchedTaskIDs[0] == fastFirst.GetUpstreamTaskID() &&
-			fetchedTaskIDs[1] == fastSecond.GetUpstreamTaskID()
-	}, 500*time.Millisecond, 10*time.Millisecond)
+	for _, want := range []string{fastFirstID, fastSecondID} {
+		select {
+		case got := <-adaptor.fetched:
+			require.Equal(t, want, got)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("fast channel did not fetch %s while slow channel was blocked", want)
+		}
+	}
 
 	releaseBlockedTask()
-	require.NoError(t, <-errCh)
+	<-done
+	require.NoError(t, pollErr)
 	assert.ElementsMatch(t, []string{
-		slowTask.GetUpstreamTaskID(),
-		fastFirst.GetUpstreamTaskID(),
-		fastSecond.GetUpstreamTaskID(),
+		slowID,
+		fastFirstID,
+		fastSecondID,
 	}, adaptor.fetchedTaskIDs())
 }
 
@@ -845,6 +854,7 @@ type scriptedPollingAdaptor struct {
 	fetchErr   error
 	parse      *relaycommon.TaskInfo
 	parseErr   error
+	adjust     int
 }
 
 func (a *scriptedPollingAdaptor) Init(*relaycommon.RelayInfo) {}
@@ -872,7 +882,7 @@ func (a *scriptedPollingAdaptor) ParseTaskResult(*model.Task, *http.Response, []
 	return &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}, nil
 }
 func (a *scriptedPollingAdaptor) AdjustBillingOnComplete(*model.Task, *relaycommon.TaskInfo) int {
-	return 0
+	return a.adjust
 }
 
 type scriptedBatchPollingAdaptor struct {
@@ -1285,14 +1295,15 @@ func TestTaskProcurementEstimateAndUnknownCompletion(t *testing.T) {
 			ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, true)
 			ObserveTaskChannelSnapshot(snapshot, &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}, true)
 			assert.Equal(t, "succeeded", snapshot.Observation.Status, "late stale running status must not revoke terminal evidence")
+			// Without completion facts the customer settlement evaluates the frozen
+			// expression on the submit facts; procurement records that same amount.
+			want := int64(1500000000)
 			if strings.Contains(expression, `u(`) {
-				assert.Nil(t, snapshot.Observation.CostUSDNano, "a request estimate is not actual completion usage")
-				assert.True(t, snapshot.NeedsReconciliation(), "terminal status alone cannot stop late cost reconciliation")
-			} else {
-				require.NotNil(t, snapshot.Observation.CostUSDNano)
-				assert.EqualValues(t, 1500000000, *snapshot.Observation.CostUSDNano)
-				assert.False(t, snapshot.NeedsReconciliation())
+				want = 15000000000
 			}
+			require.NotNil(t, snapshot.Observation.CostUSDNano)
+			assert.EqualValues(t, want, *snapshot.Observation.CostUSDNano)
+			assert.False(t, snapshot.NeedsReconciliation())
 		})
 	}
 	for _, tc := range []struct {
@@ -1444,4 +1455,442 @@ func TestTaskCredentialLookupFailuresRespectRefundThreshold(t *testing.T) {
 	poll(&stale)
 	assert.Equal(t, 11_000, getUserQuota(t, userID), "a stale poll cannot refund twice")
 	assert.EqualValues(t, 1, countLogs(t))
+}
+
+// A refunded FAILURE whose vendor finishes later is charged back exactly what
+// the refund returned and then settles as a normal SUCCESS would. Stale
+// pollers cannot charge twice and a later FAILURE cannot refund the result.
+// The claims are conditional updates, so this runs on every database.
+func TestRefundedFailureLateSuccessIsChargedOnceDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		for _, source := range []string{BillingSourceWallet, BillingSourceSubscription} {
+			t.Run(dialect+"/"+source, func(t *testing.T) {
+				var driver gorm.Dialector
+				switch dialect {
+				case "sqlite":
+					driver = sqlite.Open(":memory:")
+				case "mysql":
+					if os.Getenv("TEST_MYSQL_DSN") == "" {
+						t.Skip("TEST_MYSQL_DSN not configured")
+					}
+					driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+				case "postgres":
+					if os.Getenv("TEST_POSTGRES_DSN") == "" {
+						t.Skip("TEST_POSTGRES_DSN not configured")
+					}
+					driver = postgres.New(postgres.Config{DSN: os.Getenv("TEST_POSTGRES_DSN"), PreferSimpleProtocol: true})
+				}
+				db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "task_recharge_test_"}, Logger: logger.Default.LogMode(logger.Silent)})
+				require.NoError(t, err)
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				sqlDB.SetMaxOpenConns(1)
+				oldDB, oldLog, oldMain, oldLogType := model.DB, model.LOG_DB, common.MainDatabaseType(), common.LogDatabaseType()
+				model.DB, model.LOG_DB = db, db
+				common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+				schemas := []any{&model.Task{}, &model.User{}, &model.Token{}, &model.Log{}, &model.Channel{}, &model.UserSubscription{}}
+				t.Cleanup(func() {
+					require.NoError(t, db.Migrator().DropTable(schemas...))
+					model.DB, model.LOG_DB = oldDB, oldLog
+					common.SetDatabaseTypes(oldMain, oldLogType)
+					require.NoError(t, sqlDB.Close())
+				})
+				for range 2 {
+					require.NoError(t, db.AutoMigrate(schemas...))
+				}
+
+				const userID, tokenID, channelID, subID = 701, 701, 701, 701
+				const walletQuota, tokenRemain, preConsumed, actual = 10_000, 7_000, 3_000, 2_000
+				const subTotal, subUsed int64 = 100_000, 50_000
+				seedUser(t, userID, walletQuota)
+				seedToken(t, tokenID, userID, "sk-late-success", tokenRemain)
+				seedChannel(t, channelID)
+				seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
+				subscriptionID := 0
+				if source == BillingSourceSubscription {
+					seedSubscription(t, subID, userID, subTotal, subUsed)
+					subscriptionID = subID
+				}
+				// funded reports the funding source balance relative to its
+				// state after the submission charge.
+				funded := func() int {
+					if source == BillingSourceSubscription {
+						return int(subUsed - getSubscriptionUsed(t, subID))
+					}
+					return getUserQuota(t, userID) - walletQuota
+				}
+				task := makeTask(userID, channelID, preConsumed, tokenID, source, subscriptionID)
+				task.TaskID = "late_success_" + source
+				task.PrivateData.UpstreamTaskID = "upstream_late_success"
+				require.NoError(t, model.DB.Create(task).Error)
+				ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", Status: common.ChannelStatusEnabled}
+				reload := func() *model.Task {
+					var stored model.Task
+					require.NoError(t, model.DB.First(&stored, task.ID).Error)
+					return &stored
+				}
+				poll := func(task *model.Task, adaptor *scriptedPollingAdaptor) {
+					require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+				}
+
+				poll(task, &scriptedPollingAdaptor{statusCode: http.StatusNotFound})
+				stored := reload()
+				require.EqualValues(t, model.TaskStatusFailure, stored.Status)
+				assert.Zero(t, stored.Quota)
+				assert.Equal(t, preConsumed, stored.RefundedQuota)
+				assert.Equal(t, preConsumed, funded())
+
+				first, second := reload(), reload()
+				success := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, adjust: actual}
+				poll(first, success)
+				poll(second, success)
+
+				stored = reload()
+				assert.EqualValues(t, model.TaskStatusSuccess, stored.Status)
+				assert.Equal(t, actual, stored.Quota, "the late success settles from its result exactly as a normal success")
+				assert.Zero(t, stored.RefundedQuota)
+				assert.Equal(t, preConsumed-actual, funded(), "charged back once, then settled to the actual cost")
+				assert.Equal(t, tokenRemain+preConsumed-actual, getTokenRemainQuota(t, tokenID))
+				usedQuota, requestCount := getUserUsageAccounting(t, userID)
+				assert.Equal(t, actual, usedQuota)
+				assert.Equal(t, 1, requestCount)
+				assert.Equal(t, int64(actual), getChannelUsedQuota(t, channelID))
+				var logs []model.Log
+				require.NoError(t, model.LOG_DB.Order("id").Find(&logs).Error)
+				require.Len(t, logs, 3)
+				assert.Equal(t, []int{model.LogTypeRefund, model.LogTypeConsume, model.LogTypeRefund}, []int{logs[0].Type, logs[1].Type, logs[2].Type})
+				assert.Equal(t, []int{preConsumed, preConsumed, preConsumed - actual}, []int{logs[0].Quota, logs[1].Quota, logs[2].Quota})
+
+				poll(reload(), &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "late failure"}})
+				stored = reload()
+				assert.EqualValues(t, model.TaskStatusSuccess, stored.Status, "a delivered result is never revoked")
+				assert.Equal(t, actual, stored.Quota)
+				assert.Equal(t, preConsumed-actual, funded())
+				assert.EqualValues(t, 3, countLogs(t))
+			})
+		}
+	}
+}
+
+func TestTaskFailureLateSuccessBilling(t *testing.T) {
+	const userID, tokenID, channelID = 711, 711, 711
+	const walletQuota, tokenRemain, preConsumed, actual = 10_000, 7_000, 3_000, 2_000
+	ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", Status: common.ChannelStatusEnabled}
+	setup := func(t *testing.T, quota int) *model.Task {
+		truncate(t)
+		seedUser(t, userID, walletQuota)
+		seedToken(t, tokenID, userID, "sk-late-billing", tokenRemain)
+		seedChannel(t, channelID)
+		seedChargedAccounting(t, userID, channelID, tokenID, preConsumed, 1)
+		task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+		task.TaskID = "late_billing"
+		task.Status = model.TaskStatusFailure
+		task.Progress = "100%"
+		task.PrivateData.UpstreamTaskID = "upstream_late_billing"
+		require.NoError(t, model.DB.Create(task).Error)
+		return task
+	}
+	reload := func(t *testing.T, task *model.Task) *model.Task {
+		var stored model.Task
+		require.NoError(t, model.DB.First(&stored, task.ID).Error)
+		return &stored
+	}
+	success := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}, adjust: actual}
+
+	t.Run("an unrefunded failure settles normally", func(t *testing.T) {
+		// The refund of this FAILURE failed, so it still charges preConsumed.
+		task := setup(t, preConsumed)
+		require.NoError(t, updateVideoSingleTask(context.Background(), success, ch, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+		stored := reload(t, task)
+		assert.EqualValues(t, model.TaskStatusSuccess, stored.Status)
+		assert.Equal(t, actual, stored.Quota)
+		assert.Equal(t, walletQuota+preConsumed-actual, getUserQuota(t, userID))
+		log := getLastLog(t)
+		require.NotNil(t, log)
+		assert.Equal(t, model.LogTypeRefund, log.Type)
+		assert.Equal(t, preConsumed-actual, log.Quota)
+		assert.EqualValues(t, 1, countLogs(t))
+	})
+
+	t.Run("a refund racing a late success is withdrawn", func(t *testing.T) {
+		task := setup(t, preConsumed)
+		refunder := reload(t, task)
+		require.NoError(t, updateVideoSingleTask(context.Background(), success, ch, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+		assert.False(t, RefundTaskQuota(context.Background(), refunder, "Task failed"))
+		stored := reload(t, task)
+		assert.EqualValues(t, model.TaskStatusSuccess, stored.Status)
+		assert.Equal(t, actual, stored.Quota)
+		assert.Zero(t, stored.RefundedQuota)
+		assert.Equal(t, walletQuota+preConsumed-actual, getUserQuota(t, userID))
+		assert.Equal(t, tokenRemain+preConsumed-actual, getTokenRemainQuota(t, tokenID))
+		assert.EqualValues(t, 1, countLogs(t))
+	})
+
+	t.Run("a refunded failure never resumes", func(t *testing.T) {
+		task := setup(t, preConsumed)
+		require.True(t, RefundTaskQuota(context.Background(), task, "Task failed"))
+		running := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}}
+		require.NoError(t, updateVideoSingleTask(context.Background(), running, ch, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): reload(t, task)}))
+		stored := reload(t, task)
+		assert.EqualValues(t, model.TaskStatusFailure, stored.Status)
+		assert.Equal(t, preConsumed, stored.RefundedQuota)
+		assert.Equal(t, walletQuota+preConsumed, getUserQuota(t, userID))
+	})
+}
+
+// A client fetch triggers a poll of its own task. Its upstream errors are not
+// the background poller's and neither count nor fail the running task.
+func TestClientTriggeredPollErrorsDoNotCountAsPollFailures(t *testing.T) {
+	const userID, channelID, preConsumed = 721, 721, 3_000
+	testCases := []struct {
+		name    string
+		adaptor scriptedPollingAdaptor
+		batch   bool
+	}{
+		{name: "transport error", adaptor: scriptedPollingAdaptor{fetchErr: errors.New("connection reset")}},
+		{name: "429", adaptor: scriptedPollingAdaptor{statusCode: http.StatusTooManyRequests}},
+		{name: "5xx", adaptor: scriptedPollingAdaptor{statusCode: http.StatusBadGateway}},
+		{name: "404", adaptor: scriptedPollingAdaptor{statusCode: http.StatusNotFound}},
+		{name: "unrecognized", adaptor: scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusUnknown}}},
+		{name: "batch 429", adaptor: scriptedPollingAdaptor{statusCode: http.StatusTooManyRequests}, batch: true},
+		{name: "batch transport error", adaptor: scriptedPollingAdaptor{fetchErr: errors.New("connection reset")}, batch: true},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, userID, 10_000)
+			seedTaskPollingChannel(t, channelID, true)
+			previous := constant.TaskPollMaxFailures
+			constant.TaskPollMaxFailures = 1
+			t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
+			task := makeTask(userID, channelID, preConsumed, 0, BillingSourceWallet, 0)
+			task.TaskID = "client_poll"
+			task.PrivateData.UpstreamTaskID = "upstream_client_poll"
+			require.NoError(t, model.DB.Create(task).Error)
+			ctx := WithClientTaskPoll(context.Background())
+			ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", Status: common.ChannelStatusEnabled}
+			adaptor := testCase.adaptor
+			if testCase.batch {
+				require.NoError(t, pollCredentialBatch(ctx, &scriptedBatchPollingAdaptor{scriptedPollingAdaptor: adaptor}, ch, ch.Key, []*model.Task{task}))
+			} else {
+				require.NoError(t, updateVideoSingleTask(ctx, &adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+			}
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			assert.EqualValues(t, model.TaskStatusInProgress, stored.Status)
+			assert.Zero(t, stored.PrivateData.PollFailures)
+			assert.Equal(t, preConsumed, stored.Quota)
+			assert.Equal(t, 10_000, getUserQuota(t, userID))
+			assert.EqualValues(t, 0, countLogs(t))
+		})
+	}
+}
+
+// A legacy task without a saved key polls with its channel's current key. A
+// sealed supplier secret is opened first; one this node cannot open yields no
+// key, so the sealed value is never sent upstream.
+func TestTaskPollingKeyOpensSealedSupplierSecret(t *testing.T) {
+	t.Setenv("SUPPLIER_CREDENTIAL_KEYS", `{"v1":"`+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))+`"}`)
+	t.Setenv("SUPPLIER_CREDENTIAL_ACTIVE_KEY", "v1")
+	sealed, err := model.EncryptSupplierSecret("supplier-1", "vendor-secret")
+	require.NoError(t, err)
+	require.NotEqual(t, "vendor-secret", sealed)
+
+	assert.Equal(t, "plain-key", TaskPollingKey(&model.Channel{Key: "plain-key"}, "", nil))
+	assert.Equal(t, "saved-key", TaskPollingKey(&model.Channel{Key: sealed, OwnerSupplierID: "supplier-1"}, "saved-key", nil))
+	assert.Equal(t, "vendor-secret", TaskPollingKey(&model.Channel{Key: sealed, OwnerSupplierID: "supplier-1", SecretsWriteOnly: true}, "", nil))
+	assert.Empty(t, TaskPollingKey(&model.Channel{Key: sealed, OwnerSupplierID: "another-supplier", SecretsWriteOnly: true}, "", nil))
+}
+
+// Refund bookkeeping that still owes the funding source a charge is retried by
+// the pollers without polling the vendor, and a settled quota survives a stale
+// task copy. The claims and markers are conditional updates, so this runs on
+// every database.
+func TestPendingRefundBillingDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(":memory:")
+			case "mysql":
+				if os.Getenv("TEST_MYSQL_DSN") == "" {
+					t.Skip("TEST_MYSQL_DSN not configured")
+				}
+				driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+			case "postgres":
+				if os.Getenv("TEST_POSTGRES_DSN") == "" {
+					t.Skip("TEST_POSTGRES_DSN not configured")
+				}
+				driver = postgres.New(postgres.Config{DSN: os.Getenv("TEST_POSTGRES_DSN"), PreferSimpleProtocol: true})
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "refund_repair_test_"}, Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			oldDB, oldLog, oldMain, oldLogType := model.DB, model.LOG_DB, common.MainDatabaseType(), common.LogDatabaseType()
+			model.DB, model.LOG_DB = db, db
+			common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+			schemas := []any{&model.Task{}, &model.Midjourney{}, &model.User{}, &model.Token{}, &model.Log{}, &model.Channel{}, &model.UserSubscription{}}
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable(schemas...))
+				model.DB, model.LOG_DB = oldDB, oldLog
+				common.SetDatabaseTypes(oldMain, oldLogType)
+				require.NoError(t, sqlDB.Close())
+			})
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(schemas...))
+			}
+			// allowWalletWrites lets that many wallet writes through and fails
+			// the rest; a negative value lets every write through.
+			allowWalletWrites := -1
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:wallet_outage", func(tx *gorm.DB) {
+				if allowWalletWrites < 0 || !strings.HasSuffix(tx.Statement.Table, "users") {
+					return
+				}
+				if allowWalletWrites == 0 {
+					_ = tx.AddError(errors.New("wallet unavailable"))
+					return
+				}
+				allowWalletWrites--
+			}))
+			ctx := context.Background()
+			seedWallet := func(t *testing.T, id, quota int) {
+				name := "refund_repair_" + strconv.Itoa(id)
+				user := &model.User{Id: id, Username: name, AffCode: name, Quota: quota, Status: common.UserStatusEnabled}
+				require.NoError(t, db.Create(user).Error)
+			}
+			reloadTask := func(id int64) *model.Task {
+				var stored model.Task
+				require.NoError(t, db.First(&stored, id).Error)
+				return &stored
+			}
+
+			t.Run("a stale channel task copy cannot write back the pre-settlement quota", func(t *testing.T) {
+				const userID, channelID = 801, 801
+				seedWallet(t, userID, 10_000)
+				seedChannel(t, channelID)
+				task := makeTask(userID, channelID, 3_000, 0, BillingSourceWallet, 0)
+				task.TaskID = "stale_copy"
+				task.PrivateData.ChannelAttempt = &relaycommon.TaskChannelSnapshot{ChannelID: channelID}
+				require.NoError(t, task.Insert())
+
+				winner := reloadTask(task.ID)
+				winner.Status, winner.Progress = model.TaskStatusSuccess, "100%"
+				won, err := winner.UpdateWithStatus(model.TaskStatusInProgress)
+				require.NoError(t, err)
+				require.True(t, won)
+				stale := reloadTask(task.ID)
+				RecalculateTaskQuota(ctx, winner, 2_000, common.NewMessage("Adjusted by the channel adaptor"))
+				require.Equal(t, 2_000, reloadTask(task.ID).Quota)
+
+				stale.FailReason = "stale write"
+				won, err = stale.UpdateWithStatus(model.TaskStatusSuccess)
+				require.NoError(t, err)
+				assert.False(t, won, "a copy read before the quota write loses its CAS")
+				assert.Equal(t, 2_000, reloadTask(task.ID).Quota)
+
+				won, err = winner.UpdateWithStatus(model.TaskStatusSuccess)
+				require.NoError(t, err)
+				assert.True(t, won, "the settling copy keeps writing")
+				assert.Equal(t, 2_000, reloadTask(task.ID).Quota)
+			})
+
+			t.Run("a failed task re-charge is retried by the poller", func(t *testing.T) {
+				const userID, channelID, subID = 802, 802, 802
+				const refunded = 3_000
+				seedWallet(t, userID, 10_000)
+				seedChannel(t, channelID)
+				seedSubscription(t, subID, userID, 100_000, 99_000)
+				task := makeTask(userID, channelID, 0, 0, BillingSourceSubscription, subID)
+				task.TaskID = "recharge_retry"
+				task.Status, task.Progress, task.RefundedQuota = model.TaskStatusSuccess, "100%", refunded
+				task.PrivateData.UpstreamTaskID = "upstream_recharge_retry"
+				require.NoError(t, db.Create(task).Error)
+
+				assert.False(t, RechargeRefundedTaskQuota(ctx, reloadTask(task.ID)), "the subscription cannot absorb the charge")
+				assert.Equal(t, refunded, reloadTask(task.ID).RefundedQuota)
+				assert.True(t, model.HasUnfinishedSyncTasks(), "the pending re-charge keeps the poller running")
+				assert.Empty(t, model.GetAllUnFinishSyncTasks(10), "the vendor is not polled again")
+
+				require.NoError(t, db.Model(&model.UserSubscription{}).Where("id = ?", subID).Update("amount_total", 200_000).Error)
+				RetryPendingTaskRefundBilling(ctx)
+				RetryPendingTaskRefundBilling(ctx)
+				stored := reloadTask(task.ID)
+				assert.EqualValues(t, model.TaskStatusSuccess, stored.Status)
+				assert.Equal(t, refunded, stored.Quota)
+				assert.Zero(t, stored.RefundedQuota)
+				assert.EqualValues(t, 99_000+refunded, getSubscriptionUsed(t, subID), "charged exactly once")
+				assert.False(t, model.HasUnfinishedSyncTasks())
+			})
+
+			t.Run("a lost task refund whose withdrawal failed is taken back by the poller", func(t *testing.T) {
+				const userID, channelID, quota = 803, 803, 3_000
+				seedWallet(t, userID, 10_000)
+				seedChannel(t, channelID)
+				task := makeTask(userID, channelID, quota, 0, BillingSourceWallet, 0)
+				task.TaskID = "withdrawal_retry"
+				task.Status, task.Progress = model.TaskStatusSuccess, "100%"
+				require.NoError(t, db.Create(task).Error)
+				stale := reloadTask(task.ID)
+
+				allowWalletWrites = 1
+				assert.False(t, RefundTaskQuota(ctx, reloadTask(task.ID), "late failure"), "a SUCCESS wins over the refund claim")
+				allowWalletWrites = -1
+				stored := reloadTask(task.ID)
+				assert.Equal(t, quota, stored.Quota)
+				assert.Equal(t, quota, stored.RefundWithdrawalQuota)
+				assert.Equal(t, 10_000+quota, getUserQuota(t, userID))
+				assert.True(t, model.HasUnfinishedSyncTasks())
+
+				// Change a field: MySQL reports zero affected rows for an
+				// identical write, which callers already treat as a lost CAS.
+				stale.Progress = "99%"
+				won, err := stale.UpdateWithStatus(model.TaskStatusSuccess)
+				require.NoError(t, err)
+				require.True(t, won)
+				assert.Equal(t, quota, reloadTask(task.ID).RefundWithdrawalQuota, "a task write never clears the pending withdrawal")
+
+				RetryPendingTaskRefundBilling(ctx)
+				RetryPendingTaskRefundBilling(ctx)
+				stored = reloadTask(task.ID)
+				assert.Zero(t, stored.RefundWithdrawalQuota)
+				assert.Equal(t, quota, stored.Quota)
+				assert.Equal(t, 10_000, getUserQuota(t, userID), "withdrawn exactly once")
+				assert.False(t, model.HasUnfinishedSyncTasks())
+			})
+
+			t.Run("Midjourney re-charge and withdrawal failures are retried by the poller", func(t *testing.T) {
+				const userID, channelID, quota = 804, 804, 20
+				seedWallet(t, userID, 1_000)
+				seedChannel(t, channelID)
+				recharge := &model.Midjourney{UserId: userID, ChannelId: channelID, MjId: "mj-recharge", Action: constant.MjActionImagine,
+					Status: "SUCCESS", Progress: "100%", RefundedQuota: quota}
+				withdrawal := &model.Midjourney{UserId: userID, ChannelId: channelID, MjId: "mj-withdrawal", Action: constant.MjActionImagine,
+					Status: "SUCCESS", Progress: "100%", Quota: quota}
+				require.NoError(t, recharge.Insert())
+				require.NoError(t, withdrawal.Insert())
+
+				allowWalletWrites = 0
+				assert.False(t, RechargeRefundedMidjourneyQuota(ctx, recharge))
+				allowWalletWrites = 1
+				assert.False(t, RefundMidjourneyQuota(ctx, withdrawal, "late failure"))
+				allowWalletWrites = -1
+				assert.Equal(t, quota, getMidjourneyTask(t, recharge.Id).RefundedQuota)
+				assert.Equal(t, quota, getMidjourneyTask(t, withdrawal.Id).RefundWithdrawalQuota)
+				assert.Equal(t, 1_000+quota, getUserQuota(t, userID))
+				assert.True(t, model.HasUnfinishedMidjourneyTasks())
+				assert.Empty(t, model.GetAllUnFinishTasks(), "the vendor is not polled again")
+
+				RetryPendingMidjourneyRefundBilling(ctx)
+				RetryPendingMidjourneyRefundBilling(ctx)
+				assert.Zero(t, getMidjourneyTask(t, recharge.Id).RefundedQuota)
+				assert.Equal(t, quota, getMidjourneyTask(t, recharge.Id).Quota)
+				assert.Zero(t, getMidjourneyTask(t, withdrawal.Id).RefundWithdrawalQuota)
+				assert.Equal(t, 1_000-quota, getUserQuota(t, userID), "each owed charge is applied exactly once")
+				assert.False(t, model.HasUnfinishedMidjourneyTasks())
+			})
+		})
+	}
 }

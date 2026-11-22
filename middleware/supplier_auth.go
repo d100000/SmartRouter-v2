@@ -1,15 +1,14 @@
 package middleware
 
-import "strings"
-
 // Supplier accounts are management-only identities. Deny by default so adding
 // a new UserAuth consumer route cannot accidentally expose it to suppliers.
 func supplierDashboardRouteAllowed(method, path string) bool {
-	if strings.HasPrefix(path, "/api/supplier/") {
-		return true
-	}
 	switch method + " " + path {
-	case "GET /api/user/self", "PUT /api/user/self", "PUT /api/user/setting",
+	case "GET /api/supplier/self", "GET /api/supplier/channels", "GET /api/supplier/channels/:id",
+		"POST /api/supplier/channels", "PUT /api/supplier/channels/:id", "POST /api/supplier/channels/:id/test",
+		"GET /api/supplier/channels/:id/limits", "GET /api/supplier/channels/:id/budget-events", "GET /api/supplier/channels/:id/limit-events",
+		"GET /api/supplier/overview", "GET /api/supplier/logs", "GET /api/supplier/logs/export",
+		"GET /api/user/self", "PUT /api/user/self", "PUT /api/user/setting",
 		"GET /api/user/sessions", "DELETE /api/user/sessions/:sid", "POST /api/user/sessions/revoke-others",
 		"GET /api/verify/methods", "POST /api/verify", "GET /api/audit/self",
 		"GET /api/user/passkey", "POST /api/user/passkey/register/begin", "POST /api/user/passkey/register/finish",

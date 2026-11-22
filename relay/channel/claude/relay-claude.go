@@ -292,35 +292,7 @@ func recordClaudeServerToolUse(info *relaycommon.RelayInfo, serverToolUse *dto.C
 }
 
 func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
-	// Claude input_tokens excludes cache reads and writes, so a fully cached
-	// prompt reports zero input; the prompt is uncounted only when the total
-	// with cache is zero as well. Zero output is uncounted only when content
-	// was streamed, so a refusal before any output keeps its zeros.
-	missingInputUsage := buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage).PromptTokens == 0
-	missingOutputUsage := claudeInfo.Usage.CompletionTokens == 0 && claudeInfo.ResponseText.Len() > 0
-	if missingInputUsage || missingOutputUsage || !claudeInfo.Done {
-		if common.DebugEnabled {
-			common.SysLog(common.LogText("claude response usage is not complete, maybe upstream error"))
-		}
-		// 只补缺失字段，不整份覆盖——保留 message_start 已拿到的 cache 字段
-		fallback := service.ResponseText2Usage(c, claudeInfo.ResponseText.String(), info.UpstreamModelName, 0)
-		// Each tool_use block costs about 40 output tokens beyond its name and JSON
-		// input (measured on Claude Haiku 4.5 and Sonnet 5 agent turns).
-		fallback.CompletionTokens += claudeInfo.ToolUseCount * 40
-		if missingOutputUsage ||
-			(!claudeInfo.Done && fallback.CompletionTokens > claudeInfo.Usage.CompletionTokens) {
-			claudeInfo.Usage.CompletionTokens = fallback.CompletionTokens
-		}
-		if missingInputUsage {
-			service.FillMissingPromptTokens(info, claudeInfo.Usage)
-		}
-		claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
-		claudeInfo.Usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(claudeInfo.Usage.BillingUsage, claudeInfo.Usage.CompletionTokens)
-	}
-	if claudeInfo.Usage != nil {
-		claudeInfo.Usage.UsageSemantic = "anthropic"
-	}
-	relayconvert.FinalizeClaudeStreamBillingUsage(claudeInfo)
+	completeClaudeStreamUsage(c, info, claudeInfo)
 	if info.StreamFailure != nil {
 		failure := info.StreamFailure.Error
 		if info.RelayFormat == types.RelayFormatClaude {
@@ -360,6 +332,41 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	}
 }
 
+// completeClaudeStreamUsage fills usage the stream did not report from the
+// streamed content and finalizes the billing usage, so a failed stream that
+// already ran upstream settles the same way as a completed one.
+func completeClaudeStreamUsage(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+	// Claude input_tokens excludes cache reads and writes, so a fully cached
+	// prompt reports zero input; the prompt is uncounted only when the total
+	// with cache is zero as well. Zero output is uncounted only when content
+	// was streamed, so a refusal before any output keeps its zeros.
+	missingInputUsage := buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage).PromptTokens == 0
+	missingOutputUsage := claudeInfo.Usage.CompletionTokens == 0 && claudeInfo.ResponseText.Len() > 0
+	if missingInputUsage || missingOutputUsage || !claudeInfo.Done {
+		if common.DebugEnabled {
+			common.SysLog(common.LogText("claude response usage is not complete, maybe upstream error"))
+		}
+		// 只补缺失字段，不整份覆盖——保留 message_start 已拿到的 cache 字段
+		fallback := service.ResponseText2Usage(c, claudeInfo.ResponseText.String(), info.UpstreamModelName, 0)
+		// Each tool_use block costs about 40 output tokens beyond its name and JSON
+		// input (measured on Claude Haiku 4.5 and Sonnet 5 agent turns).
+		fallback.CompletionTokens += claudeInfo.ToolUseCount * 40
+		if missingOutputUsage ||
+			(!claudeInfo.Done && fallback.CompletionTokens > claudeInfo.Usage.CompletionTokens) {
+			claudeInfo.Usage.CompletionTokens = fallback.CompletionTokens
+		}
+		if missingInputUsage {
+			service.FillMissingPromptTokens(info, claudeInfo.Usage)
+		}
+		claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
+		claudeInfo.Usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(claudeInfo.Usage.BillingUsage, claudeInfo.Usage.CompletionTokens)
+	}
+	if claudeInfo.Usage != nil {
+		claudeInfo.Usage.UsageSemantic = "anthropic"
+	}
+	relayconvert.FinalizeClaudeStreamBillingUsage(claudeInfo)
+}
+
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -386,7 +393,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 				sr.Stop(err)
 				return
 			}
-			if frame.Type == "message_stop" && !hasMediaOutput && strings.TrimSpace(claudeInfo.ResponseText.String()) == "" {
+			if frame.Type == "message_stop" && !hasMediaOutput && strings.TrimSpace(claudeInfo.ResponseText.String()) == "" && !claudeHasActualUsage(claudeInfo.Usage) {
 				err = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 				sr.Stop(err)
 				return
@@ -411,12 +418,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		}
 	})
 	info.StreamStatus.RequireTerminal()
-	actualUsage := claudeInfo.Usage
-	if canonical, ok := actualUsage.BillingUsage.CanonicalUsage(); ok {
-		actualUsage = canonical
-	}
-	hasActualUsage := dto.HasOpenAIUsageTokens(dto.MergeUsageNonZero(nil, actualUsage)) &&
-		(claudeInfo.Usage.BillingUsage == nil || !claudeInfo.Usage.BillingUsage.Estimated)
+	hasActualUsage := claudeHasActualUsage(claudeInfo.Usage)
 	hasOutput := hasMediaOutput || strings.TrimSpace(claudeInfo.ResponseText.String()) != ""
 	outcome := info.StreamStatus.OutcomeSnapshot()
 	failure := err
@@ -424,11 +426,11 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if failure == nil && !hasOutput {
+	if failure == nil && !hasOutput && !hasActualUsage {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if failure != nil {
-		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasOutput, NoCharge: !hasOutput}
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasOutput, NoCharge: !hasOutput && !hasActualUsage}
 		info.StreamStatus.MarkFailed(string(failure.GetErrorCode()), failure.ToOpenAIError().Type, failure.StatusCode)
 		if !info.StreamStatus.HasErrors() {
 			info.StreamStatus.RecordError(failure.Error())
@@ -441,8 +443,24 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	return claudeInfo.Usage, nil
 }
 
+// claudeHasActualUsage reports billable usage upstream reported for the
+// message, excluding local estimates.
+func claudeHasActualUsage(usage *dto.Usage) bool {
+	if usage == nil || usage.BillingUsage != nil && usage.BillingUsage.Estimated {
+		return false
+	}
+	actual := usage
+	if canonical, ok := usage.BillingUsage.CanonicalUsage(); ok {
+		actual = canonical
+	}
+	return dto.HasOpenAIUsageTokens(dto.MergeUsageNonZero(nil, actual))
+}
+
+// claudeBlockHasOutput reports generated content. Thinking blocks are output
+// even when the thinking text is hidden (redacted or signature only).
 func claudeBlockHasOutput(block *dto.ClaudeMediaMessage) bool {
-	if strings.TrimSpace(block.GetText()+block.Data+block.Name) != "" ||
+	if block.Type == "thinking" || block.Type == "redacted_thinking" ||
+		strings.TrimSpace(block.GetText()+block.Data+block.Name+block.Signature) != "" ||
 		block.Thinking != nil && strings.TrimSpace(*block.Thinking) != "" ||
 		block.PartialJson != nil && strings.TrimSpace(*block.PartialJson) != "" {
 		return true
@@ -472,7 +490,10 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	for i := range claudeResponse.Content {
 		hasOutput = hasOutput || claudeBlockHasOutput(&claudeResponse.Content[i])
 	}
-	if !hasOutput {
+	// A message with upstream usage ran and is charged even without content.
+	hasActualUsage := claudeResponse.Usage != nil && (claudeResponse.Usage.InputTokens > 0 || claudeResponse.Usage.OutputTokens > 0 ||
+		claudeResponse.Usage.CacheReadInputTokens > 0 || claudeResponse.Usage.CacheCreationInputTokens > 0)
+	if !hasOutput && !hasActualUsage {
 		return types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if claudeInfo.Usage == nil {

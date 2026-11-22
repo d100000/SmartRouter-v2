@@ -84,10 +84,12 @@ type responsesWSControl struct {
 // Only the request worker reads or changes billing state. Socket readers pass
 // bounded messages to it; cancellation never performs an independent refund.
 type responsesWSCallState struct {
-	inbox    chan responsesWSMessage
-	controls chan responsesWSControl
-	done     chan struct{}
-	terminal *responsesWSMessage
+	inbox               chan responsesWSMessage
+	controls            chan responsesWSControl
+	done                chan struct{}
+	terminal            *responsesWSMessage
+	affinity            *service.ChannelAffinityWrite
+	priorErrorAddresses []string
 	// A nonzero closeCode ends the connection after this request.
 	closeCode   int
 	closeReason string
@@ -232,6 +234,9 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		close(state.done)
 		s.stateMu.Unlock()
 		s.clientWriteMu.Unlock()
+		if outgoing != nil && apiErr == nil && state.closeCode == 0 {
+			state.affinity.Commit()
+		}
 	}()
 	request := s.request.Clone(s.ctx)
 	request.Body = io.NopCloser(bytes.NewReader(message))
@@ -244,7 +249,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		c.Request.Body = io.NopCloser(bytes.NewReader(create.Body))
 		c.Request.ContentLength = int64(len(create.Body))
 		callErr := s.runCall(c, state, create)
-		upstreamURLs = common.UpstreamAddresses(c)
+		upstreamURLs = append(common.UpstreamAddresses(c), state.priorErrorAddresses...)
 		return callErr
 	})
 	if apiErr != nil && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
@@ -259,6 +264,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	modelName := create.Request.Model
 	started := time.Now()
 	var info *relaycommon.RelayInfo
+	var retry *service.RetryParam
 	billingPrepared := false
 	var ingressSteps []relaycommon.RequestPluginStep
 	var ingressRecord []relaycommon.RequestPluginRecord
@@ -287,6 +293,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if info != nil && billingPrepared {
 			apiErr = RefundFailedRequestBilling(c, info, apiErr)
 		}
+		apiErr, state.priorErrorAddresses = retry.ClientErrorAfterRefusal(apiErr)
 		// The request plugins' report hooks get the response once it settled.
 		requestplugin.Report(c, types.RelayFormatOpenAIResponses, info, ingressRecord, cmp.Or(apiErr, stopErr))
 	}()
@@ -317,9 +324,17 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 	service.GetChannelConstraints(c).AddFilter(appdto.ChannelFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 
+	canBind := true
 	if s.lockedChannelID != 0 {
 		if apiErr = s.restoreConnectionContext(c, modelName); apiErr != nil {
 			return apiErr
+		}
+		// Each create has a fresh request context and can use a different
+		// affinity key. A physical connection cannot move a pre-existing
+		// binding from another channel.
+		if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); !pinned {
+			bound, found := service.GetPreferredChannelByAffinity(c, modelName, common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup))
+			canBind = !found || bound == s.lockedChannelID
 		}
 		info = relaycommon.GenRelayInfoResponses(c, &create.Request)
 		info.IsStream = true
@@ -351,14 +366,24 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
 	} else {
-		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
-		for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
+		retry = &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
+		for retry.GetRetry() <= common.RetryTimes {
 			var channel *appmodel.Channel
 			channel, apiErr = selectResponsesWSChannel(c, modelName, retry)
 			if apiErr != nil {
 				return apiErr
 			}
 			service.AppendUsedChannel(c, channel.Id)
+			// The first generation may choose another channel until it is sent.
+			if err := service.CheckChannelRPM(channel.Id); err != nil {
+				apiErr = service.ChannelLimitRelayError(err, c)
+				service.FinishSchedulingAttempt(c, info, apiErr)
+				// Only a capacity refusal of this channel may move to another one.
+				if service.LocalChannelLimitError(apiErr) != nil && retry.TryAnotherChannelAfterRefusal(channel.Id, false, apiErr) {
+					continue
+				}
+				return apiErr
+			}
 			if info == nil {
 				info = relaycommon.GenRelayInfoResponses(c, &create.Request)
 				info.IsStream = true
@@ -397,6 +422,8 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
 				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
 				if decision.Action == "retry" {
+					retry.RememberAttemptFailure(apiErr)
+					retry.IncreaseRetry()
 					continue
 				}
 				return apiErr
@@ -409,7 +436,12 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				s.connectionMu.Lock()
 				s.target = nil
 				s.connectionMu.Unlock()
-				return service.ChannelLimitRelayError(err, c)
+				apiErr = service.ChannelLimitRelayError(err, c)
+				service.FinishSchedulingAttempt(c, info, apiErr)
+				if service.LocalChannelLimitError(apiErr) != nil && retry.TryAnotherChannelAfterRefusal(channel.Id, false, apiErr) {
+					continue
+				}
+				return apiErr
 			}
 			s.clientWriteMu.Lock()
 			s.redactKey = info.ApiKey
@@ -583,10 +615,6 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					return rejected
 				}
 				if strings.HasPrefix(event.Type, "response.") {
-					if !accepted {
-						// Like HTTP, bind the session only once upstream accepted the request.
-						service.RecordChannelAffinity(c, s.lockedChannelID)
-					}
 					accepted = true
 					if event.Response != nil && event.Response.ID != "" {
 						responseID = event.Response.ID
@@ -597,11 +625,19 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+				var status string
 				if event.Response != nil {
 					s.lastResponseID = event.Response.ID
+					_ = common.Unmarshal(event.Response.Status, &status)
 				}
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				state.terminal = terminalOf(incoming)
+				completed := event.Type == "response.completed" && (status == "completed" || status == "") ||
+					event.Type == "response.done" && status == "completed"
+				if canBind && completed && stopErr == nil && event.Response != nil && event.Response.GetOpenAIError() == nil &&
+					info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) && !info.StreamStatus.HasErrors() {
+					state.affinity = service.PrepareChannelAffinityWrite(c, s.lockedChannelID)
+				}
 				if event.Type == "response.completed" {
 					service.ObserveChannelFundingSuccess(service.ChannelFundingAttempt(c))
 				}
@@ -1175,6 +1211,9 @@ func selectResponsesWSChannel(c *gin.Context, modelName string, retryParam *serv
 	}
 	channel, _, selectErr := service.SelectChannelForRequest(c, modelName, retryParam)
 	if selectErr != nil {
+		if selectErr.NoAvailableChannel && retryParam.LocalRefusal != nil {
+			return nil, retryParam.LocalRefusal
+		}
 		message := selectErr.Message
 		if selectErr.MessageID != "" {
 			message = i18n.T(c, selectErr.MessageID, selectErr.Params)

@@ -277,7 +277,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			*usage = mappedUsage
 			hasBillableUsageMetadata = true
 		}
-		if !hasEffectiveOutput && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
+		if !hasEffectiveOutput && !hasBillableUsageMetadata && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
 			streamErr = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 			sr.Stop(streamErr)
 			return
@@ -308,7 +308,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		outcome.EndReason == relaycommon.StreamEndReasonEOF && outcome.Response != relaycommon.ResponseOutcomeCompleted) {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamInterrupted, map[string]any{"Reason": string(outcome.EndReason)})), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
-	if failure == nil && !hasEffectiveOutput {
+	if failure == nil && !hasEffectiveOutput && !hasActualUsage {
 		failure = types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 	if failure == nil {
@@ -316,7 +316,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 	if failure != nil {
 		types.ErrOptionWithSkipRetry()(failure)
-		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasEffectiveOutput, NoCharge: !hasEffectiveOutput}
+		info.StreamFailure = &relaycommon.StreamFailureInfo{Error: failure, HasActualUsage: hasActualUsage, HasEffectiveOutput: hasEffectiveOutput, NoCharge: !hasEffectiveOutput && !hasActualUsage}
 		info.StreamStatus.MarkFailed(string(failure.GetErrorCode()), failure.ToOpenAIError().Type, failure.StatusCode)
 		if !info.StreamStatus.HasErrors() {
 			info.StreamStatus.RecordError(failure.Error())
@@ -496,7 +496,8 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	grounding.observe(&geminiResponse)
 	grounding.commit(info)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
-	if !geminiResponseHasOutput(&geminiResponse) {
+	hasActualUsage := geminiResponseHasActualUsage(&geminiResponse)
+	if !geminiResponseHasOutput(&geminiResponse) && (!hasActualUsage || len(geminiResponse.Candidates) == 0) {
 		var newAPIError *types.NewAPIError
 		if geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
 			info.PerformanceBusinessRejection = true
@@ -516,8 +517,18 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 
 		service.ResetStatusCode(newAPIError, c.GetString("status_code_mapping"))
-
-		return nil, newAPIError
+		if !hasActualUsage {
+			return nil, newAPIError
+		}
+		// A blocked prompt that reports usage was processed upstream: the
+		// client gets the error and the request is charged by that usage.
+		usage := buildUsageFromGeminiResponse(c, info, &geminiResponse)
+		if info.RelayFormat == types.RelayFormatClaude {
+			c.JSON(newAPIError.StatusCode, gin.H{"type": "error", "error": newAPIError.ToClaudeError(common.UpstreamAddresses(c)...)})
+		} else {
+			c.JSON(newAPIError.StatusCode, gin.H{"error": newAPIError.ToOpenAIError(common.UpstreamAddresses(c)...)})
+		}
+		return &usage, nil
 	}
 	fullTextResponse := responseGeminiChat2OpenAI(c, &geminiResponse)
 	fullTextResponse.Model = info.UpstreamModelName
@@ -550,6 +561,15 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	return &usage, nil
 }
 
+// geminiResponseHasActualUsage reports billable usage metadata upstream
+// reported, excluding local estimates.
+func geminiResponseHasActualUsage(response *dto.GeminiChatResponse) bool {
+	metadata := response.GetUsageMetadata()
+	return dto.HasGeminiUsageMetadataTokens(metadata) && (metadata.BillingUsage == nil || !metadata.BillingUsage.Estimated)
+}
+
+// geminiResponseHasOutput reports generated content, including a thought
+// signature left by hidden thinking.
 func geminiResponseHasOutput(response *dto.GeminiChatResponse) bool {
 	for _, candidate := range response.Candidates {
 		for _, part := range candidate.Content.Parts {
@@ -558,7 +578,8 @@ func geminiResponseHasOutput(response *dto.GeminiChatResponse) bool {
 				part.InlineData != nil && strings.TrimSpace(part.InlineData.Data) != "" ||
 				part.FileData != nil && strings.TrimSpace(part.FileData.FileUri) != "" ||
 				part.ExecutableCode != nil && strings.TrimSpace(part.ExecutableCode.Code) != "" ||
-				part.CodeExecutionResult != nil && strings.TrimSpace(part.CodeExecutionResult.Output) != "" {
+				part.CodeExecutionResult != nil && strings.TrimSpace(part.CodeExecutionResult.Output) != "" ||
+				len(part.ThoughtSignature) > 0 && string(part.ThoughtSignature) != "null" && string(part.ThoughtSignature) != `""` {
 				return true
 			}
 		}

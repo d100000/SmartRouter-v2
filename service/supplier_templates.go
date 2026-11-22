@@ -12,12 +12,13 @@ import (
 // SupplierTemplate is a safe, operator-installed connection capability. It
 // never contains a plugin script, arbitrary headers, or upstream credentials.
 type SupplierTemplate struct {
-	ID            string   `json:"id"`
-	Type          int      `json:"type"`
-	Name          string   `json:"name"`
-	Models        []string `json:"models"`
-	Protocols     []string `json:"protocols"`
-	TPMApplicable bool     `json:"tpm_applicable"`
+	ID                 string   `json:"id"`
+	Type               int      `json:"type"`
+	Name               string   `json:"name"`
+	Models             []string `json:"models"`
+	AllowsCustomModels bool     `json:"allows_custom_models"`
+	Protocols          []string `json:"protocols"`
+	TPMApplicable      bool     `json:"tpm_applicable"`
 }
 
 func SupplierTemplates() []SupplierTemplate {
@@ -31,7 +32,7 @@ func SupplierTemplates() []SupplierTemplate {
 		if kind == constant.ChannelTypeMidjourney || kind == constant.ChannelTypeMidjourneyPlus {
 			protocols, tpm = []string{"async_task"}, false
 		}
-		result = append(result, SupplierTemplate{ID: strconv.Itoa(kind), Type: kind, Name: constant.GetChannelTypeName(kind), Models: []string{}, Protocols: protocols, TPMApplicable: tpm})
+		result = append(result, SupplierTemplate{ID: strconv.Itoa(kind), Type: kind, Name: constant.GetChannelTypeName(kind), Models: []string{}, AllowsCustomModels: true, Protocols: protocols, TPMApplicable: tpm})
 	}
 	for _, plugin := range jsplugin.DefaultRegistry.Generation().Plugins() {
 		tpm := false

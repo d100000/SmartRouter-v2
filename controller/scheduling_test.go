@@ -17,6 +17,7 @@ import (
 	"testing/synctest"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
 	"github.com/QuantumNous/new-api/relay/channel/baidu"
@@ -111,13 +112,16 @@ func TestRelayBudgetCancelsProviderTokenAcquisition(t *testing.T) {
 func TestSchedulingConfigRejectsUnsafeCapacityAndWeights(t *testing.T) {
 	valid := service.SchedulingConfig{Group: "default", Model: "model-a", Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100}
 	require.NoError(t, service.ValidateSchedulingConfig(valid))
+	unlimited := valid
+	unlimited.DefaultCapacity = 0
+	require.NoError(t, service.ValidateSchedulingConfig(unlimited), "zero default capacity means unlimited")
 	for _, tc := range []struct {
 		name   string
 		change func(*service.SchedulingConfig)
 	}{
 		{"auto is not a physical group", func(c *service.SchedulingConfig) { c.Group = "auto" }},
 		{"missing model", func(c *service.SchedulingConfig) { c.Model = "" }},
-		{"zero capacity", func(c *service.SchedulingConfig) { c.DefaultCapacity = 0 }},
+		{"negative capacity", func(c *service.SchedulingConfig) { c.DefaultCapacity = -1 }},
 		{"oversized capacity", func(c *service.SchedulingConfig) { c.DefaultCapacity = 100001 }},
 		{"invalid success target", func(c *service.SchedulingConfig) { c.TargetSuccessRate = 1.1 }},
 		{"non-finite target", func(c *service.SchedulingConfig) { c.TargetSuccessRate = math.NaN() }},
@@ -183,6 +187,28 @@ func TestSchedulingHandlersRejectInvalidInputBeforeDatabaseAccess(t *testing.T) 
 			assert.Equal(t, http.StatusBadRequest, recorder.Code)
 		})
 	}
+}
+
+func TestGenericOptionUpdateCannotWriteSchedulingConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	common.OptionMapRWMutex.Lock()
+	previous := common.OptionMap["SchedulingConfig"]
+	common.OptionMapRWMutex.Unlock()
+	for _, key := range []string{"SchedulingConfig", "SchedulingConfigVersion"} {
+		t.Run(key, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			body := fmt.Sprintf(`{"key":%q,"value":"[{\"group\":\"default\",\"model\":\"m\",\"target_success_rate\":5}]"}`, key)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", strings.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			UpdateOption(ctx)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, "the generic path bypasses scheduling validation and channel:write")
+			assert.Contains(t, recorder.Body.String(), `"success":false`)
+		})
+	}
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	assert.Equal(t, previous, common.OptionMap["SchedulingConfig"])
 }
 
 func TestSchedulingChannelMembership(t *testing.T) {
@@ -261,6 +287,7 @@ func TestSchedulingDefaultsFollowCurrentBusinessTraffic(t *testing.T) {
 }
 
 func TestSchedulingDatabaseMatrix(t *testing.T) {
+	require.NoError(t, i18n.Init())
 	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
 		t.Run(dialect.kind, func(t *testing.T) {
 			if dialect.env != "" && os.Getenv(dialect.env) == "" {
@@ -270,6 +297,17 @@ func TestSchedulingDatabaseMatrix(t *testing.T) {
 			// reserved group/key columns as well as isolating the database.
 			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
 			require.NoError(t, db.AutoMigrate(&model.Log{}))
+			for range 2 {
+				changed, err := model.MigrateSchedulingDefaultCapacity()
+				require.NoError(t, err)
+				assert.Empty(t, changed)
+			}
+			var freshVersion model.Option
+			require.NoError(t, db.Where(&model.Option{Key: "SchedulingConfigVersion"}).First(&freshVersion).Error)
+			assert.Equal(t, "2", freshVersion.Value)
+			var freshConfigs int64
+			require.NoError(t, db.Model(&model.Option{}).Where(&model.Option{Key: "SchedulingConfig"}).Count(&freshConfigs).Error)
+			assert.Zero(t, freshConfigs)
 			previousEngine := scheduler.Default
 			scheduler.Default = scheduler.New()
 			t.Cleanup(func() {
@@ -299,13 +337,19 @@ func TestSchedulingDatabaseMatrix(t *testing.T) {
 			configOther := service.SchedulingConfig{Group: keyOther.Group, Model: keyOther.Model, Enabled: false, TargetSuccessRate: .9, TargetTTFTMS: 4500, DefaultCapacity: 3, ChannelOverrides: []service.SchedulingChannelOverride{{ChannelID: channel.Id, Weight: common.GetPointer(0.0), CapacityKey: "matrix-other"}}}
 			sentinel := model.Option{Key: "SchedulingMatrixUnrelated", Value: "preserve this value"}
 			require.NoError(t, db.Create(&sentinel).Error)
+			save := func(config service.SchedulingConfig) {
+				t.Helper()
+				_, syncErr, err := service.SaveSchedulingConfig(config)
+				require.NoError(t, err)
+				require.NoError(t, syncErr)
+			}
 			for _, config := range []service.SchedulingConfig{configA, configB, configOther} {
-				require.NoError(t, service.SaveSchedulingConfig(config))
+				save(config)
 			}
 			configA.TargetTTFTMS = 2200
 			configA.ChannelOverrides[0].Weight = common.GetPointer(40.0)
-			require.NoError(t, service.SaveSchedulingConfig(configA))
-			require.NoError(t, service.SaveSchedulingConfig(configA), "saving again must update the same durable option")
+			save(configA)
+			save(configA) // saving again must update the same durable option
 			var stored []model.Option
 			require.NoError(t, db.Where(&model.Option{Key: "SchedulingConfig"}).Find(&stored).Error)
 			require.Len(t, stored, 1)
@@ -324,6 +368,18 @@ func TestSchedulingDatabaseMatrix(t *testing.T) {
 			attempt, err := scheduler.Default.SelectAndReserve(first, []scheduler.Candidate{candidate}, true, false)
 			require.NoError(t, err)
 			assert.Equal(t, 1, attempt.Candidate.Capacity)
+			for retry := range 2 {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				c.Set("channel_id", channel.Id)
+				routed, routeErr := getChannel(c, &relaycommon.RelayInfo{UsingGroup: keyA.Group, OriginModelName: keyA.Model}, &service.RetryParam{
+					Ctx: c, TokenGroup: keyA.Group, ModelName: keyA.Model, Retry: common.GetPointer(retry),
+				})
+				require.Nil(t, routed)
+				require.NotNil(t, routeErr)
+				assert.Equal(t, http.StatusServiceUnavailable, routeErr.StatusCode, "initial and retry wrappers preserve capacity rejection")
+				service.EndSchedulingRequest(c)
+			}
 			_, err = scheduler.Default.SelectAndReserve(second, []scheduler.Candidate{candidate}, true, false)
 			assert.ErrorIs(t, err, scheduler.ErrNoEligibleChannel)
 			scheduler.Default.EndRequest(first)
@@ -411,6 +467,49 @@ func TestSchedulingDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, "disabled", byID[channels[3].Id].RouteState)
 			recorder = modelManagementRequest(t, RecoverSchedulingChannel, http.MethodPost, "/", map[string]any{"group": keyA.Group, "model": keyA.Model, "channel_id": channel.Id}, nil)
 			assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+
+			// Version 1 stored its built-in default of 100 explicitly. The
+			// one-time migration makes those defaults unlimited and leaves every
+			// other value, including explicit channel capacities, unchanged.
+			legacy := `[{"group":"matrix-a","model":"matrix-model","enabled":true,"target_success_rate":0.95,"target_ttft_ms":3000,"default_capacity":100,"future":{"pool":9007199254740995},"channel_overrides":[{"channel_id":9007199254740993,"weight":null,"capacity":100,"capacity_key":"matrix-shared"}]},` +
+				`{"group":"matrix-b","model":"matrix-model","enabled":false,"target_success_rate":0.9,"target_ttft_ms":1500,"default_capacity":30,"channel_overrides":[]}]`
+			require.NoError(t, db.Save(&model.Option{Key: "SchedulingConfig", Value: legacy}).Error)
+			require.NoError(t, db.Where(&model.Option{Key: "SchedulingConfigVersion"}).Delete(&model.Option{}).Error)
+			changed, err := model.MigrateSchedulingDefaultCapacity()
+			require.NoError(t, err)
+			assert.Equal(t, []string{"matrix-a/matrix-model"}, changed)
+			var migrated model.Option
+			require.NoError(t, db.Where(&model.Option{Key: "SchedulingConfig"}).First(&migrated).Error)
+			var entries []struct {
+				Enabled          bool `json:"enabled"`
+				DefaultCapacity  int  `json:"default_capacity"`
+				ChannelOverrides []struct {
+					ChannelID   int64  `json:"channel_id"`
+					Capacity    *int   `json:"capacity"`
+					CapacityKey string `json:"capacity_key"`
+				} `json:"channel_overrides"`
+				Future struct{ Pool int64 } `json:"future"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(migrated.Value, &entries))
+			require.Len(t, entries, 2)
+			assert.Zero(t, entries[0].DefaultCapacity)
+			require.Len(t, entries[0].ChannelOverrides, 1)
+			assert.Equal(t, int64(9007199254740993), entries[0].ChannelOverrides[0].ChannelID)
+			assert.Equal(t, int64(9007199254740995), entries[0].Future.Pool)
+			assert.Equal(t, common.GetPointer(100), entries[0].ChannelOverrides[0].Capacity, "explicit channel capacity is preserved")
+			assert.Equal(t, "matrix-shared", entries[0].ChannelOverrides[0].CapacityKey)
+			assert.Equal(t, 30, entries[1].DefaultCapacity)
+			assert.False(t, entries[1].Enabled)
+			// A capacity of 100 saved after the migration is an explicit choice.
+			require.NoError(t, db.Save(&model.Option{Key: "SchedulingConfig", Value: legacy}).Error)
+			changed, err = model.MigrateSchedulingDefaultCapacity()
+			require.NoError(t, err)
+			assert.Empty(t, changed, "the migration runs only once")
+			require.NoError(t, db.Where(&model.Option{Key: "SchedulingConfig"}).First(&migrated).Error)
+			assert.Equal(t, legacy, migrated.Value)
+			var versions []model.Option
+			require.NoError(t, db.Where(&model.Option{Key: "SchedulingConfigVersion"}).Find(&versions).Error)
+			assert.Len(t, versions, 1)
 		})
 	}
 }

@@ -1240,6 +1240,14 @@ func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStrea
 }
 
 func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError) {
+	if taskErr != nil {
+		if local := service.LocalChannelLimitError(taskErr.Error); local != nil {
+			service.RecordRequestPolicyTermination(c, local)
+			service.WriteChannelRetryAfter(c, local)
+			respondPluginProtocolError(c, local.StatusCode, string(local.GetErrorCode()), local.Error())
+			return
+		}
+	}
 	status := http.StatusInternalServerError
 	if taskErr != nil && taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
 		status = taskErr.StatusCode

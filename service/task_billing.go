@@ -264,6 +264,10 @@ func taskModelName(task *model.Task) string {
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
+//
+// 资金先退还，再以 ClaimRefund 条件写入退款标记（任务未成功且 quota 未变）。
+// 认领失败说明任务已被后续 SUCCESS 结算接管，此时把刚退还的资金扣回，
+// 保证退款与后续成功补扣之间只有一个生效。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {
@@ -276,14 +280,32 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		return false
 	}
 
-	// 2. 退还令牌额度
+	// 2. 认领退款：退款金额记入 refunded_quota，后续 SUCCESS 据此补扣。
+	claimed, err := task.ClaimRefund(quota)
+	if err != nil || !claimed {
+		if err != nil {
+			logger.LogError(ctx, common.LogText("failed to record the task refund, task %s: %s", task.TaskID, err.Error()))
+		} else {
+			logger.LogWarn(ctx, common.LogText("task %s changed before its refund was recorded, the refund is withdrawn", task.TaskID))
+		}
+		if err := taskAdjustFunding(task, quota); err != nil {
+			logger.LogError(ctx, common.LogText("failed to withdraw an unrecorded task refund, task %s: %s", task.TaskID, err.Error()))
+			// Keep the debt durable: the task poller takes it back.
+			if err := task.AddRefundWithdrawal(quota); err != nil {
+				logger.LogError(ctx, common.LogText("failed to record the pending withdrawal of task %s refund %d: %s", task.TaskID, quota, err.Error()))
+			}
+		}
+		return false
+	}
+
+	// 3. 退还令牌额度
 	taskAdjustTokenQuota(ctx, task, -quota)
 
-	// 3. 回减预扣时累计的用户和渠道用量，请求次数保持不变
+	// 4. 回减预扣时累计的用户和渠道用量，请求次数保持不变
 	model.UpdateUserUsedQuota(task.UserId, -quota)
 	model.UpdateChannelUsedQuota(task.ChannelId, -quota)
 
-	// 4. 记录日志
+	// 5. 记录日志
 	other := taskBillingOther(task)
 	other.SetPublic("task_id", task.TaskID)
 	other.SetPublic("reason", reason)
@@ -297,14 +319,86 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		Group:     task.Group,
 		Other:     other,
 	})
-
-	// 5. 资金退款完成后再清除持久化标记。
-	// 回写失败必须显式告警，避免漏掉潜在的重复退款风险。
-	task.Quota = 0
-	if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, common.LogText("refund succeeded but clearing the task quota failed, task %s: %s", task.TaskID, err.Error()))
-	}
 	return true
+}
+
+// RechargeRefundedTaskQuota charges a task that finished with SUCCESS the
+// quota an earlier FAILURE refunded, reversing every element of that refund.
+// It returns true only for the caller that applied the charge, which then
+// owes the task its normal SUCCESS settlement. A charge the funding source
+// rejects is reverted and retried by RetryPendingTaskRefundBilling.
+func RechargeRefundedTaskQuota(ctx context.Context, task *model.Task) bool {
+	refunded := task.RefundedQuota
+	if refunded <= 0 {
+		return false
+	}
+	claimed, err := task.ClaimRefundRecharge(refunded)
+	if err != nil {
+		logger.LogError(ctx, common.LogText("failed to claim the re-charge of refunded task %s: %s", task.TaskID, err.Error()))
+		return false
+	}
+	if !claimed {
+		return false
+	}
+	if err := taskAdjustFunding(task, refunded); err != nil {
+		logger.LogError(ctx, common.LogText("failed to re-charge refunded task %s, it is retried on the next poll: %s", task.TaskID, err.Error()))
+		if err := task.RevertRefundRecharge(refunded); err != nil {
+			logger.LogError(ctx, common.LogText("failed to restore the refund marker of task %s: %s", task.TaskID, err.Error()))
+		}
+		return false
+	}
+	taskAdjustTokenQuota(ctx, task, refunded)
+	model.UpdateUserUsedQuota(task.UserId, refunded)
+	model.UpdateChannelUsedQuota(task.ChannelId, refunded)
+
+	other := taskBillingOther(task)
+	other.SetPublic("task_id", task.TaskID)
+	other.SetPublic("refunded_quota", refunded)
+	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+		UserId:    task.UserId,
+		LogType:   model.LogTypeConsume,
+		Content:   []*common.Message{common.NewMessage("The refunded task completed later and was charged again")},
+		ChannelId: task.ChannelId,
+		ModelName: taskModelName(task),
+		Quota:     refunded,
+		TokenId:   task.PrivateData.TokenId,
+		Group:     task.Group,
+		Other:     other,
+		NodeName:  task.PrivateData.NodeName,
+	})
+	return true
+}
+
+// RetryPendingTaskRefundBilling charges what earlier refund bookkeeping still
+// owes the funding source, without polling the vendor or changing any task
+// status: a refund whose withdrawal failed after its claim was lost is taken
+// back, and a SUCCESS whose refund re-charge failed is charged again.
+func RetryPendingTaskRefundBilling(ctx context.Context) {
+	for _, task := range model.GetTasksWithPendingRefundBilling(100) {
+		if ctx.Err() != nil {
+			return
+		}
+		if withdrawal := task.RefundWithdrawalQuota; withdrawal > 0 {
+			claimed, err := task.ClaimRefundWithdrawal(withdrawal)
+			if err != nil {
+				logger.LogError(ctx, common.LogText("failed to claim the pending refund withdrawal of task %s: %s", task.TaskID, err.Error()))
+			} else if claimed {
+				if err := taskAdjustFunding(task, withdrawal); err != nil {
+					logger.LogError(ctx, common.LogText("failed to withdraw an unrecorded task refund, task %s: %s", task.TaskID, err.Error()))
+					if err := task.AddRefundWithdrawal(withdrawal); err != nil {
+						logger.LogError(ctx, common.LogText("failed to record the pending withdrawal of task %s refund %d: %s", task.TaskID, withdrawal, err.Error()))
+					}
+				}
+			}
+		}
+		if task.Status != model.TaskStatusSuccess || task.RefundedQuota <= 0 {
+			continue
+		}
+		if task.PrivateData.ChannelAttempt != nil && task.PrivateData.ChannelAttempt.IsChannelTest {
+			continue
+		}
+		RechargeRefundedTaskQuota(ctx, task)
+	}
 }
 
 // RecalculateTaskQuota 通用的异步差额结算。

@@ -129,8 +129,11 @@ func (credential *UpstreamCredential) AfterFind(_ *gorm.DB) error {
 }
 
 func (channel *Channel) AfterFind(_ *gorm.DB) error {
-	if err := channel.openSupplierCredential(); err != nil {
-		return err
+	channel.credentialUnavailable, channel.sealedKey = false, ""
+	// One credential this node cannot open affects only its channel, never the
+	// query: a failed read of every channel would empty the routing cache.
+	if channel.openSupplierCredential() != nil {
+		channel.markCredentialUnavailable()
 	}
 	var snapshots []UpstreamCredentialSnapshot
 	if channel.UpstreamCredentialSnapshotData != "" {
@@ -217,6 +220,11 @@ func upstreamCredentialNamespace(channel *Channel) (string, error) {
 
 // Sync at configuration time, never by querying keys on a relay hot path.
 func syncChannelUpstreamCredentials(tx *gorm.DB, channel *Channel) error {
+	if channel.credentialUnavailable {
+		// Without the key material the bindings cannot be matched; keep them
+		// and the snapshot instead of deactivating every binding.
+		return nil
+	}
 	material, err := upstreamFingerprintSecret(tx)
 	if err != nil {
 		return err

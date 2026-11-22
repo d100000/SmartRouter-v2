@@ -58,7 +58,8 @@ func CaptureRealtimeChannelTestUsage(c *gin.Context, info *relaycommon.RelayInfo
 	ok, _, result := TryTieredSettle(info, realtimeTokenParams(info, usage))
 	quota := QuotaInfo{InputDetails: TokenDetails{ImageTokens: usage.InputTokenDetails.ImageTokens, TextTokens: usage.InputTokenDetails.TextTokens, AudioTokens: usage.InputTokenDetails.AudioTokens}, OutputDetails: TokenDetails{TextTokens: usage.OutputTokenDetails.TextTokens, AudioTokens: usage.OutputTokenDetails.AudioTokens}, ModelName: info.OriginModelName, UsePrice: info.PriceData.UsePrice, ModelPrice: info.PriceData.ModelPrice, ModelRatio: info.PriceData.ModelRatio, GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, FrozenPrice: &info.PriceData}
 	snapshot := &relaycommon.OverviewBillingSnapshot{InputTokens: int64(usage.InputTokenDetails.TextTokens), OutputTokens: int64(usage.OutputTokenDetails.TextTokens), UsageSource: "upstream_realtime", QuotaPerUnit: common.QuotaPerUnit}
-	captureAudioBillingSnapshot(info, quota, snapshot, ok, result)
+	charged := usage.TotalTokens > 0 || info.PriceData.UsePrice || ok
+	captureAudioBillingSnapshot(info, quota, snapshot, ok, result, charged)
 }
 
 // Duration-based ASR follows the existing transcription billing convention:

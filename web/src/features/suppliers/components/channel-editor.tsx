@@ -50,7 +50,6 @@ import {
 
 import { saveSupplyChannel, supplyQueryKey } from '../api'
 import { supplierChannelSchema as schema } from '../lib/forms'
-import { limitsPayload } from '../lib/limits'
 import type { SupplierTemplate, SupplyChannel } from '../types'
 
 type Values = z.infer<typeof schema>
@@ -76,17 +75,11 @@ export function ChannelEditor(props: Props) {
       key: '',
       models: props.channel?.models ?? [],
       remark: props.channel?.remark ?? '',
-      priority: String(props.channel?.priority ?? 0),
-      rpm: '',
-      tpm: '',
-      daily_usd: '',
     },
   })
   const selectedTemplate = props.templates.find(
     (template) => template.id === form.watch('template_id')
   )
-  const tpmApplicable =
-    selectedTemplate?.tpm_applicable ?? props.channel?.tpm_applicable ?? true
   const templateOptions = props.templates.map((template) => ({
     value: template.id,
     label: template.name,
@@ -101,7 +94,9 @@ export function ChannelEditor(props: Props) {
       const credentialChange =
         !props.channel ||
         values.key !== '' ||
-        values.base_url !== props.channel.base_url
+        values.base_url !== props.channel.base_url ||
+        values.template_id !==
+          (props.channel.template_id ?? String(props.channel.type))
       if (credentialChange && !values.key.trim()) {
         form.setError('key', { message: t('Enter a new upstream key') })
         return false
@@ -119,27 +114,12 @@ export function ChannelEditor(props: Props) {
         if (!proof) return false
         proofToken = proof.proof_token
       }
-      const { rpm, tpm, daily_usd, ...channelValues } = values
-      const limits = limitsPayload(
-        { rpm, tpm: tpmApplicable ? tpm : '', daily_usd },
-        0
-      )
       await saveSupplyChannel(
         props.channel?.id,
         {
-          ...channelValues,
+          ...values,
           key: values.key || undefined,
-          priority: Number(values.priority),
           version: props.channel?.version,
-          ...(!props.channel
-            ? {
-                limits: {
-                  rpm: limits.rpm,
-                  tpm: limits.tpm,
-                  daily_usd: limits.daily_usd,
-                },
-              }
-            : {}),
         },
         proofToken,
         props.audience,
@@ -164,10 +144,8 @@ export function ChannelEditor(props: Props) {
       <Dialog
         open={!verification.isActive}
         onOpenChange={(open) => !open && !mutation.isPending && props.onClose()}
-        title={props.channel ? t('Edit Channel') : t('Add Channel')}
-        description={t(
-          'Credentials are write-only. New connection settings take effect after validation.'
-        )}
+        title={props.channel ? t('Submit update') : t('Add Channel')}
+        description={t('Test the draft before an administrator publishes it.')}
       >
         <Form {...form}>
           <form
@@ -199,9 +177,8 @@ export function ChannelEditor(props: Props) {
                     onValueChange={(value) => {
                       field.onChange(value ?? '')
                       form.setValue('models', [])
-                      form.setValue('tpm', '')
                     }}
-                    disabled={Boolean(props.channel) || mutation.isPending}
+                    disabled={mutation.isPending}
                   >
                     <FormControl>
                       <SelectTrigger>
@@ -293,6 +270,7 @@ export function ChannelEditor(props: Props) {
                         (model) => ({ value: model, label: model })
                       )}
                       selected={field.value}
+                      allowCreate={selectedTemplate?.allows_custom_models}
                       onChange={field.onChange}
                       disabled={mutation.isPending}
                     />
@@ -301,80 +279,6 @@ export function ChannelEditor(props: Props) {
                 </FormItem>
               )}
             />
-            <FormField
-              control={form.control}
-              name='priority'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Supplier internal priority')}</FormLabel>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      inputMode='numeric'
-                      disabled={mutation.isPending}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            {!props.channel && (
-              <fieldset className='space-y-3'>
-                <legend className='text-sm font-medium'>
-                  {t('Channel limits')}
-                </legend>
-                <p className='text-muted-foreground text-xs'>
-                  {t(
-                    'Leave RPM or TPM blank for no limit. Daily limits use procurement cost in USD and reset at 00:00 Beijing time.'
-                  )}
-                </p>
-                <div className='grid gap-3 sm:grid-cols-3'>
-                  {(
-                    [
-                      { name: 'rpm', label: t('RPM') },
-                      { name: 'tpm', label: t('TPM') },
-                      { name: 'daily_usd', label: t('Daily limit (USD)') },
-                    ] as const
-                  ).map(({ name, label }) => (
-                    <FormField
-                      key={name}
-                      control={form.control}
-                      name={name}
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{label}</FormLabel>
-                          <FormControl>
-                            <Input
-                              {...field}
-                              inputMode={
-                                name === 'daily_usd' ? 'decimal' : 'numeric'
-                              }
-                              placeholder={
-                                name === 'tpm' && !tpmApplicable
-                                  ? t('Not applicable')
-                                  : t('Unlimited')
-                              }
-                              disabled={
-                                mutation.isPending ||
-                                (name === 'tpm' && !tpmApplicable)
-                              }
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                  ))}
-                </div>
-                {!tpmApplicable && (
-                  <p className='text-muted-foreground text-xs'>
-                    {t(
-                      'TPM does not apply to this template. Images, video seconds and credits are counted separately.'
-                    )}
-                  </p>
-                )}
-              </fieldset>
-            )}
             <FormField
               control={form.control}
               name='remark'

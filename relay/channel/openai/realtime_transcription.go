@@ -439,12 +439,15 @@ func (t *realtimeTranscriber) run(parent *gin.Context, connection *relaycommon.R
 		if writeRealtimeFrame(conn, payload) != nil {
 			return
 		}
+		// Audio upstream received is charged even if the turn is interrupted.
+		generation.markSent(segment.control)
 		offset = end
 	}
 	if writeRealtimeFrame(conn, []byte(`{"type":"input_audio_buffer.commit"}`)) != nil {
 		return
 	}
 	committedItemID := ""
+	relayedTranscript := false
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -453,6 +456,11 @@ func (t *realtimeTranscriber) run(parent *gin.Context, connection *relaycommon.R
 		event := gjson.ParseBytes(raw)
 		kind := event.Get("type").String()
 		if kind == "error" {
+			// Upstream rejected the turn before relaying any transcript:
+			// nothing ran, so it is refunded.
+			if !relayedTranscript {
+				generation.sent = false
+			}
 			return
 		}
 		if kind == "input_audio_buffer.committed" {
@@ -473,6 +481,7 @@ func (t *realtimeTranscriber) run(parent *gin.Context, connection *relaycommon.R
 		if !t.emit(realtimeTranscriptFrame{jobID: id, generation: generation, body: raw}, done) {
 			return
 		}
+		relayedTranscript = true
 		if kind == "conversation.item.input_audio_transcription.completed" || kind == "conversation.item.input_audio_transcription.failed" {
 			emitted = true
 			return

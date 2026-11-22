@@ -105,10 +105,17 @@ func main() {
 					}
 				}
 			}()
-			model.InitChannelCache()
+			if err := model.ReloadChannelCache(); err != nil {
+				service.SyncTopicLoadFailed(model.SyncTopicChannels, err)
+			}
 		}()
 
 		go model.SyncChannelCache(common.SyncFrequency)
+	}
+	// Prime the complete routing snapshot before the first relay. A failed
+	// startup read is retried by node synchronization and subsequent routing.
+	if err := service.SyncSchedulingConfig(); err != nil {
+		service.SyncTopicLoadFailed(model.SyncTopicChannels, err)
 	}
 	wsmanager.StartSubscriber(context.Background())
 
@@ -122,15 +129,21 @@ func main() {
 
 	// Every node reloads a topic within seconds of a write to it on any node.
 	// The periodic reloads below stay for writes that do not bump a topic.
-	service.RegisterSyncTopic(model.SyncTopicOptions, func(context.Context) error { return model.LoadOptionsFromDatabase() })
-	if common.MemoryCacheEnabled || common.IsMasterNode {
-		service.RegisterSyncTopic(model.SyncTopicChannels, func(ctx context.Context) error {
-			if common.MemoryCacheEnabled {
-				model.InitChannelCache()
-			}
-			return service.ScanScheduledPlugins(ctx)
-		})
-	}
+	service.RegisterSyncTopic(model.SyncTopicOptions, func(context.Context) error {
+		if err := model.LoadOptionsFromDatabase(); err != nil {
+			return err
+		}
+		return service.SyncSchedulingConfig()
+	})
+	service.RegisterSyncTopic(model.SyncTopicChannels, func(ctx context.Context) error {
+		if err := model.ReloadChannelCache(); err != nil {
+			return err
+		}
+		if err := service.SyncSchedulingConfig(); err != nil {
+			return err
+		}
+		return service.ScanScheduledPlugins(ctx)
+	})
 	service.RegisterSyncTopic(model.SyncTopicAuthz, func(context.Context) error { return authz.ReloadPolicy() })
 	service.RegisterSyncTopic(model.SyncTopicPlugins, controller.SyncTaskPluginsOnceContext)
 	service.RegisterSyncTopic(model.SyncTopicOAuthProviders, func(context.Context) error { return oauth.LoadCustomProviders() })
@@ -333,6 +346,7 @@ func InjectGoogleAnalytics() {
 }
 
 func InitResources() error {
+	var schedulingCapacityMigration []string
 	// Initialize resources here if needed
 	// This is a placeholder function for future resource initialization
 	err := godotenv.Load(".env")
@@ -389,6 +403,11 @@ func InitResources() error {
 		if err := model.MigrateSensitiveWords(); err != nil {
 			return fmt.Errorf("migrate sensitive words before accepting requests: %w", err)
 		}
+		changed, err := model.MigrateSchedulingDefaultCapacity()
+		if err != nil {
+			common.SysError(common.LogText("failed to migrate scheduling default capacity: %s", err.Error()))
+		}
+		schedulingCapacityMigration = changed
 	} else if err := model.CheckSensitiveWordsMigration(); err != nil {
 		return err
 	}
@@ -414,6 +433,7 @@ func InitResources() error {
 	if err != nil {
 		return err
 	}
+	model.RecordSchedulingCapacityMigration(schedulingCapacityMigration)
 
 	// Initialize Redis
 	err = common.InitRedisClient()

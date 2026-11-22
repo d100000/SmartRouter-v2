@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +140,143 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 	assert.Equal(t, 2102, second.Id)
 	assert.Equal(t, "default", selectedGroup)
 	assert.Equal(t, "default", common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
+}
+
+func routingTestContext(t *testing.T) *gin.Context {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	t.Cleanup(func() { EndSchedulingRequest(c) })
+	return c
+}
+
+func TestAutoGroupLocalAdmissionAndCapacityOutcomes(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const name = "auto-capacity"
+	setSchedulingTestConfig(t, []SchedulingConfig{
+		{Group: "vip", Model: name, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1},
+		{Group: "default", Model: name, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1},
+	})
+	for i, group := range []string{"vip", "vip", "default"} {
+		createChannelSelectAutoGroupsChannel(t, db, 6001+i, group, name)
+	}
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 6001).Update("priority", 100).Error)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	autoContext := func() *gin.Context {
+		c := routingTestContext(t)
+		common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, []string{"vip", "default"})
+		common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, true)
+		return c
+	}
+	selectAuto := func(c *gin.Context) (*model.Channel, string, *ChannelSelectError) {
+		// The relay constructs a new retry parameter after Distribute has reserved a channel.
+		return SelectChannelForRequest(c, name, &RetryParam{Ctx: c, TokenGroup: "auto", ModelName: name})
+	}
+	first := autoContext()
+	selected, _, selectErr := selectAuto(first)
+	require.Nil(t, selectErr)
+	require.Equal(t, 6001, selected.Id)
+	AppendUsedChannel(first, selected.Id)
+	FinishSchedulingAttempt(first, nil, types.NewOpenAIError(errors.New("local limit"), types.ErrorCode("channel_limit_unavailable"), http.StatusServiceUnavailable))
+	first.Set("channel_local_refusals", 1)
+	selected, group, selectErr := selectAuto(first)
+	require.Nil(t, selectErr)
+	require.Equal(t, "vip", group)
+	require.Equal(t, 6002, selected.Id)
+	EndSchedulingRequest(first)
+
+	for _, id := range []int{6001, 6002} {
+		channel, err := model.CacheGetChannelForRouting(id)
+		require.NoError(t, err)
+		require.NoError(t, ReserveSchedulingChannel(routingTestContext(t), channel, "vip", name))
+	}
+	fallback := autoContext()
+	selected, group, selectErr = selectAuto(fallback)
+	require.Nil(t, selectErr)
+	require.Equal(t, "default", group)
+	require.Equal(t, 6003, selected.Id)
+	exhausted := autoContext() // The successful fallback still holds the last lease.
+	selected, _, selectErr = selectAuto(exhausted)
+	require.Nil(t, selected)
+	require.NotNil(t, selectErr)
+	require.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+	exhausted.AbortWithStatus(selectErr.StatusCode)
+	EndSchedulingRequest(exhausted)
+	// A preparatory selection can fail before an HTTP handler accepts the
+	// request. Its unwritten success status must not look like a capacity 503.
+	preflight := autoContext()
+	_, _, selectErr = selectAuto(preflight)
+	require.NotNil(t, selectErr)
+	preflight.Status(http.StatusNoContent)
+	EndSchedulingRequest(preflight)
+	EndSchedulingRequest(fallback)
+	vip := scheduler.Default.Snapshot(scheduler.Key{Group: "vip", Model: name}, nil, false).Summary
+	assert.EqualValues(t, 1, vip.CapacitySkips30m)
+	assert.Zero(t, vip.CapacityExhausted30m)
+	last := scheduler.Default.Snapshot(scheduler.Key{Group: "default", Model: name}, nil, false).Summary
+	assert.Zero(t, last.CapacitySkips30m)
+	assert.EqualValues(t, 1, last.CapacityExhausted30m)
+}
+
+func TestCapacityCountsFinalRoutingOutcomeAcrossRetries(t *testing.T) {
+	for _, succeeds := range []bool{true, false} {
+		t.Run(fmt.Sprintf("retry_succeeds_%t", succeeds), func(t *testing.T) {
+			db := setupChannelSelectAutoGroupsTest(t)
+			const name = "capacity-retries"
+			setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: name, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1}})
+			for _, id := range []int{6110, 6111, 6112} {
+				createChannelSelectAutoGroupsChannel(t, db, id, "default", name)
+			}
+			model.InitChannelCache()
+			require.NoError(t, SyncSchedulingConfig())
+			var lastLease *gin.Context
+			for _, id := range []int{6110, 6112} {
+				channel, err := model.CacheGetChannelForRouting(id)
+				require.NoError(t, err)
+				lastLease = routingTestContext(t)
+				require.NoError(t, ReserveSchedulingChannel(lastLease, channel, "default", name))
+			}
+			common.RetryTimes = 1
+			request := routingTestContext(t)
+			param := &RetryParam{Ctx: request, TokenGroup: "default", ModelName: name}
+			channel, _, selectErr := SelectChannelForRequest(request, name, param)
+			require.Nil(t, selectErr)
+			require.Equal(t, 6111, channel.Id)
+			info := &relaycommon.RelayInfo{OriginModelName: name, UsingGroup: "default"}
+			AppendUsedChannel(request, channel.Id)
+			StartSchedulingAttempt(request, info)
+			FinishSchedulingAttempt(request, info, types.NewOpenAIError(errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway))
+			key := scheduler.Key{Group: "default", Model: name}
+			assert.Zero(t, scheduler.Default.Snapshot(key, nil, false).Summary.CapacitySkips30m, "an intermediate selection cannot settle the request")
+			if succeeds {
+				EndSchedulingRequest(lastLease)
+			}
+			param.IncreaseRetry()
+			channel, _, selectErr = SelectChannelForRequest(request, name, param)
+			if succeeds {
+				require.Nil(t, selectErr)
+				require.Equal(t, 6112, channel.Id)
+				StartSchedulingAttempt(request, info)
+				FinishSchedulingAttempt(request, info, nil)
+			} else {
+				require.NotNil(t, selectErr)
+				require.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+				request.AbortWithStatus(selectErr.StatusCode)
+			}
+			EndSchedulingRequest(request)
+			EndSchedulingRequest(request)
+			summary := scheduler.Default.Snapshot(key, nil, false).Summary
+			if succeeds {
+				assert.EqualValues(t, 1, summary.CapacitySkips30m)
+				assert.Zero(t, summary.CapacityExhausted30m)
+			} else {
+				assert.Zero(t, summary.CapacitySkips30m)
+				assert.EqualValues(t, 1, summary.CapacityExhausted30m)
+			}
+		})
+	}
 }
 
 func TestSchedulingAttemptsPreserveFailuresAndMeasureUsefulOutput(t *testing.T) {
@@ -470,6 +609,7 @@ func TestSupplierPoolCapacityChangesApplyAcrossIdleModels(t *testing.T) {
 	require.NotNil(t, selected)
 	require.NoError(t, db.Model(&model.SupplierAccount{}).Where("supplier_id = ?", "supplier-a").Update("pool_capacity", 2).Error)
 	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
 	second, _ := gin.CreateTestContext(httptest.NewRecorder())
 	defer EndSchedulingRequest(second)
 	selected, err = schedulerSelectChannel(second, "default", "supplier-model-a", 0, nil)
@@ -477,11 +617,17 @@ func TestSupplierPoolCapacityChangesApplyAcrossIdleModels(t *testing.T) {
 	require.NotNil(t, selected, "the idle model must no longer retain the old capacity of one")
 	require.NoError(t, db.Model(&model.SupplierAccount{}).Where("supplier_id = ?", "supplier-a").Update("pool_capacity", 1).Error)
 	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
 	third, _ := gin.CreateTestContext(httptest.NewRecorder())
 	defer EndSchedulingRequest(third)
 	selected, err = schedulerSelectChannel(third, "default", "supplier-model-b", 0, nil)
 	require.NoError(t, err)
 	assert.Nil(t, selected, "decreasing capacity must retain both outstanding leases")
+	third.AbortWithStatus(http.StatusServiceUnavailable)
+	EndSchedulingRequest(third)
+	summary := scheduler.Default.Snapshot(scheduler.Key{Group: "default", Model: "supplier-model-b"}, nil, false).Summary
+	assert.EqualValues(t, 1, summary.CapacityExhausted30m, "supplier pool saturation is visible on the model dashboard")
+	assert.Zero(t, summary.CapacitySkips30m)
 }
 
 func TestSchedulingColdFallbackSkipsUnavailableTiers(t *testing.T) {
@@ -570,7 +716,7 @@ func TestSchedulingColdRetryAdvancesAfterFallbackAndPinsStayFixed(t *testing.T) 
 	policy, err := model.BuildRequestPolicy(map[string]string{
 		"channel_affinity_setting.enabled":      "true",
 		"channel_affinity_setting.session_mode": "strict",
-		"channel_affinity_setting.rules":        `[{"name":"full-channel","model_regex":[".*"],"key_sources":[{"type":"request_header","key":"X-Session"}]}]`,
+		"channel_affinity_setting.rules":        `[{"name":"full-channel","session_mode":"inherit","model_regex":[".*"],"key_sources":[{"type":"request_header","key":"X-Session"}]}]`,
 	})
 	require.NoError(t, err)
 	*affinity = policy.Affinity
@@ -580,6 +726,7 @@ func TestSchedulingColdRetryAdvancesAfterFallbackAndPinsStayFixed(t *testing.T) 
 	defer EndSchedulingRequest(strict)
 	_, found := GetPreferredChannelByAffinity(strict, modelName, "default")
 	require.False(t, found)
+	require.Equal(t, "strict", RequestPolicy(strict).SessionMode)
 	RecordChannelAffinity(strict, top.Id)
 	t.Cleanup(func() { ClearCurrentChannelAffinityCache(strict) })
 	selected, _, selectErr = SelectChannelForRequest(strict, modelName, &RetryParam{Ctx: strict, TokenGroup: "default", ModelName: modelName})
@@ -693,6 +840,7 @@ func TestSchedulingMembershipSameChannelGroupRemovalAndCachedAliases(t *testing.
 	channel.Group = "default"
 	require.NoError(t, channel.Update())
 	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	defer EndSchedulingRequest(c)
@@ -828,4 +976,551 @@ func TestSchedulingColdRetryDoesNotSkipTierAfterPreviousIsDisabled(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, next)
 	assert.Equal(t, 4702, next.Id, "removing the previous tier does not consume the following tier too")
+}
+
+func TestSchedulingHonorsSessionAffinityAndAdmission(t *testing.T) {
+	const boundID, fallbackID = 4801, 4802
+	for _, tc := range []struct {
+		name    string
+		active  bool
+		mode    string
+		full    bool
+		refused bool
+		wantID  int
+	}{
+		{name: "active prefer keeps binding", active: true, mode: "prefer", wantID: boundID},
+		{name: "active strict keeps binding", active: true, mode: "strict", wantID: boundID},
+		{name: "active prefer full falls back", active: true, mode: "prefer", full: true, wantID: fallbackID},
+		{name: "cold prefer full falls back", mode: "prefer", full: true, wantID: fallbackID},
+		{name: "active strict full refuses", active: true, mode: "strict", full: true},
+		{name: "active prefer skips locally refused binding", active: true, mode: "prefer", refused: true, wantID: fallbackID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupChannelSelectAutoGroupsTest(t)
+			const modelName = "scheduler-session-affinity"
+			setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1}})
+			createChannelSelectAutoGroupsChannel(t, db, boundID, "default", modelName)
+			createChannelSelectAutoGroupsChannel(t, db, fallbackID, "default", modelName)
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", fallbackID).Update("priority", 100).Error)
+			model.InitChannelCache()
+
+			affinity := operation_setting.GetChannelAffinitySetting()
+			previousAffinity := *affinity
+			t.Cleanup(func() { *affinity = previousAffinity })
+			*affinity = operation_setting.ChannelAffinitySetting{
+				Enabled: true, DefaultTTLSeconds: 3600,
+				Rules: []operation_setting.ChannelAffinityRule{{
+					Name: t.Name(), ModelRegex: []string{".*"}, SessionMode: tc.mode,
+					KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+				}},
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			c.Request.Header.Set("X-Session", t.Name())
+			defer EndSchedulingRequest(c)
+			_, found := GetPreferredChannelByAffinity(c, modelName, "default")
+			require.False(t, found)
+			RecordChannelAffinity(c, boundID)
+			t.Cleanup(func() { ClearCurrentChannelAffinityCache(c) })
+			key := scheduler.Key{Group: "default", Model: modelName}
+			require.NoError(t, SyncSchedulingConfig(key))
+			if tc.active {
+				for i := range 50 {
+					request := scheduler.Default.BeginRequest(key, fmt.Sprintf("activation-%d", i), false)
+					scheduler.Default.EndRequest(request)
+				}
+			}
+			require.Equal(t, tc.active, scheduler.Default.IsActive(key))
+
+			busy, _ := gin.CreateTestContext(httptest.NewRecorder())
+			busy.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			defer EndSchedulingRequest(busy)
+			bound, err := model.CacheGetChannelForRouting(boundID)
+			require.NoError(t, err)
+			if tc.full {
+				require.NoError(t, ReserveSchedulingChannel(busy, bound, "default", modelName))
+			}
+			param := &RetryParam{Ctx: c, TokenGroup: "default", ModelName: modelName}
+			if tc.refused {
+				first, _, selectErr := SelectChannelForRequest(c, modelName, param)
+				require.Nil(t, selectErr)
+				require.NotNil(t, first)
+				require.Equal(t, boundID, first.Id)
+				AppendUsedChannel(c, boundID)
+				FinishSchedulingAttempt(c, nil, types.NewOpenAIError(errors.New("local admission refused"), types.ErrorCode("channel_limit_unavailable"), http.StatusServiceUnavailable))
+				c.Set("channel_local_refusals", 1)
+			}
+			selected, group, selectErr := SelectChannelForRequest(c, modelName, param)
+			if tc.wantID == 0 {
+				assert.Nil(t, selected)
+				require.NotNil(t, selectErr)
+				assert.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+				c.AbortWithStatus(selectErr.StatusCode)
+			} else {
+				require.Nil(t, selectErr)
+				require.NotNil(t, selected)
+				assert.Equal(t, tc.wantID, selected.Id)
+				assert.Equal(t, "default", group)
+				info, marked := c.Get(ginKeyChannelAffinityLogInfo)
+				if tc.wantID == boundID {
+					require.True(t, marked)
+					assert.Equal(t, boundID, info.(map[string]any)["channel_id"])
+					assert.Equal(t, 1, c.GetInt(ginKeyChannelAffinityRetryOffset))
+				} else {
+					assert.Equal(t, tc.refused, marked, "only a previously admitted binding may be marked")
+					assert.Zero(t, c.GetInt(ginKeyChannelAffinityRetryOffset), "fallback must not consume the affinity retry offset")
+				}
+			}
+			EndSchedulingRequest(c)
+			EndSchedulingRequest(busy)
+			snapshot := scheduler.Default.Snapshot(key, []scheduler.Candidate{SchedulerCandidate(bound)}, false)
+			assert.Zero(t, snapshot.Summary.InFlight, "selection and fallback must release all reservations")
+			assert.Zero(t, snapshot.Summary.Attempts30m, "local reservations are not upstream attempts")
+			if tc.full && tc.mode == "strict" {
+				assert.EqualValues(t, 1, snapshot.Summary.CapacityExhausted30m)
+				assert.Zero(t, snapshot.Summary.CapacitySkips30m)
+			} else if tc.full {
+				assert.EqualValues(t, 1, snapshot.Summary.CapacitySkips30m)
+				assert.Zero(t, snapshot.Summary.CapacityExhausted30m)
+			}
+		})
+	}
+}
+
+func bindRoutingTestSession(t *testing.T, name, mode string, bound int) func() *gin.Context {
+	t.Helper()
+	affinity := operation_setting.GetChannelAffinitySetting()
+	old := *affinity
+	t.Cleanup(func() { *affinity = old })
+	*affinity = operation_setting.ChannelAffinitySetting{
+		Enabled: true, SwitchOnSuccess: true,
+		Rules: []operation_setting.ChannelAffinityRule{{
+			Name: t.Name(), ModelRegex: []string{".*"}, SessionMode: mode,
+			KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+		}},
+	}
+	newRequest := func() *gin.Context {
+		c := routingTestContext(t)
+		c.Request.Header.Set("X-Session", t.Name())
+		return c
+	}
+	seed := newRequest()
+	_, found := GetPreferredChannelByAffinity(seed, name, "default")
+	require.False(t, found)
+	RecordChannelAffinity(seed, bound)
+	t.Cleanup(func() { ClearCurrentChannelAffinityCache(seed) })
+	return newRequest
+}
+
+func TestSessionBindingSurvivesRequestFilter(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const name, bound, alternate = "filtered-session", 6010, 6011
+	setSchedulingTestConfig(t, nil)
+	for _, id := range []int{bound, alternate} {
+		createChannelSelectAutoGroupsChannel(t, db, id, "default", name)
+	}
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", alternate).Update("setting", `{"responses_websocket_enabled":true}`).Error)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	for _, mode := range []string{"prefer", "strict"} {
+		t.Run(mode, func(t *testing.T) {
+			newRequest := bindRoutingTestSession(t, name, mode, bound)
+			filtered := newRequest()
+			GetChannelConstraints(filtered).AddFilter(dto.ChannelFilter{Kind: dto.FilterResponsesWebSocket})
+			selected, _, err := SelectChannelForRequest(filtered, name, &RetryParam{Ctx: filtered, TokenGroup: "default", ModelName: name})
+			if mode == "strict" {
+				require.NotNil(t, err)
+				require.Equal(t, http.StatusServiceUnavailable, err.StatusCode)
+			} else {
+				require.Nil(t, err)
+				require.Equal(t, alternate, selected.Id)
+				RecordChannelAffinity(filtered, selected.Id)
+			}
+			next := newRequest()
+			selected, _, err = SelectChannelForRequest(next, name, &RetryParam{Ctx: next, TokenGroup: "default", ModelName: name})
+			require.Nil(t, err)
+			assert.Equal(t, bound, selected.Id)
+			assert.Equal(t, bound, next.GetInt(ginKeyChannelAffinityUsedChannel))
+		})
+	}
+}
+
+func TestSessionHealthBypassRequiresReservableSupplier(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const name, other, bound, healthy, sibling = "health-session", "other-model", 6100, 6101, 6102
+	setSchedulingTestConfig(t, nil)
+	require.NoError(t, db.AutoMigrate(&model.SupplierAccount{}))
+	for priority, supplier := range []string{"healthy", "preferred"} {
+		require.NoError(t, db.Create(&model.SupplierAccount{SupplierID: supplier, SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: name + "," + other, Group: "default", PoolWeight: 1, PoolPriority: int64(priority), PoolCapacity: 1}).Error)
+	}
+	for _, row := range []struct {
+		id              int
+		supplier, model string
+	}{{bound, "preferred", name}, {healthy, "healthy", name}, {sibling, "healthy", other}} {
+		createChannelSelectAutoGroupsChannel(t, db, row.id, "default", row.model)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", row.id).Updates(map[string]any{"owner_supplier_id": row.supplier, "supplier_validated": true}).Error)
+	}
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", bound).Update("setting", `{"responses_websocket_enabled":true}`).Error)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	for _, id := range []int{healthy, bound} {
+		channel, err := model.CacheGetChannelForRouting(id)
+		require.NoError(t, err)
+		c := routingTestContext(t)
+		require.NoError(t, ReserveSchedulingChannel(c, channel, "default", name))
+		info := &relaycommon.RelayInfo{OriginModelName: name, UsingGroup: "default"}
+		StartSchedulingAttempt(c, info)
+		var failure *types.NewAPIError
+		if id == bound {
+			failure = types.NewOpenAIError(errors.New("upstream error"), types.ErrorCodeBadResponseStatusCode, http.StatusInternalServerError)
+		}
+		FinishSchedulingAttempt(c, info, failure)
+		EndSchedulingRequest(c)
+	}
+	newRequest := bindRoutingTestSession(t, name, "prefer", bound)
+	c := newRequest()
+	selected, _, selectErr := SelectChannelForRequest(c, name, &RetryParam{Ctx: c, TokenGroup: "default", ModelName: name})
+	require.Nil(t, selectErr)
+	require.Equal(t, healthy, selected.Id)
+	RecordChannelAffinity(c, selected.Id)
+	EndSchedulingRequest(c)
+	filtered := newRequest()
+	GetChannelConstraints(filtered).AddFilter(dto.ChannelFilter{Kind: dto.FilterResponsesWebSocket})
+	selected, _, selectErr = SelectChannelForRequest(filtered, name, &RetryParam{Ctx: filtered, TokenGroup: "default", ModelName: name})
+	require.Nil(t, selectErr)
+	require.Equal(t, bound, selected.Id, "the healthy supplier has no channel serving this request")
+	assert.Equal(t, bound, filtered.GetInt(ginKeyChannelAffinityUsedChannel))
+	EndSchedulingRequest(filtered)
+	// Only the supplier pool is full. The healthy channel has no active attempt.
+	busy, err := model.CacheGetChannelForRouting(sibling)
+	require.NoError(t, err)
+	require.NoError(t, ReserveSchedulingChannel(routingTestContext(t), busy, "default", other))
+	c = newRequest()
+	selected, _, selectErr = SelectChannelForRequest(c, name, &RetryParam{Ctx: c, TokenGroup: "default", ModelName: name})
+	require.Nil(t, selectErr)
+	require.Equal(t, bound, selected.Id)
+	assert.Equal(t, bound, c.GetInt(ginKeyChannelAffinityUsedChannel))
+}
+
+func TestSchedulingMetadataReloadFailureKeepsRouting(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	setSchedulingTestConfig(t, nil)
+	require.NoError(t, db.AutoMigrate(&model.SupplierAccount{}))
+	const name = "scheduler-metadata-reload"
+	createChannelSelectAutoGroupsChannel(t, db, 7401, "default", name)
+	createChannelSelectAutoGroupsChannel(t, db, 7402, "default", name)
+	// Cold routing always prefers this channel while its ability is enabled.
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 7402).Update("priority", 100).Error)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+
+	// Leave the native channel enabled while revoking just this model ability.
+	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", 7402).Update("enabled", false).Error)
+	createChannelSelectAutoGroupsChannel(t, db, 7403, "new-group", name)
+	createChannelSelectAutoGroupsChannel(t, db, 7404, "supplier-group", name)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 7404).Update("owner_supplier_id", "new-supplier").Error)
+	model.InitChannelCache()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var signal, unblock sync.Once
+	defer unblock.Do(func() { close(release) })
+	const callback = "block_supplier_membership"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "supplier_accounts" {
+			signal.Do(func() { close(started) })
+			<-release
+			tx.AddError(errors.New("supplier read offline"))
+		}
+	}))
+	selectOnce := func(group string) *model.Channel {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		defer EndSchedulingRequest(c)
+		selected, err := schedulerSelectChannel(c, group, name, 0, nil)
+		require.NoError(t, err)
+		return selected
+	}
+	// Selection must serve the old complete snapshot even when the supplier
+	// query has not returned; the revoked ability is immediately ineligible.
+	first := make(chan error, 1)
+	go func() { first <- ensureSchedulingConfig(false) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("metadata refresh did not reach supplier query")
+	}
+	select {
+	case err := <-first:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request that scheduled the refresh is blocked on the supplier query")
+	}
+	selected := selectOnce("default")
+	require.NotNil(t, selected)
+	assert.Equal(t, 7401, selected.Id)
+	schedulingConfigState.Lock()
+	work := schedulingConfigState.refresh
+	schedulingConfigState.Unlock()
+	require.NotNil(t, work)
+	assert.Nil(t, selectOnce("new-group"))
+	unblock.Do(func() { close(release) })
+	<-work.done
+	require.Error(t, work.err)
+	assert.Nil(t, selectOnce("new-group"), "a failed supplier read must publish neither layer")
+	selected = selectOnce("default")
+	require.NotNil(t, selected)
+	assert.Equal(t, 7401, selected.Id)
+	require.NoError(t, db.Callback().Query().Remove(callback))
+	require.NoError(t, SyncSchedulingConfig())
+	selected = selectOnce("new-group")
+	require.NotNil(t, selected)
+	assert.Equal(t, 7403, selected.Id, "complete publication admits the new native channel")
+}
+
+func TestAvailabilityFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  *types.NewAPIError
+		want bool
+	}{
+		{"local plugin failure", types.NewErrorWithStatusCode(errors.New("plugin"), types.ErrorCodeRequestPluginFailed, 500), false},
+		{"credential in synthesized 502", types.InitOpenAIError("invalid_api_key", 502), false},
+		{"server error", types.NewOpenAIError(errors.New("internal"), types.ErrorCodeBadResponseStatusCode, http.StatusInternalServerError), true},
+		{"overloaded", types.NewOpenAIError(errors.New("overloaded"), types.ErrorCodeBadResponseStatusCode, http.StatusServiceUnavailable), true},
+		{"rate limited", types.NewOpenAIError(errors.New("slow down"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests), true},
+		{"connection failed", types.NewError(errors.New("dial"), types.ErrorCodeDoRequestFailed), true},
+		{"invalid credential", types.NewOpenAIError(errors.New("bad key"), types.ErrorCodeBadResponseStatusCode, http.StatusUnauthorized), false},
+		{"channel configuration", types.NewError(errors.New("no key"), types.ErrorCodeChannelNoAvailableKey), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, availabilityFailure(nil, tc.err))
+		})
+	}
+	scanner := relaycommon.NewStreamStatus()
+	scanner.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("read failed"))
+	credential := relaycommon.NewStreamStatus()
+	credential.MarkFailed("invalid_api_key", "authentication_error", http.StatusBadGateway)
+	overload := relaycommon.NewStreamStatus()
+	overload.MarkFailed("overloaded_error", "", 0)
+	deadline := relaycommon.NewStreamStatus()
+	deadline.SetEndReason(relaycommon.StreamEndReasonClientGone, context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name   string
+		stream *relaycommon.StreamStatus
+		want   bool
+	}{
+		{"interrupted stream", scanner, true},
+		{"in-band credential rejection", credential, false},
+		{"in-band overload", overload, true},
+		{"upstream read deadline", deadline, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, availabilityFailure(&relaycommon.RelayInfo{IsStream: true, StreamStatus: tc.stream}, nil))
+		})
+	}
+}
+
+// A channel refused locally before dispatch is excluded, but the next pick
+// remains a weighted draw: only an upstream dispatch makes selection rank
+// candidates as a retry, which always takes the top weight.
+func TestLocalRefusalKeepsWeightedSelection(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "scheduler-local-refusal"
+	setSchedulingTestConfig(t, nil)
+	for _, id := range []int{7501, 7502, 7503} {
+		createChannelSelectAutoGroupsChannel(t, db, id, "default", modelName)
+	}
+	model.InitChannelCache()
+	key := scheduler.Key{Group: "default", Model: modelName}
+	require.NoError(t, SyncSchedulingConfig(key))
+	for i := range 50 {
+		scheduler.Default.EndRequest(scheduler.Default.BeginRequest(key, fmt.Sprintf("activation-%d", i), false))
+	}
+	require.True(t, scheduler.Default.IsActive(key))
+	chosen := make(map[int]bool)
+	for range 40 {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		AppendUsedChannel(c, 7501)
+		c.Set("channel_local_refusals", 1)
+		selected, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		assert.NotEqual(t, 7501, selected.Id, "the refused channel is excluded")
+		chosen[selected.Id] = true
+		EndSchedulingRequest(c)
+	}
+	assert.Len(t, chosen, 2, "equal remaining channels are drawn by weight, not ranked")
+}
+
+func TestSchedulingConfigFailuresKeepServingLastSnapshot(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	const name = "stale-scheduling-config"
+	key := scheduler.Key{Group: "default", Model: name}
+	setSchedulingTestConfig(t, nil)
+	createChannelSelectAutoGroupsChannel(t, db, 7601, "default", name)
+	model.InitChannelCache()
+	setRaw := func(raw string) {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap[schedulingOptionKey] = raw
+		common.OptionMapRWMutex.Unlock()
+	}
+	selectOnce := func() *ChannelSelectError {
+		c := routingTestContext(t)
+		defer EndSchedulingRequest(c)
+		_, _, err := SelectChannelForRequest(c, name, &RetryParam{Ctx: c, TokenGroup: "default", ModelName: name})
+		return err
+	}
+
+	// Without any published snapshot the request fails, with a generic message.
+	setRaw(`{"not": "a list"`)
+	selectErr := selectOnce()
+	require.NotNil(t, selectErr)
+	assert.Equal(t, http.StatusServiceUnavailable, selectErr.StatusCode)
+	assert.Equal(t, channelSelectionUnavailable, selectErr.Message, "parse errors are logged, never returned to clients")
+
+	setRaw("[]")
+	require.NoError(t, SyncSchedulingConfig())
+	require.Nil(t, selectOnce())
+	// A later invalid value keeps routing on the last published snapshot.
+	setRaw(`[{"group":"default","model":"` + name + `","target_success_rate":5}]`)
+	require.Nil(t, selectOnce())
+	require.Error(t, SyncSchedulingConfig(), "the administrative barrier still reports the failure")
+	status := GetSchedulingConfigStatus()
+	assert.True(t, status.Stale)
+	assert.NotEmpty(t, status.Error)
+	assert.Positive(t, status.Failures)
+	require.Nil(t, selectOnce(), "requests during the retry backoff still route")
+
+	// The administrator can replace the invalid value. A blank channel override
+	// is dropped and an entry equal to the defaults is removed.
+	saved, syncErr, err := SaveSchedulingConfig(SchedulingConfig{Group: "default", Model: name, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 2,
+		ChannelOverrides: []SchedulingChannelOverride{{ChannelID: 7601}}})
+	require.NoError(t, err)
+	require.NoError(t, syncErr)
+	assert.Empty(t, saved.ChannelOverrides)
+	assert.False(t, GetSchedulingConfigStatus().Stale)
+	assert.Equal(t, 2, GetSchedulingConfig(key).DefaultCapacity)
+	saved.DefaultCapacity = 0
+	_, syncErr, err = SaveSchedulingConfig(saved)
+	require.NoError(t, err)
+	require.NoError(t, syncErr)
+	common.OptionMapRWMutex.RLock()
+	assert.Equal(t, "[]", common.OptionMap[schedulingOptionKey])
+	common.OptionMapRWMutex.RUnlock()
+
+	// A reload failure after a durable save is a pending sync, not a failed save.
+	const callback = "fail_scheduling_channel_reload"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "channels" {
+			tx.AddError(errors.New("channel read offline"))
+		}
+	}))
+	saved.DefaultCapacity = 3
+	_, syncErr, err = SaveSchedulingConfig(saved)
+	require.NoError(t, err)
+	require.Error(t, syncErr)
+	assert.Equal(t, 0, GetSchedulingConfig(key).DefaultCapacity, "routing keeps the previous snapshot until the reload succeeds")
+	require.Nil(t, selectOnce())
+	require.NoError(t, db.Callback().Query().Remove(callback))
+	require.NoError(t, SyncSchedulingConfig())
+	assert.Equal(t, 3, GetSchedulingConfig(key).DefaultCapacity)
+}
+
+func TestSchedulingAliasesNeedCandidatesAndExpire(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const pattern = "gpt-4-gizmo-*"
+	setSchedulingTestConfig(t, nil)
+	createChannelSelectAutoGroupsChannel(t, db, 7701, "default", pattern)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	route := func(modelName string) *model.Channel {
+		c := routingTestContext(t)
+		defer EndSchedulingRequest(c)
+		selected, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+		require.NoError(t, err)
+		return selected
+	}
+	aliases := func() map[scheduler.Key]time.Time {
+		schedulingConfigState.Lock()
+		defer schedulingConfigState.Unlock()
+		return maps.Clone(schedulingConfigState.aliases)
+	}
+	assert.Nil(t, route("no-such-model"))
+	assert.NotContains(t, scheduler.Default.Keys(), scheduler.Key{Group: "default", Model: "no-such-model"}, "a model without candidates creates no routing state")
+	old := scheduler.Key{Group: "default", Model: "gpt-4-gizmo-old"}
+	require.NotNil(t, route(old.Model))
+	require.Contains(t, aliases(), old)
+
+	schedulingConfigState.Lock()
+	schedulingConfigState.aliases[old] = time.Now().Add(-schedulingAliasTTL)
+	schedulingConfigState.aliasSweep = time.Time{}
+	schedulingConfigState.Unlock()
+	fresh := scheduler.Key{Group: "default", Model: "gpt-4-gizmo-fresh"}
+	require.NotNil(t, route(fresh.Model))
+	current := aliases()
+	assert.NotContains(t, current, old, "an alias unused for the statistics window expires")
+	assert.Contains(t, current, fresh)
+	schedulingConfigState.Lock()
+	_, retained := schedulingConfigState.candidates[old]
+	schedulingConfigState.Unlock()
+	assert.False(t, retained)
+	require.NotNil(t, route(old.Model), "an expired alias is registered again on its next use")
+}
+
+// An alias routes with its normalized model's settings, so a shared capacity
+// key configured for the pattern also limits traffic for concrete names.
+func TestSchedulingAliasInheritsNormalizedConfig(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const pattern = "gpt-4-gizmo-*"
+	one := 1
+	setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: pattern, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000,
+		ChannelOverrides: []SchedulingChannelOverride{{ChannelID: 7711, Capacity: &one, CapacityKey: "shared-account"}}}})
+	createChannelSelectAutoGroupsChannel(t, db, 7711, "default", pattern)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	channel, err := model.CacheGetChannelForRouting(7711)
+	require.NoError(t, err)
+
+	holder := routingTestContext(t)
+	defer EndSchedulingRequest(holder)
+	require.NoError(t, ReserveSchedulingChannel(holder, channel, "default", "gpt-4-gizmo-first"))
+	second := routingTestContext(t)
+	defer EndSchedulingRequest(second)
+	assert.ErrorIs(t, ReserveSchedulingChannel(second, channel, "default", "gpt-4-gizmo-second"), scheduler.ErrNoEligibleChannel,
+		"another alias of the same pattern shares the configured capacity key")
+}
+
+func TestRealtimeConnectionDoesNotHoldGenerationCapacity(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const name = "realtime-capacity"
+	setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: name, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 1}})
+	createChannelSelectAutoGroupsChannel(t, db, 7801, "default", name)
+	model.InitChannelCache()
+	require.NoError(t, SyncSchedulingConfig())
+	channel, err := model.CacheGetChannelForRouting(7801)
+	require.NoError(t, err)
+	connect := func() *gin.Context {
+		c := routingTestContext(t)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime?model="+name, nil)
+		c.Request.Header.Set("Upgrade", "websocket")
+		return c
+	}
+	// Distribute selects the channel, then the relay reserves it again.
+	sockets := []*gin.Context{connect(), connect()}
+	for _, socket := range sockets {
+		selected, _, selectErr := SelectChannelForRequest(socket, name, &RetryParam{Ctx: socket, TokenGroup: "default", ModelName: name})
+		require.Nil(t, selectErr)
+		require.Equal(t, 7801, selected.Id)
+		require.NoError(t, ReserveSchedulingChannel(socket, channel, "default", name))
+	}
+	key := scheduler.Key{Group: "default", Model: name}
+	assert.Zero(t, scheduler.Default.Snapshot(key, nil, true).Summary.InFlight, "idle sockets hold no capacity")
+
+	// Each generation runs on its own context and reserves the slot.
+	generation := routingTestContext(t)
+	require.NoError(t, ReserveSchedulingChannel(generation, channel, "default", name))
+	assert.ErrorIs(t, ReserveSchedulingChannel(routingTestContext(t), channel, "default", name), scheduler.ErrNoEligibleChannel, "a concurrent generation respects capacity")
+	EndSchedulingRequest(generation)
+	require.NoError(t, ReserveSchedulingChannel(routingTestContext(t), channel, "default", name))
 }

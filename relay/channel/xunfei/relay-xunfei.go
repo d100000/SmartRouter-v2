@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -133,7 +134,11 @@ func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textReques
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	dataChan, stopChan, err := xunfeiMakeRequest(ctx, info, textRequest, domain, authUrl, appId)
+	dataChan, stopChan, err := xunfeiMakeRequest(c, ctx, info, textRequest, domain, authUrl, appId)
+	var admissionErr *types.NewAPIError
+	if errors.As(err, &admissionErr) {
+		return nil, admissionErr
+	}
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
@@ -143,19 +148,31 @@ func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textReques
 	}()
 	helper.SetEventStreamHeaders(c)
 	var usage dto.Usage
+	var responseText strings.Builder
+	// Once upstream answers, the generation ran: a disconnect settles what
+	// was received instead of refunding it.
+	answered := false
 	clientGone := c.Writer.CloseNotify()
 	for {
 		select {
 		case <-ctx.Done():
+			if answered {
+				return xunfeiAnsweredUsage(c, info, &usage, responseText.String()), nil
+			}
 			return &usage, types.NewError(ctx.Err(), types.ErrorCodeDoRequestFailed)
 		case <-clientGone:
 			cancel()
+			if answered {
+				return xunfeiAnsweredUsage(c, info, &usage, responseText.String()), nil
+			}
 			return &usage, types.NewError(context.Canceled, types.ErrorCodeDoRequestFailed)
 		case xunfeiResponse := <-dataChan:
+			answered = answered || xunfeiResponse.Header.Code == 0
 			usage.PromptTokens += xunfeiResponse.Payload.Usage.Text.PromptTokens
 			usage.CompletionTokens += xunfeiResponse.Payload.Usage.Text.CompletionTokens
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
 			response := streamResponseXunfei2OpenAI(&xunfeiResponse)
+			responseText.WriteString(xunfeiResponse.Payload.Choices.Text[0].Content)
 			jsonResponse, err := common.Marshal(response)
 			if err != nil {
 				common.SysLog(common.LogText("error marshalling stream response: %s", err.Error()))
@@ -165,20 +182,40 @@ func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textReques
 			c.Writer.Flush()
 		case <-stopChan:
 			if err := ctx.Err(); err != nil {
+				if answered {
+					return xunfeiAnsweredUsage(c, info, &usage, responseText.String()), nil
+				}
 				return &usage, types.NewError(err, types.ErrorCodeDoRequestFailed)
 			}
 			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
 			c.Writer.Flush()
+			if answered {
+				return xunfeiAnsweredUsage(c, info, &usage, responseText.String()), nil
+			}
 			return &usage, nil
 		}
 	}
+}
+
+// xunfeiAnsweredUsage is the usage of a generation upstream answered: the
+// usage it reported, otherwise the local estimate of the prompt and the text
+// received so far.
+func xunfeiAnsweredUsage(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseText string) *dto.Usage {
+	if service.ValidUsage(usage) {
+		return usage
+	}
+	return service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetFallbackPromptTokens())
 }
 
 func xunfeiHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	dataChan, stopChan, err := xunfeiMakeRequest(ctx, info, textRequest, domain, authUrl, appId)
+	dataChan, stopChan, err := xunfeiMakeRequest(c, ctx, info, textRequest, domain, authUrl, appId)
+	var admissionErr *types.NewAPIError
+	if errors.As(err, &admissionErr) {
+		return nil, admissionErr
+	}
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
@@ -189,12 +226,17 @@ func xunfeiHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.
 	var usage dto.Usage
 	var content string
 	var xunfeiResponse XunfeiChatResponse
+	answered := false
 	stop := false
 	for !stop {
 		select {
 		case <-ctx.Done():
+			if answered {
+				return xunfeiAnsweredUsage(c, info, &usage, content), nil
+			}
 			return &usage, types.NewError(ctx.Err(), types.ErrorCodeDoRequestFailed)
 		case xunfeiResponse = <-dataChan:
+			answered = answered || xunfeiResponse.Header.Code == 0
 			if len(xunfeiResponse.Payload.Choices.Text) == 0 {
 				continue
 			}
@@ -207,6 +249,9 @@ func xunfeiHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.
 		}
 	}
 	if err := ctx.Err(); err != nil {
+		if answered {
+			return xunfeiAnsweredUsage(c, info, &usage, content), nil
+		}
 		return &usage, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	if len(xunfeiResponse.Payload.Choices.Text) == 0 {
@@ -225,10 +270,13 @@ func xunfeiHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.
 	}
 	c.Writer.Header().Set("Content-Type", "application/json")
 	_, _ = c.Writer.Write(jsonResponse)
+	if answered {
+		return xunfeiAnsweredUsage(c, info, &usage, content), nil
+	}
 	return &usage, nil
 }
 
-func xunfeiMakeRequest(ctx context.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, domain, authUrl, appId string) (<-chan XunfeiChatResponse, <-chan struct{}, error) {
+func xunfeiMakeRequest(c *gin.Context, ctx context.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, domain, authUrl, appId string) (<-chan XunfeiChatResponse, <-chan struct{}, error) {
 	data := requestOpenAI2Xunfei(textRequest, appId, domain)
 	body, err := common.Marshal(data)
 	if err != nil {
@@ -240,7 +288,6 @@ func xunfeiMakeRequest(ctx context.Context, info *relaycommon.RelayInfo, textReq
 	d := websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
 	}
-	service.MarkOverviewUpstreamSent(info)
 	conn, resp, err := d.DialContext(ctx, authUrl, nil)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -251,6 +298,13 @@ func xunfeiMakeRequest(ctx context.Context, info *relaycommon.RelayInfo, textReq
 		}
 		return nil, nil, err
 	}
+	// The generation is sent as a WebSocket message, bypassing doRequest:
+	// admit it into the procurement ledger right before the write.
+	if err := service.BeforeChannelUpstream(c, info); err != nil {
+		_ = conn.Close()
+		return nil, nil, service.ChannelLimitRelayError(err, c)
+	}
+	service.MarkOverviewUpstreamSent(info)
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 
 	err = conn.WriteMessage(websocket.TextMessage, body)
@@ -313,10 +367,13 @@ func apiVersion2domain(apiVersion string) string {
 	return "general" + apiVersion
 }
 
+// xunfeiSparkHost is the Spark WebSocket origin; tests point it at a local server.
+var xunfeiSparkHost = "wss://spark-api.xf-yun.com"
+
 func getXunfeiAuthUrl(c *gin.Context, apiKey string, apiSecret string, modelName string) (string, string) {
 	apiVersion := getAPIVersion(c, modelName)
 	domain := apiVersion2domain(apiVersion)
-	authUrl := buildXunfeiAuthUrl(fmt.Sprintf("wss://spark-api.xf-yun.com/%s/chat", apiVersion), apiKey, apiSecret)
+	authUrl := buildXunfeiAuthUrl(fmt.Sprintf("%s/%s/chat", xunfeiSparkHost, apiVersion), apiKey, apiSecret)
 	return domain, authUrl
 }
 

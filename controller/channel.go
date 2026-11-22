@@ -3,7 +3,6 @@ package controller
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -94,6 +93,34 @@ func channelIDsFromChannels(channels []*model.Channel) []int {
 	return ids
 }
 
+func attachSupplierDraftStatus(channels []*model.Channel) error {
+	owned := make(map[int]*model.Channel)
+	ids := make([]int, 0, len(channels))
+	for _, channel := range channels {
+		if channel.OwnerSupplierID != "" {
+			owned[channel.Id] = channel
+			ids = append(ids, channel.Id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	var drafts []model.SupplierChannelDraft
+	if err := model.DB.Select("channel_id", "version", "status").Where("channel_id IN ?", ids).Find(&drafts).Error; err != nil {
+		return err
+	}
+	for _, draft := range drafts {
+		if channel := owned[draft.ChannelID]; channel.SupplierVersion == draft.Version {
+			channel.SupplierValidationStatus = draft.ValidationStatus()
+		}
+	}
+	return nil
+}
+
+func supplierReviewChannels(db *gorm.DB) *gorm.DB {
+	return db.Model(&model.SupplierChannelDraft{}).Select("channel_id").Where("status = ?", model.SupplierDraftReady)
+}
+
 func closeActiveChannelWebSockets(channelIDs []int) {
 	service.CloseActiveWebSocketsForChannels(channelIDs, service.ChannelDisabledCloseReason)
 }
@@ -149,30 +176,6 @@ func restoreMultiKeyChannelIfAvailable(channel *model.Channel) {
 	channel.SetOtherInfo(info)
 }
 
-// saveManagedKeyStatus runs change on the stored multi-key channel and writes
-// the key statuses, channel status and status reason it leaves. A change
-// another writer, on any node, makes to other_info meanwhile, such as a
-// balance query, is kept.
-func saveManagedKeyStatus(channelID int, change func(stored *model.Channel) error) error {
-	statusChanged, enabled := false, false
-	written, err := model.UpdateChannelOtherInfo(channelID, func(stored *model.Channel) (map[string]any, error) {
-		status := stored.Status
-		if err := change(stored); err != nil {
-			return nil, err
-		}
-		statusChanged, enabled = stored.Status != status, stored.Status == common.ChannelStatusEnabled
-		return map[string]any{"status": stored.Status, "channel_info": stored.ChannelInfo}, nil
-	})
-	if err != nil || !written {
-		return err
-	}
-	model.BumpSyncTopic(model.SyncTopicChannels)
-	if statusChanged {
-		return model.UpdateAbilityStatus(channelID, enabled)
-	}
-	return nil
-}
-
 func applyChannelStatusFilter(query *gorm.DB, statusFilter int) *gorm.DB {
 	return model.ApplyChannelEffectiveStatusFilter(query, statusFilter, time.Now())
 }
@@ -226,6 +229,7 @@ func GetAllChannels(c *gin.Context) {
 	idSort, _ := strconv.ParseBool(c.Query("id_sort"))
 	sortOptions := model.NewChannelSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
 	enableTagMode, _ := strconv.ParseBool(c.Query("tag_mode"))
+	supplierReview, _ := strconv.ParseBool(c.Query("supplier_review"))
 	groupFilter := model.NormalizeChannelGroupFilter(c.Query("group"))
 	statusParam := c.Query("status")
 	// statusFilter: -1 all, 1 enabled, 0 disabled (include auto & manual)
@@ -245,6 +249,10 @@ func GetAllChannels(c *gin.Context) {
 	baseQuery = model.ApplyChannelSupplierFilter(baseQuery, c.Query("owner_supplier_id"))
 	baseQuery = model.ApplyChannelFundingFilter(baseQuery, c.Query("funding_status"))
 	baseQuery = model.ApplyChannelEffectiveStatusFilter(baseQuery, statusFilter, now)
+	if supplierReview {
+		enableTagMode = false
+		baseQuery = baseQuery.Where("id IN (?)", supplierReviewChannels(model.DB))
+	}
 	listQuery := baseQuery.Session(&gorm.Session{})
 	if typeFilter >= 0 {
 		listQuery = listQuery.Where("type = ?", typeFilter)
@@ -298,6 +306,10 @@ func GetAllChannels(c *gin.Context) {
 	}
 
 	if err := model.AttachChannelFunding(channelData); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if err := attachSupplierDraftStatus(channelData); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -415,6 +427,10 @@ func SearchChannels(c *gin.Context) {
 	idSort, _ := strconv.ParseBool(c.Query("id_sort"))
 	sortOptions := model.NewChannelSortOptions(c.Query("sort_by"), c.Query("sort_order"), idSort)
 	enableTagMode, _ := strconv.ParseBool(c.Query("tag_mode"))
+	supplierReview, _ := strconv.ParseBool(c.Query("supplier_review"))
+	if supplierReview {
+		enableTagMode = false
+	}
 	channelData := make([]*model.Channel, 0)
 	if enableTagMode {
 		tags, err := model.SearchTags(keyword, group, modelKeyword, idSort, c.Query("owner_supplier_id"))
@@ -442,6 +458,18 @@ func SearchChannels(c *gin.Context) {
 			return
 		}
 		channelData = channels
+	}
+	if supplierReview {
+		var readyIDs []int
+		if err := supplierReviewChannels(model.DB).Pluck("channel_id", &readyIDs).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		ready := make(map[int]bool, len(readyIDs))
+		for _, id := range readyIDs {
+			ready[id] = true
+		}
+		channelData = slices.DeleteFunc(channelData, func(ch *model.Channel) bool { return !ready[ch.Id] })
 	}
 
 	now := time.Now()
@@ -535,6 +563,10 @@ func SearchChannels(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if err := attachSupplierDraftStatus(pagedData); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 
 	for _, datum := range pagedData {
 		clearChannelInfo(datum, now)
@@ -566,6 +598,10 @@ func GetChannel(c *gin.Context) {
 	}
 	if channel != nil {
 		if err := model.AttachChannelFunding([]*model.Channel{channel}); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if err := attachSupplierDraftStatus([]*model.Channel{channel}); err != nil {
 			common.ApiError(c, err)
 			return
 		}
@@ -911,6 +947,17 @@ func AddChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	// A create takes configuration only: identity, supplier ownership,
+	// counters and runtime state belong to the server.
+	created := addChannelRequest.Channel
+	created.Id, created.OwnerSupplierID, created.CreatedBy = 0, "", 0
+	created.SupplierPriority, created.SupplierPaused, created.SupplierVersion = 0, false, 0
+	created.SupplierValidated, created.SupplierValidationStatus, created.SecretsWriteOnly = false, "", false
+	created.Funding, created.EffectiveStatus, created.AvailabilityState, created.BalanceDetail = nil, 0, nil, nil
+	created.UsedQuota, created.Balance, created.BalanceUpdatedTime = 0, 0, 0
+	created.TestTime, created.ResponseTime = 0, 0
+	created.OtherInfo, created.ChannelInfo = "", model.ChannelInfo{}
+	created.CostVersionID, created.UpstreamCredentialSnapshotData = "", ""
 	if err := checkPluginChannelKeys(c, addChannelRequest.Channel, addChannelRequest.Channel.Key, ""); err != nil {
 		common.ApiError(c, err)
 		return
@@ -982,7 +1029,8 @@ func AddChannel(c *gin.Context) {
 		if key == "" {
 			continue
 		}
-		localChannel := addChannelRequest.Channel
+		// Each channel is its own copy, so a name prefix does not accumulate.
+		localChannel := *addChannelRequest.Channel
 		localChannel.Key = key
 		if addChannelRequest.BatchAddSetKeyPrefix2Name && len(keys) > 1 {
 			keyPrefix := localChannel.Key
@@ -991,7 +1039,7 @@ func AddChannel(c *gin.Context) {
 			}
 			localChannel.Name = fmt.Sprintf("%s %s", localChannel.Name, keyPrefix)
 		}
-		channels = append(channels, *localChannel)
+		channels = append(channels, localChannel)
 		if addChannelRequest.Mode == "multi_to_single" {
 			channelInputIndices = append(channelInputIndices, inputIndices)
 		} else {
@@ -1078,24 +1126,20 @@ func DeleteChannel(c *gin.Context) {
 }
 
 func DeleteDisabledChannel(c *gin.Context) {
-	var ids []int
-	if err := model.DB.Model(&model.Channel{}).
-		Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).
-		Pluck("id", &ids).Error; err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	var revoked []*model.Channel
-	if err := model.DB.Where("(status = ? or status = ?) AND type = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled, constant.ChannelTypeTaskPlugin).
-		Find(&revoked).Error; err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	rows, err := model.DeleteDisabledChannel()
+	deleted, err := model.DeleteDisabledPlatformChannels()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	// Revoke and disconnect exactly the channels deleted: supplier channels
+	// stay, so their credentials and connections stay too.
+	revoked := make([]*model.Channel, 0)
+	for _, channel := range deleted {
+		if channel.Type == constant.ChannelTypeTaskPlugin {
+			revoked = append(revoked, channel)
+		}
+	}
+	rows := int64(len(deleted))
 	service.RevokeDeletedChannelCredentials(revoked)
 	model.InitChannelCache()
 	if rows > 0 {
@@ -1104,7 +1148,7 @@ func DeleteDisabledChannel(c *gin.Context) {
 	recordManageAudit(c, "channel.delete_disabled", map[string]any{
 		"count": rows,
 	})
-	closeActiveChannelWebSockets(ids)
+	closeActiveChannelWebSockets(channelIDsFromChannels(deleted))
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -1196,7 +1240,8 @@ func EditTagChannels(c *gin.Context) {
 	}
 	if channelTag.ParamOverride != nil {
 		trimmed := strings.TrimSpace(*channelTag.ParamOverride)
-		if trimmed != "" && !json.Valid([]byte(trimmed)) {
+		var parsed any
+		if trimmed != "" && common.UnmarshalJsonStr(trimmed, &parsed) != nil {
 			common.ApiErrorT(c, "Parameter override must be valid JSON format")
 			return
 		}
@@ -1204,7 +1249,8 @@ func EditTagChannels(c *gin.Context) {
 	}
 	if channelTag.HeaderOverride != nil {
 		trimmed := strings.TrimSpace(*channelTag.HeaderOverride)
-		if trimmed != "" && !json.Valid([]byte(trimmed)) {
+		var parsed any
+		if trimmed != "" && common.UnmarshalJsonStr(trimmed, &parsed) != nil {
 			common.ApiErrorT(c, "Header override must be valid JSON format")
 			return
 		}
@@ -1329,6 +1375,12 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	originProxy := originChannel.GetSetting().Proxy
+	// Appending needs the stored keys; a node that cannot open them would
+	// replace them with the appended ones.
+	if originChannel.CredentialUnavailable() && channel.KeyMode != nil && *channel.KeyMode == "append" {
+		common.ApiErrorT(c, "The stored keys cannot be decrypted on this node. Replace them instead of appending")
+		return
+	}
 	if originChannel.OwnerSupplierID != "" {
 		connectionChanged := channel.Key != "" || channelHasSensitiveChanges(&channel, originChannel, requestData)
 		if _, supplied := requestData["models"]; supplied && channel.Models != originChannel.Models {
@@ -1396,8 +1448,8 @@ func UpdateChannel(c *gin.Context) {
 			// 解析现有密钥
 			if strings.HasPrefix(strings.TrimSpace(stored), "[") {
 				// JSON数组格式
-				var arr []json.RawMessage
-				if err := json.Unmarshal([]byte(strings.TrimSpace(stored)), &arr); err == nil {
+				var arr []common.RawMessage
+				if err := common.UnmarshalJsonStr(strings.TrimSpace(stored), &arr); err == nil {
 					existingKeys = make([]string, len(arr))
 					for i, v := range arr {
 						existingKeys[i] = string(v)
@@ -1591,7 +1643,7 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
+	changed := model.ManageChannelStatus(id, req.Status, "manual operation")
 	if changed {
 		model.InitChannelCache()
 		if req.Status != common.ChannelStatusEnabled {
@@ -1619,7 +1671,7 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	changedCount := 0
 	var disabledIDs []int
 	for _, id := range req.Ids {
-		if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
+		if model.ManageChannelStatus(id, req.Status, "manual batch operation") {
 			changedCount++
 			if req.Status != common.ChannelStatusEnabled {
 				disabledIDs = append(disabledIDs, id)
@@ -1930,6 +1982,12 @@ func CopyChannel(c *gin.Context) {
 		common.ApiErrorT(c, "Failed to fetch channel. Please try again later")
 		return
 	}
+	// A copy would be a live supplier channel outside the draft, review and
+	// channel limit, or would expose a write-only credential as a plain one.
+	if origin.OwnerSupplierID != "" || origin.SecretsWriteOnly {
+		common.ApiErrorT(c, "This operation is not available for supplier channels")
+		return
+	}
 	if (origin.Type == constant.ChannelTypeTaskPlugin || len(origin.GetSetting().TaskPluginBindings()) > 0) &&
 		!authz.Can(c.GetInt("id"), c.GetInt("role"), authz.TaskPluginBind) {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "task plugin channels require the task_plugin.bind permission"})
@@ -2181,7 +2239,7 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		shouldCloseWebSocket := false
-		err = saveManagedKeyStatus(channel.Id, func(stored *model.Channel) error {
+		err = model.UpdateChannelKeyStatus(channel.Id, func(stored *model.Channel) error {
 			if stored.ChannelInfo.MultiKeyStatusList == nil {
 				stored.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 			}
@@ -2220,7 +2278,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		err = saveManagedKeyStatus(channel.Id, func(stored *model.Channel) error {
+		err = model.UpdateChannelKeyStatus(channel.Id, func(stored *model.Channel) error {
 			// 从状态列表中删除该密钥的记录，使其回到默认启用状态
 			delete(stored.ChannelInfo.MultiKeyStatusList, keyIndex)
 			delete(stored.ChannelInfo.MultiKeyDisabledTime, keyIndex)
@@ -2240,7 +2298,7 @@ func ManageMultiKeys(c *gin.Context) {
 	case "enable_all_keys":
 		// 清空所有禁用状态，使所有密钥回到默认启用状态
 		var enabledCount int
-		err = saveManagedKeyStatus(channel.Id, func(stored *model.Channel) error {
+		err = model.UpdateChannelKeyStatus(channel.Id, func(stored *model.Channel) error {
 			enabledCount = len(stored.ChannelInfo.MultiKeyStatusList)
 			stored.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 			stored.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
@@ -2261,7 +2319,7 @@ func ManageMultiKeys(c *gin.Context) {
 		// 禁用所有启用的密钥
 		var disabledCount int
 		shouldCloseWebSocket := false
-		err = saveManagedKeyStatus(channel.Id, func(stored *model.Channel) error {
+		err = model.UpdateChannelKeyStatus(channel.Id, func(stored *model.Channel) error {
 			if stored.ChannelInfo.MultiKeyStatusList == nil {
 				stored.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 			}
@@ -2589,7 +2647,7 @@ func OllamaPullModelStream(c *gin.Context) {
 
 	// 创建进度回调函数
 	progressCallback := func(progress ollama.OllamaPullResponse) {
-		data, _ := json.Marshal(progress)
+		data, _ := common.Marshal(progress)
 		fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
 		c.Writer.Flush()
 	}
@@ -2598,12 +2656,12 @@ func OllamaPullModelStream(c *gin.Context) {
 	err = ollama.PullOllamaModelStream(baseURL, key, req.ModelName, progressCallback)
 
 	if err != nil {
-		errorData, _ := json.Marshal(gin.H{
+		errorData, _ := common.Marshal(gin.H{
 			"error": err.Error(),
 		})
 		fmt.Fprintf(c.Writer, "data: %s\n\n", string(errorData))
 	} else {
-		successData, _ := json.Marshal(gin.H{
+		successData, _ := common.Marshal(gin.H{
 			"message": fmt.Sprintf("Model %s pulled successfully", req.ModelName),
 		})
 		fmt.Fprintf(c.Writer, "data: %s\n\n", string(successData))

@@ -94,6 +94,9 @@ func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.M
 }
 
 // RefundMidjourneyQuota reverses every accounting element recorded for a billed legacy task.
+// The wallet is refunded first and the refund is then recorded with a claim
+// that wins only while the task is still a FAILURE charging that quota; a task
+// that a later SUCCESS took over withdraws the refund again.
 func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {
@@ -102,6 +105,22 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 
 	if err := model.IncreaseUserQuota(task.UserId, quota, false); err != nil {
 		logger.LogWarn(ctx, common.LogText("failed to refund Midjourney user quota, task %s: %s", task.MjId, err.Error()))
+		return false
+	}
+	claimed, err := task.ClaimRefund(quota)
+	if err != nil || !claimed {
+		if err != nil {
+			logger.LogError(ctx, common.LogText("failed to record the Midjourney refund, task %s: %s", task.MjId, err.Error()))
+		} else {
+			logger.LogWarn(ctx, common.LogText("Midjourney task %s changed before its refund was recorded, the refund is withdrawn", task.MjId))
+		}
+		if err := model.DecreaseUserQuota(task.UserId, quota, false); err != nil {
+			logger.LogError(ctx, common.LogText("failed to withdraw an unrecorded Midjourney refund, task %s: %s", task.MjId, err.Error()))
+			// Keep the debt durable: the Midjourney poller takes it back.
+			if err := task.AddRefundWithdrawal(quota); err != nil {
+				logger.LogError(ctx, common.LogText("failed to record the pending withdrawal of Midjourney task %s refund %d: %s", task.MjId, quota, err.Error()))
+			}
+		}
 		return false
 	}
 
@@ -129,12 +148,86 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		TokenId:   task.TokenId,
 		Other:     other,
 	})
-
-	task.Quota = 0
-	if err := task.UpdateBillingState(); err != nil {
-		logger.LogError(ctx, common.LogText("Midjourney refund succeeded but clearing the quota failed, task %s: %s", task.MjId, err.Error()))
-	}
 	return true
+}
+
+// RechargeRefundedMidjourneyQuota charges a task that finished with SUCCESS
+// the quota an earlier FAILURE refunded, reversing every element of that
+// refund exactly once. A charge the wallet rejects is reverted and retried by
+// RetryPendingMidjourneyRefundBilling.
+func RechargeRefundedMidjourneyQuota(ctx context.Context, task *model.Midjourney) bool {
+	refunded := task.RefundedQuota
+	if refunded <= 0 {
+		return false
+	}
+	claimed, err := task.ClaimRefundRecharge(refunded)
+	if err != nil {
+		logger.LogError(ctx, common.LogText("failed to claim the re-charge of refunded Midjourney task %s: %s", task.MjId, err.Error()))
+		return false
+	}
+	if !claimed {
+		return false
+	}
+	if err := model.DecreaseUserQuota(task.UserId, refunded, false); err != nil {
+		logger.LogError(ctx, common.LogText("failed to re-charge refunded Midjourney task %s, it is retried on the next refresh: %s", task.MjId, err.Error()))
+		if err := task.RevertRefundRecharge(refunded); err != nil {
+			logger.LogError(ctx, common.LogText("failed to restore the refund marker of Midjourney task %s: %s", task.MjId, err.Error()))
+		}
+		return false
+	}
+	if task.TokenId > 0 {
+		tokenKey := resolveTokenKey(ctx, task.TokenId, task.MjId)
+		if tokenKey != "" {
+			if err := model.DecreaseTokenQuota(task.TokenId, tokenKey, refunded); err != nil {
+				logger.LogWarn(ctx, common.LogText("failed to re-charge Midjourney token quota, task %s: %s", task.MjId, err.Error()))
+			}
+		}
+	}
+	billingChannelId := task.GetBillingChannelId()
+	model.UpdateUserUsedQuota(task.UserId, refunded)
+	model.UpdateChannelUsedQuota(billingChannelId, refunded)
+	other := model.NewLogOther()
+	other.SetPublic("task_id", task.MjId)
+	other.SetPublic("refunded_quota", refunded)
+	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+		UserId:    task.UserId,
+		LogType:   model.LogTypeConsume,
+		Content:   []*common.Message{common.NewMessage("The refunded task completed later and was charged again")},
+		ChannelId: billingChannelId,
+		ModelName: CovertMjpActionToModelName(task.Action),
+		Quota:     refunded,
+		TokenId:   task.TokenId,
+		Other:     other,
+	})
+	return true
+}
+
+// RetryPendingMidjourneyRefundBilling charges what earlier refund
+// bookkeeping still owes the wallet, without polling the vendor or changing
+// any task status: a refund whose withdrawal failed after its claim was lost
+// is taken back, and a SUCCESS whose refund re-charge failed is charged again.
+func RetryPendingMidjourneyRefundBilling(ctx context.Context) {
+	for _, task := range model.GetMidjourneyTasksWithPendingRefundBilling(100) {
+		if ctx.Err() != nil {
+			return
+		}
+		if withdrawal := task.RefundWithdrawalQuota; withdrawal > 0 {
+			claimed, err := task.ClaimRefundWithdrawal(withdrawal)
+			if err != nil {
+				logger.LogError(ctx, common.LogText("failed to claim the pending refund withdrawal of Midjourney task %s: %s", task.MjId, err.Error()))
+			} else if claimed {
+				if err := model.DecreaseUserQuota(task.UserId, withdrawal, false); err != nil {
+					logger.LogError(ctx, common.LogText("failed to withdraw an unrecorded Midjourney refund, task %s: %s", task.MjId, err.Error()))
+					if err := task.AddRefundWithdrawal(withdrawal); err != nil {
+						logger.LogError(ctx, common.LogText("failed to record the pending withdrawal of Midjourney task %s refund %d: %s", task.MjId, withdrawal, err.Error()))
+					}
+				}
+			}
+		}
+		if task.Status == "SUCCESS" && task.RefundedQuota > 0 {
+			RechargeRefundedMidjourneyQuota(ctx, task)
+		}
+	}
 }
 
 func GetMjRequestModel(relayMode int, midjRequest *dto.MidjourneyRequest) (string, *dto.MidjourneyResponse, bool) {
@@ -276,6 +369,9 @@ func ConvertSimpleChangeParams(content string) *dto.MidjourneyRequest {
 // HTTP 200 responses. Submissions are single-attempt: an ambiguous transport
 // failure must never create a duplicate task on another channel.
 func RecordMidjourneyPolicyResponse(c *gin.Context, response *dto.MidjourneyResponseWithStatusCode, requestErr error) bool {
+	if LocalChannelLimitError(requestErr) != nil {
+		return false
+	}
 	if response == nil {
 		response = MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "empty_response", http.StatusBadGateway)
 	}
@@ -307,7 +403,7 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
 	}
 	defer func() {
-		if protected && resultErr != nil {
+		if protected && resultErr != nil && LocalChannelLimitError(resultErr) == nil {
 			resultErr = errors.New("upstream request failed")
 		}
 		if info == nil || info.ChannelLimitAttempt == nil || !info.ChannelLimitAttempt.Sent {
@@ -387,7 +483,8 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 			info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
 		}
 		if err = PrepareTaskChannelAttempt(info, selected); err != nil {
-			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_limit_unavailable", http.StatusServiceUnavailable), nil, err
+			info.LastError = ChannelLimitRelayError(err, c)
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, info.LastError.Error(), info.LastError.StatusCode), nil, info.LastError
 		}
 		if selected == nil {
 			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_unavailable", http.StatusServiceUnavailable), nil, model.ErrChannelAttemptState
@@ -406,11 +503,11 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		if err != nil {
 			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_unavailable", http.StatusServiceUnavailable), nil, err
 		}
-		state, stateErr := model.GetChannelLimitState(selected.Id, time.Now())
+		config, stateErr := model.GetChannelLimitConfig(selected.Id)
 		if stateErr != nil {
 			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_limit_unavailable", http.StatusServiceUnavailable), nil, stateErr
 		}
-		if selected.OwnerSupplierID != "" || selected.SecretsWriteOnly || state.Config.RPM > 0 || state.Config.TPM > 0 || state.Config.DailyUSDNano > 0 {
+		if selected.OwnerSupplierID != "" || selected.SecretsWriteOnly || config.RPM > 0 || config.TPM > 0 || config.DailyUSDNano > 0 {
 			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "protocol_limit_unsupported", http.StatusServiceUnavailable), nil, &model.ChannelLimitError{Reason: "protocol_limit_unsupported"}
 		}
 	}
@@ -424,7 +521,8 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 	}
 	if info != nil {
 		if err = BeforeTaskChannelUpstream(c, info, req); err != nil {
-			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "channel_limit_unavailable", http.StatusServiceUnavailable), nil, err
+			info.LastError = ChannelLimitRelayError(err, c)
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, info.LastError.Error(), info.LastError.StatusCode), nil, info.LastError
 		}
 	}
 	if info != nil {
@@ -577,7 +675,7 @@ func FlushMidjourneyChannelObservation(ctx context.Context, task *model.Midjourn
 	if err != nil || snapshot == nil {
 		return err
 	}
-	if err := SettleTaskChannelSnapshot(ctx, snapshot, task.ProcurementVersion, time.Now()); err != nil {
+	if err := SettleTaskChannelSnapshot(ctx, snapshot, task.ProcurementVersion, time.Time{}); err != nil {
 		return err
 	}
 	result := model.DB.WithContext(ctx).Model(&model.Midjourney{}).Where("id = ? AND procurement_version = ?", task.Id, task.ProcurementVersion).Update("procurement_pending", false)
@@ -602,6 +700,10 @@ func ResolveMidjourneyTaskChannel(task *model.Midjourney) (*model.Channel, error
 	var identity hosttypes.ChannelFundingAttempt
 	_ = common.UnmarshalJsonStr(task.FundingAttemptData, &identity)
 	copy := *channel
+	// Keyless proxies are valid; refuse only a credential this node cannot open.
+	if channel.CredentialUnavailable() {
+		return nil, model.ErrChannelAttemptState
+	}
 	copy.Key = TaskPollingKey(channel, task.PollingKey, &identity)
 	copy.Keys, copy.ChannelInfo = nil, model.ChannelInfo{}
 	return &copy, nil
@@ -688,7 +790,32 @@ func RefreshMidjourneyTask(ctx context.Context, task *model.Midjourney) error {
 		return markMidjourneyResultUnknown(ctx, task, snapshot, errors.New("upstream task result unrecognized"))
 	}
 	previous := task.Status
+	// A delivered SUCCESS is never revoked and a finished task never resumes;
+	// only a FAILURE may still become SUCCESS, which charges it again.
+	keepFinal := (previous == "SUCCESS" && result.Status != "SUCCESS") ||
+		(previous == "FAILURE" && result.Status != "SUCCESS" && result.Status != "FAILURE")
 	observed := &relaycommon.TaskInfo{Status: result.Status, Progress: result.Progress}
+	if keepFinal {
+		if snapshot != nil {
+			switch {
+			case previous == "FAILURE":
+				// As after a local timeout, the purchase stays unknown and
+				// keeps being reconciled until the vendor finishes.
+				ObserveTaskChannelSnapshot(snapshot, nil, false)
+			case result.Status == "FAILURE":
+				ObserveTaskChannelSnapshot(snapshot, observed, true)
+			}
+			if err := task.SetChannelAttempt(snapshot); err != nil {
+				return err
+			}
+		}
+		task.ProcurementReconcile = snapshot != nil && (previous == "FAILURE" || snapshot.NeedsReconciliation())
+		won, err := task.UpdateWithStatus(previous)
+		if err != nil || !won {
+			return err
+		}
+		return FlushMidjourneyChannelObservation(ctx, task)
+	}
 	if snapshot != nil {
 		if result.Status == "SUCCESS" && result.ImageUrl != "" && task.Action != constant.MjActionVideo {
 			snapshot.UsageUnits = map[string]string{"image_count": "count"}
@@ -743,10 +870,16 @@ func RefreshMidjourneyTask(ctx context.Context, task *model.Midjourney) error {
 	if err != nil || !won {
 		return err
 	}
-	if task.Status == "FAILURE" && previous != "FAILURE" {
+	flushErr := FlushMidjourneyChannelObservation(ctx, task)
+	switch {
+	case task.Status == "FAILURE" && previous != "FAILURE":
 		RefundMidjourneyQuota(ctx, task, "Composition failed")
+	case task.Status == "SUCCESS" && task.RefundedQuota > 0:
+		// Midjourney is billed per request, so charging back the refund is
+		// the whole SUCCESS settlement.
+		RechargeRefundedMidjourneyQuota(ctx, task)
 	}
-	return FlushMidjourneyChannelObservation(ctx, task)
+	return flushErr
 }
 
 func markMidjourneyResultUnknown(ctx context.Context, task *model.Midjourney, snapshot *relaycommon.TaskChannelSnapshot, cause error) error {

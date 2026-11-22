@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
@@ -48,9 +49,16 @@ func TestStreamFailureLogsPreserveBillingDecisionAndMaskDetails(t *testing.T) {
 			wantSource: "local_estimate",
 		},
 		{
-			name:     "upstream input-only usage is uncharged without output",
+			// Upstream usage means the generation ran and was charged, so the
+			// log never claims an exemption even on the error-log path.
+			name:     "upstream input-only usage is charged without output",
+			failure:  &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("upstream interrupted"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), HasActualUsage: true},
+			errorLog: true, wantSource: "upstream",
+		},
+		{
+			name:     "stale no-charge flag never hides upstream usage",
 			failure:  &relaycommon.StreamFailureInfo{Error: types.NewErrorWithStatusCode(errors.New("upstream interrupted"), types.ErrorCodeBadResponseBody, http.StatusBadGateway), HasActualUsage: true, NoCharge: true},
-			errorLog: true, wantSource: "upstream", wantNoCharge: true,
+			errorLog: true, wantSource: "upstream",
 		},
 		{
 			name:     "zero output also exempts post-refund violation fee",
@@ -434,6 +442,39 @@ func TestShouldDisableChannelIgnoresLocalErrors(t *testing.T) {
 				wantHealth = "channel_disable_requested"
 			}
 			assert.Equal(t, wantHealth, events[1].Health, "the logged health matches the disable decision")
+		})
+	}
+}
+
+// The invisible stream retry may only restart an attempt that produced
+// neither upstream usage nor output; anything else ran and was charged.
+func TestStreamOverloadRetryOnlyForTrulyEmptyFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		failure relaycommon.StreamFailureInfo
+		retry   bool
+	}{
+		{name: "truly empty", failure: relaycommon.StreamFailureInfo{NoCharge: true}, retry: true},
+		{name: "upstream usage", failure: relaycommon.StreamFailureInfo{HasActualUsage: true}},
+		{name: "stale no-charge flag with usage", failure: relaycommon.StreamFailureInfo{NoCharge: true, HasActualUsage: true}},
+		{name: "output", failure: relaycommon.StreamFailureInfo{HasEffectiveOutput: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				apiErr := types.NewOpenAIError(errors.New("overloaded"), "server_is_overloaded", http.StatusServiceUnavailable)
+				failure := tc.failure
+				failure.Error, failure.RetryableOverload = apiErr, true
+				info := &relaycommon.RelayInfo{StartTime: time.Now(), ChannelMeta: &relaycommon.ChannelMeta{}, StreamFailure: &failure}
+				result := PrepareStreamOverloadRetry(c, info, apiErr, PolicyDecision{Action: "retry", Reason: "retry_status_matched", Source: "global"})
+				assert.Equal(t, "retry", result.Action)
+				if tc.retry {
+					assert.Len(t, info.StreamRetryHistory, 1)
+				} else {
+					assert.Empty(t, info.StreamRetryHistory, "a charged attempt is never an invisible stream retry")
+				}
+			})
 		})
 	}
 }

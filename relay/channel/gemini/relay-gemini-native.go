@@ -43,12 +43,17 @@ func GeminiTextGenerationHandler(c *gin.Context, info *relaycommon.RelayInfo, re
 	grounding.commit(info)
 	countGeminiBillableFunctionCalls(info, &geminiResponse)
 
+	// A response with upstream usage ran (including a blocked prompt) and is
+	// passed through as upstream sent it, charged by that usage.
+	hasActualUsage := geminiResponseHasActualUsage(&geminiResponse)
 	if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
 		info.PerformanceBusinessRejection = true
 		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
-		return nil, types.NewOpenAIError(errors.New("request blocked by Gemini API: "+*geminiResponse.PromptFeedback.BlockReason), types.ErrorCodePromptBlocked, http.StatusBadRequest)
+		if !hasActualUsage {
+			return nil, types.NewOpenAIError(errors.New("request blocked by Gemini API: "+*geminiResponse.PromptFeedback.BlockReason), types.ErrorCodePromptBlocked, http.StatusBadRequest)
+		}
 	}
-	if !geminiResponseHasOutput(&geminiResponse) {
+	if !hasActualUsage && !geminiResponseHasOutput(&geminiResponse) {
 		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayStreamEmpty)), types.ErrorCodeEmptyResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 

@@ -28,46 +28,55 @@ import (
 )
 
 type supplierChannelResponse struct {
-	ID                 int      `json:"id"`
-	Name               string   `json:"name"`
-	Type               int      `json:"type"`
-	TemplateID         string   `json:"template_id"`
-	Protocols          []string `json:"protocols"`
-	TPMApplicable      bool     `json:"tpm_applicable"`
-	BaseURL            string   `json:"base_url"`
-	Models             []string `json:"models"`
-	Remark             string   `json:"remark"`
-	Priority           int64    `json:"priority"`
-	Version            int64    `json:"version"`
-	Paused             bool     `json:"paused"`
-	Status             string   `json:"status"`
-	BlockingReasons    []string `json:"blocking_reasons"`
-	ValidationStatus   string   `json:"validation_status"`
-	HasKey             bool     `json:"has_key"`
-	HasValidatedConfig bool     `json:"has_validated_config"`
-	SupplierID         string   `json:"supplier_id"`
-	SupplierName       string   `json:"supplier_name"`
-	PlatformPriority   int64    `json:"platform_priority,omitempty"`
-	Weight             int      `json:"weight,omitempty"`
-	Group              string   `json:"group,omitempty"`
+	ID                  int      `json:"id"`
+	Name                string   `json:"name"`
+	Type                int      `json:"type"`
+	TemplateID          string   `json:"template_id"`
+	Protocols           []string `json:"protocols"`
+	TPMApplicable       bool     `json:"tpm_applicable"`
+	BaseURL             string   `json:"base_url"`
+	Models              []string `json:"models"`
+	LiveModels          []string `json:"live_models,omitempty"`
+	TestedModels        []string `json:"tested_models,omitempty"`
+	TestOnly            bool     `json:"test_only,omitempty"`
+	PublicationRevision string   `json:"publication_revision,omitempty"`
+	Remark              string   `json:"remark"`
+	Priority            int64    `json:"priority"`
+	Version             int64    `json:"version"`
+	Paused              bool     `json:"paused"`
+	Status              string   `json:"status"`
+	BlockingReasons     []string `json:"blocking_reasons"`
+	ValidationStatus    string   `json:"validation_status"`
+	HasKey              bool     `json:"has_key"`
+	HasValidatedConfig  bool     `json:"has_validated_config"`
+	SupplierID          string   `json:"supplier_id"`
+	SupplierName        string   `json:"supplier_name"`
+	PlatformPriority    int64    `json:"platform_priority,omitempty"`
+	Weight              int      `json:"weight,omitempty"`
+	ChannelWeight       int      `json:"channel_weight"`
+	Group               string   `json:"group,omitempty"`
 }
 
 type supplierAccountRequest struct {
-	Name             string   `json:"name"`
-	Revision         int64    `json:"revision"`
-	UserID           int      `json:"user_id"`
-	SupplyEnabled    bool     `json:"supply_enabled"`
-	AllowedTemplates []string `json:"allowed_templates"`
-	AllowedTypes     []int    `json:"allowed_types"`
-	AllowedModels    []string `json:"allowed_models"`
-	Group            string   `json:"group"`
-	MaxChannels      int      `json:"max_channels"`
-	MaxInputTokens   int64    `json:"max_input_tokens"`
-	MaxOutputTokens  int64    `json:"max_output_tokens"`
-	CostRatio        *float64 `json:"cost_ratio"`
-	PoolPriority     int64    `json:"pool_priority"`
-	PoolWeight       int      `json:"pool_weight"`
-	PoolCapacity     int      `json:"pool_capacity"`
+	Name              string   `json:"name"`
+	Revision          int64    `json:"revision"`
+	UserID            int      `json:"user_id"`
+	Username          string   `json:"username"`
+	Password          string   `json:"password"`
+	SupplyEnabled     bool     `json:"supply_enabled"`
+	AllowAllTemplates *bool    `json:"allow_all_templates"`
+	AllowAllModels    *bool    `json:"allow_all_models"`
+	AllowedTemplates  []string `json:"allowed_templates"`
+	AllowedTypes      []int    `json:"allowed_types"`
+	AllowedModels     []string `json:"allowed_models"`
+	Group             string   `json:"group"`
+	MaxChannels       int      `json:"max_channels"`
+	MaxInputTokens    int64    `json:"max_input_tokens"`
+	MaxOutputTokens   int64    `json:"max_output_tokens"`
+	CostRatio         *float64 `json:"cost_ratio"`
+	PoolPriority      int64    `json:"pool_priority"`
+	PoolWeight        int      `json:"pool_weight"`
+	PoolCapacity      int      `json:"pool_capacity"`
 }
 
 type supplierLimitRequest struct {
@@ -102,15 +111,13 @@ func (request *supplierLimitRequest) UnmarshalJSON(data []byte) error {
 }
 
 type supplierChannelRequest struct {
-	Name       string                `json:"name"`
-	TemplateID string                `json:"template_id"`
-	BaseURL    string                `json:"base_url"`
-	Key        string                `json:"key"`
-	Models     []string              `json:"models"`
-	Remark     string                `json:"remark"`
-	Priority   int64                 `json:"priority"`
-	Version    int64                 `json:"version"`
-	Limits     *supplierLimitRequest `json:"limits"`
+	Name       string   `json:"name"`
+	TemplateID string   `json:"template_id"`
+	BaseURL    string   `json:"base_url"`
+	Key        string   `json:"key"`
+	Models     []string `json:"models"`
+	Remark     string   `json:"remark"`
+	Version    int64    `json:"version"`
 }
 
 // These endpoints deliberately reject unknown fields instead of binding an
@@ -166,14 +173,7 @@ func supplierChannelForRequest(c *gin.Context, includeKey bool) (*model.Channel,
 }
 
 func supplierChannelDTO(channel *model.Channel, draft *model.SupplierChannelDraft, supplierName string) supplierChannelResponse {
-	baseURL := channel.GetBaseURL()
-	if parsed, err := url.Parse(baseURL); err == nil {
-		parsed.User, parsed.RawQuery, parsed.Fragment = nil, "", ""
-		baseURL = parsed.String()
-	} else {
-		baseURL = ""
-	}
-	result := supplierChannelResponse{ID: channel.Id, Name: channel.Name, Type: channel.Type, TemplateID: model.SupplierChannelTemplateID(channel), BaseURL: baseURL, Models: channel.GetModels(), Priority: channel.SupplierPriority, Version: channel.SupplierVersion, Paused: channel.SupplierPaused, Status: "available", ValidationStatus: "validated", HasKey: channel.SupplierValidated, SupplierID: channel.OwnerSupplierID, SupplierName: supplierName, PlatformPriority: channel.GetPriority(), Weight: channel.GetWeight(), Group: channel.Group}
+	result := supplierChannelResponse{ID: channel.Id, Name: channel.Name, Type: channel.Type, TemplateID: model.SupplierChannelTemplateID(channel), BaseURL: channel.GetBaseURL(), Models: channel.GetModels(), Priority: channel.SupplierPriority, Version: channel.SupplierVersion, Paused: channel.SupplierPaused, Status: "available", ValidationStatus: "validated", HasKey: channel.SupplierValidated, SupplierID: channel.OwnerSupplierID, SupplierName: supplierName, PlatformPriority: channel.GetPriority(), Weight: channel.GetWeight(), ChannelWeight: channel.GetWeight(), Group: channel.Group}
 	result.Protocols, result.TPMApplicable = service.SupplierChannelProtocols(channel)
 	result.BlockingReasons = []string{}
 	result.HasValidatedConfig = channel.SupplierValidated || channel.OwnerSupplierID == ""
@@ -181,10 +181,10 @@ func supplierChannelDTO(channel *model.Channel, draft *model.SupplierChannelDraf
 		result.Remark = *channel.Remark
 	}
 	if !channel.SupplierValidated && channel.OwnerSupplierID != "" {
-		result.Status, result.ValidationStatus = "pending", "pending"
+		result.Status, result.ValidationStatus, result.Group = "pending", "pending", ""
 		result.BlockingReasons = append(result.BlockingReasons, "pending")
 	}
-	if channel.Status != common.ChannelStatusEnabled {
+	if result.HasValidatedConfig && channel.Status != common.ChannelStatusEnabled {
 		result.Status = "paused"
 		reason := "manual_paused"
 		if channel.Status == common.ChannelStatusAutoDisabled {
@@ -196,17 +196,41 @@ func supplierChannelDTO(channel *model.Channel, draft *model.SupplierChannelDraf
 		result.Status = "paused"
 		result.BlockingReasons = append(result.BlockingReasons, "paused")
 	}
-	if draft != nil {
-		result.ValidationStatus = draft.Status
+	if result.HasValidatedConfig {
+		result.LiveModels = result.Models
+	}
+	liveTemplate, liveModels := result.TemplateID, result.Models
+	if draft != nil && draft.Version == channel.SupplierVersion {
+		result.ValidationStatus = draft.ValidationStatus()
+		result.TestOnly = draft.TestOnly
 		result.HasKey = result.HasKey || draft.Secret != ""
-		if !channel.SupplierValidated || draft.Status != "validated" {
+		if draft.TestedModels != "" {
+			result.TestedModels = strings.Split(draft.TestedModels, ",")
+		}
+		if !result.HasValidatedConfig || !draft.TestOnly && draft.Status != "validated" && draft.Status != model.SupplierDraftClosed {
+			result.Name, result.Remark = draft.Name, draft.Remark
 			result.BaseURL, result.Models, result.Type, result.TemplateID = draft.BaseURL, strings.Split(draft.Models, ","), draft.Type, draft.Template()
 			if template, ok := service.SupplierTemplateByID(draft.Template()); ok {
 				result.Protocols, result.TPMApplicable = template.Protocols, template.TPMApplicable
 			}
 		}
+		if !result.HasValidatedConfig && draft.Status == model.SupplierDraftClosed {
+			result.Status = model.SupplierDraftClosed
+		}
+	} else {
+		draft = nil
+	}
+	if parsed, err := url.Parse(result.BaseURL); err == nil {
+		parsed.User, parsed.RawQuery, parsed.Fragment = nil, "", ""
+		result.BaseURL = parsed.String()
+	} else {
+		result.BaseURL = ""
 	}
 	if channel.OwnerSupplierID != "" {
+		result.PublicationRevision = model.SupplierChannelRevision(channel, draft)
+		if !result.HasValidatedConfig {
+			liveTemplate, liveModels = result.TemplateID, result.Models
+		}
 		account, err := model.GetSupplierAccount(channel.OwnerSupplierID)
 		if err != nil {
 			result.Status = "authorization_removed"
@@ -217,20 +241,20 @@ func supplierChannelDTO(channel *model.Channel, draft *model.SupplierChannelDraf
 				result.Status = "supply_paused"
 				result.BlockingReasons = append(result.BlockingReasons, "supply_paused")
 			}
-			if _, available := service.SupplierTemplateByID(result.TemplateID); !available {
+			if _, available := service.SupplierTemplateByID(liveTemplate); !available {
 				result.Status = "template_unavailable"
 				result.BlockingReasons = append(result.BlockingReasons, "template_unavailable")
 			}
-			if !account.AllowsTemplate(result.TemplateID, result.Models) {
+			if !account.AllowsTemplate(liveTemplate, liveModels) {
 				result.Status = "authorization_removed"
 				result.BlockingReasons = append(result.BlockingReasons, "authorization_removed")
 			}
 		}
 	}
-	if state, err := model.GetChannelLimitState(channel.Id, time.Now()); err != nil {
+	if state, err := model.GetChannelLimitState(channel.Id, time.Time{}); err != nil {
 		result.Status = "accounting_unavailable"
 		result.BlockingReasons = append(result.BlockingReasons, "accounting_unavailable")
-	} else if state.Reason != "" {
+	} else if state.Reason != "" && state.Reason != "daily_pending" {
 		result.Status = state.Reason
 		result.BlockingReasons = append(result.BlockingReasons, state.Reason)
 	}
@@ -259,19 +283,22 @@ func GetSupplierSelf(c *gin.Context) {
 	}
 	templates := []service.SupplierTemplate{}
 	for _, template := range service.SupplierTemplates() {
-		if !slices.Contains(account.TemplateIDs(), template.ID) {
+		if !account.AllowsTemplateID(template.ID) {
 			continue
 		}
-		models := []string{}
-		for _, name := range account.Models() {
-			if len(template.Models) == 0 || slices.Contains(template.Models, name) {
-				models = append(models, name)
+		if !account.AllowAllModels {
+			models := []string{}
+			for _, name := range account.Models() {
+				if template.AllowsCustomModels || slices.Contains(template.Models, name) {
+					models = append(models, name)
+				}
 			}
+			template.Models = models
+			template.AllowsCustomModels = false
 		}
-		if len(models) == 0 {
+		if !template.AllowsCustomModels && len(template.Models) == 0 {
 			continue
 		}
-		template.Models = models
 		templates = append(templates, template)
 	}
 	common.ApiSuccess(c, gin.H{"supplier": gin.H{"id": id, "name": supplier.Name, "supply_enabled": account.SupplyEnabled}, "templates": templates})
@@ -328,7 +355,8 @@ func ListSupplierChannels(c *gin.Context) {
 			}
 		}
 		if c.GetInt("role") == common.RoleSupplierUser {
-			item.PlatformPriority, item.Weight, item.Group = 0, 0, ""
+			item.Priority, item.PlatformPriority, item.Weight, item.ChannelWeight, item.Group = 0, 0, 0, 0, ""
+			item.PublicationRevision = ""
 		}
 		items = append(items, item)
 	}
@@ -363,7 +391,8 @@ func GetSupplierChannel(c *gin.Context) {
 		}
 	}
 	if c.GetInt("role") == common.RoleSupplierUser {
-		item.PlatformPriority, item.Weight, item.Group = 0, 0, ""
+		item.Priority, item.PlatformPriority, item.Weight, item.ChannelWeight, item.Group = 0, 0, 0, 0, ""
+		item.PublicationRevision = ""
 	}
 	common.ApiSuccess(c, item)
 }
@@ -374,7 +403,7 @@ func SaveSupplierChannel(c *gin.Context) {
 		return
 	}
 	var request supplierChannelRequest
-	if !decodeSupplierRequest(c, &request, "name", "template_id", "base_url", "key", "models", "remark", "priority", "version", "limits") {
+	if !decodeSupplierRequest(c, &request, "name", "template_id", "base_url", "key", "models", "remark", "version") {
 		return
 	}
 	owner := c.GetString("supplier_id")
@@ -396,26 +425,26 @@ func SaveSupplierChannel(c *gin.Context) {
 		return
 	}
 	template, knownTemplate := service.SupplierTemplateByID(request.TemplateID)
-	kind := template.Type
-	if !knownTemplate || !account.AllowsTemplate(request.TemplateID, request.Models) || strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > 100 || utf8.RuneCountInString(request.Remark) > 255 || len(request.Models) > 100 || request.Priority < -1000 || request.Priority > 1000 {
+	if !knownTemplate || !account.AllowsTemplate(request.TemplateID, request.Models) || strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > 100 || utf8.RuneCountInString(request.Remark) > 255 || len(request.Models) > 100 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
+	seen := make(map[string]bool, len(request.Models))
 	for _, name := range request.Models {
-		if len(template.Models) > 0 && !slices.Contains(template.Models, name) {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name || strings.ContainsAny(name, ",\r\n") || utf8.RuneCountInString(name) > 255 || seen[name] || len(template.Models) > 0 && !slices.Contains(template.Models, name) {
 			common.ApiErrorT(c, "Invalid parameters")
 			return
 		}
+		seen[name] = true
 	}
 	if err := service.ValidateSupplierURL(request.BaseURL); err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	channelID := 0
+	draft := model.SupplierChannelDraft{TemplateID: request.TemplateID, SupplierID: owner, Type: template.Type, Name: strings.TrimSpace(request.Name), BaseURL: request.BaseURL, Models: strings.Join(request.Models, ","), Remark: request.Remark}
 	sensitive := true
-	var pendingDraft *model.SupplierChannelDraft
 	if origin != nil {
-		channelID = origin.Id
+		draft.ChannelID = origin.Id
 		if request.Version != origin.SupplierVersion {
 			common.ApiErrorT(c, "Conflict: the resource was updated. Refresh and try again.")
 			return
@@ -427,8 +456,11 @@ func SaveSupplierChannel(c *gin.Context) {
 			common.ApiErrorT(c, "Conflict: the resource was updated. Refresh and try again.")
 			return
 		}
-		if savedErr == nil && (!origin.SupplierValidated || saved.Status != "validated") {
-			pendingDraft = &saved
+		if !origin.SupplierValidated && saved.Status == model.SupplierDraftClosed {
+			common.ApiErrorT(c, "This channel draft is closed.")
+			return
+		}
+		if savedErr == nil && !saved.TestOnly && saved.Status != "validated" && saved.Status != model.SupplierDraftClosed {
 			previousURL, previousTemplate = saved.BaseURL, saved.Template()
 			if request.Key == "" {
 				previousKey, err = model.DecryptSupplierSecret(owner, saved.Secret)
@@ -436,10 +468,14 @@ func SaveSupplierChannel(c *gin.Context) {
 					common.ApiError(c, err)
 					return
 				}
+				if draft.BaseURL == previousURL && draft.Template() == previousTemplate && draft.Models == saved.Models {
+					draft.ProbeTaskIDs = saved.ProbeTaskIDs
+				}
 			}
 		}
-		sensitive = request.Key != "" || request.BaseURL != previousURL || request.TemplateID != previousTemplate
-		if (request.BaseURL != previousURL || request.TemplateID != previousTemplate) && request.Key == "" {
+		changedConnection := request.BaseURL != previousURL || request.TemplateID != previousTemplate
+		sensitive = request.Key != "" || changedConnection
+		if changedConnection && request.Key == "" {
 			common.ApiErrorT(c, "A new key is required when changing the upstream URL")
 			return
 		}
@@ -452,131 +488,130 @@ func SaveSupplierChannel(c *gin.Context) {
 		return
 	}
 	if sensitive {
-		context, _ := common.Marshal(service.SupplierChannelCredentialsContext{ChannelID: channelID, Version: request.Version})
+		context, _ := common.Marshal(service.SupplierChannelCredentialsContext{ChannelID: draft.ChannelID, Version: request.Version})
 		if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSupplierChannelCredentials, Context: context}) == nil {
 			return
 		}
 	}
-	secret, err := model.EncryptSupplierSecret(owner, request.Key)
+	draft.Secret, err = model.EncryptSupplierSecret(owner, request.Key)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	draft := model.SupplierChannelDraft{TemplateID: request.TemplateID, ChannelID: channelID, SupplierID: owner, Type: kind, Name: strings.TrimSpace(request.Name), BaseURL: request.BaseURL, Secret: secret, Models: strings.Join(request.Models, ","), Remark: request.Remark}
-	metadataOnly := pendingDraft == nil && origin != nil && origin.SupplierValidated && !sensitive && request.BaseURL == origin.GetBaseURL() && request.TemplateID == model.SupplierChannelTemplateID(origin) && request.Key == origin.Key && slices.Equal(request.Models, origin.GetModels())
-	if pendingDraft != nil && !sensitive && request.BaseURL == pendingDraft.BaseURL && request.TemplateID == pendingDraft.Template() && draft.Models == pendingDraft.Models {
-		// Cosmetic edits keep the exact same submitted connection and probes.
-		// The new version still fences publication, without another paid task.
-		draft.ProbeTaskIDs = pendingDraft.ProbeTaskIDs
-	}
-	reusedProbes := pendingDraft != nil && draft.ProbeTaskIDs != ""
 	var channel *model.Channel
 	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		var err error
-		channel, err = model.SaveSupplierChannelDraft(&draft, c.GetInt("id"), request.Version, request.Priority, tx)
-		if err != nil {
+		channel, err = model.SaveSupplierChannelDraft(&draft, c.GetInt("id"), request.Version, tx)
+		if err != nil || origin != nil {
 			return err
 		}
-		if err := model.EnsureChannelLimitTracking(channel.Id, origin == nil, time.Now(), tx); err != nil {
-			return err
-		}
-		if request.Limits != nil {
-			if origin == nil {
-				request.Limits.Revision = 1
-			}
-			if _, err := applySupplierLimits(c, channel, *request.Limits, tx); err != nil {
-				return err
-			}
-		}
-		status := "pending"
-		if metadataOnly {
-			status = "validated"
-		} else if reusedProbes {
-			status = pendingDraft.Status
-			if status == "testing" {
-				status = "waiting"
-			}
-		}
-		return tx.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ? AND status = ?", channel.Id, draft.Version, "configuring").Update("status", status).Error
+		return model.EnsureChannelLimitTracking(channel.Id, true, time.Time{}, tx)
 	})
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	recordManageAudit(c, "supplier.channel.save", map[string]any{"id": channel.Id, "supplier_id": owner, "version": channel.SupplierVersion})
-	// Metadata-only edits preserve the validated connection and do not depend
-	// on a test that could be blocked by a daily budget or a manual pause.
-	if metadataOnly {
-		model.InitChannelCache()
-		model.BumpSyncTopic(model.SyncTopicChannels)
-		GetSupplierChannel(c)
-		return
-	}
-	if reusedProbes {
-		GetSupplierChannel(c)
-		return
-	}
-	common.ApiSuccess(c, gin.H{"id": channel.Id, "version": channel.SupplierVersion, "validation_status": "pending"})
-	go validateSupplierChannelDraft(channel.Id, owner, draft.Version, c.GetInt("id"))
+	common.ApiSuccess(c, gin.H{"id": channel.Id, "version": channel.SupplierVersion, "validation_status": draft.ValidationStatus()})
 }
 
-func SetSupplierChannelStatus(c *gin.Context) {
+func PublishSupplierChannel(c *gin.Context) {
 	channel, ok := supplierChannelForRequest(c, false)
 	if !ok {
 		return
 	}
-	var request struct {
-		Paused  bool  `json:"paused"`
-		Version int64 `json:"version"`
-	}
-	if !decodeSupplierRequest(c, &request, "paused", "version") {
+	if channel.OwnerSupplierID == "" {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
 		return
 	}
-	result := model.DB.Model(&model.Channel{}).Where("id = ? AND owner_supplier_id = ? AND supplier_version = ?", channel.Id, channel.OwnerSupplierID, request.Version).Updates(map[string]any{"supplier_paused": request.Paused})
-	if result.Error != nil || result.RowsAffected != 1 {
-		common.ApiErrorT(c, "Conflict: the resource was updated. Refresh and try again.")
+	var request service.SupplierChannelPublishContext
+	if !decodeSupplierRequest(c, &request, "version", "revision", "models", "groups", "priority", "weight") {
 		return
 	}
-	model.InitChannelCache()
-	model.BumpSyncTopic(model.SyncTopicChannels)
-	recordManageAudit(c, "supplier.channel.pause", map[string]any{"id": channel.Id, "paused": request.Paused})
-	common.ApiSuccess(c, gin.H{"version": request.Version, "paused": request.Paused})
-}
-
-func CopySupplierChannel(c *gin.Context) {
-	channel, ok := supplierChannelForRequest(c, false)
-	if !ok {
+	request.ChannelID = channel.Id
+	routing := model.SupplierChannelRouting{Groups: request.Groups, Priority: request.Priority, Weight: request.Weight}
+	if err := routing.Validate(); err != nil {
+		common.ApiError(c, err)
 		return
 	}
-	var request struct {
-		Version int64  `json:"version"`
-		Name    string `json:"name"`
-	}
-	if !decodeSupplierRequest(c, &request, "version", "name") {
-		return
-	}
-	if strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > 100 {
+	if request.Version <= 0 || len(request.Revision) != 64 || len(request.Models) == 0 || len(request.Models) > 100 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	context, _ := common.Marshal(service.SupplierChannelCredentialsContext{ChannelID: channel.Id, Version: request.Version})
-	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSupplierChannelCredentials, Context: context}) == nil {
+	var draft model.SupplierChannelDraft
+	if err := model.DB.First(&draft, "channel_id = ? AND supplier_id = ? AND version = ?", channel.Id, channel.OwnerSupplierID, request.Version).Error; err != nil {
+		common.ApiErrorT(c, "Conflict: the resource was updated. Refresh and try again.")
 		return
 	}
-	id, err := model.CopySupplierChannel(channel.Id, channel.OwnerSupplierID, request.Version, c.GetInt("id"), strings.TrimSpace(request.Name))
-	if err != nil {
+	template, known := service.SupplierTemplateByID(draft.Template())
+	if !known {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	seen := make(map[string]bool, len(request.Models))
+	for _, name := range request.Models {
+		if name == "" || seen[name] || len(template.Models) > 0 && !slices.Contains(template.Models, name) {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		seen[name] = true
+	}
+	context, _ := common.Marshal(request)
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSupplierChannelPublish, Context: context}) == nil {
+		return
+	}
+	if err := model.PublishSupplierChannelDraft(channel.Id, channel.OwnerSupplierID, request.Version, request.Revision, request.Models, routing); err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	model.InitChannelCache()
-	model.BumpSyncTopic(model.SyncTopicChannels)
-	recordManageAudit(c, "supplier.channel.copy", map[string]any{"id": id, "source_id": channel.Id, "supplier_id": channel.OwnerSupplierID})
-	common.ApiSuccess(c, gin.H{"id": id})
+	closeSupplierWebSocketsForRemovedGroups(channel, request.Groups)
+	recordManageAudit(c, "supplier.channel.publish", map[string]any{"id": channel.Id, "supplier_id": channel.OwnerSupplierID, "version": request.Version, "groups": request.Groups, "models": request.Models, "priority": request.Priority, "weight": request.Weight})
+	GetSupplierChannel(c)
 }
 
-func DiscardSupplierChannel(c *gin.Context) {
+func UpdateSupplierChannelRouting(c *gin.Context) {
 	channel, ok := supplierChannelForRequest(c, false)
 	if !ok {
+		return
+	}
+	if channel.OwnerSupplierID == "" {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
+		return
+	}
+	var request struct {
+		model.SupplierChannelRouting
+		Revision string `json:"revision"`
+	}
+	if !decodeSupplierRequest(c, &request, "revision", "groups", "priority", "weight") {
+		return
+	}
+	if err := model.UpdateSupplierChannelRouting(channel.Id, channel.OwnerSupplierID, request.Revision, request.SupplierChannelRouting); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	model.InitChannelCache()
+	closeSupplierWebSocketsForRemovedGroups(channel, request.Groups)
+	recordManageAudit(c, "supplier.channel.routing", map[string]any{"id": channel.Id, "supplier_id": channel.OwnerSupplierID, "groups": request.Groups, "priority": request.Priority, "weight": request.Weight})
+	GetSupplierChannel(c)
+}
+
+func closeSupplierWebSocketsForRemovedGroups(channel *model.Channel, groups []string) {
+	for group := range strings.SplitSeq(channel.Group, ",") {
+		if group != "" && !slices.Contains(groups, group) {
+			service.CloseActiveWebSocketsForChannel(channel.Id, "upstream connection changed; reconnect required")
+			return
+		}
+	}
+}
+
+func CloseSupplierChannel(c *gin.Context) {
+	channel, ok := supplierChannelForRequest(c, false)
+	if !ok {
+		return
+	}
+	if channel.OwnerSupplierID == "" {
+		common.ApiError(c, model.ErrSupplierChannelOperation)
 		return
 	}
 	var request struct {
@@ -585,14 +620,12 @@ func DiscardSupplierChannel(c *gin.Context) {
 	if !decodeSupplierRequest(c, &request, "version") {
 		return
 	}
-	if err := model.DiscardSupplierChannelDraft(channel.Id, channel.OwnerSupplierID, request.Version); err != nil {
+	if err := model.CloseSupplierChannelDraft(channel.Id, channel.OwnerSupplierID, request.Version); err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
-	model.BumpSyncTopic(model.SyncTopicChannels)
-	recordManageAudit(c, "supplier.channel.discard", map[string]any{"id": channel.Id, "supplier_id": channel.OwnerSupplierID})
-	common.ApiSuccess(c, nil)
+	recordManageAudit(c, "supplier.channel.close", map[string]any{"id": channel.Id, "supplier_id": channel.OwnerSupplierID, "version": request.Version})
+	GetSupplierChannel(c)
 }
 
 func TestSupplierChannel(c *gin.Context) {
@@ -622,7 +655,7 @@ func GetSupplierChannelLimits(c *gin.Context) {
 	if !ok {
 		return
 	}
-	state, err := model.GetChannelLimitState(channel.Id, time.Now())
+	state, err := model.GetChannelLimitState(channel.Id, time.Time{})
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -651,15 +684,24 @@ func GetSupplierChannelLimits(c *gin.Context) {
 		}
 	}
 	protocols, tpmApplicable := service.SupplierChannelProtocols(channel)
-	common.ApiSuccess(c, gin.H{"config": gin.H{"protocols": protocols, "tpm_applicable": tpmApplicable, "channel_id": channel.Id, "revision": state.Config.Revision, "rpm": rpm, "tpm": tpm, "daily_usd": daily, "reconcile_seconds": state.Config.ReconcileSeconds, "budget_ready": state.Config.BudgetReady}, "usage": gin.H{"rpm_used": state.RPMUsed, "tpm_used": state.TPMUsed, "tpm_reserved": state.TPMReserved, "daily_used_usd": used, "daily_reserved_usd": reserved, "daily_remaining_usd": remaining, "budget_day": state.BudgetDay, "reset_at": state.ResetAt, "reason": state.Reason}})
+	rpmSupported := service.ValidateChannelLimitSupport(channel, model.ChannelLimitSettings{RPM: 1}) == nil
+	common.ApiSuccess(c, gin.H{
+		"config": gin.H{
+			"protocols": protocols, "tpm_applicable": tpmApplicable, "rpm_supported": rpmSupported,
+			"channel_id": channel.Id, "revision": state.Config.Revision, "rpm": rpm, "tpm": tpm,
+			"daily_usd": daily, "reconcile_seconds": state.Config.ReconcileSeconds, "budget_ready": state.Config.BudgetReady,
+		},
+		"usage": gin.H{
+			"rpm_used": state.RPMUsed, "rpm_reserved": state.RPMReserved, "rpm_retry_at_ms": state.RPMRetryAt,
+			"tpm_used": state.TPMUsed, "tpm_reserved": state.TPMReserved, "reason": state.Reason,
+			"daily_used_usd": used, "daily_reserved_usd": reserved, "daily_remaining_usd": remaining,
+			"budget_day": state.BudgetDay, "reset_at": state.ResetAt, "daily_active_at": state.DailyActiveAt,
+		},
+	})
 }
 
-func applySupplierLimits(c *gin.Context, channel *model.Channel, request supplierLimitRequest, transactions ...*gorm.DB) (model.ChannelLimitSettings, error) {
-	db := model.DB
-	if len(transactions) > 0 {
-		db = transactions[0]
-	}
-	state, err := model.GetChannelLimitState(channel.Id, time.Now(), db)
+func applySupplierLimits(channel *model.Channel, request supplierLimitRequest) (model.ChannelLimitSettings, error) {
+	state, err := model.GetChannelLimitState(channel.Id, time.Time{})
 	if err != nil {
 		return model.ChannelLimitSettings{}, err
 	}
@@ -693,26 +735,28 @@ func applySupplierLimits(c *gin.Context, channel *model.Channel, request supplie
 		settings.DailyUSDNano = amount
 	}
 	if request.ReconcileSeconds != nil {
-		if c.GetInt("role") < common.RoleAdminUser {
-			return model.ChannelLimitSettings{}, errors.New("Unauthorized, insufficient privileges")
-		}
 		settings.ReconcileSeconds = *request.ReconcileSeconds
 	}
 	if err := service.ValidateChannelLimitSupport(channel, settings); err != nil {
 		return model.ChannelLimitSettings{}, errors.New("Channel limits are not supported for this upstream protocol yet")
 	}
 	var pricing model.Channel
-	if err := db.Select("id", "cost_ratio", "cost_version_id", "upstream_credential_snapshot_data").First(&pricing, "id = ?", channel.Id).Error; err != nil {
+	if err := model.DB.Select("id", "cost_ratio", "cost_version_id", "upstream_credential_snapshot_data").First(&pricing, "id = ?", channel.Id).Error; err != nil {
 		return model.ChannelLimitSettings{}, err
 	}
-	if _, err := model.UpdateChannelLimits(channel.Id, request.Revision, settings, pricing.ProcurementCostReady(), time.Now(), db); err != nil {
+	if _, err := model.UpdateChannelLimits(channel.Id, request.Revision, settings, pricing.ProcurementCostReady(), time.Time{}); err != nil {
+		var limited *model.ChannelLimitError
+		if errors.As(err, &limited) && limited.Reason == "minute_window_warming" {
+			seconds := max(1, (time.Until(limited.RetryDeadline()).Milliseconds()+999)/1000)
+			return model.ChannelLimitSettings{}, common.NewMessage("Collecting the first minute of channel usage. Try again in {{seconds}} s.", map[string]any{"seconds": seconds})
+		}
 		return model.ChannelLimitSettings{}, err
 	}
 	return settings, nil
 }
 
 func saveSupplierLimits(c *gin.Context, channel *model.Channel, request supplierLimitRequest) bool {
-	settings, err := applySupplierLimits(c, channel, request)
+	settings, err := applySupplierLimits(channel, request)
 	if err != nil {
 		common.ApiError(c, err)
 		return false
@@ -722,6 +766,10 @@ func saveSupplierLimits(c *gin.Context, channel *model.Channel, request supplier
 }
 
 func UpdateSupplierChannelLimits(c *gin.Context) {
+	if c.GetInt("role") < common.RoleAdminUser {
+		common.ApiErrorT(c, "Unauthorized, insufficient privileges")
+		return
+	}
 	channel, ok := supplierChannelForRequest(c, false)
 	if !ok {
 		return
@@ -749,11 +797,16 @@ func GetSupplierBudgetEvents(c *gin.Context) {
 		}
 		query = query.Where("budget_day = ?", day)
 	}
+	// Count at most one page past the cap; a hot channel keeps many rows
+	// within the retention window and an exact count would scan them all.
+	const budgetEventCountCap = 10000
 	var total int64
-	if query.Count(&total).Error != nil {
+	if model.DB.Table("(?) AS bounded_attempts", query.Session(&gorm.Session{}).Select("id").Limit(budgetEventCountCap+1)).Count(&total).Error != nil {
 		common.ApiErrorT(c, "Please try again later.")
 		return
 	}
+	totalCapped := total > budgetEventCountCap
+	total = min(total, budgetEventCountCap)
 	page := common.GetPageQuery(c)
 	var attempts []model.ChannelLimitAttempt
 	if query.Order("sent_at_ms DESC, id DESC").Offset(page.GetStartIdx()).Limit(page.GetPageSize()).Find(&attempts).Error != nil {
@@ -783,7 +836,7 @@ func GetSupplierBudgetEvents(c *gin.Context) {
 		}
 		rows = append(rows, gin.H{"id": attempt.ID, "channel_id": attempt.ChannelID, "budget_day": attempt.BudgetDay, "sent_at": attempt.SentAtMS / 1000, "status": status, "cost_usd": cost, "reserved_usd": reserved, "tpm_estimated": attempt.TPMEstimated, "reconcile_until": attempt.ReconcileUntilMS / 1000})
 	}
-	common.ApiSuccess(c, gin.H{"items": rows, "total": total})
+	common.ApiSuccess(c, gin.H{"items": rows, "total": total, "total_capped": totalCapped})
 }
 
 func GetSupplierLimitEvents(c *gin.Context) {
@@ -824,104 +877,212 @@ func ListSupplierAccounts(c *gin.Context) {
 		_ = model.DB.First(&supplier, "id = ?", account.SupplierID).Error
 		var user model.User
 		_ = model.DB.Select("id", "username", "status").Where("supplier_id = ?", account.SupplierID).First(&user).Error
-		items = append(items, gin.H{"id": account.SupplierID, "name": supplier.Name, "revision": account.Revision, "user_id": user.Id, "username": user.Username, "login_enabled": user.Status == common.UserStatusEnabled, "supply_enabled": account.SupplyEnabled, "allowed_types": account.Types(), "allowed_templates": account.TemplateIDs(), "allowed_models": account.Models(), "group": account.Group, "max_channels": account.MaxChannels, "max_output_tokens": account.MaxOutputTokens, "max_input_tokens": account.MaxInputTokens, "cost_ratio": account.CostRatio, "pool_priority": account.PoolPriority, "pool_weight": account.PoolWeight, "pool_capacity": account.PoolCapacity})
+		items = append(items, gin.H{"id": account.SupplierID, "name": supplier.Name, "revision": account.Revision, "user_id": user.Id, "username": user.Username, "login_enabled": user.Status == common.UserStatusEnabled, "supply_enabled": account.SupplyEnabled, "allowed_types": account.Types(), "allowed_templates": account.TemplateIDs(), "allowed_models": account.Models(), "allow_all_templates": account.AllowAllTemplates, "allow_all_models": account.AllowAllModels, "group": account.Group, "max_channels": account.MaxChannels, "max_output_tokens": account.MaxOutputTokens, "max_input_tokens": account.MaxInputTokens, "cost_ratio": account.CostRatio, "pool_priority": account.PoolPriority, "pool_weight": account.PoolWeight, "pool_capacity": account.PoolCapacity})
 	}
 	common.ApiSuccess(c, gin.H{"items": items, "total": len(items)})
 }
 
 func SaveSupplierAccount(c *gin.Context) {
-	var request supplierAccountRequest
-	if !decodeSupplierRequest(c, &request, "name", "revision", "user_id", "supply_enabled", "allowed_types", "allowed_templates", "allowed_models", "group", "max_channels", "max_input_tokens", "max_output_tokens", "cost_ratio", "pool_priority", "pool_weight", "pool_capacity") {
+	id := c.Param("id")
+	var supplier model.UpstreamSupplier
+	var previous model.SupplierAccount
+	request := supplierAccountRequest{Group: "default", MaxChannels: 20, PoolWeight: 1, SupplyEnabled: true}
+	if id != "" {
+		if err := model.DB.First(&supplier, "id = ?", id).Error; err != nil {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		err := model.DB.First(&previous, "supplier_id = ?", id).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ApiError(c, err)
+			return
+		}
+		request.Name = supplier.Name
+		if previous.Revision > 0 {
+			request.SupplyEnabled, request.Group, request.MaxChannels = previous.SupplyEnabled, previous.Group, previous.MaxChannels
+			request.CostRatio, request.MaxInputTokens, request.MaxOutputTokens = previous.CostRatio, previous.MaxInputTokens, previous.MaxOutputTokens
+			request.PoolPriority, request.PoolWeight, request.PoolCapacity = previous.PoolPriority, previous.PoolWeight, previous.PoolCapacity
+		}
+	}
+	if !decodeSupplierRequest(c, &request, "name", "revision", "user_id", "username", "password", "supply_enabled", "allowed_types", "allowed_templates", "allowed_models", "allow_all_templates", "allow_all_models", "group", "max_channels", "max_input_tokens", "max_output_tokens", "cost_ratio", "pool_priority", "pool_weight", "pool_capacity") {
 		return
 	}
-	if strings.TrimSpace(request.Name) == "" || utf8.RuneCountInString(request.Name) > 100 || len(request.AllowedTypes) == 0 && len(request.AllowedTemplates) == 0 || len(request.AllowedModels) == 0 || request.PoolCapacity < 0 || request.PoolCapacity > 100000 || request.MaxOutputTokens < 0 || request.MaxOutputTokens > int64(common.MaxQuota) || request.MaxInputTokens < 0 || request.MaxInputTokens > int64(common.MaxQuota) {
+	provision := request.Username != "" || request.Password != ""
+	request.Name = strings.TrimSpace(request.Name)
+	request.Username = strings.TrimSpace(request.Username)
+	if request.Revision != previous.Revision {
+		common.ApiErrorT(c, "Conflict: the resource was updated. Refresh and try again.")
+		return
+	}
+	if request.Name == "" || utf8.RuneCountInString(request.Name) > 100 || request.UserID < 0 ||
+		request.PoolCapacity < 0 || request.PoolCapacity > 100000 || request.MaxOutputTokens < 0 || request.MaxOutputTokens > int64(common.MaxQuota) ||
+		request.MaxInputTokens < 0 || request.MaxInputTokens > int64(common.MaxQuota) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if request.AllowedTemplates == nil {
-		for _, kind := range request.AllowedTypes {
-			request.AllowedTemplates = append(request.AllowedTemplates, strconv.Itoa(kind))
-		}
+
+	if previous.Revision == 0 && !provision || provision && (request.Username == "" || request.Password == "" || request.UserID != 0) {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
 	}
-	var previousTemplates []string
-	if c.Param("id") != "" && request.Revision > 0 {
-		previous, err := model.GetSupplierAccount(c.Param("id"))
-		if err != nil {
+	var user model.User
+	if provision {
+		if c.GetInt("role") < common.RoleAdminUser {
+			common.ApiErrorT(c, "Unauthorized, insufficient privileges")
+			return
+		}
+		if _, ok := middleware.GetSessionAuthIdentity(c); !ok {
+			common.ApiErrorT(c, "The current sign-in method does not support security verification")
+			return
+		}
+		if !common.SessionCookieSecure || !common.RequestUsesTrustedHTTPS(c.Request) {
+			common.ApiErrorT(c, "Supplier credentials require HTTPS and secure session cookies")
+			return
+		}
+		user = model.User{
+			Username:    request.Username,
+			DisplayName: request.Username,
+			Password:    request.Password,
+			Role:        common.RoleSupplierUser,
+		}
+		if err := model.ValidateSupplierPassword(user.Password); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if err := common.Validate.Struct(&user); err != nil {
 			common.ApiErrorT(c, "Invalid parameters")
 			return
 		}
-		previousTemplates = previous.TemplateIDs()
 	}
-	request.AllowedTypes = nil
-	for _, id := range request.AllowedTemplates {
-		template, ok := service.SupplierTemplateByID(id)
-		if !ok {
-			if slices.Contains(previousTemplates, id) {
-				continue
+
+	allowAllTemplates, allowAllModels := previous.AllowAllTemplates, previous.AllowAllModels
+	previousTemplates := previous.TemplateIDs()
+	templates := request.AllowedTemplates
+	if templates == nil {
+		if request.AllowedTypes == nil {
+			templates = previousTemplates
+		} else {
+			templates = make([]string, 0, len(request.AllowedTypes))
+			for _, kind := range request.AllowedTypes {
+				templates = append(templates, strconv.Itoa(kind))
 			}
+		}
+	}
+	models := request.AllowedModels
+	if models == nil {
+		models = previous.Models()
+	}
+	if previous.Revision == 0 {
+		allowAllTemplates, allowAllModels = len(templates) == 0, len(models) == 0
+	}
+	if request.AllowAllTemplates != nil {
+		allowAllTemplates = *request.AllowAllTemplates
+	}
+	if request.AllowAllModels != nil {
+		allowAllModels = *request.AllowAllModels
+	}
+	changesTemplateScope := previous.Revision == 0 || request.AllowedTemplates != nil || request.AllowedTypes != nil || request.AllowAllTemplates != nil
+	changesModelScope := previous.Revision == 0 || request.AllowedModels != nil || request.AllowAllModels != nil
+	if changesTemplateScope && !allowAllTemplates && len(templates) == 0 ||
+		changesModelScope && !allowAllModels && len(models) == 0 {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	allowedTypes := []int{}
+	for _, templateID := range templates {
+		template, ok := service.SupplierTemplateByID(templateID)
+		if !ok && !slices.Contains(previousTemplates, templateID) {
 			common.ApiErrorT(c, "Invalid parameters")
 			return
 		}
-		if template.Type != constant.ChannelTypeTaskPlugin && !slices.Contains(request.AllowedTypes, template.Type) {
-			request.AllowedTypes = append(request.AllowedTypes, template.Type)
+		if ok && template.Type != constant.ChannelTypeTaskPlugin && !slices.Contains(allowedTypes, template.Type) {
+			allowedTypes = append(allowedTypes, template.Type)
 		}
 	}
-	for _, name := range request.AllowedModels {
+	for _, name := range models {
 		if strings.TrimSpace(name) == "" || strings.ContainsAny(name, ",\r\n") {
 			common.ApiErrorT(c, "Invalid parameters")
 			return
 		}
 	}
-	id := c.Param("id")
-	existingSupplier := id != ""
-	context, _ := common.Marshal(service.SupplierManageContext{SupplierID: id, Version: request.Revision})
-	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSupplierManage, Context: context}) == nil {
+
+	var authorization *model.AuthFlowAuthorization
+	if provision {
+		authorization = requireAdminUserProof(c, service.VerificationScopeSupplierProvision,
+			service.SupplierProvisionContext{SupplierID: id, Version: request.Revision, Username: request.Username})
+	} else {
+		context, _ := common.Marshal(service.SupplierManageContext{SupplierID: id, Version: request.Revision})
+		authorization = middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeSupplierManage, Context: context})
+	}
+	if authorization == nil {
 		return
 	}
+	createSupplier := id == ""
 	if id == "" {
 		id = uuid.NewString()
 	}
-	typesJSON, _ := common.Marshal(request.AllowedTypes)
-	templatesJSON, _ := common.Marshal(request.AllowedTemplates)
-	account := model.SupplierAccount{SupplierID: id, SupplyEnabled: request.SupplyEnabled, AllowedTypes: string(typesJSON), AllowedTemplates: string(templatesJSON), AllowedModels: strings.Join(request.AllowedModels, ","), Group: request.Group, MaxChannels: request.MaxChannels, MaxOutputTokens: request.MaxOutputTokens, MaxInputTokens: request.MaxInputTokens, CostRatio: request.CostRatio, PoolPriority: request.PoolPriority, PoolWeight: request.PoolWeight, PoolCapacity: request.PoolCapacity}
+	typesJSON, _ := common.Marshal(allowedTypes)
+	templatesJSON, _ := common.Marshal(templates)
+	account := model.SupplierAccount{
+		SupplierID: id, SupplyEnabled: request.SupplyEnabled, AllowAllTemplates: allowAllTemplates, AllowAllModels: allowAllModels,
+		AllowedTypes: string(typesJSON), AllowedTemplates: string(templatesJSON), AllowedModels: strings.Join(models, ","),
+		Group: request.Group, MaxChannels: request.MaxChannels, MaxOutputTokens: request.MaxOutputTokens,
+		MaxInputTokens: request.MaxInputTokens, CostRatio: request.CostRatio, PoolPriority: request.PoolPriority,
+		PoolWeight: request.PoolWeight, PoolCapacity: request.PoolCapacity,
+	}
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
-		if request.Revision == 0 {
-			if existingSupplier {
-				var supplier model.UpstreamSupplier
-				if err := tx.First(&supplier, "id = ?", id).Error; err != nil {
-					return err
-				}
-			} else {
-				if err := tx.Create(&model.UpstreamSupplier{ID: id, Name: strings.TrimSpace(request.Name), CreatedTime: time.Now().Unix()}).Error; err != nil {
-					return err
-				}
+		if createSupplier {
+			if err := tx.Create(&model.UpstreamSupplier{ID: id, Name: request.Name, CreatedTime: time.Now().Unix()}).Error; err != nil {
+				return err
 			}
-		} else {
-			if err := tx.Model(&model.UpstreamSupplier{}).Where("id = ?", id).Update("name", strings.TrimSpace(request.Name)).Error; err != nil {
+		} else if previous.Revision > 0 {
+			if err := tx.Model(&model.UpstreamSupplier{}).Where("id = ?", id).Update("name", request.Name).Error; err != nil {
 				return err
 			}
 		}
 		if err := model.SaveSupplierAccount(&account, request.Revision, tx); err != nil {
 			return err
 		}
-		if request.UserID > 0 {
-			var user model.User
-			if err := tx.First(&user, request.UserID).Error; err != nil {
+		var bound model.User
+		err := tx.Select("id").Where("supplier_id = ?", id).First(&bound).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if provision {
+			if bound.Id != 0 {
+				return common.NewMessage("Conflict: the resource was updated. Refresh and try again.")
+			}
+			var count int64
+			if err := tx.Unscoped().Model(&model.User{}).Where("username = ?", user.Username).Count(&count).Error; err != nil {
 				return err
 			}
-			if user.GetSupplierID() != id {
-				return model.AssignSupplierIdentityWithTx(tx, request.UserID, id)
+			if count != 0 {
+				return common.NewMessage("Username already exists or has been deleted")
 			}
+			user.SupplierID = &id
+			return user.InsertWithTx(tx, 0)
 		}
+		if request.UserID > 0 && request.UserID != bound.Id {
+			return common.NewMessage("Invalid parameters")
+		}
+		user.Id = bound.Id
 		return nil
 	})
 	if err != nil {
+		if provision {
+			if exists, lookupErr := model.CheckUserExistOrDeleted(request.Username, ""); lookupErr == nil && exists {
+				common.ApiErrorT(c, "Username already exists or has been deleted")
+				return
+			}
+		}
 		common.ApiError(c, err)
 		return
 	}
-	if request.UserID > 0 {
-		_ = model.PublishUserAuthCache(request.UserID)
-		_, _ = model.RevokeAllUserSessions(request.UserID, "supplier_configuration_changed")
+	if provision {
+		_ = model.PublishUserAuthCache(user.Id)
+		recordManageAuditFor(c, user.Id, "user.create", map[string]any{
+			"username": user.Username, "role": user.Role, "supplier_id": id, "verification_method": authorization.Method,
+		})
 	}
 	model.InitChannelCache()
 	model.BumpSyncTopic(model.SyncTopicChannels)
@@ -932,7 +1093,7 @@ func SaveSupplierAccount(c *gin.Context) {
 			closeActiveChannelWebSockets(ids)
 		}
 	}
-	common.ApiSuccess(c, gin.H{"id": id, "revision": account.Revision})
+	common.ApiSuccess(c, gin.H{"id": id, "revision": account.Revision, "user_id": user.Id})
 }
 
 // References keep only supplier-local opaque correlation IDs in exported
@@ -1321,7 +1482,7 @@ func GetSupplierOverview(c *gin.Context) {
 	for i := range channels {
 		channel := &channels[i]
 		ids = append(ids, channel.Id)
-		state, err := model.GetChannelLimitState(channel.Id, time.Now())
+		state, err := model.GetChannelLimitState(channel.Id, time.Time{})
 		if err != nil || !(state.Config.HistoryComplete || state.Config.ObservedSince > 0 && state.Config.ObservedSince <= dayStart.UnixMilli()) {
 			costComplete = false
 		}
@@ -1330,7 +1491,7 @@ func GetSupplierOverview(c *gin.Context) {
 			_, templateAvailable = service.SupplierTemplateByID(model.SupplierChannelTemplateID(channel))
 		}
 		if templateAvailable && channel.Status == common.ChannelStatusEnabled && model.SupplierChannelAvailable(channel) && channel.ScheduleAllowsAt(time.Now()) {
-			if err == nil && state.Reason == "" {
+			if err == nil && (state.Reason == "" || state.Reason == "daily_pending") {
 				available++
 			}
 		}
@@ -1353,8 +1514,7 @@ func GetSupplierOverview(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"async": total.Async, "realtime_generation_count": total.RealtimeGenerationCount, "video_seconds": total.VideoSeconds, "credits": total.Credits, "video_usage_known_count": total.VideoUsageKnownCount, "credit_usage_known_count": total.CreditUsageKnownCount, "channel_count": len(channels), "available_channels": available, "request_count": total.RequestCount, "logical_request_count": total.LogicalRequestCount, "last_called_at": total.LastCalledAt, "timeout_count": total.TimeoutCount, "rate_limited_count": total.RateLimitedCount, "auth_error_count": total.AuthErrorCount, "upstream_error_count": total.UpstreamErrorCount, "request_error_count": total.RequestErrorCount, "unknown_error_count": total.UnknownErrorCount, "image_count": total.ImageCount, "audio_seconds": total.AudioSeconds, "image_usage_known_count": total.ImageUsageKnownCount, "audio_usage_known_count": total.AudioUsageKnownCount, "success_count": total.SuccessCount, "failure_count": total.FailureCount, "unknown_count": total.UnknownCount, "input_tokens": total.InputTokens, "output_tokens": total.OutputTokens, "avg_latency_ms": total.AverageLatency, "daily_used_usd": daily, "budget_day": day, "updated_at": time.Now().Unix(), "channels": rows, "trend": trend, "avg_first_token_ms": total.AverageFirstToken, "cache_read_tokens": total.CacheReadTokens, "cache_write_tokens": total.CacheWriteTokens, "usage_known_count": total.UsageKnownCount, "coverage": gin.H{"collected_since": collection.CollectedSince, "timezone": "UTC", "limitations": []string{}}})
 }
 
-// Test candidates on an isolated copy. The active channel remains unchanged
-// until the complete version-fenced publish transaction succeeds.
+// Test candidates on an isolated copy without changing the active channel.
 func validateSupplierChannelDraft(id int, owner string, version int64, userID int) {
 	select {
 	case supplierTestSlots <- struct{}{}:
@@ -1362,19 +1522,21 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 	default:
 		return
 	}
-	claimed := model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND supplier_id = ? AND version = ? AND status IN ?", id, owner, version, []string{"pending", "failed", "cost_config_missing", "waiting", "result_unknown"}).Updates(map[string]any{"status": "testing", "lease_until": time.Now().Add(2 * time.Minute).Unix()})
+	testToken := uuid.NewString()
+	claim := model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND supplier_id = ? AND version = ? AND status IN ?", id, owner, version, supplierQueuedDraftStatuses)
+	claimed := claim.Updates(map[string]any{"status": model.SupplierDraftTesting, "test_token": testToken, "lease_until": time.Now().Add(2 * time.Minute).Unix()})
 	if claimed.Error != nil || claimed.RowsAffected != 1 {
 		return
 	}
 	var draft model.SupplierChannelDraft
 	var channel model.Channel
-	if model.DB.First(&draft, "channel_id = ? AND version = ?", id, version).Error != nil || model.DB.First(&channel, "id = ? AND owner_supplier_id = ?", id, owner).Error != nil {
+	if model.DB.First(&draft, "channel_id = ? AND version = ? AND test_token = ?", id, version, testToken).Error != nil || model.DB.First(&channel, "id = ? AND owner_supplier_id = ?", id, owner).Error != nil {
 		return
 	}
 	status := "failed"
+	testedModels := ""
 	stop := make(chan struct{})
 	defer close(stop)
-	_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ?", id, version).Update("lease_until", time.Now().Add(2*time.Minute).Unix()).Error
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -1383,20 +1545,18 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 			case <-stop:
 				return
 			case <-ticker.C:
-				_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ? AND status = ?", id, version, "testing").Update("lease_until", time.Now().Add(2*time.Minute).Unix()).Error
+				_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ? AND status = ? AND test_token = ? AND lease_until > ?", id, version, model.SupplierDraftTesting, testToken, time.Now().Unix()).Update("lease_until", time.Now().Add(2*time.Minute).Unix()).Error
 			}
 		}
 	}()
 	defer func() {
-		_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ? AND status = ?", id, version, "testing").Updates(map[string]any{"status": status, "error_code": status}).Error
-		model.InitChannelCache()
-		model.BumpSyncTopic(model.SyncTopicChannels)
+		_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("channel_id = ? AND version = ? AND status = ? AND test_token = ? AND lease_until > ?", id, version, model.SupplierDraftTesting, testToken, time.Now().Unix()).Updates(map[string]any{"status": status, "error_code": status, "tested_models": testedModels, "lease_until": 0}).Error
 	}()
 	account, err := model.GetSupplierAccount(owner)
 	if err != nil || !account.SupplyEnabled || !account.AllowsTemplate(draft.Template(), strings.Split(draft.Models, ",")) {
 		return
 	}
-	state, err := model.GetChannelLimitState(id, time.Now())
+	state, err := model.GetChannelLimitState(id, time.Time{})
 	if err != nil {
 		return
 	}
@@ -1405,14 +1565,14 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 		return
 	}
 	if state.Config.BudgetReady != pricing.ProcurementCostReady() {
-		config, err := model.UpdateChannelLimits(id, state.Config.Revision, state.Config.ChannelLimitSettings, pricing.ProcurementCostReady(), time.Now())
+		config, err := model.UpdateChannelLimits(id, state.Config.Revision, state.Config.ChannelLimitSettings, pricing.ProcurementCostReady(), time.Time{})
 		if err != nil {
 			return
 		}
 		state.Config = config
 	}
 	if state.Config.DailyUSDNano > 0 && !state.Config.BudgetReady {
-		status = "cost_config_missing"
+		status = model.SupplierDraftCostMissing
 		return
 	}
 	secret, err := model.DecryptSupplierSecret(owner, draft.Secret)
@@ -1433,14 +1593,15 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 	}
 	channel.Type, channel.Key, channel.Keys, channel.BaseURL, channel.Models = draft.Type, secret, nil, &draft.BaseURL, draft.Models
 	draft.ApplyTemplate(&channel)
+	channel.Group = account.Group
 	channel.CostRatio, channel.CostVersionID = pricing.CostRatio, pricing.CostVersionID
 	channel.ChannelInfo = model.ChannelInfo{}
-	// Validation probes test the isolated draft even when the live channel is
-	// new or supplier-paused. Only PublishSupplierChannelDraft may activate it.
+	// This copy is used by the restricted probe, even while production is disabled.
 	channel.SupplierValidated, channel.SupplierPaused = true, false
 	keys := strings.Split(strings.TrimSpace(secret), "\n")
 	passed := []string{}
 	pendingStatus := ""
+	modelPriceMissing := false
 	batchContext, batchCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer batchCancel()
 	for _, name := range strings.Split(draft.Models, ",") {
@@ -1476,6 +1637,9 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 				result := testChannel(ctx, &candidate, userID, name, endpoint, false)
 				if result.localErr != nil || result.newAPIError != nil {
 					probeStatus = "failed"
+					if result.modelPriceUnavailable {
+						modelPriceMissing = true
+					}
 				}
 			}
 			cancel()
@@ -1491,14 +1655,27 @@ func validateSupplierChannelDraft(id int, owner string, version int64, userID in
 			passed = append(passed, name)
 		}
 	}
-	if pendingStatus != "" {
-		status = pendingStatus
+	if pendingStatus == "waiting" {
+		status = model.SupplierDraftWaiting
 		return
 	}
-	if len(passed) > 0 && model.PublishSupplierChannelDraft(id, owner, version, passed) == nil {
-		status = "validated"
+	if pendingStatus == "result_unknown" {
+		status = model.SupplierDraftUnknown
+		return
+	}
+	if len(passed) > 0 {
+		status = model.SupplierDraftReady
+		if draft.TestOnly {
+			status = "validated"
+		}
+		testedModels = strings.Join(passed, ",")
+	} else if modelPriceMissing {
+		status = model.SupplierDraftPriceMissing
 	}
 }
+
+// The legacy worker cannot claim the new review states during a rolling update.
+var supplierQueuedDraftStatuses = []string{model.SupplierDraftQueued, model.SupplierDraftWaiting, model.SupplierDraftUnknown, model.SupplierDraftCostMissing, "pending", "waiting", "result_unknown", "cost_config_missing"}
 
 var supplierTestSlots = make(chan struct{}, 4)
 var supplierWorkerOnce sync.Once
@@ -1510,9 +1687,9 @@ func StartSupplierValidationWorker() {
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("status = ? AND lease_until < ?", "testing", time.Now().Unix()).Update("status", "pending").Error
+				_ = model.DB.Model(&model.SupplierChannelDraft{}).Where("status IN ? AND lease_until <= ?", []string{model.SupplierDraftTesting, "testing"}, time.Now().Unix()).Update("status", model.SupplierDraftQueued).Error
 				var drafts []model.SupplierChannelDraft
-				if model.DB.Where("status IN ?", []string{"pending", "cost_config_missing", "waiting", "result_unknown"}).Order("created_at ASC").Limit(20).Find(&drafts).Error != nil {
+				if model.DB.Where("status IN ?", supplierQueuedDraftStatuses).Order("created_at ASC").Limit(20).Find(&drafts).Error != nil {
 					continue
 				}
 				for _, draft := range drafts {

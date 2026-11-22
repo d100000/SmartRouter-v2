@@ -221,7 +221,9 @@ func AccessTokenScopeGranted(scopes []string, scope string) bool {
 // obtain it; scopes missing from this table are denied too.
 var accessTokenVerificationScopes = map[string]string{
 	VerificationScopeSupplierChannelCredentials: AccessTokenScopeOf(authz.ChannelSensitiveWrite),
+	VerificationScopeSupplierChannelPublish:     "",
 	VerificationScopeSupplierManage:             "user:write",
+	VerificationScopeSupplierProvision:          "",
 	VerificationScopeChannelKeyRead:             AccessTokenScopeOf(authz.ChannelSecretView),
 	VerificationScopeAdminUserCreate:            "user:write",
 	VerificationScopeAdminUserUpdate:            "user:write",

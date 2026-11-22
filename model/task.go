@@ -87,6 +87,14 @@ type Task struct {
 	ProcurementNextPoll      int64  `json:"-" gorm:"bigint"`
 	ProcurementPending       bool   `json:"-" gorm:"index"`
 	ProcurementVersion       int64  `json:"-"`
+	// RefundedQuota is the quota a FAILURE refund returned to the funding
+	// source. A later SUCCESS charges it again exactly once; Quota holds what
+	// is currently charged.
+	RefundedQuota int `json:"-" gorm:"default:0;index"`
+	// RefundWithdrawalQuota is refunded quota whose refund claim was lost and
+	// whose withdrawal from the funding source failed. The task poller takes
+	// it back. Only atomic increments and claims write it.
+	RefundWithdrawalQuota int `json:"-" gorm:"default:0;index"`
 }
 
 func (t *Task) SetData(data any) {
@@ -447,6 +455,20 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	return tasks
 }
 
+// GetTasksWithPendingRefundBilling returns tasks whose refund bookkeeping
+// still owes the funding source a charge: a SUCCESS whose refund re-charge
+// failed, or a refund whose withdrawal failed after its claim was lost.
+func GetTasksWithPendingRefundBilling(limit int) []*Task {
+	var tasks []*Task
+	err := DB.Where("status = ? AND refunded_quota > ?", TaskStatusSuccess, 0).
+		Or("refund_withdrawal_quota > ?", 0).
+		Order("id").Limit(limit).Find(&tasks).Error
+	if err != nil {
+		return nil
+	}
+	return tasks
+}
+
 // HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is
 // still in progress. It is a cheap existence check (LIMIT 1) used to decide
 // whether the async_task_poll system task needs to run; when no task is pending
@@ -457,6 +479,14 @@ func HasUnfinishedSyncTasks() bool {
 		Where("progress != ?", "100%").
 		Where("status != ?", TaskStatusFailure).
 		Where("status != ?", TaskStatusSuccess).
+		Limit(1).
+		Pluck("id", &id).Error
+	if err == nil && id != 0 {
+		return true
+	}
+	err = DB.Model(&Task{}).
+		Where("status = ? AND refunded_quota > ?", TaskStatusSuccess, 0).
+		Or("refund_withdrawal_quota > ?", 0).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
@@ -602,12 +632,29 @@ func (t *Task) Snapshot() taskSnapshot {
 
 func (Task *Task) Update() error {
 	var err error
-	err = DB.Save(Task).Error
+	err = DB.Omit("refund_withdrawal_quota").Save(Task).Error
 	return err
 }
 
+// UpdateQuota writes the settled quota. The procurement version moves so a
+// channel task copy read before this write loses its CAS and cannot write the
+// previous quota back.
 func (t *Task) UpdateQuota() error {
-	return DB.Model(t).Update("quota", t.Quota).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		err := tx.Model(&Task{}).Where("id = ?", t.ID).Updates(map[string]any{
+			"quota":               t.Quota,
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		}).Error
+		if err != nil {
+			return err
+		}
+		var current Task
+		if err := tx.Select("procurement_version").First(&current, t.ID).Error; err != nil {
+			return err
+		}
+		t.ProcurementVersion = current.ProcurementVersion
+		return nil
+	})
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -624,11 +671,100 @@ func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 	if t.PrivateData.ChannelAttempt != nil {
 		return t.updateChannelTaskWithStatus(fromStatus)
 	}
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	// The refund marker guard makes a copy read before a refund or re-charge
+	// claim lose, so it cannot write the claimed quota fields back.
+	result := DB.Model(t).Where("status = ? AND COALESCE(refunded_quota, 0) = ?", fromStatus, t.RefundedQuota).Select("*").Omit("refund_withdrawal_quota").Updates(t)
 	if result.Error != nil {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+// ClaimRefund records a refund of quota that was already returned to the
+// funding source. It wins only while the task has not succeeded and still
+// charges exactly quota, so it cannot race a later SUCCESS or a second refund. The
+// procurement version moves so a channel task copy read earlier loses its CAS.
+func (t *Task) ClaimRefund(quota int) (bool, error) {
+	if quota <= 0 {
+		return false, nil
+	}
+	result := DB.Model(&Task{}).
+		Where("id = ? AND status <> ? AND quota = ?", t.ID, TaskStatusSuccess, quota).
+		Updates(map[string]any{
+			"quota":               0,
+			"refunded_quota":      gorm.Expr("COALESCE(refunded_quota, 0) + ?", quota),
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return false, result.Error
+	}
+	t.Quota, t.RefundedQuota = 0, t.RefundedQuota+quota
+	t.ProcurementVersion++
+	return true, nil
+}
+
+// ClaimRefundRecharge moves the refunded quota of a task that finished with
+// SUCCESS back into Quota. Only one caller wins for a given refund.
+func (t *Task) ClaimRefundRecharge(refunded int) (bool, error) {
+	if refunded <= 0 {
+		return false, nil
+	}
+	result := DB.Model(&Task{}).
+		Where("id = ? AND status = ? AND refunded_quota = ?", t.ID, TaskStatusSuccess, refunded).
+		Updates(map[string]any{
+			"quota":               gorm.Expr("COALESCE(quota, 0) + ?", refunded),
+			"refunded_quota":      0,
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return false, result.Error
+	}
+	t.Quota, t.RefundedQuota = t.Quota+refunded, 0
+	t.ProcurementVersion++
+	return true, nil
+}
+
+// AddRefundWithdrawal records refunded quota that still has to be taken back
+// from the funding source.
+func (t *Task) AddRefundWithdrawal(quota int) error {
+	return DB.Model(&Task{}).Where("id = ?", t.ID).
+		UpdateColumn("refund_withdrawal_quota", gorm.Expr("COALESCE(refund_withdrawal_quota, 0) + ?", quota)).Error
+}
+
+// ClaimRefundWithdrawal takes the recorded withdrawal for one caller, which
+// then charges it or adds it back.
+func (t *Task) ClaimRefundWithdrawal(quota int) (bool, error) {
+	if quota <= 0 {
+		return false, nil
+	}
+	result := DB.Model(&Task{}).Where("id = ? AND refund_withdrawal_quota = ?", t.ID, quota).
+		UpdateColumn("refund_withdrawal_quota", 0)
+	if result.Error != nil || result.RowsAffected == 0 {
+		return false, result.Error
+	}
+	t.RefundWithdrawalQuota = 0
+	return true, nil
+}
+
+// RevertRefundRecharge undoes a won ClaimRefundRecharge whose charge could
+// not be applied, so a later SUCCESS poll retries it.
+func (t *Task) RevertRefundRecharge(refunded int) error {
+	result := DB.Model(&Task{}).
+		Where("id = ? AND status = ? AND refunded_quota = ? AND quota >= ?", t.ID, TaskStatusSuccess, 0, refunded).
+		Updates(map[string]any{
+			"quota":               gorm.Expr("quota - ?", refunded),
+			"refunded_quota":      refunded,
+			"procurement_version": gorm.Expr("COALESCE(procurement_version, 0) + 1"),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("task refund re-charge state changed")
+	}
+	t.Quota, t.RefundedQuota = t.Quota-refunded, refunded
+	t.ProcurementVersion++
+	return nil
 }
 
 func (t *Task) preparePerformanceSample(fromStatus TaskStatus) {

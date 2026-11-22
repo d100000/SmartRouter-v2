@@ -260,3 +260,67 @@ func TestAddChannelPanicRollsBackWithoutSuccess(t *testing.T) {
 	assert.Zero(t, channels)
 	assert.Zero(t, abilities)
 }
+
+// A create accepts configuration only: identity, supplier ownership, counters
+// and runtime state in the request are ignored, in every add mode.
+func TestAddChannelIgnoresServerOwnedFields(t *testing.T) {
+	rootID := setupChannelCreateTest(t)
+	for _, mode := range []string{"single", "batch", "multi_to_single"} {
+		t.Run(mode, func(t *testing.T) {
+			name := "server-owned-" + mode
+			body := fmt.Sprintf(`{"mode":%q,"multi_key_mode":"polling","channel":{
+				"id":987654,"name":%q,"type":1,"key":"sk-owned-a\nsk-owned-b","models":"test-model","group":"default",
+				"owner_supplier_id":"supplier-a","created_by":77,"supplier_priority":5,"supplier_paused":true,
+				"supplier_version":9,"supplier_validated":true,"secrets_write_only":true,
+				"used_quota":1000,"balance":12.5,"balance_updated_time":123,"test_time":456,"response_time":789,
+				"cost_version_id":"forged","other_info":"{\"status_reason\":\"forged\"}",
+				"channel_info":{"is_multi_key":true,"multi_key_size":9,"multi_key_status_list":{"0":2},"multi_key_polling_index":4}}}`, mode, name)
+			response := postAddChannel(t, rootID, common.RoleRootUser, body)
+			require.Contains(t, response.Body.String(), `"success":true`)
+			var created []model.Channel
+			require.NoError(t, model.DB.Where("name = ?", name).Order("id").Find(&created).Error)
+			require.NotEmpty(t, created)
+			for _, channel := range created {
+				assert.NotEqual(t, 987654, channel.Id)
+				assert.Empty(t, channel.OwnerSupplierID)
+				assert.Zero(t, channel.CreatedBy)
+				assert.Zero(t, channel.SupplierPriority)
+				assert.False(t, channel.SupplierPaused)
+				assert.Zero(t, channel.SupplierVersion)
+				assert.False(t, channel.SupplierValidated)
+				assert.False(t, channel.SecretsWriteOnly)
+				assert.Zero(t, channel.UsedQuota)
+				assert.Zero(t, channel.Balance)
+				assert.Zero(t, channel.BalanceUpdatedTime)
+				assert.Zero(t, channel.TestTime)
+				assert.Zero(t, channel.ResponseTime)
+				assert.NotEqual(t, "forged", channel.CostVersionID)
+				assert.NotContains(t, channel.OtherInfo, "forged")
+				assert.Empty(t, channel.ChannelInfo.MultiKeyStatusList)
+				assert.Zero(t, channel.ChannelInfo.MultiKeyPollingIndex)
+				assert.Equal(t, mode == "multi_to_single", channel.ChannelInfo.IsMultiKey)
+			}
+			if mode == "multi_to_single" {
+				require.Len(t, created, 1)
+				assert.Equal(t, 2, created[0].ChannelInfo.MultiKeySize)
+				assert.Equal(t, constant.MultiKeyModePolling, created[0].ChannelInfo.MultiKeyMode)
+			} else {
+				assert.Len(t, created, map[string]int{"single": 1, "batch": 2}[mode])
+			}
+		})
+	}
+}
+
+// Batch adding with key prefixes names each channel after its own key only.
+func TestAddChannelBatchKeyPrefixNamesEachChannelOnce(t *testing.T) {
+	rootID := setupChannelCreateTest(t)
+	request, err := common.Marshal(AddChannelRequest{Mode: "batch", BatchAddSetKeyPrefix2Name: true, Channel: &model.Channel{
+		Name: "prefixed", Type: constant.ChannelTypeOpenAI, Key: "sk-first-key\nsk-second-key\nshort", Models: "test-model", Group: "default",
+	}})
+	require.NoError(t, err)
+	response := postAddChannel(t, rootID, common.RoleRootUser, string(request))
+	require.Contains(t, response.Body.String(), `"success":true`)
+	var names []string
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("name LIKE ?", "prefixed%").Order("id").Pluck("name", &names).Error)
+	assert.Equal(t, []string{"prefixed sk-first", "prefixed sk-secon", "prefixed short"}, names)
+}

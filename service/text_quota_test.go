@@ -47,9 +47,9 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 	}{
 		{name: "free group preserves cache image tool and request multipliers", group: 0, base: common.GetPointer(2399.75)},
 		{name: "paid group preserves unrounded base", group: .8, base: common.GetPointer(2399.75), revenue: 1920},
-		{name: "locally estimated usage has unknown cost", group: .8, local: true, revenue: 1920},
-		{name: "estimated native usage has unknown cost without context flag", group: .8, estimatedNative: true, revenue: 1920},
-		{name: "missing usage has unknown cost", group: .8, missing: true, revenue: 1840},
+		{name: "locally estimated usage prices procurement like the customer", group: .8, local: true, base: common.GetPointer(2399.75), revenue: 1920},
+		{name: "estimated native usage prices procurement without context flag", group: .8, estimatedNative: true, base: common.GetPointer(2399.75), revenue: 1920},
+		{name: "missing usage prices procurement on the fallback estimate", group: .8, missing: true, base: common.GetPointer(2300.0), revenue: 1840},
 		{name: "free tiered group preserves actual base", group: 0, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0)},
 		{name: "historical tiered unit preserves monetary tool cost", group: 0, changedUnit: true, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0)},
 		{name: "mixed tiered and tool units preserve fee and mark income unknown", group: .8, changedUnit: true, expression: `tier("base", p * 2 + c * 4)`, base: common.GetPointer(2420.0), revenue: 3312},
@@ -57,10 +57,11 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 		{name: "saturated charge has unknown cost", group: .8, overflow: true, revenue: int64(common.MaxQuota)},
 		{name: "audio free group preserves pre group cost", group: 0, mode: "audio", base: common.GetPointer(120.0)},
 		{name: "audio paid group preserves pre group cost", group: .8, mode: "audio", base: common.GetPointer(120.0), revenue: 96},
-		{name: "audio estimate has unknown cost", group: .8, mode: "audio", local: true, revenue: 96},
-		{name: "audio estimated native usage has unknown cost without context flag", group: .8, mode: "audio", estimatedNative: true, revenue: 96},
+		{name: "audio estimate prices procurement like the customer", group: .8, mode: "audio", local: true, base: common.GetPointer(120.0), revenue: 96},
+		{name: "audio estimated native usage prices procurement without context flag", group: .8, mode: "audio", estimatedNative: true, base: common.GetPointer(120.0), revenue: 96},
 		{name: "realtime total usage preserves pre group cost", group: .8, mode: "realtime", base: common.GetPointer(120.0), revenue: 96},
-		{name: "requested image count has unknown procurement cost", group: .8, mode: "image_estimate", revenue: 49600},
+		{name: "audio per call price records its procurement price", group: .8, mode: "audio_price", base: common.GetPointer(.01 * 500000)},
+		{name: "requested image count prices procurement on the reserved count", group: .8, mode: "image_estimate", base: common.GetPointer(62000.0), revenue: 49600},
 		{name: "measured image count preserves procurement cost", group: .8, mode: "image_actual", base: common.GetPointer(62000.0), revenue: 49600},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,6 +113,9 @@ func TestOverviewBillingSnapshotsUseMeasuredPreGroupAmounts(t *testing.T) {
 			}
 			switch tc.mode {
 			case "audio":
+				PostAudioConsumeQuota(ctx, info, usage, nil)
+			case "audio_price":
+				info.PriceData.UsePrice, info.PriceData.ModelPrice = true, .01
 				PostAudioConsumeQuota(ctx, info, usage, nil)
 			case "realtime":
 				PostWssConsumeQuota(ctx, info, info.OriginModelName, &dto.RealtimeUsage{InputTokens: 100, OutputTokens: 20, TotalTokens: 120, InputTokenDetails: dto.InputTokenDetails{TextTokens: 100}, OutputTokenDetails: dto.OutputTokenDetails{TextTokens: 20}}, nil)

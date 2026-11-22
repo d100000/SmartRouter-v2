@@ -38,6 +38,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		ctx = context.Background()
 	}
 
+	service.RetryPendingMidjourneyRefundBilling(ctx)
 	tasks := model.GetAllUnFinishTasks()
 	if len(tasks) == 0 {
 		return summary
@@ -124,6 +125,11 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			var identity hosttypes.ChannelFundingAttempt
 			_ = common.UnmarshalJsonStr(task.FundingAttemptData, &identity)
 			key := service.TaskPollingKey(midjourneyChannel, task.PollingKey, &identity)
+			if key == "" && task.PollingKey == "" && midjourneyChannel.CredentialUnavailable() {
+				// The channel credential cannot be opened on this node.
+				logger.LogWarn(ctx, common.LogText("Midjourney task %s skipped: channel #%d credential unavailable", task.MjId, channelId))
+				continue
+			}
 			if _, exists := groups[key]; !exists {
 				order = append(order, key)
 			}
@@ -263,6 +269,8 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 					logger.LogError(ctx, common.LogText("UpdateMidjourneyTask task error: %s", err.Error()))
 				} else if won && shouldReturnQuota {
 					service.RefundMidjourneyQuota(ctx, task, "Composition failed")
+				} else if won && task.Status == "SUCCESS" && task.RefundedQuota > 0 {
+					service.RechargeRefundedMidjourneyQuota(ctx, task)
 				}
 			}
 		}

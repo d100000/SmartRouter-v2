@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createFileRoute, redirect } from '@tanstack/react-router'
+import { z } from 'zod'
 
 import { SuppliersAdmin } from '@/features/suppliers/admin'
 import { ROLE } from '@/lib/roles'
@@ -28,5 +29,20 @@ export const Route = createFileRoute('/_authenticated/suppliers/')({
       throw redirect({ to: '/403' })
     }
   },
-  component: SuppliersAdmin,
+  validateSearch: z.object({
+    add: z.boolean().optional().catch(undefined),
+    supplier: z.string().optional().catch(undefined),
+  }),
+  component: SupplierManagementPage,
 })
+
+function SupplierManagementPage() {
+  const search = Route.useSearch()
+  return (
+    <SuppliersAdmin
+      key={search.supplier ?? String(search.add)}
+      create={search.add}
+      supplierId={search.supplier}
+    />
+  )
+}

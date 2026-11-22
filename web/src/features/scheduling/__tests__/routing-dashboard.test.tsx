@@ -32,6 +32,7 @@ import {
 import userEvent from '@testing-library/user-event'
 import { AxiosError, AxiosHeaders, type AxiosAdapter } from 'axios'
 import { StrictMode, type ReactNode } from 'react'
+import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
@@ -89,6 +90,9 @@ beforeEach(() => {
       degraded_channels: 1,
       in_flight: 3,
       top_traffic_share: 0.8,
+      capacity_skips_30m: 0,
+      capacity_exhausted_30m: 0,
+      cooldown_suppressed_30m: 0,
     },
     trend: [],
     channels: [
@@ -117,6 +121,8 @@ beforeEach(() => {
         quality_score: 52,
         selection_probability: 0.4,
         can_recover: true,
+        cooldown_skipped: 0,
+        cooldown_probes: 0,
       },
       {
         channel_id: 2,
@@ -143,6 +149,8 @@ beforeEach(() => {
         quality_score: 80,
         selection_probability: 0,
         can_recover: false,
+        cooldown_skipped: 0,
+        cooldown_probes: 0,
       },
     ],
   }
@@ -596,6 +604,46 @@ describe('routing dashboard interactions', () => {
     )
   })
 
+  test('a save that the server persisted but has not applied yet closes the dialog with a warning', async () => {
+    const user = userEvent.setup()
+    const warning = vi.spyOn(toast, 'warning')
+    const success = vi.spyOn(toast, 'success')
+    vi.mocked(api.post).mockResolvedValue({
+      data: { success: true, sync_pending: true },
+    })
+    render(<Scheduling />, { wrapper: Wrapper })
+    await screen.findByText('Native routing')
+    await user.click(
+      screen.getByRole('button', { name: 'Routing configuration' })
+    )
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Save' })
+    )
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    expect(warning).toHaveBeenCalledWith(
+      'Routing configuration saved. It takes effect after the routing snapshot reloads.'
+    )
+    expect(success).not.toHaveBeenCalled()
+  })
+
+  test('a configuration load failure shows a warning while the last routing state stays visible', async () => {
+    snapshot.config_status = {
+      published: true,
+      stale: true,
+      error: 'invalid scheduling configuration',
+      failures: 2,
+    }
+    render(<Scheduling />, { wrapper: Wrapper })
+    expect(
+      await screen.findByText(
+        'The latest routing configuration failed to load. Routing continues with the last valid configuration while it retries.'
+      )
+    ).toBeVisible()
+    expect(screen.getByText('Native routing')).toBeVisible()
+  })
+
   test('an invalid concurrency value stays in the form without saving and Escape closes the dialog', async () => {
     const user = userEvent.setup()
     render(<Scheduling />, { wrapper: Wrapper })
@@ -617,6 +665,112 @@ describe('routing dashboard interactions', () => {
     await waitFor(() =>
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     )
+  })
+
+  test('clearing the default concurrency saves zero so new requests are never refused for capacity', async () => {
+    const user = userEvent.setup()
+    render(<Scheduling />, { wrapper: Wrapper })
+    await screen.findByText('Native routing')
+    await user.click(
+      screen.getByRole('button', { name: 'Routing configuration' })
+    )
+    const dialog = screen.getByRole('dialog')
+    const capacity = within(dialog).getByRole('spinbutton', {
+      name: 'Default safe concurrency',
+    })
+    await user.clear(capacity)
+    expect(capacity).toHaveAttribute('placeholder', 'Unlimited')
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        '/api/scheduling/config',
+        expect.objectContaining({ default_capacity: 0 })
+      )
+    )
+  })
+
+  test('an unlimited default capacity opens with an empty concurrency field', async () => {
+    const user = userEvent.setup()
+    snapshot.config.default_capacity = 0
+    render(<Scheduling />, { wrapper: Wrapper })
+    await screen.findByText('Native routing')
+    await user.click(
+      screen.getByRole('button', { name: 'Routing configuration' })
+    )
+    expect(
+      within(screen.getByRole('dialog')).getByRole('spinbutton', {
+        name: 'Default safe concurrency',
+      })
+    ).toHaveValue(null)
+  })
+
+  test('an unlimited channel shows its in-flight count against no capacity limit', async () => {
+    const user = userEvent.setup()
+    snapshot.channels[0].capacity = 0
+    render(<Scheduling />, { wrapper: Wrapper })
+    await user.click(await screen.findByRole('tab', { name: 'Groups' }))
+    const primary = screen.getByRole('row', { name: /Primary/ })
+    expect(within(primary).getByText(/3 \/ Unlimited/)).toBeVisible()
+  })
+
+  test('capacity refusals surface as a watchpoint with their bypass count', async () => {
+    snapshot.summary.capacity_skips_30m = 7
+    snapshot.summary.capacity_exhausted_30m = 2
+    render(<Scheduling />, { wrapper: Wrapper })
+    expect(
+      await screen.findByText(
+        '2 selections found every channel at capacity (30m)'
+      )
+    ).toBeVisible()
+    expect(screen.getByText('Capacity bypasses (30m): 7')).toBeVisible()
+  })
+
+  test('a cooling channel shows when its cooldown started, its length, the time left and the skipped requests', async () => {
+    const user = userEvent.setup()
+    snapshot.channels[0].route_state = 'cooling'
+    snapshot.channels[0].cooldown_started_at = new Date(
+      (snapshot.refreshed_at - 20) * 1000
+    ).toISOString()
+    snapshot.channels[0].cooldown_until = new Date(
+      (snapshot.refreshed_at + 40) * 1000
+    ).toISOString()
+    snapshot.channels[0].cooldown_seconds = 30
+    snapshot.channels[0].cooldown_level = 2
+    snapshot.channels[0].cooldown_skipped = 9
+    snapshot.channels[0].cooldown_probes = 1
+    snapshot.channels[0].cooldown_probe_result = 'failed'
+    render(<Scheduling />, { wrapper: Wrapper })
+    await user.click(await screen.findByRole('tab', { name: 'Groups' }))
+    const details = within(
+      screen.getByRole('row', { name: /Primary/ })
+    ).getByLabelText('Cooldown details')
+    expect(details).toHaveTextContent('Cooldown length: 30 s (level 2)')
+    expect(details).toHaveTextContent('Time left: 40 s')
+    expect(details).toHaveTextContent('Requests skipped during cooldown: 9')
+    expect(details).toHaveTextContent('Recovery probes: 1, last result: Failed')
+  })
+
+  test('an ended cooldown keeps its start and skipped requests without a time left', async () => {
+    const user = userEvent.setup()
+    snapshot.channels[0].route_state = 'eligible'
+    snapshot.channels[0].cooldown_started_at = new Date(
+      (snapshot.refreshed_at - 600) * 1000
+    ).toISOString()
+    snapshot.channels[0].cooldown_seconds = 15
+    snapshot.channels[0].cooldown_level = 1
+    snapshot.channels[0].cooldown_skipped = 3
+    render(<Scheduling />, { wrapper: Wrapper })
+    await user.click(await screen.findByRole('tab', { name: 'Groups' }))
+    const details = within(
+      screen.getByRole('row', { name: /Primary/ })
+    ).getByLabelText('Cooldown details')
+    expect(details).toHaveTextContent('Requests skipped during cooldown: 3')
+    expect(details).not.toHaveTextContent('Time left')
+    expect(
+      within(
+        screen.getByRole('row', { name: /Disabled upstream/ })
+      ).queryByLabelText('Cooldown details')
+    ).not.toBeInTheDocument()
   })
 
   test('a pending health request displays loading before any channel metrics', () => {

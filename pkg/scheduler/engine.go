@@ -15,6 +15,15 @@ const (
 	channelRampSuccesses    = 20
 	channelRampInitialShare = 0.05
 	failureCooldown         = 15 * time.Second
+	// A recovery probe holds its half-open gate until its first useful output
+	// or for at most this long, so one slow stream cannot hold a channel out.
+	probeWindow = 45 * time.Second
+	// maxSeenRequests bounds per-dimension request deduplication state; beyond
+	// it only the last seenRequestsBusyWindow of request IDs is kept.
+	maxSeenRequests        = 100_000
+	seenRequestsBusyWindow = 5 * time.Minute
+	// Idle dimensions and unregistered channel state are reclaimed at most this often.
+	sweepInterval = time.Minute
 )
 
 type dimension struct {
@@ -22,9 +31,64 @@ type dimension struct {
 	channelID int
 }
 
+// capacityPool caches the strictest positive member capacity, so admission
+// never scans the members of a pool shared by many group/model dimensions.
 type capacityPool struct {
 	inFlight int
 	members  map[dimension]int
+	limits   map[int]int
+	minLimit int
+}
+
+func newCapacityPool() *capacityPool {
+	return &capacityPool{members: make(map[dimension]int), limits: make(map[int]int)}
+}
+
+func (p *capacityPool) setMember(member dimension, limit int) {
+	if previous, ok := p.members[member]; ok {
+		if previous == limit {
+			return
+		}
+		p.dropLimit(previous)
+	}
+	p.members[member] = limit
+	if limit > 0 {
+		p.limits[limit]++
+		if p.minLimit == 0 || limit < p.minLimit {
+			p.minLimit = limit
+		}
+	}
+}
+
+func (p *capacityPool) removeMember(member dimension) {
+	if p == nil {
+		return
+	}
+	previous, ok := p.members[member]
+	if !ok {
+		return
+	}
+	delete(p.members, member)
+	p.dropLimit(previous)
+}
+
+func (p *capacityPool) dropLimit(limit int) {
+	if limit <= 0 {
+		return
+	}
+	if p.limits[limit]--; p.limits[limit] > 0 {
+		return
+	}
+	delete(p.limits, limit)
+	if limit != p.minLimit {
+		return
+	}
+	p.minLimit = 0
+	for value := range p.limits {
+		if p.minLimit == 0 || value < p.minLimit {
+			p.minLimit = value
+		}
+	}
 }
 
 type latencyBucket struct {
@@ -58,48 +122,55 @@ type healthBucket struct {
 }
 
 type channelState struct {
-	registered         bool
-	outcomeVersion     uint64
-	windowCache        [4]windowCache
-	candidate          Candidate
-	pool               string
-	buckets            map[int64]*secondBucket
-	learningBuckets    map[int64]*secondBucket
-	dispatches         map[int64]int64
-	inFlight           int
-	lastScore          time.Time
-	scoreVersion       uint64
-	baseSuccess        float64
-	baseHealth         float64
-	latencyScore       [2]float64
-	recoveryLimit      float64
-	learningSuccesses  int64
-	learningEpoch      uint64
-	learningSince      time.Time
-	cooldownUntil      time.Time
-	failureStreak      int
-	failureStreakSince time.Time
-	healthBuckets      []healthBucket
-	shortHealthCursor  int
-	longHealthCursor   int
-	healthLong         Window
-	healthShort        Window
+	registered        bool
+	outcomeVersion    uint64
+	windowCache       [4]windowCache
+	candidate         Candidate
+	pool              string
+	defaultPool       string
+	buckets           map[int64]*secondBucket
+	learningBuckets   map[int64]*secondBucket
+	dispatches        map[int64]int64
+	inFlight          int
+	lastScore         time.Time
+	scoreVersion      uint64
+	baseSuccess       float64
+	baseHealth        float64
+	latencyScore      [2]float64
+	recoveryLimit     float64
+	learningSuccesses int64
+	learningEpoch     uint64
+	learningSince     time.Time
+	cooldown          cooldownState
+	healthBuckets     []healthBucket
+	shortHealthCursor int
+	longHealthCursor  int
+	healthLong        Window
+	healthShort       Window
 }
 
 type keyState struct {
-	loadPeaks        map[int64]int
-	config           Config
-	overrides        map[int]Override
-	channels         map[int]*channelState
-	requests         map[int64]int64
-	seenRequests     map[string]time.Time
-	activation       []time.Time
-	active           bool
-	learningSamples  int64
-	lastBusiness     time.Time
-	businessInFlight int
-	inFlight         int
-	lastPrune        time.Time
+	loadPeaks           map[int64]int
+	capacitySkips       map[int64]int64
+	capacityExhausted   map[int64]int64
+	lastCapacityWarning time.Time
+	cooldownSuppressed  map[int64]int64
+	config              Config
+	overrides           map[int]Override
+	channels            map[int]*channelState
+	requests            map[int64]int64
+	seenRequests        map[string]time.Time
+	activation          []time.Time
+	active              bool
+	learningSamples     int64
+	lastBusiness        time.Time
+	businessInFlight    int
+	inFlight            int
+	lastPrune           time.Time
+	// openRequests counts Requests that have not ended. A dimension with an
+	// open request or reservation is never evicted.
+	openRequests int
+	lastUsed     time.Time
 }
 
 func New() *Engine {
@@ -108,6 +179,8 @@ func New() *Engine {
 		random: rand.Float64,
 		states: make(map[Key]*keyState),
 		pools:  make(map[string]*capacityPool),
+
+		channelCooldowns: make(map[int]*channelCooldown),
 	}
 }
 
@@ -116,11 +189,13 @@ func (e *Engine) state(key Key, now time.Time) *keyState {
 	if s == nil {
 		s = &keyState{
 			config: DefaultConfig(), overrides: make(map[int]Override), loadPeaks: make(map[int64]int),
+			capacitySkips: make(map[int64]int64), capacityExhausted: make(map[int64]int64), cooldownSuppressed: make(map[int64]int64),
 			channels: make(map[int]*channelState), requests: make(map[int64]int64),
 			seenRequests: make(map[string]time.Time),
 		}
 		e.states[key] = s
 	}
+	s.lastUsed = now
 	if !s.lastBusiness.IsZero() && now.Sub(s.lastBusiness) >= longWindow && s.businessInFlight == 0 && s.inFlight == 0 {
 		s.active = false
 		s.learningSamples = 0
@@ -151,8 +226,29 @@ func (e *Engine) state(key Key, now time.Time) *keyState {
 				delete(s.requests, second)
 			}
 		}
+		for second := range s.capacitySkips {
+			if second < cutoff {
+				delete(s.capacitySkips, second)
+			}
+		}
+		for second := range s.capacityExhausted {
+			if second < cutoff {
+				delete(s.capacityExhausted, second)
+			}
+		}
+		for second := range s.cooldownSuppressed {
+			if second < cutoff {
+				delete(s.cooldownSuppressed, second)
+			}
+		}
+		// Deduplication only needs a request's own lifetime. Keep the full
+		// window normally, but bound memory on very busy dimensions.
+		seenCutoff := now.Add(-longWindow)
+		if len(s.seenRequests) > maxSeenRequests {
+			seenCutoff = now.Add(-seenRequestsBusyWindow)
+		}
 		for id, at := range s.seenRequests {
-			if at.Before(now.Add(-longWindow)) {
+			if at.Before(seenCutoff) {
 				delete(s.seenRequests, id)
 			}
 		}
@@ -186,7 +282,8 @@ func (e *Engine) BeginRequest(key Key, id string, probe bool) *Request {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.now()
-	e.state(key, now)
+	e.maybeSweep(now)
+	e.state(key, now).openRequests++
 	if id == "" {
 		e.sequence++
 		id = fmt.Sprintf("scheduler-%d", e.sequence)
@@ -269,10 +366,76 @@ func (e *Engine) EndRequest(r *Request) {
 		e.finishAttempt(a, Outcome{}, now)
 	}
 	r.ended = true
-	if !r.businessAt.IsZero() {
-		e.states[r.Key].businessInFlight--
+	if s := e.states[r.Key]; s != nil {
+		s.openRequests--
+		if !r.businessAt.IsZero() {
+			s.businessInFlight--
+		}
 	}
 	e.state(r.Key, now)
+}
+
+// maybeSweep reclaims state left by request-supplied model names, removed
+// memberships and deleted channels. It runs at most once per sweepInterval.
+// Dimensions with registered members belong to the published membership and
+// stay; other dimensions are evicted after a full statistics window without
+// use, open requests or reservations, so late completions never find them gone.
+func (e *Engine) maybeSweep(now time.Time) {
+	if !e.lastSweep.IsZero() && now.Sub(e.lastSweep) < sweepInterval {
+		return
+	}
+	e.lastSweep = now
+	cutoff := now.Add(-longWindow)
+	for key, s := range e.states {
+		if s.openRequests > 0 || s.inFlight > 0 || s.businessInFlight > 0 {
+			continue
+		}
+		registered := false
+		for id, ch := range s.channels {
+			if ch.registered {
+				registered = true
+				continue
+			}
+			if ch.inFlight > 0 || ch.cooldown.halfOpen || ch.cooldown.endedAt.After(cutoff) || ch.hasSamplesSince(cutoff.Unix()) {
+				continue
+			}
+			delete(s.channels, id)
+		}
+		if !registered && s.lastUsed.Before(cutoff) {
+			delete(e.states, key)
+		}
+	}
+	for name, pool := range e.pools {
+		if pool.inFlight == 0 && len(pool.members) == 0 {
+			delete(e.pools, name)
+		}
+	}
+	for id, wide := range e.channelCooldowns {
+		if wide.halfOpen || wide.probeInFlight || wide.endedAt.After(cutoff) {
+			continue
+		}
+		recent := false
+		for _, at := range wide.modelFailures {
+			recent = recent || now.Sub(at) <= cooldownStreakWindow
+		}
+		if !recent {
+			delete(e.channelCooldowns, id)
+		}
+	}
+}
+
+func (ch *channelState) hasSamplesSince(cutoff int64) bool {
+	for second := range ch.buckets {
+		if second >= cutoff {
+			return true
+		}
+	}
+	for second := range ch.dispatches {
+		if second >= cutoff {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) IsActive(key Key) bool {
@@ -347,9 +510,13 @@ func (e *Engine) GetConfig(key Key) Config {
 	return e.state(key, e.now()).config
 }
 
+func (config Config) valid() bool {
+	return config.SuccessTarget > 0 && config.SuccessTarget <= 1 && isFinite(config.SuccessTarget) &&
+		config.LatencyTargetMS > 0 && isFinite(config.LatencyTargetMS) && config.DefaultCapacity >= 0
+}
+
 func (e *Engine) SetConfig(key Key, config Config) error {
-	if config.SuccessTarget <= 0 || config.SuccessTarget > 1 || !isFinite(config.SuccessTarget) ||
-		config.LatencyTargetMS <= 0 || !isFinite(config.LatencyTargetMS) || config.DefaultCapacity < 0 {
+	if !config.valid() {
 		return ErrInvalidConfig
 	}
 	e.mu.Lock()
@@ -412,13 +579,76 @@ func (e *Engine) RegisterCandidates(key Key, candidates []Candidate) {
 	e.replaceCandidates(key, candidates, e.now())
 }
 
+// Membership contains a complete generation prepared without holding either routing engine's lock.
+type Membership struct {
+	Candidates map[Key][]Candidate
+	Metadata   []Candidate
+}
+
+// RoutingConfig applies to one group/model. Channel overrides do not alter its supplier pools.
+type RoutingConfig struct {
+	Config    Config
+	Overrides map[int]Override
+}
+
+// PublishRoutingMembership installs channel and supplier routing as a single generation.
+// Both engines retain their existing attempts, capacity leases and learning history.
+func (e *Engine) PublishRoutingMembership(channels Membership, poolEngine *Engine, pools Membership, settings map[Key]RoutingConfig) error {
+	if poolEngine == nil || e == poolEngine {
+		return ErrInvalidConfig
+	}
+	for _, entry := range settings {
+		if !entry.Config.valid() {
+			return ErrInvalidConfig
+		}
+		for id, override := range entry.Overrides {
+			if err := validateOverride(id, override); err != nil {
+				return err
+			}
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	poolEngine.mu.Lock()
+	defer poolEngine.mu.Unlock()
+	for _, engine := range []*Engine{e, poolEngine} {
+		now := engine.now()
+		for key, entry := range settings {
+			state := engine.state(key, now)
+			for _, channel := range state.channels {
+				channel.lastScore = time.Time{}
+			}
+			state.config = entry.Config
+			if engine != e {
+				// Supplier pools carry their own capacity (0 = unlimited); a
+				// group/model's per-channel default must not cap a whole pool.
+				state.config.DefaultCapacity = 0
+			}
+			clear(state.overrides)
+			if engine == e {
+				for id, override := range entry.Overrides {
+					state.overrides[id] = cloneOverride(override)
+				}
+			}
+		}
+	}
+	e.replaceCandidateMembership(channels.Candidates, channels.Metadata)
+	poolEngine.replaceCandidateMembership(pools.Candidates, pools.Metadata)
+	return nil
+}
+
 // ReplaceCandidateMembership reconciles an authoritative complete metadata
 // snapshot atomically. Never pass a request's filtered candidates here. Removed
 // memberships release their limits, while leases retain their original pools.
 func (e *Engine) ReplaceCandidateMembership(candidates map[Key][]Candidate, channelMetadata ...Candidate) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.replaceCandidateMembership(candidates, channelMetadata)
+}
+
+func (e *Engine) replaceCandidateMembership(candidates map[Key][]Candidate, channelMetadata []Candidate) {
 	now := e.now()
+	e.maybeSweep(now)
 	for key := range e.states {
 		if _, present := candidates[key]; !present {
 			e.replaceCandidates(key, nil, now)
@@ -457,7 +687,7 @@ func (e *Engine) replaceCandidates(key Key, candidates []Candidate, now time.Tim
 		if !ch.registered || present[id] {
 			continue
 		}
-		delete(e.pools[ch.pool].members, dimension{key: key, channelID: id})
+		e.pools[ch.pool].removeMember(dimension{key: key, channelID: id})
 		ch.pool = ""
 		ch.registered = false
 		// A returning member must establish fresh channel-level confidence.
@@ -501,21 +731,45 @@ func validateOverride(channelID int, override Override) error {
 func isFinite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
 
 func (e *Engine) resolveCandidate(key Key, s *keyState, candidate Candidate) (*channelState, Candidate) {
+	ch := s.channels[candidate.ID]
 	if e.membershipManaged {
-		ch := s.channels[candidate.ID]
 		if ch == nil || !ch.registered {
 			candidate.Excluded = true
 			return ch, candidate
 		}
 		// Request candidates can be stale or filtered. They must not change the
 		// authoritative membership, channel status, or shared capacity pool.
+		// Publication and configuration changes already registered this member.
 		excluded := candidate.Excluded
-		candidate = ch.candidate
-		ch, candidate = e.registerCandidate(key, s, candidate)
+		candidate = e.admissionCandidate(s, ch, ch.candidate, e.now())
 		candidate.Excluded = candidate.Excluded || excluded
 		return ch, candidate
 	}
+	if ch != nil && ch.registered && ch.candidate == candidate {
+		return ch, e.admissionCandidate(s, ch, candidate, e.now())
+	}
 	return e.registerCandidate(key, s, candidate)
+}
+
+// admissionCandidate applies dimension settings, cooldown and the shared
+// pool's strictest capacity to an already registered member.
+func (e *Engine) admissionCandidate(s *keyState, ch *channelState, candidate Candidate, now time.Time) Candidate {
+	candidate = e.configuredCandidate(s, ch, candidate, now)
+	if pool := e.pools[candidate.CapacityKey]; pool != nil && pool.minLimit > 0 {
+		candidate.Capacity = pool.minLimit
+	}
+	return candidate
+}
+
+// pool returns the named capacity pool, creating it for an exceptional pinned
+// reservation or after an idle sweep removed an empty pool.
+func (e *Engine) pool(name string) *capacityPool {
+	pool := e.pools[name]
+	if pool == nil {
+		pool = newCapacityPool()
+		e.pools[name] = pool
+	}
+	return pool
 }
 
 func (e *Engine) registerCandidate(key Key, s *keyState, candidate Candidate) (*channelState, Candidate) {
@@ -531,31 +785,41 @@ func (e *Engine) registerCandidate(key Key, s *keyState, candidate Candidate) (*
 	}
 	ch.registered = true
 	ch.candidate = candidate
-	candidate = configuredCandidate(s, ch, candidate)
+	candidate = e.configuredCandidate(s, ch, candidate, e.now())
 	member := dimension{key: key, channelID: candidate.ID}
 	if ch.pool != "" && ch.pool != candidate.CapacityKey {
-		delete(e.pools[ch.pool].members, member)
+		e.pools[ch.pool].removeMember(member)
 	}
 	ch.pool = candidate.CapacityKey
-	pool := e.pools[ch.pool]
-	if pool == nil {
-		pool = &capacityPool{members: make(map[dimension]int)}
-		e.pools[ch.pool] = pool
-	}
+	pool := e.pool(ch.pool)
 	if candidate.Status == 1 && !candidate.Excluded {
-		pool.members[member] = candidate.Capacity
+		pool.setMember(member, candidate.Capacity)
 	} else {
-		delete(pool.members, member)
+		pool.removeMember(member)
 	}
-	if capacity := poolCapacity(pool); capacity > 0 {
-		candidate.Capacity = capacity
+	if pool.minLimit > 0 {
+		candidate.Capacity = pool.minLimit
 	}
 	return ch, candidate
 }
 
-func configuredCandidate(s *keyState, ch *channelState, candidate Candidate) Candidate {
-	if ch.cooldownUntil.After(candidate.CooldownUntil) {
-		candidate.CooldownUntil = ch.cooldownUntil
+func (e *Engine) configuredCandidate(s *keyState, ch *channelState, candidate Candidate, now time.Time) Candidate {
+	candidate.probeBlocked, candidate.wideGuard = false, false
+	// Like the channel-wide guard, a dimension's own cooldown or probe lease
+	// never removes its last viable route. Alternatives can be disabled, removed
+	// or filled after the cooldown started, so this is decided at admission.
+	if (ch.cooldown.until.After(now) || ch.cooldown.probeBusy(now)) && e.hasAlternative(s, candidate.ID, now) {
+		if ch.cooldown.until.After(candidate.CooldownUntil) {
+			candidate.CooldownUntil = ch.cooldown.until
+		}
+		candidate.probeBlocked = ch.cooldown.probeBusy(now)
+	}
+	if wide := e.channelCooldowns[candidate.ID]; wide != nil && wide.halfOpen && e.hasAlternative(s, candidate.ID, now) {
+		candidate.wideGuard = true
+		if wide.until.After(candidate.CooldownUntil) {
+			candidate.CooldownUntil = wide.until
+		}
+		candidate.probeBlocked = candidate.probeBlocked || wide.probeBusy(now)
 	}
 	if candidate.Capacity <= 0 {
 		candidate.Capacity = s.config.DefaultCapacity
@@ -572,19 +836,19 @@ func configuredCandidate(s *keyState, ch *channelState, candidate Candidate) Can
 		}
 	}
 	if candidate.CapacityKey == "" {
-		candidate.CapacityKey = fmt.Sprintf("channel:%d", candidate.ID)
+		if ch.defaultPool == "" {
+			ch.defaultPool = fmt.Sprintf("channel:%d", candidate.ID)
+		}
+		candidate.CapacityKey = ch.defaultPool
 	}
 	return candidate
 }
 
 func poolCapacity(pool *capacityPool) int {
-	capacity := 0
-	for _, limit := range pool.members {
-		if limit > 0 && (capacity == 0 || limit < capacity) {
-			capacity = limit
-		}
+	if pool == nil {
+		return 0
 	}
-	return capacity
+	return pool.minLimit
 }
 
 // ReserveCandidate preserves externally selected fixed/static routing. Unlike
@@ -611,17 +875,45 @@ func (e *Engine) ReserveCandidate(r *Request, candidate Candidate, stream bool) 
 			ch = &channelState{buckets: make(map[int64]*secondBucket), learningBuckets: make(map[int64]*secondBucket), dispatches: make(map[int64]int64), recoveryLimit: 1}
 			s.channels[candidate.ID] = ch
 		}
-		candidate = configuredCandidate(s, ch, canonical)
-		if e.pools[candidate.CapacityKey] == nil {
-			e.pools[candidate.CapacityKey] = &capacityPool{members: make(map[dimension]int)}
-		}
+		candidate = e.configuredCandidate(s, ch, canonical, now)
+		e.pool(candidate.CapacityKey)
 	} else {
 		_, candidate = e.resolveCandidate(r.Key, s, candidate)
 	}
 	if !e.eligible(candidate, now) {
+		if e.available(candidate, now) {
+			r.capacityBlocked.Store(true)
+		}
+		r.countCooldownSkip(s.channels[candidate.ID], candidate, now)
 		return nil, ErrNoEligibleChannel
 	}
 	return e.reserve(r, candidate, stream, now), nil
+}
+
+// TakeCapacityBlock consumes a capacity observation from this selection.
+func (r *Request) TakeCapacityBlock() bool {
+	return r != nil && r.capacityBlocked.Swap(false)
+}
+
+// RecordCapacityOutcome records the final routing decision for a dimension
+// where capacity blocked a candidate at either the channel or supplier layer.
+// It returns true on the first exhaustion in the current minute for logging.
+func (e *Engine) RecordCapacityOutcome(key Key, exhausted bool) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.now()
+	s := e.state(key, now)
+	if exhausted {
+		s.capacityExhausted[now.Unix()]++
+		minute := now.Truncate(time.Minute)
+		if s.lastCapacityWarning != minute {
+			s.lastCapacityWarning = minute
+			return true
+		}
+	} else {
+		s.capacitySkips[now.Unix()]++
+	}
+	return false
 }
 
 func (e *Engine) reserve(r *Request, candidate Candidate, stream bool, now time.Time) *Attempt {
@@ -634,17 +926,32 @@ func (e *Engine) reserve(r *Request, candidate Candidate, stream bool, now time.
 	s.inFlight++
 	minute := now.Truncate(time.Minute).Unix()
 	s.loadPeaks[minute] = max(s.loadPeaks[minute], s.inFlight)
-	s.channels[candidate.ID].inFlight++
-	e.pools[a.pool].inFlight++
+	ch := s.channels[candidate.ID]
+	ch.inFlight++
+	e.pool(a.pool).inFlight++
+	a.cooldownGeneration = ch.cooldown.generation
+	// A waived last-viable route may admit traffic while a probe is still
+	// busy; only one attempt at a time owns each probe gate.
+	if wide := e.channelCooldowns[candidate.ID]; candidate.wideGuard && !wide.probeBusy(now) {
+		wide.claimProbe(a, now, &a.wideProbe)
+	}
+	if ch.cooldown.halfOpen && !ch.cooldown.probeBusy(now) {
+		ch.cooldown.claimProbe(a, now, &a.probe)
+	}
 	return a
 }
 
+// available ignores capacity: the candidate could serve if its pool had room.
+func (e *Engine) available(candidate Candidate, now time.Time) bool {
+	return !candidate.Excluded && candidate.Status == 1 && !candidate.CooldownUntil.After(now) && !candidate.probeBlocked
+}
+
 func (e *Engine) eligible(candidate Candidate, now time.Time) bool {
-	if candidate.Excluded || candidate.Status != 1 || candidate.CooldownUntil.After(now) {
+	if !e.available(candidate, now) {
 		return false
 	}
-	pool := e.pools[candidate.CapacityKey]
-	capacity := poolCapacity(pool)
+	pool := e.pool(candidate.CapacityKey)
+	capacity := pool.minLimit
 	if candidate.Capacity > 0 && (capacity == 0 || candidate.Capacity < capacity) {
 		capacity = candidate.Capacity
 	}
@@ -688,13 +995,30 @@ func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) (chan
 	a.finished = true
 	r := a.request
 	delete(r.attempts, a)
+	if pool := e.pools[a.pool]; pool != nil {
+		pool.inFlight--
+	}
+	// An open request keeps its dimension and reserved channel from eviction;
+	// these guards only keep an unexpected late completion from panicking.
 	s := e.states[r.Key]
+	if s == nil {
+		return channelObservation{}, false
+	}
 	ch := s.channels[a.Candidate.ID]
 	minute := now.Truncate(time.Minute).Unix()
 	s.loadPeaks[minute] = max(s.loadPeaks[minute], s.inFlight)
 	s.inFlight--
+	if ch == nil {
+		return channelObservation{}, false
+	}
 	ch.inFlight--
-	e.pools[a.pool].inFlight--
+	if a.probe {
+		// Any end of the probe admits the next one unless it cooled again.
+		ch.cooldown.releaseProbe(a)
+	}
+	if a.wideProbe {
+		e.channelCooldowns[a.Candidate.ID].releaseProbe(a)
+	}
 	if !a.started || r.businessAt.IsZero() || (!outcome.Success && !outcome.ChannelFailure) {
 		return channelObservation{}, false
 	}
@@ -714,18 +1038,7 @@ func (e *Engine) finishAttempt(a *Attempt, outcome Outcome, now time.Time) (chan
 		streamIndex = 1
 	}
 	bucket.recordOutcome(outcome, streamIndex)
-	if outcome.Success || !outcome.CooldownFailure {
-		ch.failureStreak = 0
-	} else {
-		if ch.failureStreak == 0 || now.Sub(ch.failureStreakSince) > time.Minute {
-			ch.failureStreak, ch.failureStreakSince = 0, now
-		}
-		ch.failureStreak++
-		if ch.failureStreak >= 3 {
-			ch.cooldownUntil = now.Add(failureCooldown)
-			ch.failureStreak = 0
-		}
-	}
+	e.recordCooldownOutcome(a, s, ch, outcome, now)
 	// Old leases still release normally and retain history, but cannot establish
 	// confidence for a new membership/learning epoch after metadata changed.
 	if a.learningEpoch != ch.learningEpoch {

@@ -44,7 +44,7 @@ export function ConfigDialog(props: {
     enabled: z.boolean(),
     target_success_rate: positiveNumber.max(100, t('Must not exceed 100')),
     target_ttft_ms: positiveNumber.min(1).max(3600000),
-    default_capacity: positiveNumber.int().max(100000),
+    default_capacity: positiveNumber.int().max(100000).nullable(),
     channel_overrides: z.array(
       z.object({
         channel_id: z.number(),
@@ -63,6 +63,7 @@ export function ConfigDialog(props: {
     defaultValues: {
       ...props.data.config,
       target_success_rate: props.data.config.target_success_rate * 100,
+      default_capacity: props.data.config.default_capacity || null,
       channel_overrides: props.data.channels.map((channel) => {
         const override = (props.data.config.channel_overrides ?? []).find(
           (item) => item.channel_id === channel.channel_id
@@ -109,6 +110,7 @@ export function ConfigDialog(props: {
           props.onSave({
             ...values,
             target_success_rate: values.target_success_rate / 100,
+            default_capacity: values.default_capacity ?? 0,
           })
         )}
         className='space-y-5'
@@ -158,6 +160,7 @@ export function ConfigDialog(props: {
                 step: 1,
                 min: 1,
                 max: 100000,
+                placeholder: t('Unlimited'),
               },
             ] as const
           ).map((field) => (
@@ -169,9 +172,20 @@ export function ConfigDialog(props: {
                 step={field.step}
                 min={field.min}
                 max={field.max}
+                placeholder={
+                  'placeholder' in field ? field.placeholder : undefined
+                }
                 disabled={props.pending}
                 aria-invalid={!!form.formState.errors[field.name]}
-                {...form.register(field.name, { valueAsNumber: true })}
+                {...form.register(
+                  field.name,
+                  field.name === 'default_capacity'
+                    ? {
+                        setValueAs: (value: string) =>
+                          value == null || value === '' ? null : Number(value),
+                      }
+                    : { valueAsNumber: true }
+                )}
               />
               {form.formState.errors[field.name] && (
                 <p role='alert' className='text-destructive text-xs'>
@@ -185,7 +199,7 @@ export function ConfigDialog(props: {
           <h3 className='text-sm font-semibold'>{t('Channel overrides')}</h3>
           <p className='text-muted-foreground text-xs'>
             {t(
-              'Blank values inherit channel weight or default capacity. Matching capacity pool keys share upstream concurrency across channels and groups.'
+              'Blank values inherit channel weight or default capacity. A blank default capacity is unlimited. Matching capacity pool keys share upstream concurrency across channels and groups.'
             )}
           </p>
           {props.data.channels.map((channel, index) => (

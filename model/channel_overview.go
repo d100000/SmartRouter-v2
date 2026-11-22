@@ -310,12 +310,13 @@ var errOverviewClaimChanged = errors.New("overview projection claim changed")
 var overviewProjectorOnce sync.Once
 
 func StartOverviewProjector() {
+	StartChannelLimitAttemptCleanup()
 	overviewProjectorOnce.Do(func() {
 		go func() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				if err := ReconcileChannelAttempts(time.Now()); err != nil {
+				if err := ReconcileChannelAttempts(time.Time{}); err != nil {
 					common.SysError("channel limit reconciliation failed")
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

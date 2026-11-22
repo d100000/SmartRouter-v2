@@ -1029,6 +1029,20 @@ func CreateUser(c *gin.Context) {
 		common.ApiErrorT(c, "Cannot create users with permission level equal to or higher than yourself")
 		return
 	}
+	if user.Role == common.RoleSupplierUser {
+		if !authz.Can(c.GetInt("id"), myRole, authz.ChannelSensitiveWrite) {
+			common.ApiErrorT(c, "Unauthorized, insufficient privileges")
+			return
+		}
+		if _, ok := middleware.GetSessionAuthIdentity(c); !ok {
+			common.ApiErrorT(c, "The current sign-in method does not support security verification")
+			return
+		}
+		if !common.SessionCookieSecure || !common.RequestUsesTrustedHTTPS(c.Request) {
+			common.ApiErrorT(c, "Supplier credentials require HTTPS and secure session cookies")
+			return
+		}
+	}
 	auditParams := map[string]any{"role": user.Role}
 	// Creating an administrator grants privilege just like promoting one.
 	if user.Role >= common.RoleAdminUser || user.Role == common.RoleSupplierUser {
@@ -1048,6 +1062,15 @@ func CreateUser(c *gin.Context) {
 	}
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if cleanUser.Role == common.RoleSupplierUser {
+			var account model.SupplierAccount
+			if err := tx.Select("supplier_id").First(&account, "supplier_id = ?", cleanUser.GetSupplierID()).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return common.NewMessage("Invalid parameters")
+				}
+				return err
+			}
+		}
 		if err := cleanUser.InsertWithTx(tx, 0); err != nil {
 			return err
 		}

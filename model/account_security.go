@@ -2,7 +2,6 @@ package model
 
 import (
 	"errors"
-	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
@@ -35,8 +34,10 @@ func ChangeUserPassword(identity AuthSessionIdentity, update *User, firstPasswor
 		if firstPassword != (current.Password == "") {
 			return ErrAccountPasswordState
 		}
-		if current.Role == common.RoleSupplierUser && utf8.RuneCountInString(update.Password) < 15 {
-			return ErrSupplierPasswordLength
+		if current.Role == common.RoleSupplierUser {
+			if err := ValidateSupplierPassword(update.Password); err != nil {
+				return err
+			}
 		}
 		if !firstPassword && !common.ValidatePasswordAndHash(update.OriginalPassword, current.Password) {
 			return ErrCurrentPasswordInvalid

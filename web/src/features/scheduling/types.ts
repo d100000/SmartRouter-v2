@@ -27,6 +27,7 @@ export interface SchedulingConfig {
   enabled: boolean
   target_success_rate: number
   target_ttft_ms: number
+  /** Zero leaves concurrency unlimited. */
   default_capacity: number
   channel_overrides: ChannelOverride[]
 }
@@ -41,6 +42,7 @@ export interface SchedulingChannel {
     | 'degraded'
     | 'disabled'
     | 'cooling'
+    | 'probing'
     | 'saturated'
     | 'cold'
   traffic_share: number
@@ -51,6 +53,7 @@ export interface SchedulingChannel {
   success_rate_30m: number | null
   success_rate_5m: number | null
   in_flight: number
+  /** Zero means unlimited. */
   capacity: number
   health_attainment: number | null
   health_score: number
@@ -60,6 +63,14 @@ export interface SchedulingChannel {
   ramp_progress: number
   ramp_limited: boolean
   cooldown_until?: string
+  /** The most recent cooldown cycle that began in the last 30 minutes. */
+  cooldown_started_at?: string
+  cooldown_seconds?: number
+  cooldown_level?: number
+  cooldown_channel_wide?: boolean
+  cooldown_skipped: number
+  cooldown_probes: number
+  cooldown_probe_result?: 'recovered' | 'failed'
   avg_ttft_ms_5m: number | null
   quality_score: number
   selection_probability: number
@@ -72,6 +83,16 @@ export interface SchedulingTrendPoint {
   success_rate: number | null
   avg_ttft_ms: number | null
   in_flight: number | null
+}
+
+/** A failed configuration or metadata load; routing keeps the last snapshot. */
+export interface SchedulingConfigStatus {
+  published: boolean
+  stale: boolean
+  error?: string
+  failed_at?: number
+  retry_at?: number
+  failures?: number
 }
 
 export interface SchedulingSnapshot {
@@ -88,6 +109,7 @@ export interface SchedulingSnapshot {
   activation_requests: number
   activation_threshold: number
   config: SchedulingConfig
+  config_status?: SchedulingConfigStatus
   summary: {
     requests_30m: number
     attempts_30m: number
@@ -99,6 +121,9 @@ export interface SchedulingSnapshot {
     degraded_channels: number
     in_flight: number
     top_traffic_share: number
+    capacity_skips_30m: number
+    capacity_exhausted_30m: number
+    cooldown_suppressed_30m: number
   }
   trend: SchedulingTrendPoint[]
   channels: SchedulingChannel[]

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -530,6 +531,65 @@ func TestSharedCapacityAtomicReservationAndPoolChanges(t *testing.T) {
 	_, err = f.engine.ReserveCandidate(r, candidate, false)
 	assert.ErrorIs(t, err, ErrNoEligibleChannel)
 	f.engine.EndRequest(r)
+}
+
+func TestUnconfiguredCapacityIsUnlimitedAndCapacityRefusalsAreCounted(t *testing.T) {
+	f := newSchedulerFixture()
+	unlimited := []Candidate{{ID: 1, Name: "A", Status: 1, Weight: 10}, {ID: 2, Name: "B", Status: 1, Weight: 10}}
+	requests := make([]*Request, 0, 250)
+	for range 250 {
+		r := f.engine.BeginRequest(f.key, "", false)
+		_, err := f.engine.SelectAndReserve(r, unlimited, true, false)
+		require.NoError(t, err, "an unconfigured capacity never refuses a request")
+		requests = append(requests, r)
+	}
+	snapshot := f.engine.Snapshot(f.key, unlimited, true)
+	assert.Zero(t, snapshot.Channels[0].Capacity)
+	assert.Zero(t, snapshot.Summary.CapacitySkips30m)
+	for _, r := range requests {
+		f.engine.EndRequest(r)
+	}
+
+	// A busy unlimited channel still loses weight to an idle one.
+	busy := f.engine.BeginRequest(f.key, "busy", false)
+	for range 100 {
+		_, err := f.engine.ReserveCandidate(busy, unlimited[0], true)
+		require.NoError(t, err)
+	}
+	snapshot = f.engine.Snapshot(f.key, unlimited, true)
+	assert.Less(t, snapshot.Channels[0].EffectiveWeight, snapshot.Channels[1].EffectiveWeight)
+	f.engine.EndRequest(busy)
+
+	// An unlimited pool member does not lower an explicit limit.
+	limited := []Candidate{{ID: 3, Name: "C", Status: 1, Weight: 10, Capacity: 1, CapacityKey: "account"}, {ID: 4, Name: "D", Status: 1, Weight: 10, CapacityKey: "account"}}
+	first := f.engine.BeginRequest(f.key, "first", false)
+	_, err := f.engine.SelectAndReserve(first, limited, true, false)
+	require.NoError(t, err)
+	refused := f.engine.BeginRequest(f.key, "refused", false)
+	_, err = f.engine.SelectAndReserve(refused, limited, true, false)
+	require.ErrorIs(t, err, ErrNoEligibleChannel)
+	require.True(t, refused.TakeCapacityBlock())
+	assert.True(t, f.engine.RecordCapacityOutcome(f.key, true), "the first exhausted request emits a warning")
+	assert.False(t, refused.TakeCapacityBlock(), "one refusal is counted once")
+	bypassed := f.engine.BeginRequest(f.key, "bypassed", false)
+	_, err = f.engine.SelectAndReserve(bypassed, append(slices.Clone(limited), unlimited[0]), true, false)
+	require.NoError(t, err, "a full pool is bypassed when another channel has room")
+	require.True(t, bypassed.TakeCapacityBlock())
+	assert.False(t, f.engine.RecordCapacityOutcome(f.key, false), "a bypass does not emit an exhaustion warning")
+	snapshot = f.engine.Snapshot(f.key, limited, true)
+	assert.Equal(t, 1, snapshot.Channels[1].Capacity)
+	assert.Equal(t, int64(1), snapshot.Summary.CapacitySkips30m)
+	assert.Equal(t, int64(1), snapshot.Summary.CapacityExhausted30m)
+	assert.False(t, f.engine.RecordCapacityOutcome(f.key, true), "further exhausted requests in the same minute only increment the count")
+	assert.EqualValues(t, 2, f.engine.Snapshot(f.key, limited, true).Summary.CapacityExhausted30m)
+	for _, r := range []*Request{first, refused, bypassed} {
+		f.engine.EndRequest(r)
+	}
+	f.now = f.now.Add(31 * time.Minute)
+	snapshot = f.engine.Snapshot(f.key, limited, true)
+	assert.Zero(t, snapshot.Summary.CapacitySkips30m)
+	assert.Zero(t, snapshot.Summary.CapacityExhausted30m)
+	assert.True(t, f.engine.RecordCapacityOutcome(f.key, true), "an exhaustion in a later minute emits another warning")
 }
 
 func TestExplorationRequiresHealthyRecentEvidence(t *testing.T) {
@@ -1169,15 +1229,19 @@ func TestNewChannelRampSharesInitialBudgetAndKeepsFallbackAvailable(t *testing.T
 	f.engine.EndRequest(request)
 }
 
+// cooldownBackup is a healthy second member, so the last-channel guard does
+// not withhold a cooldown under test.
+var cooldownBackup = Candidate{ID: 90, Name: "Backup", Status: 1, Weight: 10, Capacity: 100}
+
 func TestFailureCooldownUsesQualifiedFailuresAndSurvivesAdministrativeActions(t *testing.T) {
 	f := newSchedulerFixture()
+	f.engine.Snapshot(f.key, []Candidate{f.candidate, cooldownBackup}, true)
 	for _, outcome := range []Outcome{
 		{ChannelFailure: true, CooldownFailure: true},
-		{Success: true},
+		{Success: true}, // only a success resets the availability streak
 		{ChannelFailure: true, CooldownFailure: true},
-		{ChannelFailure: true}, // an ordinary failure breaks the availability streak
-		{ChannelFailure: true, CooldownFailure: true},
-		{}, // ignored client mistakes/cancellations cannot be the third failure
+		{ChannelFailure: true}, // an ordinary failure neither advances nor resets it
+		{},                     // ignored client mistakes/cancellations cannot advance it
 		{ChannelFailure: true, CooldownFailure: true},
 	} {
 		f.dispatch(t, f.candidate, true, outcome)
@@ -1190,7 +1254,7 @@ func TestFailureCooldownUsesQualifiedFailuresAndSurvivesAdministrativeActions(t 
 	assert.Equal(t, f.now.Add(15*time.Second), *row.CooldownUntil)
 	f.engine.ClearPenalty(f.key, f.candidate.ID)
 	f.engine.RegisterCandidates(f.key, nil)
-	f.engine.RegisterCandidates(f.key, []Candidate{f.candidate})
+	f.engine.RegisterCandidates(f.key, []Candidate{f.candidate, cooldownBackup})
 	request := f.engine.BeginRequest(f.key, "cooling", false)
 	_, err := f.engine.SelectAndReserve(request, []Candidate{f.candidate}, true, true)
 	assert.ErrorIs(t, err, ErrNoEligibleChannel)
@@ -1208,6 +1272,152 @@ func TestFailureCooldownUsesQualifiedFailuresAndSurvivesAdministrativeActions(t 
 	row = f.engine.Snapshot(f.key, []Candidate{f.candidate}, true).Channels[0]
 	assert.Equal(t, "disabled", row.RouteState, "idle reset and cooldown expiry cannot enable a channel")
 	assert.Zero(t, row.SelectionProbability)
+}
+
+func TestCoolingChannelServesWhenItBecomesTheLastViableRoute(t *testing.T) {
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+	for _, tc := range []struct {
+		name string
+		cut  func(t *testing.T, f *schedulerFixture, backup *Candidate) func()
+	}{
+		{name: "backup disabled", cut: func(t *testing.T, f *schedulerFixture, backup *Candidate) func() {
+			disabled := *backup
+			disabled.Status = 2
+			f.engine.RegisterCandidates(f.key, []Candidate{f.candidate, disabled})
+			return func() {}
+		}},
+		{name: "backup removed", cut: func(t *testing.T, f *schedulerFixture, _ *Candidate) func() {
+			f.engine.RegisterCandidates(f.key, []Candidate{f.candidate})
+			return func() {}
+		}},
+		{name: "backup full", cut: func(t *testing.T, f *schedulerFixture, backup *Candidate) func() {
+			blocker := f.engine.BeginRequest(f.key, "long stream", false)
+			_, err := f.engine.ReserveCandidate(blocker, *backup, true)
+			require.NoError(t, err)
+			return func() { f.engine.EndRequest(blocker) }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSchedulerFixture()
+			backup := cooldownBackup
+			backup.Capacity = 1
+			both := []Candidate{f.candidate, backup}
+			f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: both})
+			for range 3 {
+				f.dispatch(t, f.candidate, true, failure)
+			}
+			request := f.engine.BeginRequest(f.key, "", false)
+			_, err := f.engine.ReserveCandidate(request, f.candidate, true)
+			require.ErrorIs(t, err, ErrNoEligibleChannel, "a healthy alternative keeps the cooldown in force")
+			f.engine.EndRequest(request)
+
+			release := tc.cut(t, f, &backup)
+			defer release()
+			request = f.engine.BeginRequest(f.key, "", false)
+			defer f.engine.EndRequest(request)
+			attempt, err := f.engine.SelectAndReserve(request, []Candidate{f.candidate}, true, false)
+			require.NoError(t, err, "an enabled cooling channel still serves as the last viable route")
+			assert.Equal(t, f.candidate.ID, attempt.Candidate.ID)
+		})
+	}
+}
+
+func TestRecoveryProbeReleasesGateOnFirstOutputOrAfterWindow(t *testing.T) {
+	f := newSchedulerFixture()
+	both := []Candidate{f.candidate, cooldownBackup}
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: both})
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+	for range 3 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	f.now = f.now.Add(15 * time.Second)
+	reserve := func() (*Request, *Attempt, error) {
+		request := f.engine.BeginRequest(f.key, "", false)
+		attempt, err := f.engine.ReserveCandidate(request, f.candidate, true)
+		return request, attempt, err
+	}
+
+	// First useful output recovers the channel while the stream continues.
+	probeRequest, probe, err := reserve()
+	require.NoError(t, err)
+	f.engine.TouchRequest(probeRequest)
+	f.engine.StartAttempt(probe)
+	blocked, _, err := reserve()
+	require.ErrorIs(t, err, ErrNoEligibleChannel)
+	f.engine.EndRequest(blocked)
+	f.engine.ObserveFirstOutput(probe)
+	next, attempt, err := reserve()
+	require.NoError(t, err, "first output opens the probe gate before the stream ends")
+	f.engine.FinishAttempt(attempt, Outcome{})
+	f.engine.EndRequest(next)
+	row := f.engine.Snapshot(f.key, both, true).Channels[0]
+	assert.Equal(t, ProbeRecovered, row.CooldownProbeResult)
+	assert.NotEqual(t, "probing", row.RouteState)
+	// The stream later fails: a health failure, but not a second probe result.
+	f.engine.FinishAttempt(probe, failure)
+	f.engine.EndRequest(probeRequest)
+	row = f.engine.Snapshot(f.key, both, true).Channels[0]
+	assert.EqualValues(t, 4, row.Window5m.Failures)
+	assert.EqualValues(t, 1, row.CooldownProbes)
+
+	// A probe that produces no output releases the gate after the probe window.
+	for range 2 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	f.now = f.now.Add(15 * time.Second)
+	silentRequest, silent, err := reserve()
+	require.NoError(t, err)
+	f.engine.StartAttempt(silent)
+	f.now = f.now.Add(probeWindow - time.Second)
+	blocked, _, err = reserve()
+	require.ErrorIs(t, err, ErrNoEligibleChannel)
+	f.engine.EndRequest(blocked)
+	f.now = f.now.Add(time.Second)
+	takeoverRequest, takeover, err := reserve()
+	require.NoError(t, err, "a silent probe cannot hold the channel past the probe window")
+	f.engine.StartAttempt(takeover)
+	// The superseded probe can no longer resolve or reopen the circuit.
+	f.engine.FinishAttempt(silent, Outcome{Success: true})
+	f.engine.EndRequest(silentRequest)
+	assert.Equal(t, "probing", f.engine.Snapshot(f.key, both, true).Channels[0].RouteState)
+	f.engine.FinishAttempt(takeover, Outcome{Success: true})
+	f.engine.EndRequest(takeoverRequest)
+	assert.NotEqual(t, "probing", f.engine.Snapshot(f.key, both, true).Channels[0].RouteState)
+}
+
+func TestIdleUnregisteredStateIsEvictedWithoutBreakingOpenRequests(t *testing.T) {
+	f := newSchedulerFixture()
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {f.candidate, cooldownBackup}})
+	for i := range 100 {
+		f.engine.EndRequest(f.engine.BeginRequest(Key{Group: f.key.Group, Model: fmt.Sprintf("random-%d", i)}, "", false))
+	}
+	held := Key{Group: f.key.Group, Model: "random-held"}
+	heldRequest := f.engine.BeginRequest(held, "held", false)
+	attempt, err := f.engine.ReserveCandidate(heldRequest, f.candidate, true)
+	require.NoError(t, err)
+	f.engine.StartAttempt(attempt)
+	// Deleting the backup leaves only history that will age out.
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: {f.candidate}})
+	sweep := func() {
+		f.engine.EndRequest(f.engine.BeginRequest(f.key, "", false))
+	}
+
+	f.now = f.now.Add(31 * time.Minute)
+	sweep()
+	assert.ElementsMatch(t, []Key{f.key, held}, f.engine.Keys(), "only published and in-use dimensions remain")
+	assert.NotContains(t, f.engine.states[f.key].channels, cooldownBackup.ID)
+	assert.NotContains(t, f.engine.pools, "channel:90")
+
+	f.engine.FinishAttempt(attempt, Outcome{Success: true})
+	f.engine.EndRequest(heldRequest)
+	assert.Zero(t, f.engine.pools["channel:1"].inFlight, "a late completion releases its pool lease")
+	f.now = f.now.Add(31 * time.Minute)
+	sweep()
+	assert.Equal(t, []Key{f.key}, f.engine.Keys())
+	request := f.engine.BeginRequest(f.key, "", false)
+	defer f.engine.EndRequest(request)
+	_, err = f.engine.SelectAndReserve(request, []Candidate{f.candidate}, true, false)
+	require.NoError(t, err, "published membership survives the sweep")
 }
 
 func TestFailureCooldownStreakExpiresAndIdleResetPreservesExternalCooldown(t *testing.T) {
@@ -1304,6 +1514,7 @@ func TestPinnedReservationOutsideAbilityDoesNotCreateMembership(t *testing.T) {
 
 func TestProbesDoNotSupplyBusinessLearningOrCooldownEvidence(t *testing.T) {
 	f := newSchedulerFixture()
+	f.engine.Snapshot(f.key, []Candidate{f.candidate, cooldownBackup}, true)
 	for range 2 {
 		f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
 	}
@@ -1328,6 +1539,7 @@ func TestProbesDoNotSupplyBusinessLearningOrCooldownEvidence(t *testing.T) {
 
 func TestIdleLearningResetPreservesFreshFailureCooldown(t *testing.T) {
 	f := newSchedulerFixture()
+	f.engine.Snapshot(f.key, []Candidate{f.candidate, cooldownBackup}, true)
 	var requests []*Request
 	var attempts []*Attempt
 	for range 3 {
@@ -1453,4 +1665,316 @@ func TestFixedChannelWithoutCurrentAbilitiesRemainsPinnable(t *testing.T) {
 	_, err = f.engine.SelectAndReserve(request, []Candidate{f.candidate}, false, false)
 	assert.ErrorIs(t, err, ErrNoEligibleChannel, "native pins must not restore ordinary ability eligibility")
 	f.engine.EndRequest(request)
+}
+
+func TestCooldownBackoffHalfOpenProbeAndSkipCounts(t *testing.T) {
+	f := newSchedulerFixture()
+	both := []Candidate{f.candidate, cooldownBackup}
+	f.engine.Snapshot(f.key, both, true)
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+
+	// Retries of a single request never cool a channel on their own.
+	request := f.engine.BeginRequest(f.key, "one request", false)
+	for range 3 {
+		attempt, err := f.engine.ReserveCandidate(request, f.candidate, true)
+		require.NoError(t, err)
+		f.engine.StartAttempt(attempt)
+		f.engine.FinishAttempt(attempt, failure)
+	}
+	f.engine.EndRequest(request)
+	assert.NotEqual(t, "cooling", f.engine.Snapshot(f.key, both, true).Channels[0].RouteState)
+
+	// That request counts once; two more requests complete the streak.
+	for range 2 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	row := f.engine.Snapshot(f.key, both, true).Channels[0]
+	require.Equal(t, "cooling", row.RouteState)
+	assert.Equal(t, 15, row.CooldownSeconds)
+	assert.Equal(t, 1, row.CooldownLevel)
+	require.NotNil(t, row.CooldownStartedAt)
+	assert.Equal(t, f.now, *row.CooldownStartedAt)
+	cycleStart := f.now
+
+	// Each request that would have considered the cooling channel counts once.
+	for i := range 4 {
+		r := f.engine.BeginRequest(f.key, fmt.Sprintf("skip-%d", i), false)
+		attempt, err := f.engine.SelectAndReserve(r, both, true, false)
+		require.NoError(t, err)
+		assert.Equal(t, cooldownBackup.ID, attempt.Candidate.ID)
+		_, _ = f.engine.SelectAndReserve(r, both, true, true)
+		f.engine.EndRequest(r)
+	}
+	assert.EqualValues(t, 4, f.engine.Snapshot(f.key, both, true).Channels[0].CooldownSkipped)
+
+	// Each failed probe doubles the next cooldown, up to five minutes.
+	for i, want := range []int{30, 60, 120, 240, 300, 300} {
+		f.now = f.now.Add(time.Duration(row.CooldownSeconds) * time.Second)
+		row = f.engine.Snapshot(f.key, both, true).Channels[0]
+		require.Equal(t, "probing", row.RouteState)
+		probe := f.engine.BeginRequest(f.key, "", false)
+		attempt, err := f.engine.ReserveCandidate(probe, f.candidate, true)
+		require.NoError(t, err)
+		other := f.engine.BeginRequest(f.key, "", false)
+		_, err = f.engine.ReserveCandidate(other, f.candidate, true)
+		assert.ErrorIs(t, err, ErrNoEligibleChannel, "a half-open channel admits one probe at a time")
+		f.engine.EndRequest(other)
+		f.engine.StartAttempt(attempt)
+		f.engine.FinishAttempt(attempt, failure)
+		f.engine.EndRequest(probe)
+		row = f.engine.Snapshot(f.key, both, true).Channels[0]
+		require.Equal(t, "cooling", row.RouteState)
+		assert.Equal(t, want, row.CooldownSeconds)
+		assert.Equal(t, ProbeFailed, row.CooldownProbeResult)
+		assert.Equal(t, cycleStart, *row.CooldownStartedAt, "failed probes extend the same cycle")
+		assert.EqualValues(t, 4+i+1, row.CooldownSkipped, "a request refused during a probe also bypassed the channel")
+	}
+
+	// An abandoned probe admits the next one; a successful probe recovers.
+	f.now = f.now.Add(5 * time.Minute)
+	abandoned := f.engine.BeginRequest(f.key, "", false)
+	_, err := f.engine.ReserveCandidate(abandoned, f.candidate, true)
+	require.NoError(t, err)
+	f.engine.EndRequest(abandoned)
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	row = f.engine.Snapshot(f.key, both, true).Channels[0]
+	assert.NotEqual(t, "probing", row.RouteState)
+	assert.Equal(t, ProbeRecovered, row.CooldownProbeResult)
+	assert.EqualValues(t, 7, row.CooldownProbes, "six failed probes and one recovery; an abandoned probe is not counted")
+	for range 3 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	assert.Equal(t, 15, f.engine.Snapshot(f.key, both, true).Channels[0].CooldownSeconds, "recovery resets the backoff")
+
+	// A probe still pending after 30 minutes remains visible. Once it
+	// recovers the dashboard retains the completed cycle for 30 minutes.
+	f.now = f.now.Add(31 * time.Minute)
+	require.NotNil(t, f.engine.Snapshot(f.key, both, true).Channels[0].CooldownStartedAt)
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	require.NotNil(t, f.engine.Snapshot(f.key, both, true).Channels[0].CooldownStartedAt)
+	f.now = f.now.Add(31 * time.Minute)
+	assert.Nil(t, f.engine.Snapshot(f.key, both, true).Channels[0].CooldownStartedAt)
+}
+
+func TestCooldownNeverRemovesTheLastChannelAndSpreadsAcrossDimensions(t *testing.T) {
+	f := newSchedulerFixture()
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+	for range 3 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	snapshot := f.engine.Snapshot(f.key, []Candidate{f.candidate}, true)
+	assert.NotEqual(t, "cooling", snapshot.Channels[0].RouteState, "the only channel keeps serving")
+	assert.EqualValues(t, 1, snapshot.Summary.CooldownSuppressed30m)
+
+	// Cooling in two models cools the channel in a third model as well,
+	// unless it is that model's last channel.
+	models := []Key{{Group: "default", Model: "m1"}, {Group: "default", Model: "m2"}, {Group: "default", Model: "m3"}, {Group: "default", Model: "solo"}}
+	for _, key := range models[:3] {
+		f.engine.Snapshot(key, []Candidate{f.candidate, cooldownBackup}, true)
+	}
+	f.engine.Snapshot(models[3], []Candidate{f.candidate}, true)
+	for _, key := range models[:2] {
+		f.key = key
+		for range 3 {
+			f.dispatch(t, f.candidate, true, failure)
+		}
+	}
+	third := f.engine.Snapshot(models[2], []Candidate{f.candidate, cooldownBackup}, true).Channels[0]
+	assert.Equal(t, "cooling", third.RouteState)
+	assert.True(t, third.CooldownChannelWide)
+	assert.NotEqual(t, "cooling", f.engine.Snapshot(models[3], []Candidate{f.candidate}, true).Channels[0].RouteState)
+	f.now = f.now.Add(16 * time.Second)
+	assert.NotEqual(t, "cooling", f.engine.Snapshot(models[2], []Candidate{f.candidate, cooldownBackup}, true).Channels[0].RouteState)
+}
+
+func TestOutstandingRequestsCannotAdvanceOrResetLaterCooldown(t *testing.T) {
+	f := newSchedulerFixture()
+	both := []Candidate{f.candidate, cooldownBackup}
+	f.engine.RegisterCandidates(f.key, both)
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+	var pending []*Attempt
+	for range 7 {
+		request := f.engine.BeginRequest(f.key, "", false)
+		attempt, err := f.engine.ReserveCandidate(request, f.candidate, true)
+		require.NoError(t, err)
+		f.engine.StartAttempt(attempt)
+		pending = append(pending, attempt)
+	}
+	for _, attempt := range pending[:6] {
+		f.engine.FinishAttempt(attempt, failure)
+		f.engine.EndRequest(attempt.request)
+	}
+	row := f.engine.Snapshot(f.key, both, true).Channels[0]
+	assert.Equal(t, 15, row.CooldownSeconds)
+	assert.EqualValues(t, 0, row.CooldownProbes)
+	f.now = f.now.Add(15 * time.Second)
+	f.engine.FinishAttempt(pending[6], Outcome{Success: true})
+	f.engine.EndRequest(pending[6].request)
+	f.dispatch(t, f.candidate, true, failure)
+	row = f.engine.Snapshot(f.key, both, true).Channels[0]
+	assert.Equal(t, 30, row.CooldownSeconds, "only the probe advances the second interval")
+	assert.EqualValues(t, 1, row.CooldownProbes)
+}
+
+func TestSaturatedOrProbingBackupCannotBeLastAlternative(t *testing.T) {
+	f := newSchedulerFixture()
+	backup := cooldownBackup
+	backup.Capacity, backup.CapacityKey = 1, "shared-provider"
+	secondBackup := backup
+	secondBackup.ID, secondBackup.Capacity = backup.ID+1, 100
+	both := []Candidate{f.candidate, backup}
+	all := []Candidate{f.candidate, backup, secondBackup}
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: all})
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+	blocker := f.engine.BeginRequest(f.key, "long stream", false)
+	_, err := f.engine.ReserveCandidate(blocker, secondBackup, true)
+	require.NoError(t, err)
+	for range 3 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	row := f.engine.Snapshot(f.key, all, true)
+	assert.NotEqual(t, "cooling", row.Channels[0].RouteState)
+	assert.EqualValues(t, 1, row.Summary.CooldownSuppressed30m)
+	f.engine.EndRequest(blocker)
+	backup.Capacity = 100
+	both[1] = backup
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{f.key: both})
+	for range 3 {
+		f.dispatch(t, backup, true, failure)
+	}
+	f.now = f.now.Add(15 * time.Second)
+	blocker = f.engine.BeginRequest(f.key, "backup probe", false)
+	_, err = f.engine.ReserveCandidate(blocker, backup, true)
+	require.NoError(t, err)
+	for range 3 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	row = f.engine.Snapshot(f.key, both, true)
+	assert.NotEqual(t, "cooling", row.Channels[0].RouteState)
+	assert.EqualValues(t, 2, row.Summary.CooldownSuppressed30m)
+	f.engine.EndRequest(blocker)
+}
+
+func TestChannelWideCooldownRequiresDistinctModelsAndOneSharedProbe(t *testing.T) {
+	f := newSchedulerFixture()
+	both := []Candidate{f.candidate, cooldownBackup}
+	one, two, three, four := Key{"group-1", "m1"}, Key{"group-2", "m1"}, Key{"group-1", "m2"}, Key{"group-1", "m3"}
+	for _, key := range []Key{one, two, three, four} {
+		f.engine.RegisterCandidates(key, both)
+	}
+	failure := Outcome{ChannelFailure: true, CooldownFailure: true}
+	for _, key := range []Key{one, two} {
+		f.key = key
+		for range 3 {
+			f.dispatch(t, f.candidate, true, failure)
+		}
+	}
+	assert.NotEqual(t, "cooling", f.engine.Snapshot(four, both, true).Channels[0].RouteState, "one failing model in two groups cannot suppress another model")
+	f.key = three
+	for range 3 {
+		f.dispatch(t, f.candidate, true, failure)
+	}
+	require.Equal(t, "cooling", f.engine.Snapshot(four, both, true).Channels[0].RouteState)
+	f.now = f.now.Add(15 * time.Second)
+	require.Equal(t, "probing", f.engine.Snapshot(four, both, true).Channels[0].RouteState)
+	probe := f.engine.BeginRequest(four, "shared probe", false)
+	a, err := f.engine.ReserveCandidate(probe, f.candidate, false)
+	require.NoError(t, err)
+	// A refreshed complete membership must carry the active global probe lease.
+	f.engine.ReplaceCandidateMembership(map[Key][]Candidate{one: both, two: both, three: both, four: both})
+	blocked := f.engine.BeginRequest(one, "other model", false)
+	_, err = f.engine.ReserveCandidate(blocked, f.candidate, false)
+	assert.ErrorIs(t, err, ErrNoEligibleChannel, "only one probe for the entire physical channel")
+	f.engine.EndRequest(blocked)
+	f.engine.StartAttempt(a)
+	f.engine.FinishAttempt(a, failure)
+	f.engine.EndRequest(probe)
+	row := f.engine.Snapshot(four, both, true).Channels[0]
+	assert.True(t, row.CooldownChannelWide)
+	assert.Equal(t, 30, row.CooldownSeconds)
+	assert.Equal(t, ProbeFailed, row.CooldownProbeResult)
+	f.now = f.now.Add(30 * time.Second)
+	canceled := f.engine.BeginRequest(four, "unstarted probe", false)
+	_, err = f.engine.ReserveCandidate(canceled, f.candidate, false)
+	require.NoError(t, err)
+	f.engine.EndRequest(canceled)
+	f.key = four
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	row = f.engine.Snapshot(four, both, true).Channels[0]
+	assert.NotEqual(t, "probing", row.RouteState)
+	assert.Equal(t, ProbeRecovered, row.CooldownProbeResult)
+}
+
+func TestBindingYieldsAfterRecentAvailabilityFailureOnlyWithHealthyAlternative(t *testing.T) {
+	f := newSchedulerFixture()
+	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID))
+	f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
+	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "no healthy alternative keeps the binding")
+	f.dispatch(t, cooldownBackup, true, Outcome{Success: true})
+	assert.False(t, f.engine.BindingAdvisable(f.key, f.candidate.ID))
+	f.now = f.now.Add(time.Minute + time.Second)
+	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "an old failure no longer redirects the binding")
+}
+
+// benchmarkMembership mirrors a large deployment: 40 channels serving 3 groups
+// and 300 models, so each channel's default pool has 900 members.
+func benchmarkMembership() (map[Key][]Candidate, []Candidate) {
+	candidates := make([]Candidate, 40)
+	for i := range candidates {
+		candidates[i] = Candidate{ID: i + 1, Name: fmt.Sprintf("channel-%d", i+1), Status: 1, Priority: int64(i % 3), Weight: 10, Capacity: 50}
+	}
+	membership := make(map[Key][]Candidate, 900)
+	for group := range 3 {
+		for model := range 300 {
+			membership[Key{Group: fmt.Sprintf("group-%d", group), Model: fmt.Sprintf("model-%d", model)}] = candidates
+		}
+	}
+	return membership, candidates
+}
+
+func BenchmarkSelectAndReserve(b *testing.B) {
+	engine := New()
+	membership, candidates := benchmarkMembership()
+	engine.ReplaceCandidateMembership(membership)
+	key := Key{Group: "group-0", Model: "model-0"}
+	b.ReportAllocs()
+	for b.Loop() {
+		request := engine.BeginRequest(key, "", true)
+		attempt, err := engine.SelectAndReserve(request, candidates, true, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+		engine.FinishAttempt(attempt, Outcome{})
+		engine.EndRequest(request)
+	}
+}
+
+func BenchmarkPublishRoutingMembership(b *testing.B) {
+	engine, pools := New(), New()
+	membership, _ := benchmarkMembership()
+	settings := map[Key]RoutingConfig{{Group: "group-0", Model: "model-0"}: {Config: DefaultConfig()}}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := engine.PublishRoutingMembership(Membership{Candidates: membership}, pools, Membership{}, settings); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// A supplier pool's own capacity of 0 means unlimited; the per-channel default
+// capacity of a group/model must not turn it into a cap for the whole pool.
+func TestPublishedDefaultCapacityDoesNotCapSupplierPools(t *testing.T) {
+	channels, pools := New(), New()
+	key := Key{Group: "default", Model: "pooled"}
+	config := DefaultConfig()
+	config.DefaultCapacity = 1
+	pool := Candidate{ID: 1, Name: "supplier:x", Status: 1, Weight: 1, CapacityKey: "supplier:x"}
+	err := channels.PublishRoutingMembership(Membership{Candidates: map[Key][]Candidate{}}, pools,
+		Membership{Candidates: map[Key][]Candidate{key: {pool}}}, map[Key]RoutingConfig{key: {Config: config}})
+	require.NoError(t, err)
+	for i := range 3 {
+		request := pools.BeginRequest(key, fmt.Sprintf("request-%d", i), false)
+		_, err := pools.ReserveCandidate(request, pool, false)
+		require.NoError(t, err, "concurrent reservation %d on an unlimited supplier pool", i)
+	}
 }

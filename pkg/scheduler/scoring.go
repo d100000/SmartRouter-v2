@@ -166,7 +166,14 @@ func (e *Engine) refreshScore(ch *channelState, config Config, now time.Time) {
 	ch.scoreVersion = ch.outcomeVersion
 }
 
-func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time.Time, stream bool, exclude map[int]bool) []evaluatedCandidate {
+// evaluate also reports whether full capacity refused an otherwise available
+// candidate, so selection can account for capacity pressure.
+// A nil request evaluates for the dashboard and records no skips.
+func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time.Time, stream bool, r *Request) ([]evaluatedCandidate, bool) {
+	var exclude map[int]bool
+	if r != nil {
+		exclude = r.attempted
+	}
 	// Register the entire batch first, so members sharing a capacity pool all
 	// see the strictest configured capacity before selection or reservation.
 	registered := make([]Candidate, 0, len(candidates))
@@ -180,8 +187,14 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		registered = append(registered, candidate)
 	}
 	result := make([]evaluatedCandidate, 0, len(registered))
+	capacityBlocked := false
 	for _, candidate := range registered {
-		if exclude[candidate.ID] || !e.eligible(candidate, now) {
+		if exclude[candidate.ID] {
+			continue
+		}
+		if !e.eligible(candidate, now) {
+			capacityBlocked = capacityBlocked || e.available(candidate, now)
+			r.countCooldownSkip(s.channels[candidate.ID], candidate, now)
 			continue
 		}
 		ch := s.channels[candidate.ID]
@@ -218,7 +231,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		})
 	}
 	if len(result) == 0 {
-		return result
+		return result, capacityBlocked
 	}
 	maxPriority := result[0].candidate.Priority
 	for _, item := range result {
@@ -283,7 +296,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		total += item.weight
 	}
 	if total <= 0 {
-		return nil
+		return nil, capacityBlocked
 	}
 	top := 0
 	for i := range result {
@@ -350,7 +363,7 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 			}
 		}
 	}
-	return result
+	return result, capacityBlocked
 }
 
 // SelectAndReserve reads fresh eligibility and load under the same lock used to
@@ -363,7 +376,10 @@ func (e *Engine) SelectAndReserve(r *Request, candidates []Candidate, stream, re
 	}
 	now := e.now()
 	s := e.state(r.Key, now)
-	evaluated := e.evaluate(r.Key, s, candidates, now, stream, r.attempted)
+	evaluated, capacityBlocked := e.evaluate(r.Key, s, candidates, now, stream, r)
+	if capacityBlocked {
+		r.capacityBlocked.Store(true)
+	}
 	if len(evaluated) == 0 {
 		return nil, ErrNoEligibleChannel
 	}

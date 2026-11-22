@@ -23,6 +23,7 @@ import i18next from 'i18next'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { api } from '@/lib/api'
 import { createAppQueryClient } from '@/lib/query-client'
 
 import { getChannelRecentStats } from '../../api'
@@ -32,6 +33,7 @@ import type {
   ChannelRecentStats,
 } from '../../types'
 import {
+  ChannelRPMCell,
   ChannelRecentStatsCell,
   ChannelRecentStatsProvider,
 } from '../channel-recent-stats'
@@ -321,6 +323,18 @@ describe('channel recent statistics', () => {
   })
 
   test('requests the deduplicated current page and tag children in one batch', async () => {
+    vi.mocked(getChannelRecentStats).mockResolvedValue({
+      ...snapshot,
+      rpm_by_channel: {
+        1: {
+          used: 58,
+          reserved: 2,
+          limit: 60,
+          observed: true,
+          supported: true,
+        },
+      },
+    })
     const client = createAppQueryClient(onInternalServerError)
     clients.push(client)
     const row = { id: 1 } as Channel
@@ -330,6 +344,7 @@ describe('channel recent statistics', () => {
         <TooltipProvider>
           <ChannelRecentStatsProvider channels={page}>
             <ChannelRecentStatsCell channel={row} />
+            <ChannelRPMCell channel={row} />
           </ChannelRecentStatsProvider>
         </TooltipProvider>
       </QueryClientProvider>
@@ -341,6 +356,59 @@ describe('channel recent statistics', () => {
       expect.any(AbortSignal),
       [1, 2]
     )
+    const reserved = screen.getByTitle('Reserved requests')
+    expect(reserved).toHaveTextContent('+ 2')
+    expect(reserved.parentElement).toHaveTextContent(
+      '58 + 2 Reserved requests / 60'
+    )
+    expect(reserved.parentElement).toHaveClass('text-destructive')
+  })
+
+  test('keeps RPM data for tag groups larger than the endpoint limit', async () => {
+    const { getChannelRecentStats: fetchPage } =
+      await vi.importActual<typeof import('../../api')>('../../api')
+    const ids = Array.from(
+      { length: 501 },
+      (_, i) => Number.MAX_SAFE_INTEGER - i
+    )
+    const usage = {
+      used: 3,
+      reserved: 0,
+      limit: 10,
+      observed: true,
+      supported: true,
+    }
+    const requested: number[] = []
+    const request = vi
+      .spyOn(api, 'get')
+      .mockImplementation(async (_url, config) => {
+        const params = config?.params as { channel_ids: string }
+        const csv = params.channel_ids
+        const batchIds = csv.split(',').map(Number)
+        expect(csv.length).toBeLessThanOrEqual(8192)
+        expect(batchIds.length).toBeLessThanOrEqual(500)
+        requested.push(...batchIds)
+        return {
+          data: {
+            success: true,
+            data: {
+              ...snapshot,
+              items: [],
+              rpm_by_channel: Object.fromEntries(
+                batchIds.map((id) => [id, usage])
+              ),
+            },
+          },
+        }
+      })
+    try {
+      const result = await fetchPage(undefined, ids)
+      expect(requested).toEqual(ids)
+      expect(Object.keys(result.rpm_by_channel ?? {})).toHaveLength(ids.length)
+      expect(result.rpm_by_channel?.[ids[500]]).toEqual(usage)
+    } finally {
+      request.mockRestore()
+    }
   })
 
   test('renders card statistics once in the footer and omits the table column', () => {

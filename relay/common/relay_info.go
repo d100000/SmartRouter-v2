@@ -219,12 +219,15 @@ type RelayInfo struct {
 	// Each realtime operation re-enters token authorization using a new context.
 	RealtimeRequestRunner func(*http.Request, string, func(*gin.Context) *types.NewAPIError) *types.NewAPIError
 	RealtimeMetered       bool
-	InputAudioFormat      string
-	OutputAudioFormat     string
-	RealtimeTools         []dto.RealTimeTool
-	IsFirstRequest        bool
-	AudioUsage            bool
-	ReasoningEffort       string
+	// RealtimeSettlement explains a metered realtime generation settled
+	// without fully usable upstream usage; it is written to the admin log.
+	RealtimeSettlement *RealtimeSettlement
+	InputAudioFormat   string
+	OutputAudioFormat  string
+	RealtimeTools      []dto.RealTimeTool
+	IsFirstRequest     bool
+	AudioUsage         bool
+	ReasoningEffort    string
 	// ReasoningConversion is the suffix-derived reasoning intent attached
 	// after model mapping. Converters read it via ReasoningState().
 	ReasoningConversion *dto.ReasoningConversionState
@@ -367,9 +370,9 @@ type RelayInfo struct {
 }
 
 // StreamFailureInfo separates a failed stream from its billable usage. A
-// partially delivered response may still be settled under the configured price,
-// while a failure without effective output must skip settlement even if the
-// upstream reports usage.
+// failure after upstream reported usage or produced output is settled under the
+// configured price (upstream usage first, otherwise the local estimate); only a
+// failure with neither (NoCharge) skips settlement and may be retried.
 // Error stays in memory; log writers persist only its masked, bounded message.
 type StreamFailureInfo struct {
 	Error              *types.NewAPIError
@@ -379,6 +382,20 @@ type StreamFailureInfo struct {
 	ErrorDelivered     bool // The upstream error frame already reached the client.
 	RetryableOverload  bool
 	RetryAfter         time.Duration
+}
+
+// RealtimeSettlement records how a realtime generation was charged when the
+// upstream usage was missing or inconsistent. Audio output that has no
+// upstream usage is estimated from the delivered bytes; the raw bytes and
+// seconds stay in the log so the estimate is auditable.
+type RealtimeSettlement struct {
+	Reason             string  `json:"reason"`
+	UsageInconsistent  bool    `json:"usage_inconsistent,omitempty"`
+	ReservedInput      int     `json:"reserved_input_tokens"`
+	EstimatedText      int     `json:"estimated_text_output_tokens"`
+	EstimatedAudio     int     `json:"estimated_audio_output_tokens"`
+	AudioOutputBytes   int64   `json:"audio_output_bytes"`
+	AudioOutputSeconds float64 `json:"audio_output_seconds"`
 }
 
 // StreamRetryAttempt is a bounded, masked diagnostic, never request content.

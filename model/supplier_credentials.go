@@ -83,7 +83,20 @@ func DecryptSupplierSecret(owner, value string) (string, error) {
 	return string(plain), nil
 }
 
+// errChannelCredentialUnavailable reports a channel whose stored credential
+// this node cannot open: its key ring lacks the key, or the row is corrupt.
+var errChannelCredentialUnavailable = errors.New("channel credential cannot be decrypted on this node")
+
 func (channel *Channel) BeforeSave(_ *gorm.DB) error {
+	if channel.credentialUnavailable {
+		if channel.Key == "" {
+			// Write back the sealed value as read, never the empty usable key.
+			channel.Key = channel.sealedKey
+			return nil
+		}
+		// A new key replaces the credential this node could not open.
+		channel.credentialUnavailable, channel.sealedKey = false, ""
+	}
 	if channel.OwnerSupplierID != "" {
 		channel.SecretsWriteOnly = true
 	}
@@ -117,8 +130,33 @@ func (channel *Channel) sealSupplierCredential() error {
 	return nil
 }
 
+// BeforeCreate refuses to copy a credential this node cannot open.
+func (channel *Channel) BeforeCreate(_ *gorm.DB) error {
+	if channel.credentialUnavailable {
+		return errChannelCredentialUnavailable
+	}
+	return nil
+}
+
 func (channel *Channel) AfterSave(_ *gorm.DB) error {
+	if channel.credentialUnavailable {
+		channel.Key = ""
+		return nil
+	}
 	return channel.openSupplierCredential()
+}
+
+// markCredentialUnavailable keeps a channel whose credential cannot be opened
+// loadable: it has no usable key, routing and tests skip it, and every save
+// writes back the sealed value read instead of an empty key.
+func (channel *Channel) markCredentialUnavailable() {
+	channel.sealedKey, channel.credentialUnavailable = channel.Key, true
+	channel.Key, channel.Keys, channel.SecretsWriteOnly = "", nil, true
+}
+
+// CredentialUnavailable reports a stored credential this node cannot open.
+func (channel *Channel) CredentialUnavailable() bool {
+	return channel.credentialUnavailable
 }
 
 func (channel *Channel) openSupplierCredential() error {

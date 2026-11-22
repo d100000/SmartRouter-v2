@@ -185,14 +185,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 	c.Header("Content-Type", contentType)
 	c.Data(http.StatusOK, contentType, audioData)
 
-	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-	usage = &dto.Usage{
-		PromptTokens:     info.GetFallbackPromptTokens(),
-		CompletionTokens: 0,
-		TotalTokens:      info.GetFallbackPromptTokens(),
-	}
-
-	return usage, nil
+	return volcengineTTSUsage(c, info), nil
 }
 
 func generateRequestID() string {
@@ -227,7 +220,6 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 			http.StatusBadGateway,
 		)
 	}
-	service.MarkOverviewUpstreamSent(info)
 	conn, resp, dialErr := websocket.DefaultDialer.DialContext(c.Request.Context(), requestURL, header)
 	if dialErr != nil {
 		if resp != nil {
@@ -244,6 +236,12 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 		)
 	}
 	defer conn.Close()
+	// The synthesis request is a WebSocket message, bypassing doRequest:
+	// admit it into the procurement ledger right before it is written.
+	if admitErr := service.BeforeChannelUpstream(c, info); admitErr != nil {
+		return nil, service.ChannelLimitRelayError(admitErr, c)
+	}
+	service.MarkOverviewUpstreamSent(info)
 	stopCancellation := context.AfterFunc(c.Request.Context(), func() { _ = conn.Close() })
 	defer stopCancellation()
 
@@ -259,11 +257,17 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	c.Header("Content-Type", contentType)
 	c.Header("Transfer-Encoding", "chunked")
 
+	// Once upstream returned audio it processed the input, so a client
+	// disconnect or a later failure settles by the input instead of refunding.
+	audioReceived := false
 	for {
 		msg, recvErr := ReceiveMessage(conn)
 		if recvErr != nil {
 			if websocket.IsCloseError(recvErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				break
+			}
+			if audioReceived {
+				return volcengineTTSUsage(c, info), nil
 			}
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("failed to receive message: %w", recvErr),
@@ -274,6 +278,9 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 
 		switch msg.MsgType {
 		case MsgTypeError:
+			if audioReceived {
+				return volcengineTTSUsage(c, info), nil
+			}
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("received error from server: code=%d, %s", msg.ErrorCode, string(msg.Payload)),
 				types.ErrorCodeBadResponse,
@@ -283,25 +290,16 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 			continue
 		case MsgTypeAudioOnlyServer:
 			if len(msg.Payload) > 0 {
+				audioReceived = true
 				if _, writeErr := c.Writer.Write(msg.Payload); writeErr != nil {
-					return nil, types.NewErrorWithStatusCode(
-						fmt.Errorf("failed to write audio data: %w", writeErr),
-						types.ErrorCodeBadResponse,
-						http.StatusInternalServerError,
-					)
+					return volcengineTTSUsage(c, info), nil
 				}
 				c.Writer.Flush()
 			}
 
 			if msg.Sequence < 0 {
 				c.Status(http.StatusOK)
-				common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-				usage = &dto.Usage{
-					PromptTokens:     info.GetFallbackPromptTokens(),
-					CompletionTokens: 0,
-					TotalTokens:      info.GetFallbackPromptTokens(),
-				}
-				return usage, nil
+				return volcengineTTSUsage(c, info), nil
 			}
 		default:
 			continue
@@ -309,11 +307,16 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	}
 
 	c.Status(http.StatusOK)
+	return volcengineTTSUsage(c, info), nil
+}
+
+// volcengineTTSUsage is the usage of a synthesis upstream processed. TTS is
+// billed by its input, so it is the locally counted prompt.
+func volcengineTTSUsage(c *gin.Context, info *relaycommon.RelayInfo) *dto.Usage {
 	common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-	usage = &dto.Usage{
+	return &dto.Usage{
 		PromptTokens:     info.GetFallbackPromptTokens(),
 		CompletionTokens: 0,
 		TotalTokens:      info.GetFallbackPromptTokens(),
 	}
-	return usage, nil
 }

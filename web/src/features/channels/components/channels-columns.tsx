@@ -48,6 +48,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { getSuppliers, supplyQueryKey } from '@/features/suppliers/api'
+import { SupplierChannelTestStatus } from '@/features/suppliers/components/channel-test-status'
 import { toIntlLocale } from '@/i18n/languages'
 import {
   formatCurrencyFromUSD,
@@ -102,7 +103,7 @@ import type { Channel } from '../types'
 import { ChannelBalanceDetails } from './channel-balance-details'
 import { ChannelCostCell } from './channel-cost-cell'
 import { ChannelFundingBadge, FundingStatusBadge } from './channel-funding'
-import { ChannelRecentStatsCell } from './channel-recent-stats'
+import { ChannelRecentStatsCell, ChannelRPMCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { TaskPluginChannelBadge } from './channel-type-badge'
 import { useChannels } from './channels-provider'
@@ -914,6 +915,13 @@ export function useChannelsColumns(
         minSize: 220,
       },
 
+      {
+        id: 'rpm',
+        header: t('RPM'),
+        cell: ({ row }) => <ChannelRPMCell channel={row.original} />,
+        enableSorting: false,
+        size: 108,
+      },
       // Type column
       {
         accessorKey: 'type',
@@ -1117,6 +1125,23 @@ export function useChannelsColumns(
                 />
               )
             }
+          }
+
+          if (
+            channel.owner_supplier_id &&
+            channel.supplier_validation_status &&
+            !['validated', ''].includes(channel.supplier_validation_status)
+          ) {
+            return (
+              <div className='flex flex-wrap items-center gap-2 text-xs'>
+                {channel.supplier_validated && (
+                  <span>{status === 1 ? t('Enabled') : t('Disabled')}</span>
+                )}
+                <SupplierChannelTestStatus
+                  status={channel.supplier_validation_status}
+                />
+              </div>
+            )
           }
 
           // Regular channel row

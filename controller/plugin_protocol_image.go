@@ -237,6 +237,7 @@ func taskPluginImageResponseFormat(request pluginruntime.ProtocolRequestContext)
 // API. DashScope failure bodies arrive as JSON {code, message}; their message
 // is surfaced so a client sees the vendor reason instead of raw JSON.
 func respondTaskPluginImageError(c *gin.Context, taskErr *dto.TaskError) {
+	service.WriteChannelRetryAfter(c, taskErr.Error)
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	status := http.StatusInternalServerError
 	if taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {

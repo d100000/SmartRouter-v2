@@ -502,18 +502,25 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	} else if originUsage.UsageSource != "" {
 		relayInfo.AnalyticsBilling.UsageSource = originUsage.UsageSource
 	}
-	if actualUsage && relayInfo.QuotaClamp == nil {
+	// The procurement base is the amount this settlement charges before the
+	// group ratio, whenever it computes one: upstream or locally estimated
+	// usage, fixed per-call prices, tiered expressions and reserved image
+	// counts alike. UsageSource keeps estimated usage apart in reports.
+	// A failed expression evaluation charges from the reservation, which has
+	// no separate pre-group amount here: that cost stays unknown.
+	expressionFailed := snap != nil && snap.BillingMode == "tiered_expr" && tieredResult == nil
+	if relayInfo.QuotaClamp == nil && !expressionFailed {
 		base := summary.BaseQuota
-		if snap != nil && snap.BillingMode == "tiered_expr" {
-			if tieredResult == nil {
-				actualUsage = false
-			} else {
-				toolBase := summary.ToolCallSurchargeBaseQuota.Div(decimal.NewFromFloat(summary.QuotaPerUnit)).Mul(decimal.NewFromFloat(snap.QuotaPerUnit))
-				base = relayInfo.PriceData.ApplyOtherRatiosToDecimal(decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup)).Add(toolBase)
-			}
+		switch {
+		case snap != nil && snap.BillingMode == "tiered_expr":
+			toolBase := summary.ToolCallSurchargeBaseQuota.Div(decimal.NewFromFloat(summary.QuotaPerUnit)).Mul(decimal.NewFromFloat(snap.QuotaPerUnit))
+			base = relayInfo.PriceData.ApplyOtherRatiosToDecimal(decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup)).Add(toolBase)
+		case !summary.hasBillableUsage():
+			// The customer is charged nothing for a response without usage.
+			base = decimal.Zero
 		}
 		value := base.InexactFloat64()
-		if actualUsage && value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+		if value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
 			relayInfo.AnalyticsBilling.BaseQuota = &value
 		}
 	}

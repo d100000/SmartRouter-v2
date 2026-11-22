@@ -86,6 +86,10 @@ function ChannelCardComponent({
   const showStatusBadge =
     isTagRow ||
     Boolean(
+      (row.original as Channel).supplier_validation_status &&
+      (row.original as Channel).supplier_validation_status !== 'validated'
+    ) ||
+    Boolean(
       !isTagRow && (row.original as Channel).availability_state?.enabled
     ) ||
     (row.original.status !== CHANNEL_STATUS.ENABLED &&
@@ -170,6 +174,12 @@ function ChannelCardComponent({
           <span className={labelClass}>{t('Cost Ratio')}</span>
           {costRatioCell}
         </div>
+        {!isTagRow && (
+          <div className='flex items-center justify-between gap-2'>
+            <span className={labelClass}>{t('RPM')}</span>
+            {renderCell('rpm')}
+          </div>
+        )}
 
         {/* Groups retain their compact, full-width footer. */}
         <div className='flex min-w-0 items-center justify-between gap-2'>

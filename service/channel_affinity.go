@@ -27,6 +27,9 @@ const (
 	ginKeyChannelAffinityLogInfo     = "channel_affinity_log_info"
 	ginKeyChannelAffinitySkipRetry   = "channel_affinity_skip_retry_on_failure"
 	ginKeyChannelAffinityRetryOffset = "channel_affinity_retry_offset"
+	ginKeyChannelAffinityUsedChannel = "channel_affinity_used_channel"
+	ginKeyChannelAffinityObserved    = "channel_affinity_observed_channel"
+	ginKeyChannelAffinityPreserved   = "channel_affinity_preserved"
 
 	channelAffinityCacheNamespace           = "new-api:channel_affinity:v1"
 	channelAffinityUsageCacheStatsNamespace = "new-api:channel_affinity_usage_cache_stats:v1"
@@ -619,13 +622,12 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		cache := getChannelAffinityCache()
 		channelID, found, err := cache.Get(cacheKeySuffix)
 		if err != nil {
+			c.Set(ginKeyChannelAffinityObserved, -1)
 			common.SysError(common.LogText("channel affinity cache get failed: key=%s, err=%v", cacheKeyFull, err))
 			return 0, false
 		}
-		if found {
-			return channelID, true
-		}
-		return 0, false
+		c.Set(ginKeyChannelAffinityObserved, channelID)
+		return channelID, found
 	}
 	return 0, false
 }
@@ -658,18 +660,28 @@ func ClearCurrentChannelAffinityCache(c *gin.Context) bool {
 	}
 
 	cache := getChannelAffinityCache()
-	deleted, err := cache.DeleteMany([]string{cacheKey})
+	observed := c.GetInt(ginKeyChannelAffinityObserved)
+	if _, lookedUp := c.Get(ginKeyChannelAffinityObserved); !lookedUp {
+		var err error
+		observed, _, err = cache.Get(cacheKey)
+		if err != nil {
+			common.SysError(common.LogText("channel affinity cache delete current failed: err=%v", err))
+			return false
+		}
+	}
+	if observed <= 0 {
+		return false
+	}
+	deleted, err := cachex.CompareAndSwapWithTTL(cache, cacheKey, &observed, nil, 0)
 	if err != nil {
 		common.SysError(common.LogText("channel affinity cache delete current failed: err=%v", err))
 		return false
 	}
 	c.Set(ginKeyChannelAffinitySkipRetry, false)
-	for _, ok := range deleted {
-		if ok {
-			return true
-		}
+	if deleted {
+		c.Set(ginKeyChannelAffinityObserved, 0)
 	}
-	return false
+	return deleted
 }
 
 func ShouldKeepChannelAffinityOnChannelDisabled() bool {
@@ -689,6 +701,7 @@ func MarkChannelAffinityUsed(c *gin.Context, selectedGroup string, channelID int
 		return
 	}
 	c.Set(ginKeyChannelAffinitySkipRetry, meta.SkipRetry)
+	c.Set(ginKeyChannelAffinityUsedChannel, channelID)
 	// Affinity consumes an attempt, but does not visit a normal priority tier.
 	c.Set(ginKeyChannelAffinityRetryOffset, 1)
 	info := map[string]any{
@@ -726,25 +739,59 @@ func AppendChannelAffinityAdminInfo(c *gin.Context, other *model.LogOther) {
 	other.SetAdmin("channel_affinity", anyInfo)
 }
 
-func RecordChannelAffinity(c *gin.Context, channelID int) {
-	if channelID <= 0 {
+// PreserveChannelAffinity keeps the current binding when this request had to
+// bypass its bound channel for a temporary reason (full capacity, cooldown or
+// a local admission refusal). The request may still be served elsewhere, but
+// the session keeps its channel; only a real upstream failure can move it.
+func PreserveChannelAffinity(c *gin.Context, channelID int, reason string) {
+	if c == nil || c.GetBool(ginKeyChannelAffinityPreserved) {
 		return
+	}
+	c.Set(ginKeyChannelAffinityPreserved, true)
+	RequestPolicy(c).AddEvent(PolicyEvent{ChannelID: channelID, Decision: PolicyDecision{Action: "preserve", Reason: reason, Source: "session_rule"}})
+}
+
+// PreserveChannelAffinityAfterLocalRefusal keeps the binding when the bound
+// channel was refused locally before anything was sent upstream.
+func PreserveChannelAffinityAfterLocalRefusal(c *gin.Context, channelID int) {
+	if c != nil && channelID > 0 && c.GetInt(ginKeyChannelAffinityUsedChannel) == channelID {
+		PreserveChannelAffinity(c, channelID, "session_binding_temporarily_unavailable")
+	}
+}
+
+// ChannelAffinityWrite carries the conditional cache update without retaining
+// a pooled request context while a WebSocket terminal is delivered.
+type ChannelAffinityWrite struct {
+	cacheKey            string
+	ttl                 time.Duration
+	observed, channelID int
+}
+
+func PrepareChannelAffinityWrite(c *gin.Context, channelID int) *ChannelAffinityWrite {
+	if c == nil || channelID <= 0 || c.GetBool(ginKeyChannelAffinityPreserved) {
+		return nil
 	}
 	setting := operation_setting.GetChannelAffinitySetting()
 	if RequestPolicy(c).SessionMode == "off" {
-		return
+		return nil
 	}
 	if setting == nil || !setting.Enabled {
-		return
+		return nil
 	}
-	if setting.SwitchOnSuccess && c != nil {
-		if successChannelID := c.GetInt("channel_id"); successChannelID > 0 {
-			channelID = successChannelID
-		}
+	observed := c.GetInt(ginKeyChannelAffinityObserved)
+	if observed < 0 {
+		return nil // A failed cache read cannot establish which binding may be changed.
+	}
+	// The switch controls moving an existing binding. The first binding
+	// always belongs to the channel that actually served the request.
+	if observed > 0 && !setting.SwitchOnSuccess {
+		channelID = observed
+	} else if successChannelID := c.GetInt("channel_id"); successChannelID > 0 {
+		channelID = successChannelID
 	}
 	cacheKey, ttlSeconds, ok := getChannelAffinityContext(c)
 	if !ok {
-		return
+		return nil
 	}
 	if ttlSeconds <= 0 {
 		ttlSeconds = setting.DefaultTTLSeconds
@@ -752,9 +799,28 @@ func RecordChannelAffinity(c *gin.Context, channelID int) {
 	if ttlSeconds <= 0 {
 		ttlSeconds = 3600
 	}
-	cache := getChannelAffinityCache()
-	if err := cache.SetWithTTL(cacheKey, channelID, time.Duration(ttlSeconds)*time.Second); err != nil {
-		common.SysError(common.LogText("channel affinity cache set failed: key=%s, err=%v", cacheKey, err))
+	return &ChannelAffinityWrite{cacheKey: cacheKey, ttl: time.Duration(ttlSeconds) * time.Second, observed: observed, channelID: channelID}
+}
+
+func (w *ChannelAffinityWrite) Commit() bool {
+	if w == nil {
+		return false
+	}
+	var expected *int
+	if w.observed > 0 {
+		expected = &w.observed
+	}
+	changed, err := cachex.CompareAndSwapWithTTL(getChannelAffinityCache(), w.cacheKey, expected, &w.channelID, w.ttl)
+	if err != nil {
+		common.SysError(common.LogText("channel affinity cache set failed: key=%s, err=%v", w.cacheKey, err))
+	}
+	return changed
+}
+
+func RecordChannelAffinity(c *gin.Context, channelID int) {
+	write := PrepareChannelAffinityWrite(c, channelID)
+	if write.Commit() {
+		c.Set(ginKeyChannelAffinityObserved, write.channelID)
 	}
 }
 

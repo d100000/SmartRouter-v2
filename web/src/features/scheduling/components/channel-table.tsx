@@ -39,9 +39,12 @@ import { formatNumber, formatTimestamp } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 import type { SchedulingChannel } from '../types'
+import { CooldownDetails } from './cooldown-details'
 
 export function ChannelTable(props: {
   channels: SchedulingChannel[]
+  /** Snapshot time in Unix seconds; cooldown time left is measured from it. */
+  refreshedAt: number
   onRecover: (channel: SchedulingChannel) => void
   pending: boolean
   canOperate: boolean
@@ -61,6 +64,7 @@ export function ChannelTable(props: {
     degraded: t('Downweighted'),
     disabled: t('Disabled'),
     cooling: t('Cooling down'),
+    probing: t('Recovery probe'),
     saturated: t('At capacity'),
     cold: t('Cold start'),
   }
@@ -139,6 +143,10 @@ export function ChannelTable(props: {
                   })}
                 </span>
               )}
+              <CooldownDetails
+                channel={channel}
+                refreshedAt={props.refreshedAt}
+              />
             </TableCell>
             <TableCell className='bg-background sticky left-0 z-10 max-w-64 min-w-40'>
               <div className='truncate font-medium' title={channel.name}>
@@ -173,7 +181,8 @@ export function ChannelTable(props: {
               {percent(channel.success_rate_5m)}
             </TableCell>
             <TableCell className='tabular-nums'>
-              {number(channel.in_flight)} / {number(channel.capacity)}
+              {number(channel.in_flight)} /{' '}
+              {channel.capacity > 0 ? number(channel.capacity) : t('Unlimited')}
             </TableCell>
             <TableCell className='tabular-nums'>
               {percent(channel.health_attainment)}

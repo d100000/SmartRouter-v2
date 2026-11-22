@@ -179,6 +179,7 @@ func TestSelectResponsesWSChannelAcceptsNativeResponsesChannelTypes(t *testing.T
 			channel.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: tc.advanced})
 			require.NoError(t, database.Create(channel).Error)
 			model.InitChannelCache()
+			require.NoError(t, service.SyncSchedulingConfig())
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 			constraints := service.GetChannelConstraints(c)
@@ -314,6 +315,7 @@ func TestResponsesWSChannelRoutingRequiresExplicitOptIn(t *testing.T) {
 	})
 	common.MemoryCacheEnabled = true
 	model.InitChannelCache()
+	require.NoError(t, service.SyncSchedulingConfig())
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	params := &service.RetryParam{Ctx: c, ModelName: "ws-model", TokenGroup: "default"}
@@ -363,6 +365,7 @@ func TestSelectResponsesWSChannelHonorsStrictSessionBinding(t *testing.T) {
 	})
 	common.MemoryCacheEnabled = true
 	model.InitChannelCache()
+	require.NoError(t, service.SyncSchedulingConfig())
 	affinity := operation_setting.GetChannelAffinitySetting()
 	previousAffinity := *affinity
 	t.Cleanup(func() { *affinity = previousAffinity })

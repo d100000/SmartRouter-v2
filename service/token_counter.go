@@ -297,6 +297,12 @@ func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	// duration 来自上游返回的音频元数据，饱和转换防止 int 回绕
-	return common.QuotaFromFloat(duration / 60 * 200 / 0.24), nil
+	return AudioOutputTokensForSeconds(duration), nil
+}
+
+// AudioOutputTokensForSeconds converts generated audio duration to output
+// audio tokens. Durations come from upstream metadata or delivered bytes, so
+// the conversion saturates instead of wrapping.
+func AudioOutputTokensForSeconds(seconds float64) int {
+	return common.QuotaFromFloat(seconds / 60 * 200 / 0.24)
 }

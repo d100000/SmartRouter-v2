@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -16,137 +15,84 @@ import (
 	"gorm.io/gorm"
 )
 
-// Pool identities outlive channel membership. Deleting or adding a channel
-// cannot reset the supplier's health samples, ramp or shared capacity.
-var supplierRouting = struct {
-	sync.Mutex
-	engine        *scheduler.Engine
-	channelEngine *scheduler.Engine
-	identities    map[int]string
-}{identities: make(map[int]string)}
-
 type supplierRoutingPool struct {
 	candidate scheduler.Candidate
 	channels  []*model.Channel
 }
 
-// Synchronize all dimensions from authoritative metadata. A supplier capacity
-// change must replace the old value even in a model that is currently idle.
-// Request-filtered candidates must never become the pool's membership source.
-func syncSupplierRoutingMembership(channels []*model.Channel, channelSets map[scheduler.Key][]scheduler.Candidate, entries []SchedulingConfig) (map[scheduler.Key][]scheduler.Candidate, error) {
-	byChannel := make(map[int]scheduler.Candidate, len(channels))
-	metadata := make(map[int]scheduler.Candidate)
-	for _, channel := range channels {
-		pool, err := supplierRoutingPoolForChannel(channel)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		byChannel[channel.Id] = pool.candidate
-		metadata[pool.candidate.ID] = pool.candidate
+func supplierPoolKey(channel *model.Channel) string {
+	if channel.OwnerSupplierID != "" {
+		return "supplier:" + channel.OwnerSupplierID
 	}
-	sets := make(map[scheduler.Key][]scheduler.Candidate, len(channelSets))
+	return fmt.Sprintf("channel:%d", channel.Id)
+}
+
+// Build the complete supplier layer before either engine publishes the generation.
+func buildSupplierMembership(channels []*model.Channel, channelSets map[scheduler.Key][]scheduler.Candidate, accounts map[string]model.SupplierAccount) (scheduler.Membership, map[string]scheduler.Candidate, error) {
+	byChannel := make(map[int]scheduler.Candidate, len(channels))
+	byKey := make(map[string]scheduler.Candidate)
+	identities := make(map[int]string)
+	pools := scheduler.Membership{Candidates: make(map[scheduler.Key][]scheduler.Candidate, len(channelSets))}
+	for _, channel := range channels {
+		key := supplierPoolKey(channel)
+		candidate, exists := byKey[key]
+		if !exists {
+			candidate = scheduler.Candidate{Status: common.ChannelStatusEnabled, Priority: channel.GetPriority(), Weight: float64(channel.GetWeight()), CapacityKey: key}
+			if channel.OwnerSupplierID != "" {
+				account, ok := accounts[channel.OwnerSupplierID]
+				if !ok {
+					continue
+				}
+				candidate.Priority, candidate.Weight, candidate.Capacity = account.PoolPriority, float64(account.PoolWeight), account.PoolCapacity
+			}
+			digest := sha256.Sum256([]byte(key))
+			candidate.ID = max(1, int(binary.BigEndian.Uint64(digest[:8])&uint64(^uint(0)>>1)))
+			if other, found := identities[candidate.ID]; found && other != key {
+				return scheduler.Membership{}, nil, errors.New("supplier routing identity collision")
+			}
+			identities[candidate.ID] = key
+			byKey[key] = candidate
+			pools.Metadata = append(pools.Metadata, candidate)
+		}
+		byChannel[channel.Id] = candidate
+	}
 	for key, members := range channelSets {
-		pools := make(map[int]scheduler.Candidate)
+		candidates := make(map[int]scheduler.Candidate)
 		for _, member := range members {
 			pool, ok := byChannel[member.ID]
 			if !ok {
 				continue
 			}
 			pool.Excluded = member.Excluded || member.Status != common.ChannelStatusEnabled
-			if previous, exists := pools[pool.ID]; exists {
+			if previous, exists := candidates[pool.ID]; exists {
 				pool.Excluded = pool.Excluded && previous.Excluded
 			}
-			pools[pool.ID] = pool
+			candidates[pool.ID] = pool
 		}
-		for _, pool := range pools {
-			sets[key] = append(sets[key], pool)
-		}
-	}
-	supplierRouting.Lock()
-	engine := supplierRouting.engine
-	supplierRouting.Unlock()
-	if engine == nil {
-		return sets, nil
-	}
-	keys := make(map[scheduler.Key]bool, len(sets))
-	for key := range sets {
-		keys[key] = true
-	}
-	for _, key := range engine.Keys() {
-		keys[key] = true
-	}
-	for key := range keys {
-		config := scheduler.DefaultConfig()
-		for _, entry := range entries {
-			if entry.Group == key.Group && entry.Model == key.Model {
-				config = scheduler.Config{Enabled: entry.Enabled, SuccessTarget: entry.TargetSuccessRate, LatencyTargetMS: entry.TargetTTFTMS, DefaultCapacity: entry.DefaultCapacity}
-				break
-			}
-		}
-		if err := engine.SetConfig(key, config); err != nil {
-			return nil, err
+		for _, candidate := range candidates {
+			pools.Candidates[key] = append(pools.Candidates[key], candidate)
 		}
 	}
-	canonical := make([]scheduler.Candidate, 0, len(metadata))
-	for _, pool := range metadata {
-		canonical = append(canonical, pool)
-	}
-	engine.ReplaceCandidateMembership(sets, canonical...)
-	return sets, nil
+	return pools, byKey, nil
 }
 
 func supplierRoutingPoolForChannel(channel *model.Channel) (*supplierRoutingPool, error) {
-	key := fmt.Sprintf("channel:%d", channel.Id)
-	priority, weight := channel.GetPriority(), float64(channel.GetWeight())
-	capacity := 0
-	if channel.OwnerSupplierID != "" {
-		key = "supplier:" + channel.OwnerSupplierID
-		account, err := model.GetSupplierAccount(channel.OwnerSupplierID)
-		if err != nil {
-			return nil, err
-		}
-		priority, weight = account.PoolPriority, float64(account.PoolWeight)
-		capacity = account.PoolCapacity
+	schedulingConfigState.Lock()
+	candidate, ok := schedulingConfigState.poolByKey[supplierPoolKey(channel)]
+	schedulingConfigState.Unlock()
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
 	}
-	supplierRouting.Lock()
-	defer supplierRouting.Unlock()
-	if supplierRouting.engine == nil || supplierRouting.channelEngine != scheduler.Default {
-		supplierRouting.engine, supplierRouting.channelEngine = scheduler.New(), scheduler.Default
-		supplierRouting.identities = make(map[int]string)
-	}
-	digest := sha256.Sum256([]byte(key))
-	id := int(binary.BigEndian.Uint64(digest[:8]) & uint64(^uint(0)>>1))
-	if id == 0 {
-		id = 1
-	}
-	if identity, exists := supplierRouting.identities[id]; exists && identity != key {
-		return nil, errors.New("supplier routing identity collision")
-	}
-	supplierRouting.identities[id] = key
-	return &supplierRoutingPool{candidate: scheduler.Candidate{ID: id, Status: common.ChannelStatusEnabled, Priority: priority, Weight: weight, Capacity: capacity, CapacityKey: key}, channels: []*model.Channel{channel}}, nil
+	return &supplierRoutingPool{candidate: candidate, channels: []*model.Channel{channel}}, nil
 }
 
 func supplierPoolRequest(state *schedulingRequest, key scheduler.Key) *scheduler.Request {
 	if state.poolEngine == nil {
-		supplierRouting.Lock()
-		state.poolEngine = supplierRouting.engine
-		supplierRouting.Unlock()
+		schedulingConfigState.Lock()
+		state.poolEngine = schedulingConfigState.poolEngine
+		schedulingConfigState.Unlock()
 		state.poolRequests = make(map[scheduler.Key]*scheduler.Request)
 	}
-	config := scheduler.DefaultConfig()
-	schedulingConfigState.Lock()
-	for _, entry := range schedulingConfigState.entries {
-		if entry.Group == key.Group && entry.Model == key.Model {
-			config = scheduler.Config{Enabled: entry.Enabled, SuccessTarget: entry.TargetSuccessRate, LatencyTargetMS: entry.TargetTTFTMS, DefaultCapacity: entry.DefaultCapacity}
-			break
-		}
-	}
-	schedulingConfigState.Unlock()
-	// Configuration was validated by SyncSchedulingConfig before selection.
-	_ = state.poolEngine.SetConfig(key, config)
 	request := state.poolRequests[key]
 	if request == nil {
 		request = state.poolEngine.BeginRequest(key, state.id, true)
@@ -211,6 +157,9 @@ func selectSupplierPoolChannel(c *gin.Context, state *schedulingRequest, request
 			continue
 		}
 		pool, err := supplierRoutingPoolForChannel(channel)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

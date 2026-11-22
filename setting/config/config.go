@@ -265,16 +265,15 @@ func updateConfigFromMap(config any, configMap map[string]string) error {
 					continue
 				}
 			}
-		case reflect.Map:
-			// json.Unmarshal merges into existing maps (keeps old keys that are
-			// absent from the new JSON). Allocate a fresh map so removed keys
-			// are properly cleared.
+		case reflect.Map, reflect.Slice:
+			// These options are complete replacements. Decoding in place can
+			// retain old map keys or omitted fields in reused slice elements.
 			fresh := reflect.New(field.Type())
-			if err := json.Unmarshal([]byte(strValue), fresh.Interface()); err != nil {
+			if err := common.UnmarshalJsonStr(strValue, fresh.Interface()); err != nil {
 				continue
 			}
 			field.Set(fresh.Elem())
-		case reflect.Slice, reflect.Struct:
+		case reflect.Struct:
 			err := json.Unmarshal([]byte(strValue), field.Addr().Interface())
 			if err != nil {
 				continue

@@ -22,7 +22,6 @@ import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
-import { ConfirmDialog } from '@/components/confirm-dialog'
 import { DataTablePage, useDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
@@ -32,17 +31,11 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAuthStore } from '@/stores/auth-store'
 
-import {
-  getSupplyChannels,
-  discardSupplyChannel,
-  setSupplyChannelPaused,
-  testSupplyChannel,
-  supplyQueryKey,
-} from '../api'
+import { getSupplyChannels, testSupplyChannel, supplyQueryKey } from '../api'
 import type { SupplierMode, SupplierTemplate, SupplyChannel } from '../types'
 import { ChannelEditor } from './channel-editor'
 import { ChannelLimitsDialog } from './channel-limits-dialog'
-import { CopySupplyChannelDialog } from './copy-channel-dialog'
+import { SupplierChannelTestStatus } from './channel-test-status'
 
 interface Props {
   mode: SupplierMode
@@ -56,11 +49,8 @@ export function SupplyChannelList(props: Props) {
   const [draftSearch, setDraftSearch] = useState('')
   const [keyword, setKeyword] = useState('')
   const [editing, setEditing] = useState<SupplyChannel | 'new' | null>(null)
-  const [copying, setCopying] = useState<SupplyChannel | null>(null)
   const [detailSnapshot, setDetail] = useState<SupplyChannel | null>(null)
   const [limits, setLimits] = useState<SupplyChannel | null>(null)
-  const [pausing, setPausing] = useState<SupplyChannel | null>(null)
-  const [discarding, setDiscarding] = useState<SupplyChannel | null>(null)
   const query = useQuery<Awaited<ReturnType<typeof getSupplyChannels>>>({
     meta: { errorRedirect: false },
     queryKey: [
@@ -73,7 +63,7 @@ export function SupplyChannelList(props: Props) {
     ],
     refetchInterval: (query) =>
       query.state.data?.items.some((channel) =>
-        ['configuring', 'pending', 'testing', 'waiting'].includes(
+        ['pending', 'testing', 'waiting', 'result_unknown'].includes(
           channel.validation_status
         )
       )
@@ -93,25 +83,8 @@ export function SupplyChannelList(props: Props) {
   const detail =
     query.data?.items.find((channel) => channel.id === detailSnapshot?.id) ??
     detailSnapshot
-  const statusMutation = useMutation({
-    mutationFn: (channel: SupplyChannel) =>
-      setSupplyChannelPaused(channel, !channel.paused),
-    onSuccess: () => {
-      setPausing(null)
-      toast.success(t('Saved successfully'))
-      void queryClient.invalidateQueries({ queryKey: supplyQueryKey })
-    },
-  })
-  const discardMutation = useMutation({
-    mutationFn: discardSupplyChannel,
-    onSuccess: () => {
-      setDiscarding(null)
-      toast.success(t('Draft discarded'))
-      void queryClient.invalidateQueries({ queryKey: supplyQueryKey })
-    },
-  })
   const testMutation = useMutation({
-    mutationFn: testSupplyChannel,
+    mutationFn: (channel: SupplyChannel) => testSupplyChannel(channel),
     onSuccess: () => {
       toast.success(t('Channel test requested'))
       void queryClient.invalidateQueries({ queryKey: supplyQueryKey })
@@ -167,7 +140,9 @@ export function SupplyChannelList(props: Props) {
       {
         accessorKey: 'validation_status',
         header: t('Configuration validation'),
-        cell: ({ row }) => validationState(row.original.validation_status, t),
+        cell: ({ row }) => (
+          <SupplierChannelTestStatus status={row.original.validation_status} />
+        ),
       },
       { accessorKey: 'priority', header: t('Supplier internal priority') },
       {
@@ -182,75 +157,41 @@ export function SupplyChannelList(props: Props) {
             >
               {t('Limits')}
             </Button>
-            {props.mode === 'supplier' && (
-              <>
-                <Button
-                  size='sm'
-                  variant='ghost'
-                  disabled={
-                    !(
-                      row.original.has_validated_config ??
-                      row.original.validation_status === 'validated'
-                    )
-                  }
-                  onClick={() => setCopying(row.original)}
-                >
-                  {t('Copy Channel')}
-                </Button>
-                <Button
-                  size='sm'
-                  variant='ghost'
-                  onClick={() => setEditing(row.original)}
-                >
-                  {t('Edit')}
-                </Button>
-                <Button
-                  size='sm'
-                  variant='ghost'
-                  disabled={statusMutation.isPending}
-                  onClick={() => setPausing(row.original)}
-                >
-                  {row.original.paused ? t('Resume') : t('Pause')}
-                </Button>
-                <Button
-                  size='sm'
-                  variant='ghost'
-                  disabled={
-                    testMutation.isPending ||
-                    ['testing', 'waiting'].includes(
-                      row.original.validation_status
-                    )
-                  }
-                  onClick={() => testMutation.mutate(row.original)}
-                >
-                  {t('Test')}
-                </Button>
-                {row.original.has_validated_config === false &&
-                  !['testing', 'waiting', 'result_unknown'].includes(
-                    row.original.validation_status
-                  ) && (
-                    <Button
-                      size='sm'
-                      variant='ghost'
-                      disabled={discardMutation.isPending}
-                      onClick={() => setDiscarding(row.original)}
-                    >
-                      {t('Discard draft')}
-                    </Button>
-                  )}
-              </>
-            )}
+            {props.mode === 'supplier' &&
+              (row.original.validation_status !== 'closed' ||
+                row.original.has_validated_config) && (
+                <>
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    onClick={() => setEditing(row.original)}
+                  >
+                    {t('Submit update')}
+                  </Button>
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    disabled={
+                      testMutation.isPending ||
+                      [
+                        'closed',
+                        'pending',
+                        'testing',
+                        'waiting',
+                        'result_unknown',
+                      ].includes(row.original.validation_status)
+                    }
+                    onClick={() => testMutation.mutate(row.original)}
+                  >
+                    {t('Test')}
+                  </Button>
+                </>
+              )}
           </div>
         ),
       },
     ],
-    [
-      props.mode,
-      statusMutation.isPending,
-      discardMutation.isPending,
-      t,
-      testMutation,
-    ]
+    [props.mode, t, testMutation]
   )
   const { table } = useDataTable({
     data: query.data?.items ?? [],
@@ -338,12 +279,6 @@ export function SupplyChannelList(props: Props) {
           }
         />
       )}
-      {copying && (
-        <CopySupplyChannelDialog
-          channel={copying}
-          onClose={() => setCopying(null)}
-        />
-      )}
       {editing && (
         <ChannelEditor
           key={editing === 'new' ? 'new' : editing.id}
@@ -387,8 +322,26 @@ export function SupplyChannelList(props: Props) {
               <dt className='text-muted-foreground'>
                 {t('Configuration validation')}
               </dt>
-              <dd>{validationState(detail.validation_status, t)}</dd>
+              <dd>
+                <SupplierChannelTestStatus status={detail.validation_status} />
+              </dd>
             </div>
+            {detail.live_models && detail.validation_status !== 'validated' && (
+              <div>
+                <dt className='text-muted-foreground'>
+                  {t('Published models')}
+                </dt>
+                <dd className='break-all'>
+                  {detail.live_models.join(', ') || '—'}
+                </dd>
+              </div>
+            )}
+            {detail.tested_models && detail.tested_models.length > 0 && (
+              <div>
+                <dt className='text-muted-foreground'>{t('Tested models')}</dt>
+                <dd className='break-all'>{detail.tested_models.join(', ')}</dd>
+              </div>
+            )}
             {props.mode === 'viewer' && (
               <>
                 <div>
@@ -426,41 +379,6 @@ export function SupplyChannelList(props: Props) {
           </dl>
         </Dialog>
       )}
-      <ConfirmDialog
-        open={discarding !== null}
-        onOpenChange={(open) => !open && setDiscarding(null)}
-        title={t('Discard draft')}
-        desc={t(
-          'Only an unused draft can be discarded. Channels that have sent upstream requests are retained.'
-        )}
-        confirmText={t('Discard')}
-        destructive
-        isLoading={discardMutation.isPending}
-        handleConfirm={() => discarding && discardMutation.mutate(discarding)}
-      />
-      <ConfirmDialog
-        open={pausing !== null}
-        onOpenChange={(open) => !open && setPausing(null)}
-        title={pausing?.paused ? t('Resume channel') : t('Pause channel')}
-        desc={
-          <>
-            <p>
-              {t(
-                'Only your manual pause is changed. Other supply restrictions remain in effect.'
-              )}
-            </p>
-            {!pausing?.paused && (
-              <p>
-                {t(
-                  'Pausing closes active realtime connections. Submitted tasks continue to be checked for results.'
-                )}
-              </p>
-            )}
-          </>
-        }
-        isLoading={statusMutation.isPending}
-        handleConfirm={() => pausing && statusMutation.mutate(pausing)}
-      />
     </>
   )
 }
@@ -468,6 +386,9 @@ function channelStates(
   channel: SupplyChannel,
   t: (key: string) => string
 ): string[] {
+  if (channel.has_validated_config === false) {
+    return [t('Not published')]
+  }
   const reasons = channel.blocking_reasons?.length
     ? channel.blocking_reasons
     : [channel.status]
@@ -498,36 +419,9 @@ function channelState(status: string, t: (key: string) => string): string {
       return t('RPM limit reached')
     case 'tpm_limited':
       return t('TPM limit reached')
-    case 'daily_exhausted':
-      return t('Daily budget exhausted')
-    case 'budget_reserved':
-      return t('Budget is reserved by pending requests')
-    case 'cost_config_missing':
-      return t('Waiting for cost configuration')
     case 'accounting_unavailable':
       return t('Usage accounting is temporarily unavailable')
     default:
       return t('Unavailable')
-  }
-}
-function validationState(status: string, t: (key: string) => string): string {
-  switch (status) {
-    case 'validated':
-      return t('Validated')
-    case 'failed':
-      return t('Validation failed')
-    case 'testing':
-      return t('Testing')
-    case 'waiting':
-      return t('Waiting for task completion')
-    case 'result_unknown':
-      return t('Validation result unknown')
-    case 'cost_config_missing':
-      return t('Waiting for cost configuration')
-    case 'pending':
-    case 'configuring':
-      return t('Pending validation')
-    default:
-      return t('Unknown')
   }
 }

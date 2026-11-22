@@ -24,14 +24,18 @@ export function supplierChannelTemplates(
 ): SupplierTemplate[] {
   const allowed =
     supplier.allowed_templates ?? supplier.allowed_types.map(String)
-  return catalog
-    .filter((template) => allowed.includes(template.id))
-    .map((template) => ({
-      ...template,
-      models: template.models.length
-        ? template.models.filter((model) =>
-            supplier.allowed_models.includes(model)
-          )
-        : supplier.allowed_models,
-    }))
+  return catalog.flatMap((template) => {
+    if (!supplier.allow_all_templates && !allowed.includes(template.id)) {
+      return []
+    }
+    if (supplier.allow_all_models) return [template]
+    const models = template.models.length
+      ? template.models.filter((model) =>
+          supplier.allowed_models.includes(model)
+        )
+      : supplier.allowed_models
+    return models.length
+      ? [{ ...template, models, allows_custom_models: false }]
+      : []
+  })
 }

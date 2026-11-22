@@ -74,7 +74,7 @@ export function SupplierBudgetEvents(props: {
             ? formatTimestampToDate(row.original.sent_at)
             : t('Unknown'),
       },
-      { accessorKey: 'budget_day', header: t('Budget date (Beijing time)') },
+      { accessorKey: 'budget_day', header: t('Cost date (Beijing time)') },
       {
         accessorKey: 'status',
         header: t('Accounting status'),
@@ -129,7 +129,7 @@ export function SupplierBudgetEvents(props: {
   })
   if (query.isError) return <ErrorState onRetry={() => void query.refetch()} />
   return (
-    <section className='space-y-3' aria-label={t('Budget details')}>
+    <section className='space-y-3' aria-label={t('Cost details')}>
       <p className='text-muted-foreground text-xs'>
         {t(
           'Estimated TPM does not confirm the request result. Unknown procurement costs remain pending.'
@@ -141,7 +141,7 @@ export function SupplierBudgetEvents(props: {
         fixedHeight={false}
         isLoading={query.isPending}
         isFetching={query.isFetching}
-        emptyTitle={t('No budget events')}
+        emptyTitle={t('No cost records')}
         toolbar={
           <form
             className='flex gap-2'
@@ -153,7 +153,7 @@ export function SupplierBudgetEvents(props: {
           >
             <Input
               type='date'
-              aria-label={t('Budget date (Beijing time)')}
+              aria-label={t('Cost date (Beijing time)')}
               value={draftDay}
               onChange={(event) => setDraftDay(event.target.value)}
             />

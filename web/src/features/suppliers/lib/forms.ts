@@ -18,7 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
-import { channelLimitsSchema } from './limits'
+import {
+  accountPasswordSchema,
+  SUPPLIER_PASSWORD_MIN_LENGTH,
+} from '@/lib/password-policy'
 
 export const supplierChannelSchema = z.object({
   name: z.string().trim().min(1, 'Name is required').max(100),
@@ -45,17 +48,6 @@ export const supplierChannelSchema = z.object({
       (value) => [...value].length <= 255,
       'Use no more than 255 characters'
     ),
-  priority: z
-    .string()
-    .refine(
-      (value) =>
-        /^-?\d+$/.test(value) &&
-        Number.isSafeInteger(Number(value)) &&
-        Number(value) >= -1000 &&
-        Number(value) <= 1000,
-      'Enter a whole number from -1000 to 1000'
-    ),
-  ...channelLimitsSchema.shape,
 })
 
 const positive = z
@@ -65,66 +57,108 @@ const positive = z
     (value) => Number.isSafeInteger(Number(value)),
     'Enter a valid number'
   )
-export const supplierAccountSchema = z.object({
-  name: z.string().trim().min(1, 'Name is required').max(100),
-  user_id: z
-    .string()
-    .refine(
-      (value) =>
-        value === '' ||
-        (/^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value))),
-      'Enter a valid user ID'
+export const supplierAccountSchema = z
+  .object({
+    name: z.string().trim().min(1, 'Name is required').max(100),
+    username: z.string().trim(),
+    password: z.string(),
+    allowed_types: z.array(z.string()),
+    allowed_models: z.array(z.string()),
+    allow_all_templates: z.boolean(),
+    allow_all_models: z.boolean(),
+    max_channels: positive.refine(
+      (value) => Number(value) <= 10000,
+      'Enter a valid number'
     ),
-  allowed_types: z.array(z.string()).min(1, 'Select a channel template'),
-  allowed_models: z.array(z.string()).min(1, 'Select at least one model'),
-  group: z.string().trim().min(1, 'Group is required'),
-  max_channels: positive.refine(
-    (value) => Number(value) <= 10000,
-    'Enter a valid number'
+    cost_ratio: z
+      .string()
+      .refine(
+        (value) =>
+          value === '' ||
+          (Number.isFinite(Number(value)) &&
+            Number(value) >= 0 &&
+            Number(value) <= 100),
+        'cost ratio must be finite and between 0 and 100'
+      ),
+    pool_priority: z
+      .string()
+      .refine(
+        (value) => /^-?\d+$/.test(value) && Number.isSafeInteger(Number(value)),
+        'Enter a whole number'
+      ),
+    pool_capacity: z
+      .string()
+      .regex(/^\d+$/, 'Enter a valid number')
+      .refine(
+        (value) => Number.isSafeInteger(Number(value)),
+        'Enter a valid number'
+      ),
+    pool_weight: positive.refine(
+      (value) => Number(value) <= 1000,
+      'Enter a valid number'
+    ),
+    max_output_tokens: z
+      .string()
+      .refine(
+        (value) =>
+          value === '' ||
+          (/^\d+$/.test(value) && Number.isSafeInteger(Number(value))),
+        'Enter a valid number'
+      ),
+    max_input_tokens: z
+      .string()
+      .refine(
+        (value) =>
+          value === '' ||
+          (/^\d+$/.test(value) && Number.isSafeInteger(Number(value))),
+        'Enter a valid number'
+      )
+      .optional(),
+    supply_enabled: z.boolean(),
+  })
+  .superRefine((values, ctx) => {
+    if (!values.allow_all_templates && !values.allowed_types.length) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['allowed_types'],
+        message: 'Select a channel template',
+      })
+    }
+    if (!values.allow_all_models && !values.allowed_models.length) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['allowed_models'],
+        message: 'Select at least one model',
+      })
+    }
+  })
+
+export const supplierAccountCredentialsSchema = z.object({
+  username: z.string().trim().min(1, 'Name is required').max(20),
+  password: accountPasswordSchema.refine(
+    (value) => [...value].length >= SUPPLIER_PASSWORD_MIN_LENGTH,
+    'Supplier account passwords must contain at least 15 characters'
   ),
-  cost_ratio: z
-    .string()
+})
+
+export const supplierRoutingSchema = z.object({
+  models: z.array(z.string()),
+  groups: z
+    .array(z.string())
+    .min(1, 'Select at least one group')
     .refine(
-      (value) =>
-        value === '' ||
-        (Number.isFinite(Number(value)) &&
-          Number(value) >= 0 &&
-          Number(value) <= 100),
-      'cost ratio must be finite and between 0 and 100'
+      (value) => new TextEncoder().encode(value.join(',')).length <= 64,
+      'Selected group names are too long'
     ),
-  pool_priority: z
+  priority: z
     .string()
+    .regex(/^-?\d+$/, 'Enter a whole number')
     .refine(
-      (value) => /^-?\d+$/.test(value) && Number.isSafeInteger(Number(value)),
-      'Enter a whole number'
+      (value) => Number(value) >= -1000 && Number(value) <= 1000,
+      'Enter a whole number from -1000 to 1000'
     ),
-  pool_capacity: z
+  weight: z
     .string()
     .regex(/^\d+$/, 'Enter a valid number')
-    .refine(
-      (value) => Number.isSafeInteger(Number(value)),
-      'Enter a valid number'
-    ),
-  pool_weight: positive.refine(
-    (value) => Number(value) <= 1000,
-    'Enter a valid number'
-  ),
-  max_output_tokens: z
-    .string()
-    .refine(
-      (value) =>
-        value === '' ||
-        (/^\d+$/.test(value) && Number.isSafeInteger(Number(value))),
-      'Enter a valid number'
-    ),
-  max_input_tokens: z
-    .string()
-    .refine(
-      (value) =>
-        value === '' ||
-        (/^\d+$/.test(value) && Number.isSafeInteger(Number(value))),
-      'Enter a valid number'
-    )
-    .optional(),
-  supply_enabled: z.boolean(),
+    .refine((value) => Number(value) <= 1000, 'Enter a valid number'),
 })

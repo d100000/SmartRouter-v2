@@ -63,7 +63,9 @@ export function HealthOverview(props: { data: SchedulingSnapshot }) {
     {
       label: t('In-flight requests'),
       value: number(summary.in_flight),
-      detail: t('Shared upstream capacity across groups'),
+      detail: t('Capacity bypasses (30m): {{count}}', {
+        count: summary.capacity_skips_30m,
+      }),
     },
     {
       label: t('Largest traffic share (30m)'),
@@ -97,6 +99,23 @@ export function HealthOverview(props: { data: SchedulingSnapshot }) {
             {t('{{count}} downweighted channels', {
               count: summary.degraded_channels,
             })}
+          </Badge>
+        )}
+        {summary.capacity_exhausted_30m > 0 && (
+          <Badge variant='destructive'>
+            {t('{{count}} selections found every channel at capacity (30m)', {
+              count: summary.capacity_exhausted_30m,
+            })}
+          </Badge>
+        )}
+        {summary.cooldown_suppressed_30m > 0 && (
+          <Badge variant='outline'>
+            {t(
+              '{{count}} cooldowns withheld for the last available channel (30m)',
+              {
+                count: summary.cooldown_suppressed_30m,
+              }
+            )}
           </Badge>
         )}
         {summary.top_traffic_share > 0.9 && summary.eligible_channels > 1 && (

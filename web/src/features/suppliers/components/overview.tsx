@@ -181,7 +181,7 @@ function SupplyOverviewData(props: { overview: SupplyOverview }) {
     <div className='space-y-4'>
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <p className='text-muted-foreground text-sm'>
-          {t('Budget date (Beijing time)')}: {overview.budget_day || '—'}
+          {t('Cost date (Beijing time)')}: {overview.budget_day || '—'}
         </p>
         <p className='text-muted-foreground text-xs'>
           {t('Updated at')}:{' '}
