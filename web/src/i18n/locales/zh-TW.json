@@ -4270,6 +4270,7 @@
     "Logical requests reached": "觸達請求數",
     "Login": "登入",
     "Login & Authentication": "登入與驗證",
+    "Login access and supply permission are independent.": "登入權限與供貨權限相互獨立。",
     "Login access and supply permission are independent. Midnight budget recovery changes neither.": "登入權限與供貨權限相互獨立，零點預算恢復不會改變這兩項狀態。",
     "Login failed": "登入失敗",
     "Login field {{field}} is invalid": "登入欄位 {{field}} 無效",

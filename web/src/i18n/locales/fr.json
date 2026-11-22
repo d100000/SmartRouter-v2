@@ -4270,6 +4270,7 @@
     "Logical requests reached": "Requêtes logiques reçues",
     "Login": "Connexion",
     "Login & Authentication": "Connexion et authentification",
+    "Login access and supply permission are independent.": "Les droits de connexion et de fourniture sont indépendants.",
     "Login access and supply permission are independent. Midnight budget recovery changes neither.": "Connexion et autorisation de fourniture sont indépendantes. Le renouvellement du budget à minuit ne les modifie pas.",
     "Login failed": "Échec de la connexion",
     "Login field {{field}} is invalid": "Le champ de connexion {{field}} n’est pas valide",

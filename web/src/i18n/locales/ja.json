@@ -4270,6 +4270,7 @@
     "Logical requests reached": "到達した論理リクエスト数",
     "Login": "ログイン",
     "Login & Authentication": "ログインと認証",
+    "Login access and supply permission are independent.": "ログイン権限と供給権限は独立しています。",
     "Login access and supply permission are independent. Midnight budget recovery changes neither.": "ログイン権限と供給権限は独立しています。午前0時の予算回復では変更されません。",
     "Login failed": "ログインに失敗しました",
     "Login field {{field}} is invalid": "ログイン項目 {{field}} が無効です",

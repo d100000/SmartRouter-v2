@@ -4270,6 +4270,7 @@
     "Logical requests reached": "Logical requests reached",
     "Login": "Login",
     "Login & Authentication": "Login & Authentication",
+    "Login access and supply permission are independent.": "Login access and supply permission are independent.",
     "Login access and supply permission are independent. Midnight budget recovery changes neither.": "Login access and supply permission are independent. Midnight budget recovery changes neither.",
     "Login failed": "Login failed",
     "Login field {{field}} is invalid": "Login field {{field}} is invalid",

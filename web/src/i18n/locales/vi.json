@@ -4270,6 +4270,7 @@
     "Logical requests reached": "Số yêu cầu logic đã nhận",
     "Login": "Đăng nhập",
     "Login & Authentication": "Đăng nhập và xác thực",
+    "Login access and supply permission are independent.": "Quyền đăng nhập và quyền cung cấp độc lập với nhau.",
     "Login access and supply permission are independent. Midnight budget recovery changes neither.": "Quyền đăng nhập và cung cấp độc lập. Khôi phục ngân sách lúc nửa đêm không đổi hai quyền này.",
     "Login failed": "Đăng nhập thất bại",
     "Login field {{field}} is invalid": "Trường đăng nhập {{field}} không hợp lệ",

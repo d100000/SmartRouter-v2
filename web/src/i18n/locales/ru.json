@@ -4270,6 +4270,7 @@
     "Logical requests reached": "Число полученных логических запросов",
     "Login": "Вход",
     "Login & Authentication": "Вход и аутентификация",
+    "Login access and supply permission are independent.": "Право входа и право на поставки независимы.",
     "Login access and supply permission are independent. Midnight budget recovery changes neither.": "Вход и разрешение поставок независимы. Сброс бюджета в полночь не меняет их.",
     "Login failed": "Ошибка входа",
     "Login field {{field}} is invalid": "Недопустимое поле входа {{field}}",

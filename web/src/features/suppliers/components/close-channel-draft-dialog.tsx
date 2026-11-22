@@ -47,7 +47,8 @@ export function CloseSupplierChannelDraftDialog(props: {
       onOpenChange={(open) => !open && !close.isPending && props.onClose()}
       title={t('Close draft')}
       desc={
-        props.channel.has_validated_config && props.channel.status === 'available'
+        props.channel.has_validated_config &&
+        props.channel.status === 'available'
           ? t(
               'Closing the draft keeps its test history. The current published configuration stays active.'
             )

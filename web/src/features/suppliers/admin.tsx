@@ -258,9 +258,7 @@ export function SuppliersAdmin(props: {
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
         <p className='text-muted-foreground mb-4 text-sm'>
-          {t(
-            'Login access and supply permission are independent. Midnight budget recovery changes neither.'
-          )}
+          {t('Login access and supply permission are independent.')}
         </p>
         {query.isError ? (
           <ErrorState onRetry={() => void query.refetch()} />
