@@ -643,15 +643,21 @@ func TestDistributeSessionBindingWriteBack(t *testing.T) {
 		// The injected failure must not leak into later subtests.
 		t.Cleanup(func() { scheduler.Default = scheduler.New() })
 		key := scheduler.Key{Group: "default", Model: modelName}
-		for id, outcome := range map[int]scheduler.Outcome{boundID: {ChannelFailure: true, CooldownFailure: true}, otherID: {Success: true}} {
-			request := scheduler.Default.BeginRequest(key, fmt.Sprintf("health-gate-%d", id), false)
+		observe := func(id int, requestID string, outcome scheduler.Outcome) {
+			request := scheduler.Default.BeginRequest(key, requestID, false)
 			attempt, err := scheduler.Default.ReserveCandidate(request, scheduler.Candidate{ID: id, Status: common.ChannelStatusEnabled}, true)
 			require.NoError(t, err)
 			scheduler.Default.StartAttempt(attempt)
 			scheduler.Default.FinishAttempt(attempt, outcome)
 			scheduler.Default.EndRequest(request)
 		}
-		assert.Equal(t, otherID, send("health-gate", succeeded), "a recently failing bound channel yields to a healthy one")
+		observe(otherID, "health-gate-other", scheduler.Outcome{Success: true})
+		observe(boundID, "health-gate-first", scheduler.Outcome{ChannelFailure: true, CooldownFailure: true})
+		assert.Equal(t, boundID, send("health-gate", succeeded), "one isolated failure does not move the session")
+		// Two consecutive failed requests are an outage in progress.
+		observe(boundID, "health-gate-second", scheduler.Outcome{ChannelFailure: true, CooldownFailure: true})
+		observe(boundID, "health-gate-third", scheduler.Outcome{ChannelFailure: true, CooldownFailure: true})
+		assert.Equal(t, otherID, send("health-gate", succeeded), "a bound channel failing consecutive requests yields to a healthy one")
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
 		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 		c.Request.Header.Set("X-Session", t.Name()[:strings.Index(t.Name(), "/")]+"health-gate")

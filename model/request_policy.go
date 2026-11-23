@@ -105,7 +105,7 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 	for key, value := range raw {
 		if field, ok := strings.CutPrefix(key, "channel_affinity_setting."); ok {
 			switch field {
-			case "enabled", "session_mode", "switch_on_success", "keep_on_channel_disabled", "max_entries", "default_ttl_seconds", "rules":
+			case "enabled", "session_mode", "switch_on_success", "keep_on_channel_disabled", "max_entries", "default_ttl_seconds", "return_to_priority_idle_seconds", "rules":
 			default:
 				return nil, fmt.Errorf("unknown affinity option: %s", key)
 			}

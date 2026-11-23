@@ -1312,7 +1312,6 @@ func EnableChannelAutomatically(channelId int, usingKey string) bool {
 }
 
 func updateChannelStatus(channelId int, usingKey string, status int, reason string, automatic, administrative bool) bool {
-	defer invalidateRoutingMetadata()
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -1420,6 +1419,13 @@ func updateChannelStatus(channelId int, usingKey string, status int, reason stri
 		// Other nodes must stop routing to a disabled channel or key before
 		// their own failures or the periodic sync find it.
 		bumpChannelsCoalesced()
+	}
+	if !changed && cachedChannelStatusIs(channelId, channel.Status) {
+		// Nothing was written and this node already routes by the stored
+		// status. During an outage every failing in-flight request reports
+		// the same channel; republishing the routing membership for each of
+		// them would stall selection for no new information.
+		return false
 	}
 	CacheUpdateChannel(channel)
 	CacheUpdateChannelStatus(channelId, channel.Status)

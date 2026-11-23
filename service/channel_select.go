@@ -505,9 +505,19 @@ func reserveAffinityChannel(c *gin.Context, modelName, usingGroup string, filter
 		return nil, "", nil
 	}
 	if !strict {
-		key := scheduler.Key{Group: selectedGroup, Model: modelName}
-		if healthy := scheduler.Default.HealthyBindingAlternatives(key, id); len(healthy) > 0 {
-			alternative, err := selectSchedulingCandidates(c, key, 0, filters, healthy)
+		key := SchedulingKey(selectedGroup, modelName)
+		healthy := scheduler.Default.HealthyBindingAlternatives(key, id)
+		returning := false
+		if len(healthy) == 0 && preferred.OwnerSupplierID == "" {
+			// A session that failed over to a lower priority tier goes back
+			// to a healthy higher tier once it has been idle long enough
+			// for the upstream prompt cache to have expired anyway.
+			if higher := scheduler.Default.HigherPriorityAlternatives(key, id); len(higher) > 0 && channelAffinityIdle(c) {
+				healthy, returning = higher, true
+			}
+		}
+		if len(healthy) > 0 {
+			alternative, err := selectSchedulingCandidates(c, scheduler.Key{Group: selectedGroup, Model: modelName}, 0, filters, healthy)
 			if err != nil {
 				return nil, selectedGroup, schedulingSelectError(c, err)
 			}
@@ -515,7 +525,11 @@ func reserveAffinityChannel(c *gin.Context, modelName, usingGroup string, filter
 				// Recheck the host's current status after the pool selection,
 				// as ordinary routing does before handing the lease to the relay.
 				if err := ReserveSchedulingChannel(c, alternative, selectedGroup, modelName); err == nil {
-					PreserveChannelAffinity(c, id, "session_binding_recent_failure")
+					if returning {
+						releaseChannelAffinity(c, id)
+					} else {
+						PreserveChannelAffinity(c, id, "session_binding_recent_failure")
+					}
 					if usingGroup == "auto" {
 						common.SetContextKey(c, constant.ContextKeyAutoGroup, selectedGroup)
 					}

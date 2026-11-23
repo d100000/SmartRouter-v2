@@ -416,7 +416,7 @@ func (e *Engine) maybeSweep(now time.Time) {
 		}
 		recent := false
 		for _, at := range wide.modelFailures {
-			recent = recent || now.Sub(at) <= cooldownStreakWindow
+			recent = recent || now.Sub(at) <= channelCooldownWindow
 		}
 		if !recent {
 			delete(e.channelCooldowns, id)
@@ -649,9 +649,13 @@ func (e *Engine) ReplaceCandidateMembership(candidates map[Key][]Candidate, chan
 func (e *Engine) replaceCandidateMembership(candidates map[Key][]Candidate, channelMetadata []Candidate) {
 	now := e.now()
 	e.maybeSweep(now)
-	for key := range e.states {
+	for key, s := range e.states {
 		if _, present := candidates[key]; !present {
+			// Unregistering is not a use: an abandoned dimension must still
+			// age out while new generations keep being published.
+			used := s.lastUsed
 			e.replaceCandidates(key, nil, now)
+			s.lastUsed = used
 		}
 	}
 	for key, members := range candidates {

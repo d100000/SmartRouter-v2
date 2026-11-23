@@ -29,6 +29,10 @@ export interface SchedulingConfig {
   target_ttft_ms: number
   /** Zero leaves concurrency unlimited. */
   default_capacity: number
+  /** Absent or false keeps priority tiers exclusive after activation. */
+  soft_priority?: boolean
+  /** Absent or false keeps configured weights as a lasting multiplier. */
+  learned_weight_only?: boolean
   channel_overrides: ChannelOverride[]
 }
 

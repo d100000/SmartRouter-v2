@@ -29,6 +29,10 @@ type SchedulingConfig struct {
 	TargetTTFTMS      float64                     `json:"target_ttft_ms"`
 	DefaultCapacity   int                         `json:"default_capacity"`
 	ChannelOverrides  []SchedulingChannelOverride `json:"channel_overrides"`
+	// Both default to false: priority tiers stay exclusive and configured
+	// weights keep shaping the split after adaptive routing activates.
+	SoftPriority      bool `json:"soft_priority,omitempty"`
+	LearnedWeightOnly bool `json:"learned_weight_only,omitempty"`
 }
 
 type SchedulingChannelOverride struct {
@@ -65,15 +69,7 @@ var schedulingConfigState = struct {
 	failures        int
 	failedAt        time.Time
 	retryAt         time.Time
-	// aliases are concrete request models routed with their normalized
-	// model's membership, keyed to their last use. Unused aliases expire.
-	aliases    map[scheduler.Key]time.Time
-	aliasSweep time.Time
 }{}
-
-// schedulingAliasTTL matches the statistics window: an alias unused this long
-// has no in-flight work or windowed history left to preserve.
-const schedulingAliasTTL = 30 * time.Minute
 
 // SchedulingConfigStatus reports whether routing is serving an older snapshot
 // because the latest configuration or metadata failed to load.
@@ -126,15 +122,8 @@ func ValidateSchedulingConfig(config SchedulingConfig) error {
 
 // SyncSchedulingConfig is the synchronous publication barrier for administrative
 // reads and writes. Traffic with a usable snapshot requests the same work asynchronously.
-// Requested keys are registered like routed request models.
-func SyncSchedulingConfig(requestedKeys ...scheduler.Key) error {
-	if err := ensureSchedulingConfig(true); err != nil {
-		return err
-	}
-	for _, key := range requestedKeys {
-		registerSchedulingKey(key, 0)
-	}
-	return nil
+func SyncSchedulingConfig() error {
+	return ensureSchedulingConfig(true)
 }
 
 // GetSchedulingConfigStatus exposes the last load failure to administrators.
@@ -202,63 +191,27 @@ func ensureSchedulingConfig(wait bool) error {
 	}
 }
 
-// registerSchedulingKey gives a concrete request model its normalized model's
-// membership. Call it only after the request found routable candidates, so
-// arbitrary model names cannot create routing state. A positive channelID
-// additionally requires that channel to be a routable member of the alias.
-func registerSchedulingKey(key scheduler.Key, channelID int) {
+// SchedulingKey is the routing dimension of a request model. A model with its
+// own membership keeps its name. Any other spelling of a routable model (a
+// reasoning suffix, "@key:value" modifiers) shares the dimension of its
+// normalized model, so text chosen by the caller can neither dilute what the
+// scheduler has learned nor multiply the dimensions it keeps.
+func SchedulingKey(group, modelName string) scheduler.Key {
+	key := scheduler.Key{Group: group, Model: modelName}
+	normalized := scheduler.Key{Group: group, Model: ratio_setting.RoutingMatchModelName(modelName)}
+	if normalized == key {
+		return key
+	}
 	state := &schedulingConfigState
 	state.Lock()
 	defer state.Unlock()
-	if state.poolEngine == nil {
-		return
+	if _, own := state.candidates[key]; own {
+		return key
 	}
-	now := time.Now()
-	if _, alias := state.aliases[key]; alias {
-		state.aliases[key] = now
-		return
+	if len(state.candidates[normalized]) > 0 {
+		return normalized
 	}
-	if _, known := state.candidates[key]; known {
-		return
-	}
-	normalized := scheduler.Key{Group: key.Group, Model: ratio_setting.RoutingMatchModelName(key.Model)}
-	candidates := state.candidates[normalized]
-	if len(candidates) == 0 || channelID > 0 && !slices.ContainsFunc(candidates, func(candidate scheduler.Candidate) bool { return candidate.ID == channelID && !candidate.Excluded }) {
-		return
-	}
-	if state.aliases == nil {
-		state.aliases = make(map[scheduler.Key]time.Time)
-	}
-	state.aliases[key] = now
-	state.candidates[key] = candidates
-	// An alias routes with its normalized model's configuration: targets,
-	// overrides and shared capacity keys must apply to its traffic too.
-	if settings, configured := state.settings[normalized]; configured {
-		_ = state.engine.SetConfig(key, settings.Config)
-		_ = state.engine.ReplaceOverrides(key, settings.Overrides)
-		poolConfig := settings.Config
-		poolConfig.DefaultCapacity = 0
-		_ = state.poolEngine.SetConfig(key, poolConfig)
-	}
-	state.engine.RegisterCandidates(key, candidates)
-	pools := state.poolCandidates[normalized]
-	state.poolCandidates[key] = pools
-	state.poolEngine.RegisterCandidates(key, pools)
-	if now.Sub(state.aliasSweep) < time.Minute {
-		return
-	}
-	state.aliasSweep = now
-	for alias, used := range state.aliases {
-		if now.Sub(used) < schedulingAliasTTL {
-			continue
-		}
-		delete(state.aliases, alias)
-		delete(state.candidates, alias)
-		delete(state.poolCandidates, alias)
-		// Unregistered dimensions are evicted by the engines once idle.
-		state.engine.RegisterCandidates(alias, nil)
-		state.poolEngine.RegisterCandidates(alias, nil)
-	}
+	return key
 }
 
 type schedulingSnapshot struct {
@@ -305,26 +258,9 @@ func (work *schedulingRefresh) run(version uint64) {
 					snapshot.settings[key] = scheduler.RoutingConfig{Config: scheduler.DefaultConfig()}
 				}
 			}
-			// Recently used aliases keep their membership in the new generation;
-			// expired ones are dropped from it and later evicted by the engines.
-			for key, used := range state.aliases {
-				normalized := scheduler.Key{Group: key.Group, Model: ratio_setting.RoutingMatchModelName(key.Model)}
-				if _, already := snapshot.channels.Candidates[key]; already || time.Since(used) >= schedulingAliasTTL || len(snapshot.channels.Candidates[normalized]) == 0 {
-					delete(state.aliases, key)
-					continue
-				}
-				snapshot.channels.Candidates[key] = snapshot.channels.Candidates[normalized]
-				snapshot.pools.Candidates[key] = snapshot.pools.Candidates[normalized]
-				if settings, configured := snapshot.settings[normalized]; configured {
-					snapshot.settings[key] = settings
-				}
-			}
 		}
 		err = work.source.engine.PublishRoutingMembership(snapshot.channels, poolEngine, snapshot.pools, snapshot.settings)
 		if err == nil {
-			if state.poolEngine != poolEngine {
-				clear(state.aliases)
-			}
 			state.schedulingSource, state.metadataVersion = work.source, version
 			state.candidates, state.poolCandidates = snapshot.channels.Candidates, snapshot.pools.Candidates
 			state.poolEngine, state.poolByKey = poolEngine, snapshot.poolByKey
@@ -390,7 +326,10 @@ func loadSchedulingSnapshot(source schedulingSource) (*schedulingSnapshot, error
 			overrides[override.ChannelID] = scheduler.Override{Weight: override.Weight, Capacity: override.Capacity, CapacityKey: override.CapacityKey}
 		}
 		snapshot.settings[key] = scheduler.RoutingConfig{
-			Config:    scheduler.Config{Enabled: entry.Enabled, SuccessTarget: entry.TargetSuccessRate, LatencyTargetMS: entry.TargetTTFTMS, DefaultCapacity: entry.DefaultCapacity},
+			Config: scheduler.Config{
+				Enabled: entry.Enabled, SuccessTarget: entry.TargetSuccessRate, LatencyTargetMS: entry.TargetTTFTMS, DefaultCapacity: entry.DefaultCapacity,
+				SoftPriority: entry.SoftPriority, LearnedWeightOnly: entry.LearnedWeightOnly,
+			},
 			Overrides: overrides,
 		}
 	}
@@ -510,7 +449,7 @@ func SaveSchedulingConfig(config SchedulingConfig) (saved SchedulingConfig, sync
 	if config.ChannelOverrides == nil {
 		config.ChannelOverrides = []SchedulingChannelOverride{}
 	}
-	defaults := config.Enabled && config.TargetSuccessRate == .95 && config.TargetTTFTMS == 3000 && config.DefaultCapacity == 0 && len(config.ChannelOverrides) == 0
+	defaults := config.Enabled && config.TargetSuccessRate == .95 && config.TargetTTFTMS == 3000 && config.DefaultCapacity == 0 && !config.SoftPriority && !config.LearnedWeightOnly && len(config.ChannelOverrides) == 0
 	schedulingSaveLock.Lock()
 	defer schedulingSaveLock.Unlock()
 	// An invalid persisted value must not block the administrator from

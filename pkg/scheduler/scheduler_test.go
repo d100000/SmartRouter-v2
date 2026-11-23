@@ -38,6 +38,17 @@ func (f *schedulerFixture) dispatch(t *testing.T, candidate Candidate, stream bo
 	f.engine.EndRequest(r)
 }
 
+// softRouting selects the earlier active-mode rules for the fixture's
+// dimension: priority as a bounded preference and configured weights that fade
+// out. The tests that call it pin those rules; the defaults are covered by
+// routing_goals_test.go.
+func (f *schedulerFixture) softRouting(t *testing.T) {
+	t.Helper()
+	config := DefaultConfig()
+	config.SoftPriority, config.LearnedWeightOnly = true, true
+	require.NoError(t, f.engine.SetConfig(f.key, config))
+}
+
 func latency(value time.Duration) *time.Duration { return &value }
 
 func TestActivationOriginalRequestLifecycleAndIdleReset(t *testing.T) {
@@ -277,6 +288,7 @@ func TestLongWindowDegradationKeepsRecoveryActionAfterShortErrorsExpire(t *testi
 
 func TestRetryRankingExclusionAndMonotonicDynamicTransition(t *testing.T) {
 	f := newSchedulerFixture()
+	f.softRouting(t)
 	slow := f.candidate
 	slow.Priority = 100
 	fast := Candidate{ID: 2, Name: "Fast", Status: 1, Priority: 1, Weight: 1, Capacity: 100}
@@ -285,9 +297,12 @@ func TestRetryRankingExclusionAndMonotonicDynamicTransition(t *testing.T) {
 		f.dispatch(t, fast, true, Outcome{Success: true, TTFT: latency(time.Second)})
 	}
 	r := f.engine.BeginRequest(f.key, "retry", false)
+	// A retry draws by the same shares as a first attempt. The fast channel
+	// holds most of the share, so a draw in the upper range lands on it.
+	f.engine.random = func() float64 { return 0.99 }
 	a, err := f.engine.SelectAndReserve(r, []Candidate{slow, fast}, true, true)
 	require.NoError(t, err)
-	assert.Equal(t, fast.ID, a.Candidate.ID, "dynamic retry ranks across static priority tiers")
+	assert.Equal(t, fast.ID, a.Candidate.ID, "dynamic retry draws across static priority tiers")
 	f.engine.StartAttempt(a)
 	f.engine.FinishAttempt(a, Outcome{ChannelFailure: true})
 	a, err = f.engine.SelectAndReserve(r, []Candidate{slow, fast}, true, true)
@@ -339,6 +354,7 @@ func TestMaturePriorityPreference(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSchedulerFixture()
+			f.softRouting(t)
 			high := f.candidate
 			high.Priority, high.Capacity = tc.highPriority, 2
 			low := Candidate{ID: 2, Name: "Lower priority", Status: 1, Priority: tc.lowPriority, Weight: 1, Capacity: 100}
@@ -427,14 +443,20 @@ func TestMaturePriorityPreference(t *testing.T) {
 				f.engine.EndRequest(request)
 				cumulative += row.SelectionProbability
 			}
-			expectedRetry := high.ID
-			if rows[low.ID].EffectiveWeight > rows[high.ID].EffectiveWeight {
-				expectedRetry = low.ID
+			// A retry draws from the same displayed intervals as a first
+			// attempt: the lowest draw lands on the first candidate with a share.
+			expectedRetry := 0
+			for _, candidate := range candidates {
+				if rows[candidate.ID].SelectionProbability > 0 {
+					expectedRetry = candidate.ID
+					break
+				}
 			}
+			f.engine.random = func() float64 { return 0 }
 			request := f.engine.BeginRequest(f.key, "retry", false)
 			attempt, err := f.engine.SelectAndReserve(request, candidates, true, true)
 			require.NoError(t, err)
-			assert.Equal(t, expectedRetry, attempt.Candidate.ID, "retry ranks the same effective weights shown in the snapshot")
+			assert.Equal(t, expectedRetry, attempt.Candidate.ID, "retry draws from the same shares shown in the snapshot")
 			f.engine.EndRequest(request)
 			if tc.name == "signed-extremes" {
 				high.CooldownUntil = f.now.Add(time.Minute)
@@ -448,6 +470,7 @@ func TestMaturePriorityPreference(t *testing.T) {
 
 func TestPriorityCannotBypassResidualRecoveryPenalty(t *testing.T) {
 	f := newSchedulerFixture()
+	f.softRouting(t)
 	high := f.candidate
 	high.Priority = math.MaxInt64
 	low := Candidate{ID: 2, Name: "Recovered", Status: 1, Priority: math.MinInt64, Weight: 1, Capacity: 100}
@@ -596,6 +619,7 @@ func TestExplorationRequiresHealthyRecentEvidence(t *testing.T) {
 	for _, healthy := range []bool{true, false} {
 		t.Run(fmt.Sprintf("healthy-alternative-%v", healthy), func(t *testing.T) {
 			f := newSchedulerFixture()
+			f.softRouting(t)
 			f.candidate.Priority = math.MaxInt64
 			alternative := Candidate{ID: 2, Name: "Alternative", Status: 1, Priority: math.MinInt64, Weight: 10, Capacity: 100}
 			for range 100 {
@@ -1135,6 +1159,7 @@ func TestRecoveryNeedsNewSuccessAfterErrorExpiry(t *testing.T) {
 
 func TestNewChannelRampInMatureDimension(t *testing.T) {
 	f := newSchedulerFixture()
+	f.softRouting(t)
 	for range 100 {
 		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(20 * time.Second)})
 	}
@@ -1172,6 +1197,7 @@ func TestNewChannelRampInMatureDimension(t *testing.T) {
 
 func TestPriorityCannotBenefitUnprovenNewChannel(t *testing.T) {
 	f := newSchedulerFixture()
+	f.softRouting(t)
 	for range 100 {
 		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(20 * time.Second)})
 	}
@@ -1197,6 +1223,7 @@ func TestPriorityCannotBenefitUnprovenNewChannel(t *testing.T) {
 
 func TestNewChannelRampSharesInitialBudgetAndKeepsFallbackAvailable(t *testing.T) {
 	f := newSchedulerFixture()
+	f.softRouting(t)
 	for range 100 {
 		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Millisecond)})
 	}
@@ -1589,6 +1616,7 @@ func TestAuthoritativeDashboardKeepsUnavailableHistoryWithoutMembership(t *testi
 
 func TestDimensionTransitionFadesConfiguredWeightAndReenabledChannelRamps(t *testing.T) {
 	f := newSchedulerFixture()
+	f.softRouting(t)
 	second := Candidate{ID: 2, Name: "Initially low weight", Status: 1, Weight: 1, Capacity: 100}
 	for range 25 {
 		f.dispatch(t, f.candidate, true, Outcome{Success: true, TTFT: latency(time.Second)})
@@ -1911,9 +1939,29 @@ func TestBindingYieldsAfterRecentAvailabilityFailureOnlyWithHealthyAlternative(t
 	f.dispatch(t, f.candidate, true, Outcome{ChannelFailure: true, CooldownFailure: true})
 	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "no healthy alternative keeps the binding")
 	f.dispatch(t, cooldownBackup, true, Outcome{Success: true})
-	assert.False(t, f.engine.BindingAdvisable(f.key, f.candidate.ID))
+	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "one isolated failure never moves a session")
+	fail := func(id string) {
+		r := f.engine.BeginRequest(f.key, id, false)
+		a, err := f.engine.ReserveCandidate(r, f.candidate, true)
+		require.NoError(t, err)
+		f.engine.StartAttempt(a)
+		f.engine.FinishAttempt(a, Outcome{ChannelFailure: true, CooldownFailure: true})
+		f.engine.EndRequest(r)
+	}
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	fail("first")
+	fail("first")
+	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "retries of one request are one failure")
+	fail("second")
+	assert.False(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "consecutive failed requests yield to the healthy alternative")
 	f.now = f.now.Add(time.Minute + time.Second)
 	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "an old failure no longer redirects the binding")
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	fail("third")
+	fail("fourth")
+	assert.False(t, f.engine.BindingAdvisable(f.key, f.candidate.ID))
+	f.dispatch(t, f.candidate, true, Outcome{Success: true})
+	assert.True(t, f.engine.BindingAdvisable(f.key, f.candidate.ID), "a success ends the failing streak")
 }
 
 // benchmarkMembership mirrors a large deployment: 40 channels serving 3 groups

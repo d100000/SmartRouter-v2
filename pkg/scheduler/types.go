@@ -40,6 +40,15 @@ type Config struct {
 	SuccessTarget   float64 `json:"target_success_rate"`
 	LatencyTargetMS float64 `json:"target_ttft_ms"`
 	DefaultCapacity int     `json:"default_capacity"`
+	// SoftPriority restores the earlier active-mode rule: priority is only a
+	// preference of at most 2x between comparable channels. By default a
+	// lower tier receives traffic only when every higher tier is unavailable
+	// or unhealthy, as it already does during the cold start.
+	SoftPriority bool `json:"soft_priority,omitempty"`
+	// LearnedWeightOnly lets the configured weight ratio fade out completely
+	// once 100 samples exist. By default the ratio inside a priority tier
+	// stays a permanent multiplier of the learned quality.
+	LearnedWeightOnly bool `json:"learned_weight_only,omitempty"`
 }
 
 // DefaultConfig leaves concurrency unlimited. Load still lowers the weight of

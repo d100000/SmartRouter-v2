@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -855,8 +854,8 @@ func TestSchedulingMembershipSameChannelGroupRemovalAndCachedAliases(t *testing.
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) { queries++ }))
 	t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callback)) })
 	require.NoError(t, SyncSchedulingConfig())
-	require.NoError(t, SyncSchedulingConfig(scheduler.Key{Group: "default", Model: "gpt-4-gizmo-another"}))
-	assert.Zero(t, queries, "stable metadata and new aliases use the complete cached snapshot, not database scans")
+	require.NoError(t, SyncSchedulingConfig())
+	assert.Zero(t, queries, "stable metadata uses the complete cached snapshot, not database scans")
 }
 
 func TestSchedulingStaticWeightUnaffectedByCapacityOverride(t *testing.T) {
@@ -1023,7 +1022,7 @@ func TestSchedulingHonorsSessionAffinityAndAdmission(t *testing.T) {
 			RecordChannelAffinity(c, boundID)
 			t.Cleanup(func() { ClearCurrentChannelAffinityCache(c) })
 			key := scheduler.Key{Group: "default", Model: modelName}
-			require.NoError(t, SyncSchedulingConfig(key))
+			require.NoError(t, SyncSchedulingConfig())
 			if tc.active {
 				for i := range 50 {
 					request := scheduler.Default.BeginRequest(key, fmt.Sprintf("activation-%d", i), false)
@@ -1163,7 +1162,9 @@ func TestSessionHealthBypassRequiresReservableSupplier(t *testing.T) {
 	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", bound).Update("setting", `{"responses_websocket_enabled":true}`).Error)
 	model.InitChannelCache()
 	require.NoError(t, SyncSchedulingConfig())
-	for _, id := range []int{healthy, bound} {
+	// Two consecutive failed requests on the bound channel are an outage in
+	// progress; one isolated failure would leave the session where it is.
+	for _, id := range []int{healthy, bound, bound} {
 		channel, err := model.CacheGetChannelForRouting(id)
 		require.NoError(t, err)
 		c := routingTestContext(t)
@@ -1332,7 +1333,7 @@ func TestLocalRefusalKeepsWeightedSelection(t *testing.T) {
 	}
 	model.InitChannelCache()
 	key := scheduler.Key{Group: "default", Model: modelName}
-	require.NoError(t, SyncSchedulingConfig(key))
+	require.NoError(t, SyncSchedulingConfig())
 	for i := range 50 {
 		scheduler.Default.EndRequest(scheduler.Default.BeginRequest(key, fmt.Sprintf("activation-%d", i), false))
 	}
@@ -1427,49 +1428,48 @@ func TestSchedulingConfigFailuresKeepServingLastSnapshot(t *testing.T) {
 	assert.Equal(t, 3, GetSchedulingConfig(key).DefaultCapacity)
 }
 
-func TestSchedulingAliasesNeedCandidatesAndExpire(t *testing.T) {
+// A concrete spelling of a routable model shares its normalized model's
+// dimension: caller-chosen names create neither aliases nor engine state.
+func TestConcreteModelNamesShareNormalizedDimension(t *testing.T) {
 	db := setupChannelSelectAutoGroupsTest(t)
 	const pattern = "gpt-4-gizmo-*"
 	setSchedulingTestConfig(t, nil)
-	createChannelSelectAutoGroupsChannel(t, db, 7701, "default", pattern)
+	createChannelSelectAutoGroupsChannel(t, db, 7711, "default", pattern)
+	createChannelSelectAutoGroupsChannel(t, db, 7712, "default", "gpt-4-gizmo-own")
 	model.InitChannelCache()
 	require.NoError(t, SyncSchedulingConfig())
-	route := func(modelName string) *model.Channel {
+	normalized := scheduler.Key{Group: "default", Model: pattern}
+	assert.Equal(t, normalized, SchedulingKey("default", "gpt-4-gizmo-abc"))
+	assert.Equal(t, normalized, SchedulingKey("default", pattern))
+	own := scheduler.Key{Group: "default", Model: "gpt-4-gizmo-own"}
+	assert.Equal(t, own, SchedulingKey("default", own.Model), "a model with its own membership keeps its dimension")
+	assert.Equal(t, scheduler.Key{Group: "default", Model: "no-such-model"}, SchedulingKey("default", "no-such-model"))
+	assert.Equal(t, scheduler.Key{Group: "other", Model: "gpt-4-gizmo-abc"}, SchedulingKey("other", "gpt-4-gizmo-abc"), "normalizing needs a routable normalized model in the same group")
+
+	before := len(scheduler.Default.Keys())
+	for i := range 50 {
+		c := routingTestContext(t)
+		name := fmt.Sprintf("gpt-4-gizmo-%d", i)
+		selected, err := schedulerSelectChannel(c, "default", name, 0, nil)
+		require.NoError(t, err)
+		require.NotNil(t, selected)
+		require.Equal(t, 7711, selected.Id)
+		require.NoError(t, ReserveSchedulingChannel(c, selected, "default", name))
+		EndSchedulingRequest(c)
+	}
+	assert.Len(t, scheduler.Default.Keys(), before, "fifty spellings add no dimension")
+	assert.Nil(t, func() *model.Channel {
 		c := routingTestContext(t)
 		defer EndSchedulingRequest(c)
-		selected, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+		selected, err := schedulerSelectChannel(c, "default", "no-such-model", 0, nil)
 		require.NoError(t, err)
 		return selected
-	}
-	aliases := func() map[scheduler.Key]time.Time {
-		schedulingConfigState.Lock()
-		defer schedulingConfigState.Unlock()
-		return maps.Clone(schedulingConfigState.aliases)
-	}
-	assert.Nil(t, route("no-such-model"))
+	}())
 	assert.NotContains(t, scheduler.Default.Keys(), scheduler.Key{Group: "default", Model: "no-such-model"}, "a model without candidates creates no routing state")
-	old := scheduler.Key{Group: "default", Model: "gpt-4-gizmo-old"}
-	require.NotNil(t, route(old.Model))
-	require.Contains(t, aliases(), old)
-
-	schedulingConfigState.Lock()
-	schedulingConfigState.aliases[old] = time.Now().Add(-schedulingAliasTTL)
-	schedulingConfigState.aliasSweep = time.Time{}
-	schedulingConfigState.Unlock()
-	fresh := scheduler.Key{Group: "default", Model: "gpt-4-gizmo-fresh"}
-	require.NotNil(t, route(fresh.Model))
-	current := aliases()
-	assert.NotContains(t, current, old, "an alias unused for the statistics window expires")
-	assert.Contains(t, current, fresh)
-	schedulingConfigState.Lock()
-	_, retained := schedulingConfigState.candidates[old]
-	schedulingConfigState.Unlock()
-	assert.False(t, retained)
-	require.NotNil(t, route(old.Model), "an expired alias is registered again on its next use")
 }
 
-// An alias routes with its normalized model's settings, so a shared capacity
-// key configured for the pattern also limits traffic for concrete names.
+// A concrete name routes in its normalized model's dimension, so a shared
+// capacity key configured for the pattern also limits traffic for every name.
 func TestSchedulingAliasInheritsNormalizedConfig(t *testing.T) {
 	db := setupChannelSelectAutoGroupsTest(t)
 	const pattern = "gpt-4-gizmo-*"
@@ -1488,7 +1488,7 @@ func TestSchedulingAliasInheritsNormalizedConfig(t *testing.T) {
 	second := routingTestContext(t)
 	defer EndSchedulingRequest(second)
 	assert.ErrorIs(t, ReserveSchedulingChannel(second, channel, "default", "gpt-4-gizmo-second"), scheduler.ErrNoEligibleChannel,
-		"another alias of the same pattern shares the configured capacity key")
+		"another name of the same pattern shares the configured capacity key")
 }
 
 func TestRealtimeConnectionDoesNotHoldGenerationCapacity(t *testing.T) {

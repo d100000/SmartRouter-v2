@@ -45,6 +45,8 @@ export function ConfigDialog(props: {
     target_success_rate: positiveNumber.max(100, t('Must not exceed 100')),
     target_ttft_ms: positiveNumber.min(1).max(3600000),
     default_capacity: positiveNumber.int().max(100000).nullable(),
+    soft_priority: z.boolean(),
+    learned_weight_only: z.boolean(),
     channel_overrides: z.array(
       z.object({
         channel_id: z.number(),
@@ -64,6 +66,8 @@ export function ConfigDialog(props: {
       ...props.data.config,
       target_success_rate: props.data.config.target_success_rate * 100,
       default_capacity: props.data.config.default_capacity || null,
+      soft_priority: props.data.config.soft_priority ?? false,
+      learned_weight_only: props.data.config.learned_weight_only ?? false,
       channel_overrides: props.data.channels.map((channel) => {
         const override = (props.data.config.channel_overrides ?? []).find(
           (item) => item.channel_id === channel.channel_id
@@ -134,9 +138,57 @@ export function ConfigDialog(props: {
         </div>
         <p className='text-muted-foreground text-xs leading-relaxed'>
           {t(
-            'Cold start follows native priority and configured weights. Dynamic routing activates after 50 original requests in 30 minutes, then gradually replaces the initial weights.'
+            'Cold start follows native priority and configured weights. Dynamic routing activates after 50 original requests in 30 minutes and then adjusts the split by observed health, latency and load.'
           )}
         </p>
+        <div className='space-y-1'>
+          <div className='flex items-center justify-between gap-4'>
+            <Label htmlFor='scheduling-strict-priority'>
+              {t('Strict priority tiers')}
+            </Label>
+            <Controller
+              control={form.control}
+              name='soft_priority'
+              render={({ field }) => (
+                <Switch
+                  id='scheduling-strict-priority'
+                  checked={!field.value}
+                  onCheckedChange={(checked) => field.onChange(!checked)}
+                  disabled={props.pending}
+                />
+              )}
+            />
+          </div>
+          <p className='text-muted-foreground text-xs leading-relaxed'>
+            {t(
+              'Lower-priority channels only receive traffic when every higher tier is unavailable or unhealthy. Turn off to let observed performance spread traffic across tiers.'
+            )}
+          </p>
+        </div>
+        <div className='space-y-1'>
+          <div className='flex items-center justify-between gap-4'>
+            <Label htmlFor='scheduling-keep-weights'>
+              {t('Keep configured weights')}
+            </Label>
+            <Controller
+              control={form.control}
+              name='learned_weight_only'
+              render={({ field }) => (
+                <Switch
+                  id='scheduling-keep-weights'
+                  checked={!field.value}
+                  onCheckedChange={(checked) => field.onChange(!checked)}
+                  disabled={props.pending}
+                />
+              )}
+            />
+          </div>
+          <p className='text-muted-foreground text-xs leading-relaxed'>
+            {t(
+              'Configured weights keep shaping the split inside a priority tier after dynamic routing activates. Turn off to let learned weights replace them.'
+            )}
+          </p>
+        </div>
         <div className='grid gap-4 sm:grid-cols-3'>
           {(
             [

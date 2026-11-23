@@ -310,7 +310,7 @@ export function Scheduling() {
                     {!data.active && data.config.enabled && (
                       <p className='text-muted-foreground basis-full leading-relaxed'>
                         {t(
-                          'Cold start follows native priority and configured weights. Dynamic routing activates after 50 original requests in 30 minutes, then gradually replaces the initial weights.'
+                          'Cold start follows native priority and configured weights. Dynamic routing activates after 50 original requests in 30 minutes and then adjusts the split by observed health, latency and load.'
                         )}
                       </p>
                     )}

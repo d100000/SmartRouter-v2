@@ -39,6 +39,10 @@ type ChannelAffinitySetting struct {
 	MaxEntries            int                   `json:"max_entries"`
 	DefaultTTLSeconds     int                   `json:"default_ttl_seconds"`
 	Rules                 []ChannelAffinityRule `json:"rules"`
+	// A preferred session bound to a lower priority tier returns to a healthy
+	// higher tier after this many idle seconds. Zero uses the default of 300;
+	// a negative value keeps such sessions where they are.
+	ReturnToPriorityIdleSeconds int `json:"return_to_priority_idle_seconds"`
 }
 
 // Keep Codex CLI passthrough aligned with upstream. Codex uses lower-case
@@ -150,6 +154,20 @@ var channelAffinitySetting = ChannelAffinitySetting{
 			IncludeUsingGroup:     true,
 			IncludeRuleName:       true,
 			UserAgentInclude:      nil,
+		},
+		{
+			// Any other client that names its own prompt cache key keeps the
+			// channel that holds that cache, without the strict mode of the
+			// CLI rules above.
+			Name:       "prompt cache key",
+			ModelRegex: []string{"^.*$"},
+			KeySources: []ChannelAffinityKeySource{
+				{Type: "gjson", Path: "prompt_cache_key"},
+			},
+			SessionMode:       "prefer",
+			IncludeUsingGroup: true,
+			IncludeModelName:  true,
+			IncludeRuleName:   true,
 		},
 	},
 }

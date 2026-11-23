@@ -30,6 +30,17 @@ const (
 	ginKeyChannelAffinityUsedChannel = "channel_affinity_used_channel"
 	ginKeyChannelAffinityObserved    = "channel_affinity_observed_channel"
 	ginKeyChannelAffinityPreserved   = "channel_affinity_preserved"
+	ginKeyChannelAffinityReleased    = "channel_affinity_released"
+	ginKeyChannelAffinityTouch       = "channel_affinity_touch"
+
+	// channelAffinitySeenPrefix marks the entry that records when a session
+	// bound below the best healthy priority tier last used its binding. The
+	// session key is hashed so no caller-chosen value can name another
+	// session's entry.
+	channelAffinitySeenPrefix = "#seen:"
+	// defaultChannelAffinityReturnIdle is how long such a session must be
+	// idle before it returns to the higher tier.
+	defaultChannelAffinityReturnIdle = 5 * time.Minute
 
 	channelAffinityCacheNamespace           = "new-api:channel_affinity:v1"
 	channelAffinityUsageCacheStatsNamespace = "new-api:channel_affinity_usage_cache_stats:v1"
@@ -160,6 +171,11 @@ func GetChannelAffinityCacheStats() ChannelAffinityCacheStats {
 			continue
 		}
 		rest := strings.TrimPrefix(k, prefix)
+		if strings.HasPrefix(rest, channelAffinitySeenPrefix) {
+			// Bookkeeping for a binding, not a binding of its own.
+			total--
+			continue
+		}
 		parts := strings.Split(rest, ":")
 		if len(parts) < 2 {
 			unknown++
@@ -759,12 +775,60 @@ func PreserveChannelAffinityAfterLocalRefusal(c *gin.Context, channelID int) {
 	}
 }
 
+// channelAffinityReturnIdle is the idle time after which a session bound to a
+// lower priority tier may return to a healthy higher one. Zero disables it.
+func channelAffinityReturnIdle() time.Duration {
+	setting := operation_setting.GetChannelAffinitySetting()
+	switch {
+	case setting == nil || setting.ReturnToPriorityIdleSeconds < 0:
+		return 0
+	case setting.ReturnToPriorityIdleSeconds == 0:
+		return defaultChannelAffinityReturnIdle
+	}
+	return time.Duration(setting.ReturnToPriorityIdleSeconds) * time.Second
+}
+
+func channelAffinitySeenKey(cacheKey string) string {
+	return channelAffinitySeenPrefix + common.Sha1([]byte(cacheKey))
+}
+
+// channelAffinityIdle reports whether the current session's binding has been
+// unused for the return interval. It is asked only for a session whose bound
+// channel sits below a healthy higher priority tier. The first such request
+// starts the clock: a successful request then records its time.
+func channelAffinityIdle(c *gin.Context) bool {
+	idle := channelAffinityReturnIdle()
+	cacheKey, _, ok := getChannelAffinityContext(c)
+	if idle <= 0 || !ok {
+		return false
+	}
+	seen, found, err := getChannelAffinityCache().Get(channelAffinitySeenKey(cacheKey))
+	if err != nil {
+		return false
+	}
+	if found && time.Since(time.Unix(int64(seen), 0)) > idle {
+		return true
+	}
+	c.Set(ginKeyChannelAffinityTouch, true)
+	return false
+}
+
+// releaseChannelAffinity lets this request rebind its session to the channel
+// that serves it, even when bindings otherwise never switch on success.
+func releaseChannelAffinity(c *gin.Context, channelID int) {
+	c.Set(ginKeyChannelAffinityReleased, true)
+	RequestPolicy(c).AddEvent(PolicyEvent{ChannelID: channelID, Decision: PolicyDecision{Action: "release", Reason: "session_binding_returns_to_priority", Source: "session_rule"}})
+}
+
 // ChannelAffinityWrite carries the conditional cache update without retaining
 // a pooled request context while a WebSocket terminal is delivered.
 type ChannelAffinityWrite struct {
 	cacheKey            string
 	ttl                 time.Duration
 	observed, channelID int
+	// touch records the use of a binding that sits below a healthy higher
+	// priority tier. A binding that moves starts without that record.
+	touch bool
 }
 
 func PrepareChannelAffinityWrite(c *gin.Context, channelID int) *ChannelAffinityWrite {
@@ -784,7 +848,8 @@ func PrepareChannelAffinityWrite(c *gin.Context, channelID int) *ChannelAffinity
 	}
 	// The switch controls moving an existing binding. The first binding
 	// always belongs to the channel that actually served the request.
-	if observed > 0 && !setting.SwitchOnSuccess {
+	released := c.GetBool(ginKeyChannelAffinityReleased)
+	if observed > 0 && !setting.SwitchOnSuccess && !released {
 		channelID = observed
 	} else if successChannelID := c.GetInt("channel_id"); successChannelID > 0 {
 		channelID = successChannelID
@@ -799,7 +864,12 @@ func PrepareChannelAffinityWrite(c *gin.Context, channelID int) *ChannelAffinity
 	if ttlSeconds <= 0 {
 		ttlSeconds = 3600
 	}
-	return &ChannelAffinityWrite{cacheKey: cacheKey, ttl: time.Duration(ttlSeconds) * time.Second, observed: observed, channelID: channelID}
+	return &ChannelAffinityWrite{
+		cacheKey: cacheKey, ttl: time.Duration(ttlSeconds) * time.Second, observed: observed, channelID: channelID,
+		// A return that ended on the old channel after all waits another
+		// full interval before it is tried again.
+		touch: c.GetBool(ginKeyChannelAffinityTouch) || released,
+	}
 }
 
 func (w *ChannelAffinityWrite) Commit() bool {
@@ -810,9 +880,24 @@ func (w *ChannelAffinityWrite) Commit() bool {
 	if w.observed > 0 {
 		expected = &w.observed
 	}
-	changed, err := cachex.CompareAndSwapWithTTL(getChannelAffinityCache(), w.cacheKey, expected, &w.channelID, w.ttl)
+	cache := getChannelAffinityCache()
+	changed, err := cachex.CompareAndSwapWithTTL(cache, w.cacheKey, expected, &w.channelID, w.ttl)
 	if err != nil {
 		common.SysError(common.LogText("channel affinity cache set failed: key=%s, err=%v", w.cacheKey, err))
+	}
+	switch {
+	case !changed:
+	case w.observed > 0 && w.channelID != w.observed:
+		// The idle clock belongs to the previous channel. A session that is
+		// demoted again later must start a new one.
+		if _, err := cache.DeleteMany([]string{channelAffinitySeenKey(w.cacheKey)}); err != nil {
+			common.SysError(common.LogText("channel affinity seen delete failed: key=%s, err=%v", w.cacheKey, err))
+		}
+	case w.touch:
+		// Only a session still using its lower-tier binding keeps the clock.
+		if err := cache.SetWithTTL(channelAffinitySeenKey(w.cacheKey), int(time.Now().Unix()), w.ttl); err != nil {
+			common.SysError(common.LogText("channel affinity seen set failed: key=%s, err=%v", w.cacheKey, err))
+		}
 	}
 	return changed
 }

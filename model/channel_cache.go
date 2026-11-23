@@ -455,6 +455,18 @@ func advanceCachedPollingIndex(id int, advance func(cursor int) int) bool {
 	return true
 }
 
+// cachedChannelStatusIs reports whether routing on this node already uses
+// status for the channel. Without the memory cache routing reads the database.
+func cachedChannelStatusIs(id int, status int) bool {
+	if !common.MemoryCacheEnabled {
+		return true
+	}
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	channel, ok := channelsIDM[id]
+	return ok && channel.Status == status
+}
+
 func CacheUpdateChannelStatus(id int, status int) {
 	defer invalidateRoutingMetadata()
 	if !common.MemoryCacheEnabled {

@@ -78,7 +78,7 @@ func SchedulerCandidate(channel *model.Channel) scheduler.Candidate {
 
 func schedulerRequestForGroup(c *gin.Context, group, modelName string) (*schedulingRequest, *scheduler.Request) {
 	state := schedulingState(c)
-	key := scheduler.Key{Group: group, Model: modelName}
+	key := SchedulingKey(group, modelName)
 	request := state.requests[key]
 	if request == nil {
 		request = scheduler.Default.BeginRequest(key, state.id, true)
@@ -93,6 +93,8 @@ func schedulerSelectChannel(c *gin.Context, group, modelName string, retry int, 
 
 // allowed restricts normal routing to healthy alternatives for a preferred
 // binding. Supplier pool and channel reservations still run in their usual order.
+// key carries the request's own model name: candidates and filters are
+// resolved for it, while the statistics live in its SchedulingKey dimension.
 func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, filters []dto.ChannelFilter, allowed map[int]bool) (selected *model.Channel, selectionErr error) {
 	state := schedulingState(c)
 	var request *scheduler.Request
@@ -104,7 +106,6 @@ func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, fi
 	if err != nil || len(channels) == 0 {
 		return nil, err
 	}
-	registerSchedulingKey(key, 0)
 	withSuppliers := slices.ContainsFunc(channels, func(channel *model.Channel) bool { return channel.OwnerSupplierID != "" })
 	if allowed != nil {
 		channels = slices.DeleteFunc(channels, func(channel *model.Channel) bool { return !allowed[channel.Id] })
@@ -299,7 +300,6 @@ func ReserveSchedulingChannel(c *gin.Context, channel *model.Channel, group, mod
 			}
 		}
 	}
-	registerSchedulingKey(scheduler.Key{Group: group, Model: modelName}, channel.Id)
 	_, request = schedulerRequestForGroup(c, group, modelName)
 	state.mu.Lock()
 	if state.attempt != nil && state.currentRequest == request && state.attempt.Candidate.ID == channel.Id && !state.started {

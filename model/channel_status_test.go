@@ -426,6 +426,45 @@ func TestBatchSetChannelTagDatabaseMatrix(t *testing.T) {
 
 // A periodic reload that finds the same routing rows keeps the scheduling
 // metadata version, and a failed read keeps the previously published cache.
+// During an outage every failing in-flight request reports the same channel.
+// Only the first report changes anything and republishes routing membership.
+func TestRepeatedStatusReportsPublishRoutingMetadataOnce(t *testing.T) {
+	for _, cached := range []bool{true, false} {
+		t.Run(fmt.Sprintf("memory-cache=%t", cached), func(t *testing.T) {
+			setupChannelStatusTest(t)
+			common.MemoryCacheEnabled = cached
+			channel := &Channel{Id: 9111, Name: "repeated", Type: 1, Key: "key", Status: common.ChannelStatusEnabled, Group: "default", Models: "repeated-model"}
+			require.NoError(t, DB.Create(channel).Error)
+			require.NoError(t, channel.AddAbilities(DB))
+			InitChannelCache()
+			version := RoutingMetadataVersion()
+
+			require.True(t, UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, "upstream down"))
+			changed := RoutingMetadataVersion()
+			assert.Greater(t, changed, version, "the status change is published")
+			for range 20 {
+				assert.False(t, UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, "upstream down"))
+			}
+			assert.Equal(t, changed, RoutingMetadataVersion(), "repeated reports of a known status publish nothing")
+			if cached {
+				stored, err := CacheGetChannel(channel.Id)
+				require.NoError(t, err)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+
+				// Another node re-enabled the channel: this node's cache is
+				// stale, so a report that changes nothing in the database
+				// must still bring the cache in line.
+				require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).Update("status", common.ChannelStatusEnabled).Error)
+				require.False(t, EnableChannelAutomatically(channel.Id, ""))
+				stored, err = CacheGetChannel(channel.Id)
+				require.NoError(t, err)
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Greater(t, RoutingMetadataVersion(), changed, "bringing a stale cache in line is published")
+			}
+		})
+	}
+}
+
 func TestChannelCacheReloadPublishesOnlyChangedRoutingMetadata(t *testing.T) {
 	setupChannelStatusTest(t)
 	common.MemoryCacheEnabled = true

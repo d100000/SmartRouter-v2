@@ -6,7 +6,14 @@ import (
 	"time"
 )
 
-const prioritySuccessTolerance = 0.03
+const (
+	prioritySuccessTolerance = 0.03
+	// With strict priority a lower tier starts to receive traffic once the
+	// best channel above it falls below this fraction of the health a channel
+	// has at the success target (capped at the 95% prior of a new channel).
+	strictPriorityHealthMargin = 0.9
+	strictPriorityHealthTarget = 0.95
+)
 
 type evaluatedCandidate struct {
 	candidate        Candidate
@@ -246,10 +253,28 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		}
 	}
 	active := s.config.Enabled && s.active
+	strict := active && !s.config.SoftPriority
 	transition := min(1, max(0.01, float64(s.learningSamples)/100))
+	// The configured weight of a candidate relative to the mean of its own
+	// priority tier: 1 for an even split, 0 for a zero weight beside peers
+	// that have one.
+	type tierStat struct {
+		total float64
+		count int
+	}
+	tiers := make(map[int64]*tierStat)
+	for _, item := range result {
+		tier := tiers[item.candidate.Priority]
+		if tier == nil {
+			tier = &tierStat{}
+			tiers[item.candidate.Priority] = tier
+		}
+		tier.total += max(0, item.candidate.Weight)
+		tier.count++
+	}
 	priorityRanks := make(map[int64]float64)
 	bestSuccess := 0.0
-	if active {
+	if active && !strict {
 		priorities := make([]int64, 0, len(result))
 		for _, item := range result {
 			// Keep tier ranks stable when a new peer finishes its ramp. Only
@@ -282,13 +307,58 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		if !active {
 			item.weight = staticShare
 		} else {
-			// The configured ratio fades as 100 real attempt samples
-			// accumulate; comparable observed success retains a soft tier bias.
-			item.weight *= transition + (1-transition)*staticShare*float64(len(result))
-			if item.priorityEligible {
+			// The cold-start ratio hands over to the learned quality as 100
+			// real attempt samples accumulate. The configured ratio inside
+			// the candidate's own tier stays as a multiplier of that quality
+			// unless the dimension asks for learned weights only.
+			configured := 1.0
+			if tier := tiers[item.candidate.Priority]; !s.config.LearnedWeightOnly && tier.total > 0 {
+				configured = max(0, item.candidate.Weight) * float64(tier.count) / tier.total
+			}
+			item.weight *= transition*configured + (1-transition)*staticShare*float64(len(result))
+			if !strict && item.priorityEligible {
 				closeness := max(0, 1-(bestSuccess-item.success)/prioritySuccessTolerance)
 				item.weight *= 1 + transition*priorityRanks[item.candidate.Priority]*closeness
 			}
+		}
+	}
+	if strict && len(tiers) > 1 {
+		// Priority tiers stay exclusive after activation. A lower tier only
+		// receives the share its higher tiers cannot carry in good health:
+		// nothing while the best usable channel above is near the target,
+		// rising as that channel degrades. A channel that has not yet proven
+		// itself carries only its ramp allowance, so a new or re-enabled
+		// high-priority channel takes over within its first 20 successes
+		// instead of at once. A tier whose channels are all disabled,
+		// cooling, full or already tried is absent here, so the next tier
+		// takes over completely.
+		reference := strictPriorityHealthMargin * math.Pow(min(s.config.SuccessTarget, strictPriorityHealthTarget), 4)
+		priorities := make([]int64, 0, len(tiers))
+		carried := make(map[int64]float64, len(tiers))
+		for priority := range tiers {
+			priorities = append(priorities, priority)
+		}
+		for _, item := range result {
+			if item.weight <= 0 {
+				continue
+			}
+			share := min(1, item.health/reference)
+			if !item.mature {
+				progress := float64(s.channels[item.candidate.ID].learningSuccesses) / channelRampSuccesses
+				share *= channelRampInitialShare + (1-channelRampInitialShare)*progress
+			}
+			carried[item.candidate.Priority] = max(carried[item.candidate.Priority], share)
+		}
+		slices.Sort(priorities)
+		slices.Reverse(priorities)
+		spill := 1.0
+		factors := make(map[int64]float64, len(tiers))
+		for _, priority := range priorities {
+			factors[priority] = spill
+			spill *= 1 - carried[priority]
+		}
+		for i := range result {
+			result[i].weight *= factors[result[i].candidate.Priority]
 		}
 	}
 	total := 0.0
@@ -367,7 +437,9 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 }
 
 // SelectAndReserve reads fresh eligibility and load under the same lock used to
-// reserve capacity. Retries rank all remaining candidates by effective weight.
+// reserve capacity. A retry draws from the remaining candidates with the same
+// probabilities as a first attempt, so the retries of a failing channel spread
+// over its peers instead of all landing on the single best one.
 func (e *Engine) SelectAndReserve(r *Request, candidates []Candidate, stream, retry bool) (*Attempt, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -383,24 +455,17 @@ func (e *Engine) SelectAndReserve(r *Request, candidates []Candidate, stream, re
 	if len(evaluated) == 0 {
 		return nil, ErrNoEligibleChannel
 	}
-	if retry && s.active && s.config.Enabled {
-		slices.SortFunc(evaluated, func(a, b evaluatedCandidate) int {
-			if a.weight > b.weight {
-				return -1
-			}
-			if a.weight < b.weight {
-				return 1
-			}
-			return a.candidate.ID - b.candidate.ID
-		})
-		return e.reserve(r, evaluated[0].candidate, stream, now), nil
-	}
 	threshold := e.random()
+	// Rounding may leave the threshold unspent. Fall back to the last
+	// candidate that has a share, never to one whose share is zero.
 	selected := evaluated[len(evaluated)-1].candidate
 	for _, item := range evaluated {
+		if item.probability <= 0 {
+			continue
+		}
+		selected = item.candidate
 		threshold -= item.probability
 		if threshold < 0 {
-			selected = item.candidate
 			break
 		}
 	}

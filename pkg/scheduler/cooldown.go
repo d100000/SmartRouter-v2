@@ -7,13 +7,19 @@ import (
 
 const (
 	cooldownStreakFailures = 3
-	cooldownStreakWindow   = time.Minute
-	cooldownMaxDuration    = 5 * time.Minute
+	// The streak is consecutive: any success resets it. The window only
+	// bounds how far apart those failures may be, so a dimension with a
+	// request every minute or less can still cool a dead channel.
+	cooldownStreakWindow = 10 * time.Minute
+	cooldownMaxDuration  = 5 * time.Minute
 	// A channel entering cooldown in this many distinct models within
-	// cooldownStreakWindow cools in every dimension.
+	// channelCooldownWindow cools in every dimension.
 	channelCooldownModels = 2
-	// bindingFailureWindow is how recent an availability failure must be for a
-	// preferred session binding to yield to a healthy alternative.
+	channelCooldownWindow = time.Minute
+	// A preferred session binding yields to a healthy alternative only while
+	// its channel shows this many consecutive failed requests, the latest
+	// within bindingFailureWindow. One isolated error never moves a session.
+	bindingFailureStreak = 2
 	bindingFailureWindow = time.Minute
 )
 
@@ -141,7 +147,7 @@ func (e *Engine) startCooldown(key Key, s *keyState, ch *channelState, channelID
 	if !wide.halfOpen {
 		wide.modelFailures[key.Model] = now
 		for model, at := range wide.modelFailures {
-			if now.Sub(at) > cooldownStreakWindow {
+			if now.Sub(at) > channelCooldownWindow {
 				delete(wide.modelFailures, model)
 			}
 		}
@@ -211,10 +217,10 @@ func (e *Engine) recordCooldownOutcome(a *Attempt, s *keyState, ch *channelState
 	}
 	if outcome.Success {
 		cooldown.streakRequests = nil
+		cooldown.lastFailure = time.Time{}
 		if a.probe {
 			cooldown.probes++
 			cooldown.probeResult = ProbeRecovered
-			cooldown.lastFailure = time.Time{}
 			cooldown.close(now)
 		}
 		return
@@ -262,8 +268,8 @@ func (r *Request) countCooldownSkip(ch *channelState, candidate Candidate, now t
 }
 
 // BindingAdvisable reports whether a preferred session should still try its
-// bound channel. It yields when that channel recently failed for
-// availability and another member is healthy and has room.
+// bound channel. It yields when that channel is failing consecutive requests
+// for availability and another member is healthy and has room.
 func (e *Engine) BindingAdvisable(key Key, channelID int) bool {
 	return len(e.HealthyBindingAlternatives(key, channelID)) == 0
 }
@@ -277,7 +283,8 @@ func (e *Engine) HealthyBindingAlternatives(key Key, channelID int) map[int]bool
 	now := e.now()
 	s := e.state(key, now)
 	ch := s.channels[channelID]
-	if ch == nil || ch.cooldown.lastFailure.IsZero() || now.Sub(ch.cooldown.lastFailure) > bindingFailureWindow {
+	if ch == nil || len(ch.cooldown.streakRequests) < bindingFailureStreak ||
+		ch.cooldown.lastFailure.IsZero() || now.Sub(ch.cooldown.lastFailure) > bindingFailureWindow {
 		return nil
 	}
 	var healthy map[int]bool
@@ -285,14 +292,7 @@ func (e *Engine) HealthyBindingAlternatives(key Key, channelID int) map[int]bool
 		if id == channelID || !other.registered {
 			continue
 		}
-		candidate := e.configuredCandidate(s, other, other.candidate, now)
-		if !e.eligible(candidate, now) {
-			continue
-		}
-		e.refreshScore(other, s.config, now)
-		_, short := channelWindows(other, now, true, false, s.config.LatencyTargetMS)
-		shortSuccess := float64(short.Successes+19) / float64(short.Attempts+20)
-		if short.Successes > 0 && other.baseSuccess >= s.config.SuccessTarget && shortSuccess >= s.config.SuccessTarget {
+		if _, ok := e.healthyBindingTarget(s, other, now); ok {
 			if healthy == nil {
 				healthy = make(map[int]bool)
 			}
@@ -300,4 +300,46 @@ func (e *Engine) HealthyBindingAlternatives(key Key, channelID int) map[int]bool
 		}
 	}
 	return healthy
+}
+
+// healthyBindingTarget reports a member that can take a session now and has
+// recent successes at the target rate, with its configured candidate.
+func (e *Engine) healthyBindingTarget(s *keyState, ch *channelState, now time.Time) (Candidate, bool) {
+	candidate := e.configuredCandidate(s, ch, ch.candidate, now)
+	if !e.eligible(candidate, now) {
+		return candidate, false
+	}
+	e.refreshScore(ch, s.config, now)
+	_, short := channelWindows(ch, now, true, false, s.config.LatencyTargetMS)
+	shortSuccess := float64(short.Successes+19) / float64(short.Attempts+20)
+	return candidate, short.Successes > 0 && ch.baseSuccess >= s.config.SuccessTarget && shortSuccess >= s.config.SuccessTarget
+}
+
+// HigherPriorityAlternatives identifies healthy members of a higher priority
+// tier than a session's bound channel. A session that failed over to a lower
+// tier may return to them once the host decides its binding has gone idle.
+// Dimensions with soft priority never ask a session to move for priority.
+func (e *Engine) HigherPriorityAlternatives(key Key, channelID int) map[int]bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.now()
+	s := e.state(key, now)
+	ch := s.channels[channelID]
+	if ch == nil || !ch.registered || s.config.SoftPriority {
+		return nil
+	}
+	bound := e.configuredCandidate(s, ch, ch.candidate, now).Priority
+	var higher map[int]bool
+	for id, other := range s.channels {
+		if id == channelID || !other.registered || other.candidate.Priority <= bound {
+			continue
+		}
+		if candidate, ok := e.healthyBindingTarget(s, other, now); ok && candidate.Priority > bound {
+			if higher == nil {
+				higher = make(map[int]bool)
+			}
+			higher[id] = true
+		}
+	}
+	return higher
 }
