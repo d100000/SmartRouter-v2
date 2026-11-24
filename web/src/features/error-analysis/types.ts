@@ -193,6 +193,7 @@ export type AnalysisTask = {
       duration_ms: number
     }
     coverage?: {
+      reused_days?: number
       stable?: boolean
       complete?: boolean
       source?: string

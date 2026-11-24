@@ -32,6 +32,7 @@ import { StaticDataTable } from '@/components/data-table'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber, formatTimestamp } from '@/lib/format'
 
@@ -51,16 +52,22 @@ const severityClass: Record<AnalysisSeverity, string> = {
   low: 'bg-muted text-muted-foreground',
 }
 
-function SeverityBadge(props: { severity?: string }) {
+const severityOrder: AnalysisSeverity[] = ['critical', 'high', 'medium', 'low']
+
+function useSeverityLabels(): Record<AnalysisSeverity, string> {
   const { t } = useTranslation()
-  const severity = props.severity as AnalysisSeverity | undefined
-  if (!severity || !(severity in severityClass)) return null
-  const labels: Record<AnalysisSeverity, string> = {
+  return {
     critical: t('Critical'),
     high: t('High'),
     medium: t('Medium'),
     low: t('Low'),
   }
+}
+
+function SeverityBadge(props: { severity?: string }) {
+  const labels = useSeverityLabels()
+  const severity = props.severity as AnalysisSeverity | undefined
+  if (!severity || !(severity in severityClass)) return null
   return <Badge className={severityClass[severity]}>{labels[severity]}</Badge>
 }
 
@@ -83,11 +90,35 @@ export function ReportContent(props: { task: AnalysisTask }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const labels = useAnalysisLabels()
+  const severityLabels = useSeverityLabels()
   const [detail, setDetail] = useState<{
     row?: FailureLog
     requestID?: string
   } | null>(null)
+  const [filter, setFilter] = useState({ severity: '', channel: '', model: '' })
   const result = props.task.result
+  // Issues can be narrowed by severity, channel and model. A filter value the
+  // shown report does not offer is ignored, so switching reports resets it.
+  const sections = result?.sections ?? []
+  const issues = sections.filter((section) => section.id.startsWith('issue-'))
+  const severities = severityOrder.filter((value) =>
+    issues.some((issue) => issue.severity === value)
+  )
+  const channels = [...new Set(issues.flatMap((issue) => issue.channels ?? []))]
+  const models = [...new Set(issues.flatMap((issue) => issue.models ?? []))]
+  const severity = severities.find((value) => value === filter.severity) ?? ''
+  const channel = channels.includes(filter.channel) ? filter.channel : ''
+  const model = models.includes(filter.model) ? filter.model : ''
+  const visibleSections = sections.filter(
+    (section) =>
+      !section.id.startsWith('issue-') ||
+      ((!severity || section.severity === severity) &&
+        (!channel || (section.channels ?? []).includes(channel)) &&
+        (!model || (section.models ?? []).includes(model)))
+  )
+  const visibleIssues = visibleSections.filter((section) =>
+    section.id.startsWith('issue-')
+  ).length
   const current = result?.snapshot
   const previous = result?.comparison
   const versioned = result?.version === 2
@@ -132,6 +163,10 @@ export function ReportContent(props: { task: AnalysisTask }) {
                   seconds: Math.round(result.run.duration_ms / 1000),
                 }
               )}
+              {(result.coverage?.reused_days ?? 0) > 0 &&
+                ` · ${t('{{days}} days reused from earlier reports', {
+                  days: result.coverage?.reused_days,
+                })}`}
             </p>
           )}
         </section>
@@ -226,11 +261,82 @@ export function ReportContent(props: { task: AnalysisTask }) {
       )}
       {versioned && result.sections && result.sections.length > 0 ? (
         <>
+          {issues.length > 1 && (
+            <div
+              className='flex flex-wrap items-center gap-2'
+              role='group'
+              aria-label={t('Filter issues')}
+            >
+              {severities.length > 1 && (
+                <NativeSelect
+                  size='sm'
+                  aria-label={t('Severity')}
+                  value={severity}
+                  onChange={(event) =>
+                    setFilter({ ...filter, severity: event.target.value })
+                  }
+                >
+                  <NativeSelectOption value=''>
+                    {t('All severities')}
+                  </NativeSelectOption>
+                  {severities.map((value) => (
+                    <NativeSelectOption key={value} value={value}>
+                      {severityLabels[value]}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
+              {channels.length > 1 && (
+                <NativeSelect
+                  size='sm'
+                  aria-label={t('Channel')}
+                  value={channel}
+                  onChange={(event) =>
+                    setFilter({ ...filter, channel: event.target.value })
+                  }
+                >
+                  <NativeSelectOption value=''>
+                    {t('All channels')}
+                  </NativeSelectOption>
+                  {channels.map((value) => (
+                    <NativeSelectOption key={value} value={value}>
+                      {t('Channel')} {value}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
+              {models.length > 1 && (
+                <NativeSelect
+                  size='sm'
+                  aria-label={t('Model')}
+                  value={model}
+                  onChange={(event) =>
+                    setFilter({ ...filter, model: event.target.value })
+                  }
+                >
+                  <NativeSelectOption value=''>
+                    {t('All models')}
+                  </NativeSelectOption>
+                  {models.map((value) => (
+                    <NativeSelectOption key={value} value={value}>
+                      {value}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              )}
+              <span className='text-muted-foreground text-xs'>
+                {t('{{shown}} of {{total}} issues', {
+                  shown: visibleIssues,
+                  total: issues.length,
+                })}
+              </span>
+            </div>
+          )}
           <nav
             className='flex flex-wrap gap-x-4 gap-y-2 text-sm'
             aria-label={t('Report sections')}
           >
-            {result.sections.map((section) => (
+            {visibleSections.map((section) => (
               <a
                 key={section.id}
                 href={`#analysis-section-${encodeURIComponent(section.id)}`}
@@ -240,7 +346,7 @@ export function ReportContent(props: { task: AnalysisTask }) {
               </a>
             ))}
           </nav>
-          {result.sections.map((section) => {
+          {visibleSections.map((section) => {
             const Icon = section.id.startsWith('issue-')
               ? Search
               : (sectionIcons[section.id as keyof typeof sectionIcons] ??

@@ -8943,6 +8943,12 @@
     "Unable to fetch models. Check the endpoint and API key.": "Impossible de récupérer les modèles. Vérifiez le point d'accès et la clé API.",
     "Enter the API key for this endpoint": "Saisissez la clé API de ce point d'accès",
     "Critical": "Critique",
-    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Modèle {{model}} · {{calls}} appels · {{tokens}} tokens en entrée · {{seconds}} s"
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Modèle {{model}} · {{calls}} appels · {{tokens}} tokens en entrée · {{seconds}} s",
+    "Filter issues": "Filtrer les problèmes",
+    "Severity": "Gravité",
+    "All severities": "Toutes les gravités",
+    "All channels": "Tous les canaux",
+    "{{shown}} of {{total}} issues": "{{shown}} problèmes sur {{total}}",
+    "{{days}} days reused from earlier reports": "{{days}} jours repris de rapports précédents"
   }
 }

@@ -8943,6 +8943,12 @@
     "Unable to fetch models. Check the endpoint and API key.": "モデルを取得できません。エンドポイントと API キーを確認してください。",
     "Enter the API key for this endpoint": "このエンドポイントの API キーを入力してください",
     "Critical": "重大",
-    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "モデル {{model}} · 呼び出し {{calls}} 回 · 入力 {{tokens}} トークン · {{seconds}} 秒"
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "モデル {{model}} · 呼び出し {{calls}} 回 · 入力 {{tokens}} トークン · {{seconds}} 秒",
+    "Filter issues": "問題を絞り込む",
+    "Severity": "重大度",
+    "All severities": "すべての重大度",
+    "All channels": "すべてのチャネル",
+    "{{shown}} of {{total}} issues": "{{total}} 件中 {{shown}} 件を表示",
+    "{{days}} days reused from earlier reports": "以前のレポートの {{days}} 日分を再利用"
   }
 }

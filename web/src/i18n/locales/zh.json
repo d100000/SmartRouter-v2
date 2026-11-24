@@ -8943,6 +8943,12 @@
     "Unable to fetch models. Check the endpoint and API key.": "无法获取模型，请检查地址和 API Key。",
     "Enter the API key for this endpoint": "请填写该地址的 API Key",
     "Critical": "严重",
-    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "模型 {{model}} · {{calls}} 次调用 · 输入 {{tokens}} token · {{seconds}} 秒"
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "模型 {{model}} · {{calls}} 次调用 · 输入 {{tokens}} token · {{seconds}} 秒",
+    "Filter issues": "筛选问题",
+    "Severity": "严重程度",
+    "All severities": "全部严重程度",
+    "All channels": "全部渠道",
+    "{{shown}} of {{total}} issues": "显示 {{shown}} / {{total}} 个问题",
+    "{{days}} days reused from earlier reports": "复用了此前报告的 {{days}} 天数据"
   }
 }

@@ -8943,6 +8943,12 @@
     "Unable to fetch models. Check the endpoint and API key.": "Không lấy được mô hình. Hãy kiểm tra địa chỉ và API key.",
     "Enter the API key for this endpoint": "Hãy nhập API key cho địa chỉ này",
     "Critical": "Nghiêm trọng",
-    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Mô hình {{model}} · {{calls}} lần gọi · {{tokens}} token đầu vào · {{seconds}} giây"
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Mô hình {{model}} · {{calls}} lần gọi · {{tokens}} token đầu vào · {{seconds}} giây",
+    "Filter issues": "Lọc vấn đề",
+    "Severity": "Mức độ nghiêm trọng",
+    "All severities": "Mọi mức độ",
+    "All channels": "Tất cả kênh",
+    "{{shown}} of {{total}} issues": "Hiển thị {{shown}} / {{total}} vấn đề",
+    "{{days}} days reused from earlier reports": "Dùng lại {{days}} ngày từ các báo cáo trước"
   }
 }

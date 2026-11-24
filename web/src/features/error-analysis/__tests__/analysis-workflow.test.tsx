@@ -586,6 +586,83 @@ describe('Error analysis workflow', () => {
     ).toBeVisible()
   })
 
+  test('issues of a report can be narrowed by severity, channel and model', async () => {
+    tasks = [
+      {
+        task_id: 'filtered-report',
+        status: 'succeeded',
+        payload: { start: 1000, end: 2000 },
+        created_at: 2000,
+        updated_at: 2100,
+        error: '',
+        state: null,
+        result: {
+          version: 2,
+          summary: 'Two kinds of failure.',
+          report: 'Full report',
+          model: 'test',
+          snapshot: { ...snapshot, logs: [] },
+          sections: [
+            {
+              id: 'issue-1',
+              title: 'Timeouts on two channels',
+              content: 'Upstream timed out.',
+              severity: 'critical',
+              affected: 12,
+              channels: ['1', '2'],
+              models: ['model-a'],
+            },
+            {
+              id: 'issue-2',
+              title: 'Rate limited on one channel',
+              content: 'Too many requests.',
+              severity: 'high',
+              affected: 3,
+              channels: ['3'],
+              models: ['model-b'],
+            },
+            { id: 'actions', title: 'Next steps', content: 'Check channel 1.' },
+          ],
+          sample_count: 0,
+          attempts: [],
+          complete: true,
+          coverage: { reused_days: 13, scanned_rows: 10, total_rows: 10 },
+          run: { calls: 2, input_tokens: 900, duration_ms: 4000 },
+        },
+      },
+    ]
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await user.click(screen.getByRole('tab', { name: 'AI analysis & history' }))
+    const filters = await screen.findByRole('group', { name: 'Filter issues' })
+    const heading = (name: RegExp) => screen.queryByRole('heading', { name })
+    expect(within(filters).getByText('2 of 2 issues')).toBeVisible()
+    expect(
+      screen.getByText(/13 days reused from earlier reports/)
+    ).toBeVisible()
+
+    await user.selectOptions(within(filters).getByLabelText('Channel'), '3')
+    expect(heading(/Timeouts on two channels/)).not.toBeInTheDocument()
+    expect(heading(/Rate limited on one channel/)).toBeVisible()
+    expect(heading(/Next steps/)).toBeVisible()
+    expect(within(filters).getByText('1 of 2 issues')).toBeVisible()
+
+    await user.selectOptions(within(filters).getByLabelText('Channel'), '')
+    await user.selectOptions(
+      within(filters).getByLabelText('Severity'),
+      'critical'
+    )
+    expect(heading(/Timeouts on two channels/)).toBeVisible()
+    expect(heading(/Rate limited on one channel/)).not.toBeInTheDocument()
+
+    await user.selectOptions(
+      within(filters).getByLabelText('Model'),
+      'model-b'
+    )
+    expect(within(filters).getByText('0 of 2 issues')).toBeVisible()
+    expect(heading(/Next steps/)).toBeVisible()
+  })
+
   test('a saved report opens its captured evidence instead of querying live logs', async () => {
     const row = {
       id: 9,

@@ -8943,6 +8943,12 @@
     "Unable to fetch models. Check the endpoint and API key.": "Unable to fetch models. Check the endpoint and API key.",
     "Enter the API key for this endpoint": "Enter the API key for this endpoint",
     "Critical": "Critical",
-    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s"
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s",
+    "Filter issues": "Filter issues",
+    "Severity": "Severity",
+    "All severities": "All severities",
+    "All channels": "All channels",
+    "{{shown}} of {{total}} issues": "{{shown}} of {{total}} issues",
+    "{{days}} days reused from earlier reports": "{{days}} days reused from earlier reports"
   }
 }

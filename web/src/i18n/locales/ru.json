@@ -8943,6 +8943,12 @@
     "Unable to fetch models. Check the endpoint and API key.": "Не удалось получить модели. Проверьте адрес и API-ключ.",
     "Enter the API key for this endpoint": "Введите API-ключ для этого адреса",
     "Critical": "Критично",
-    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Модель {{model}} · вызовов: {{calls}} · входных токенов: {{tokens}} · {{seconds}} с"
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Модель {{model}} · вызовов: {{calls}} · входных токенов: {{tokens}} · {{seconds}} с",
+    "Filter issues": "Фильтр проблем",
+    "Severity": "Серьёзность",
+    "All severities": "Любая серьёзность",
+    "All channels": "Все каналы",
+    "{{shown}} of {{total}} issues": "Показано {{shown}} из {{total}} проблем",
+    "{{days}} days reused from earlier reports": "{{days}} дн. взято из прежних отчётов"
   }
 }
