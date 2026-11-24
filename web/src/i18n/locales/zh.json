@@ -8928,6 +8928,7 @@
     "Scheduling configuration is unavailable": "调度配置不可用",
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "此节点无法解密已保存的密钥，请改为替换密钥而不是追加",
     "channel credential cannot be decrypted on this node": "此节点无法解密渠道凭据",
-    "The refunded task completed later and was charged again": "已退款的任务后来完成，已重新扣费"
+    "The refunded task completed later and was charged again": "已退款的任务后来完成，已重新扣费",
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "请求的输出超过模型的输出上限，已自动降低输出预算。"
   }
 }

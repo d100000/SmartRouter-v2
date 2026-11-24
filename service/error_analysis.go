@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -78,12 +80,26 @@ type AnalysisResult struct {
 // compactAnalysisEvidence applies the same evidence bounds to every sampled
 // request and retry. Flags distinguish omitted evidence from absent evidence.
 func compactAnalysisEvidence(entry *model.FailureLog) {
+	compactAnalysisEvidenceRecords(entry, 5)
+}
+
+// compactAnalysisEvidenceRecords keeps up to limit retries. Follow-up requests
+// ask for the fuller retry history, so they use a larger limit.
+func compactAnalysisEvidenceRecords(entry *model.FailureLog, limit int) {
+	// The stored retry list includes the representative attempt itself. The
+	// model needs it once: as the entry, not again among its retries.
+	for i, record := range entry.Records {
+		if sameFailureAttempt(record, *entry) {
+			entry.Records = append(slices.Clone(entry.Records[:i]), entry.Records[i+1:]...)
+			break
+		}
+	}
 	if len([]rune(entry.ErrorMessage)) > 1024 {
 		entry.ErrorTruncated = true
 	}
 	entry.ErrorMessage = model.SafeFailureFact(entry.ErrorMessage, 1024)
-	if len(entry.Records) > 5 {
-		entry.Records = entry.Records[:5]
+	if len(entry.Records) > limit {
+		entry.Records = entry.Records[:limit]
 		entry.RecordsTruncated = true
 	}
 	for i := range entry.Records {
@@ -116,6 +132,10 @@ func compactAnalysisEvidence(entry *model.FailureLog) {
 			}
 		}
 	}
+}
+
+func sameFailureAttempt(a, b model.FailureLog) bool {
+	return a.ID == b.ID && a.CreatedAt == b.CreatedAt && a.LogType == b.LogType && a.Channel == b.Channel && a.RequestID == b.RequestID && a.ErrorMessage == b.ErrorMessage
 }
 
 type analysisFailure struct {
@@ -181,7 +201,26 @@ func StartErrorAnalysis(filter model.ErrorAnalysisFilter) (*model.SystemTask, bo
 	return EnqueueSystemTask(model.ErrorAnalysisTaskType, errorAnalysisPayload{ErrorAnalysisFilter: filter, WorkflowVersion: 2})
 }
 
+// analysisEvidenceRetention bounds how long per-request evidence of finished
+// analyses stays in the main database. Override with
+// ERROR_ANALYSIS_EVIDENCE_RETENTION_DAYS (0 keeps evidence until the report is
+// deleted).
+func analysisEvidenceRetention() time.Duration {
+	days := 30
+	if value := strings.TrimSpace(os.Getenv("ERROR_ANALYSIS_EVIDENCE_RETENTION_DAYS")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed >= 0 {
+			days = parsed
+		}
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
 func (handler errorAnalysisHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	if retention := analysisEvidenceRetention(); retention > 0 {
+		if _, err := model.PruneErrorAnalysisEvidence(ctx, time.Now().Add(-retention).Unix()); err != nil {
+			logger.LogError(ctx, common.LogText("error analysis evidence pruning failed: %v", err))
+		}
+	}
 	var payload errorAnalysisPayload
 	if task.DecodePayload(&payload) == nil && payload.WorkflowVersion == 2 {
 		handler.runWorkflow(ctx, task, runnerID)

@@ -8928,6 +8928,7 @@
     "Scheduling configuration is unavailable": "Конфигурация планирования недоступна",
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "Сохранённые ключи нельзя расшифровать на этом узле. Замените их вместо добавления",
     "channel credential cannot be decrypted on this node": "учётные данные канала нельзя расшифровать на этом узле",
-    "The refunded task completed later and was charged again": "Возвращённая задача позже завершилась и была оплачена повторно"
+    "The refunded task completed later and was charged again": "Возвращённая задача позже завершилась и была оплачена повторно",
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "Запрошенный вывод превышает лимит модели. Бюджет вывода уменьшается автоматически."
   }
 }

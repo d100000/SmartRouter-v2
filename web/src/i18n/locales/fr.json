@@ -8928,6 +8928,7 @@
     "Scheduling configuration is unavailable": "La configuration de l’ordonnancement est indisponible",
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "Les clés enregistrées ne peuvent pas être déchiffrées sur ce nœud. Remplacez-les au lieu d’en ajouter",
     "channel credential cannot be decrypted on this node": "les identifiants du canal ne peuvent pas être déchiffrés sur ce nœud",
-    "The refunded task completed later and was charged again": "La tâche remboursée s’est terminée plus tard et a été facturée à nouveau"
+    "The refunded task completed later and was charged again": "La tâche remboursée s’est terminée plus tard et a été facturée à nouveau",
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "La sortie demandée dépasse la limite du modèle. Le budget de sortie est réduit automatiquement."
   }
 }

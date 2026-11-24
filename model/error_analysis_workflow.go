@@ -1008,3 +1008,57 @@ func recoverExpiredErrorAnalysisTask(taskID string) (bool, error) {
 	})
 	return handled, err
 }
+
+// PruneErrorAnalysisEvidence removes per-request evidence and cached model
+// replies of analyses last updated before the cutoff. A completed report keeps
+// its result, statistics and findings; the evidence dialog then reports that
+// the evidence has expired. A failed analysis keeps only its configuration, so
+// a late resume collects again instead of aggregating a partial snapshot.
+// Deletes run in small batches to keep transactions short.
+func PruneErrorAnalysisEvidence(ctx context.Context, cutoff int64) (int64, error) {
+	var removed int64
+	for _, scope := range []struct {
+		status SystemTaskStatus
+		kinds  func(*gorm.DB) *gorm.DB
+	}{
+		{SystemTaskStatusSucceeded, func(q *gorm.DB) *gorm.DB { return q.Where("kind IN ?", []string{"request", "completion"}) }},
+		{SystemTaskStatusFailed, func(q *gorm.DB) *gorm.DB { return q.Where("kind <> ?", "config") }},
+	} {
+		count, err := pruneErrorAnalysisArtifacts(ctx, cutoff, scope.status, scope.kinds)
+		removed += count
+		if err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
+func pruneErrorAnalysisArtifacts(ctx context.Context, cutoff int64, status SystemTaskStatus, kinds func(*gorm.DB) *gorm.DB) (int64, error) {
+	var removed int64
+	for {
+		var taskIDs []string
+		err := DB.WithContext(ctx).Model(&SystemTask{}).
+			Where("type = ? AND status = ? AND updated_at < ?", ErrorAnalysisTaskType, status, cutoff).
+			Where("EXISTS (?)", kinds(DB.Model(&ErrorAnalysisArtifact{}).Select("1").Where("error_analysis_artifacts.task_id = system_tasks.task_id"))).
+			Order("id asc").Limit(20).Pluck("task_id", &taskIDs).Error
+		if err != nil || len(taskIDs) == 0 {
+			return removed, err
+		}
+		for _, taskID := range taskIDs {
+			for {
+				var ids []int64
+				if err := kinds(DB.WithContext(ctx).Model(&ErrorAnalysisArtifact{}).Where("task_id = ?", taskID)).Order("id asc").Limit(1000).Pluck("id", &ids).Error; err != nil {
+					return removed, err
+				}
+				if len(ids) == 0 {
+					break
+				}
+				result := DB.WithContext(ctx).Where("id IN ?", ids).Delete(&ErrorAnalysisArtifact{})
+				if result.Error != nil {
+					return removed, result.Error
+				}
+				removed += result.RowsAffected
+			}
+		}
+	}
+}

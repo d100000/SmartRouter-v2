@@ -341,7 +341,7 @@ func TestErrorAnalysisDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, model.SystemTaskStatusFailed, stale.Status)
 			assert.Equal(t, "task lease expired", stale.Error)
 			assert.ErrorIs(t, model.UpdateSystemTaskState(second.TaskID, "lost-worker", state), model.ErrSystemTaskLockLost)
-			loc, err := time.LoadLocation("Asia/Shanghai")
+			loc, err := time.LoadLocation(defaultAnalysisTimezone)
 			require.NoError(t, err)
 			morning := time.Date(2026, 10, 29, 3, 0, 0, 0, loc)
 			assert.True(t, (errorAnalysisHandler{}).Due(morning, &model.SystemTask{CreatedAt: morning.AddDate(0, 0, -1).Unix()}))
@@ -965,7 +965,7 @@ func TestErrorAnalysisNonStreamingCompletion(t *testing.T) {
 				}
 				require.NoError(t, common.DecodeJson(request.Body, &payload))
 				assert.False(t, payload.Stream)
-				assert.Equal(t, 2048, payload.MaxTokens)
+				assert.Equal(t, defaultAnalysisMaxOutput, payload.MaxTokens)
 				assert.Equal(t, "application/json", request.Header.Get("Accept"))
 				assert.Equal(t, "Bearer test-key", request.Header.Get("Authorization"))
 				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.body)), Request: request}, nil
@@ -1491,6 +1491,12 @@ func TestErrorAnalysisWorkflowResumesSizeFailureBySplitting(t *testing.T) {
 			})}
 			task, _, err := StartErrorAnalysis(filter)
 			require.NoError(t, err)
+			// A truncated parent first asks for more output (16K, 32K, then the
+			// 64K ceiling) before it is split; an input overflow splits at once.
+			maxParent := 1
+			if sizeFailure == "length" {
+				maxParent = 3
+			}
 			completed := false
 			for run := range 10 {
 				if run > 0 {
@@ -1504,17 +1510,18 @@ func TestErrorAnalysisWorkflowResumesSizeFailureBySplitting(t *testing.T) {
 				(errorAnalysisHandler{client: client}).Run(context.Background(), claimed, runner)
 				task, err = model.GetSystemTaskByTaskID(task.TaskID)
 				require.NoError(t, err)
-				assert.Equal(t, 1, parentCalls, "resuming must reuse the known size failure instead of sending the parent again")
+				assert.LessOrEqual(t, parentCalls, maxParent, "resuming must reuse the known size failure instead of sending the parent again")
 				if task.Status == model.SystemTaskStatusSucceeded {
 					completed = true
 					break
 				}
 				require.Equal(t, "analysis_call_budget_exhausted", task.Error)
-				if run == 1 {
+				if run == maxParent {
 					assert.Equal(t, 1, childCalls["split-A"]+childCalls["split-B"], "one granted call advances to a smaller child")
 				}
 			}
 			require.True(t, completed, "repeated explicit one-call resumes must eventually finish the bounded workflow")
+			assert.Equal(t, maxParent, parentCalls)
 			assert.Equal(t, map[string]int{"split-A": 1, "split-B": 1}, childCalls)
 			var result AnalysisResult
 			require.NoError(t, common.UnmarshalJsonStr(string(task.Result), &result))
@@ -1565,7 +1572,9 @@ func TestErrorAnalysisWorkflowFollowUpPreservesOtherFindings(t *testing.T) {
 			expandedSeen = true
 			require.Len(t, group.Samples, 1)
 			assert.Equal(t, "follow-A", group.Samples[0].RequestID)
-			assert.Len(t, group.Samples[0].Records, 6, "follow-up must load the additional saved retry evidence")
+			// Six attempts: the representative one is the sample itself, the other
+			// five are its retry records.
+			assert.Len(t, group.Samples[0].Records, 5, "follow-up must load the additional saved retry evidence")
 			return analysisWorkflowTestResponse(t, request, analysisFinding{Title: "A retry evidence", Facts: []string{"A had six failed attempts"}, EvidenceIDs: []string{"follow-A"}}, "stop")
 		}
 		if gjson.Parse(input).IsArray() {

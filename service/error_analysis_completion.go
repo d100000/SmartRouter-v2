@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/tokenkit"
+	"github.com/tidwall/gjson"
 )
 
 type errorAnalysisPayload struct {
@@ -30,19 +31,19 @@ type AnalysisReportSection struct {
 // The context setting is an operator limit, not a claim about provider capacity.
 func normalizeAnalysisBudgets(config ErrorAnalysisConfig) ErrorAnalysisConfig {
 	if config.ContextWindowTokens == 0 {
-		config.ContextWindowTokens = 32768
+		config.ContextWindowTokens = defaultAnalysisContextWindow
 	}
 	if config.ChunkInputTokens == 0 {
-		config.ChunkInputTokens = 8000
+		config.ChunkInputTokens = defaultAnalysisChunkInput
 	}
 	if config.MaxOutputTokens == 0 {
-		config.MaxOutputTokens = 2048
+		config.MaxOutputTokens = defaultAnalysisMaxOutput
 	}
 	if config.SafetyMarginTokens == 0 {
-		config.SafetyMarginTokens = 4096
+		config.SafetyMarginTokens = defaultAnalysisSafetyMargin
 	}
 	if config.MaxCalls == 0 {
-		config.MaxCalls = 100
+		config.MaxCalls = defaultAnalysisMaxCalls
 	}
 	return config
 }
@@ -124,11 +125,6 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 		return "", &analysisFailure{Code: "analysis_response_too_large"}
 	}
 	var completion struct {
-		Error *struct {
-			Code    string `json:"code"`
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
@@ -137,7 +133,9 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 		} `json:"choices"`
 	}
 	decodeErr := common.Unmarshal(data, &completion)
-	if response.StatusCode != http.StatusOK || completion.Error != nil {
+	providerError := gjson.GetBytes(data, "error")
+	hasProviderError := providerError.Exists() && providerError.Type != gjson.Null
+	if response.StatusCode != http.StatusOK || hasProviderError {
 		failure := &analysisFailure{Code: "analysis_http_error", Status: response.StatusCode, Retryable: response.StatusCode == 408 || response.StatusCode == 429 || response.StatusCode >= 500}
 		switch response.StatusCode {
 		case 401, 403:
@@ -147,12 +145,11 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 		case 400, 404, 422:
 			failure.Code = "analysis_invalid_request"
 		}
-		if completion.Error != nil {
-			code := strings.ToLower(completion.Error.Code + " " + completion.Error.Type)
-			message := strings.ToLower(completion.Error.Message)
-			if strings.Contains(code, "context_length") || strings.Contains(code, "context_window") || strings.Contains(message, "maximum context length") || strings.Contains(message, "context window exceeded") {
-				failure.Code, failure.Retryable = "analysis_context_limit", false
-			}
+		switch classifyAnalysisSizeError(response.StatusCode, data) {
+		case "input":
+			failure.Code, failure.Retryable = "analysis_context_limit", false
+		case "output":
+			failure.Code, failure.Retryable = "analysis_output_limit", false
 		}
 		// Respect bounded Retry-After without retaining provider-controlled text.
 		if seconds, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && seconds > 0 {
@@ -182,6 +179,52 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 		content = strings.ReplaceAll(content, key, "[redacted]")
 	}
 	return content, nil
+}
+
+// Size errors are worded differently by every provider and gateway, and the
+// error may be an object, a bare string or a top-level message. Only the
+// classification is kept; provider text never reaches diagnostics.
+var (
+	analysisOutputLimitMarkers = []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "maximum output", "output token"}
+	analysisInputLimitMarkers  = []string{
+		"context_length", "context length", "context_window", "context window", "maximum context",
+		"prompt is too long", "prompt too long", "prompt_too_long", "input is too long", "input too long", "input_too_long",
+		"too many tokens", "too_many_tokens", "too many input tokens", "request too large", "request_too_large",
+		"reduce the length", "exceeds the maximum", "token limit", "string_above_max_length",
+		"上下文", "超出最大", "过长", "太长",
+	}
+)
+
+func classifyAnalysisSizeError(status int, data []byte) string {
+	if status == http.StatusTooManyRequests || status >= 500 {
+		return "" // Rate and capacity limits are retried, never split.
+	}
+	root := gjson.ParseBytes(data)
+	parts := []string{root.Get("message").String()}
+	if node := root.Get("error"); node.IsObject() {
+		parts = append(parts, node.Get("code").String(), node.Get("type").String(), node.Get("message").String())
+	} else if node.Exists() {
+		parts = append(parts, node.String())
+	}
+	if !root.Exists() || !root.IsObject() {
+		// Proxies often answer an oversized body with plain text or HTML.
+		parts = append(parts, string(data[:min(len(data), 2048)]))
+	}
+	text := strings.ToLower(strings.Join(parts, " "))
+	for _, marker := range analysisOutputLimitMarkers {
+		if strings.Contains(text, marker) {
+			return "output"
+		}
+	}
+	if status == http.StatusRequestEntityTooLarge {
+		return "input"
+	}
+	for _, marker := range analysisInputLimitMarkers {
+		if strings.Contains(text, marker) {
+			return "input"
+		}
+	}
+	return ""
 }
 
 func newAnalysisCompletionClient(timeout time.Duration) *http.Client {

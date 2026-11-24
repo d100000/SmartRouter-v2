@@ -38,10 +38,52 @@ type ErrorAnalysisConfig struct {
 	MaxOutputTokens     int    `json:"max_output_tokens"`
 	SafetyMarginTokens  int    `json:"safety_margin_tokens"`
 	MaxCalls            int    `json:"max_calls"`
+	// DefaultsRevision records which built-in defaults a stored configuration
+	// has been upgraded to. Values still equal to an older default move to the
+	// current one once; values an operator changed are kept.
+	DefaultsRevision int `json:"defaults_revision,omitempty"`
+}
+
+const errorAnalysisDefaultsRevision = 2
+
+const (
+	defaultAnalysisContextWindow = 131072
+	defaultAnalysisChunkInput    = 65536
+	defaultAnalysisMaxOutput     = 16384
+	defaultAnalysisSafetyMargin  = 4096
+	defaultAnalysisMaxCalls      = 200
+	defaultAnalysisTimezone      = "Asia/Ho_Chi_Minh"
+)
+
+// upgradeAnalysisDefaults replaces values that still match the first release's
+// defaults. Those budgets (8000 input, 2048 output) were too small for reasoning
+// models and split ordinary evidence into dozens of calls.
+func upgradeAnalysisDefaults(config ErrorAnalysisConfig) ErrorAnalysisConfig {
+	if config.DefaultsRevision >= errorAnalysisDefaultsRevision {
+		return config
+	}
+	for _, field := range []struct {
+		value     *int
+		old, next int
+	}{
+		{&config.ContextWindowTokens, 32768, defaultAnalysisContextWindow},
+		{&config.ChunkInputTokens, 8000, defaultAnalysisChunkInput},
+		{&config.MaxOutputTokens, 2048, defaultAnalysisMaxOutput},
+		{&config.MaxCalls, 100, defaultAnalysisMaxCalls},
+	} {
+		if *field.value == field.old {
+			*field.value = field.next
+		}
+	}
+	if config.Timezone == "Asia/Shanghai" {
+		config.Timezone = defaultAnalysisTimezone
+	}
+	config.DefaultsRevision = errorAnalysisDefaultsRevision
+	return config
 }
 
 func GetErrorAnalysisConfig() (ErrorAnalysisConfig, error) {
-	config := ErrorAnalysisConfig{Endpoint: "https://api.bob-api.com/v1/chat/completions", Model: "deepseek-v4.1-flash", Timezone: "Asia/Shanghai", Hour: 3, MaxAttempts: 3, TimeoutSeconds: 600, IdleSeconds: 60, SampleLimit: 60, ReportLanguage: "zh", ContextWindowTokens: 32768, ChunkInputTokens: 8000, MaxOutputTokens: 2048, SafetyMarginTokens: 4096, MaxCalls: 100}
+	config := ErrorAnalysisConfig{Endpoint: "https://api.bob-api.com/v1/chat/completions", Model: "deepseek-v4.1-flash", Timezone: defaultAnalysisTimezone, Hour: 3, MaxAttempts: 3, TimeoutSeconds: 600, IdleSeconds: 60, SampleLimit: 60, ReportLanguage: "zh", ContextWindowTokens: defaultAnalysisContextWindow, ChunkInputTokens: defaultAnalysisChunkInput, MaxOutputTokens: defaultAnalysisMaxOutput, SafetyMarginTokens: defaultAnalysisSafetyMargin, MaxCalls: defaultAnalysisMaxCalls, DefaultsRevision: errorAnalysisDefaultsRevision}
 	var option model.Option
 	err := model.DB.Where(map[string]any{"key": errorAnalysisConfigOption}).Take(&option).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -53,7 +95,7 @@ func GetErrorAnalysisConfig() (ErrorAnalysisConfig, error) {
 	if err := common.UnmarshalJsonStr(option.Value, &config); err != nil {
 		return config, common.NewMessage("Invalid error analysis configuration")
 	}
-	config = normalizeAnalysisBudgets(config)
+	config = upgradeAnalysisDefaults(normalizeAnalysisBudgets(config))
 	config.APIKeyConfigured = config.EncryptedKey != ""
 	return config, nil
 }
@@ -146,6 +188,7 @@ func SaveErrorAnalysisConfig(config ErrorAnalysisConfig, key string, clearKey bo
 		return common.NewMessage("Configure an analysis API key first")
 	}
 	config.Version++
+	config.DefaultsRevision = errorAnalysisDefaultsRevision
 	config.APIKeyConfigured = config.EncryptedKey != ""
 	raw, err := common.Marshal(config)
 	if err != nil {

@@ -113,6 +113,9 @@ export function useAnalysisLabels(): Record<string, string> {
     analysis_context_limit: t(
       'The request exceeded the model context limit. Review the context settings.'
     ),
+    analysis_output_limit: t(
+      'The requested output exceeded the model output limit. The output budget is reduced automatically.'
+    ),
     analysis_invalid_response: t('The provider returned an invalid response.'),
     analysis_invalid_finding: t(
       'The model returned findings that could not be verified.'
