@@ -64,3 +64,21 @@ This repo is new-api plus local routing and supplier extensions (see the merge c
 - Supplier features: `controller/supplier*.go`, `router/supplier-router.go`, `middleware/supplier_auth.go`; product plans in `design-plans/`.
 
 `.local-tests/` holds ad-hoc local verification artifacts and logs, not part of the test suite.
+
+## Open item: MySQL verification of error analysis (run after go-live)
+
+Status: **OPEN**, recorded 2026-11-25 at the owner's request. Delete this section once both steps are done and the result is recorded.
+
+The error analysis changes (`83b4503`, `db4fa2f`, `e5a5891`, `a50e83e` and later error-analysis commits) were verified on real SQLite and PostgreSQL 16.15 only. No MySQL instance was available, so the three-database rule in AGENTS.md is not met yet. Do not describe these changes as verified on MySQL until the steps below have been run.
+
+1. **Run one analysis on the live MySQL deployment.** After the release is deployed, start an error analysis from the console over a real range (for example the last 7 days) and let it finish. Check that the task succeeds, the server log has no SQL error from `error_analysis`, and the request totals in the report match the usage log for the same range.
+2. **Run the test suite on MySQL.** The tests drop and recreate their tables, so use a throwaway database, never the production one:
+
+   ```bash
+   TEST_ANALYSIS_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/analysis_test?charset=utf8mb4&parseTime=True&loc=Local' \
+     go test -race -count=1 -p 1 -run 'ErrorAnalysis|TestAnalysis' ./service/
+   ```
+
+Points that differ on MySQL and deserve a look: request IDs compare case-insensitively under the default collation (the exact request lookup filters again in Go); upserts into `error_analysis_artifacts` use `ON DUPLICATE KEY UPDATE`; the look-ahead for later rows of a request uses `idx_logs_request_id` with up to 1,000 IDs per page.
+
+Record the MySQL version, the commands and the results in the handoff, as AGENTS.md requires.
