@@ -327,7 +327,9 @@ export function parseTaskResult() {return {status:"SUCCESS"};}`)
 	}{
 		{"unknown cost", model.ChannelLimitSettings{DailyUSDNano: 1000}, http.StatusServiceUnavailable, 0},
 		{"token limit", model.ChannelLimitSettings{TPM: 1}, http.StatusTooManyRequests, 0},
-		{"provider failure", model.ChannelLimitSettings{}, http.StatusBadGateway, 1},
+		// The one retry returns to the channel that was sent to: the RPM
+		// channel declined before dispatch and is not asked again.
+		{"provider failure", model.ChannelLimitSettings{}, http.StatusBadGateway, 2},
 	} {
 		for _, rpmFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/rpm_first_%t", other.name, rpmFirst), func(t *testing.T) {
