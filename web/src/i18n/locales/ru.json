@@ -8941,6 +8941,8 @@
     "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "Выбранная модель не распознана. Используются осторожные значения; настройте их под провайдера.",
     "Parallel model calls (0 = preset)": "Параллельные вызовы модели (0 = пресет)",
     "Unable to fetch models. Check the endpoint and API key.": "Не удалось получить модели. Проверьте адрес и API-ключ.",
-    "Enter the API key for this endpoint": "Введите API-ключ для этого адреса"
+    "Enter the API key for this endpoint": "Введите API-ключ для этого адреса",
+    "Critical": "Критично",
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Модель {{model}} · вызовов: {{calls}} · входных токенов: {{tokens}} · {{seconds}} с"
   }
 }

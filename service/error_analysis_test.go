@@ -1065,7 +1065,9 @@ func TestErrorAnalysisWorkflowResumesSavedResults(t *testing.T) {
 	t.Setenv("CRYPTO_SECRET", "workflow-test-secret-not-for-production")
 	config, err := GetErrorAnalysisConfig()
 	require.NoError(t, err)
-	config.MaxCalls, config.MaxAttempts, config.Timezone = 2, 1, "UTC"
+	// One call finishes the only anomaly group; the final summary call then
+	// exceeds the budget, so the run pauses between the two.
+	config.MaxCalls, config.MaxAttempts, config.Timezone = 1, 1, "UTC"
 	require.NoError(t, SaveErrorAnalysisConfig(config, "workflow-key", false))
 	start := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
 	filter := model.ErrorAnalysisFilter{Start: start, End: start + 7*86400}
@@ -1096,7 +1098,7 @@ func TestErrorAnalysisWorkflowResumesSavedResults(t *testing.T) {
 		content := "根据证据检查渠道响应耗时，当前原因尚未确认。"
 		input := gjson.Parse(payload.Messages[1].Content)
 		channel := input.Get("channel_comparisons.0")
-		if strings.Contains(payload.Messages[0].Content, "Return ONLY a JSON object") {
+		if input.Get("samples").IsArray() {
 			assert.Equal(t, "2024-01-08 00:00", input.Get("current_window.start").String())
 			assert.Equal(t, "2024-01-15 00:00", input.Get("current_window.end").String())
 			assert.Equal(t, "2024-01-01 00:00", input.Get("previous_window.start").String())
@@ -1129,9 +1131,9 @@ func TestErrorAnalysisWorkflowResumesSavedResults(t *testing.T) {
 	var pausedState AnalysisState
 	require.NoError(t, paused.DecodeState(&pausedState))
 	assert.True(t, pausedState.CanResume)
-	assert.Equal(t, 2, pausedState.CallsUsed)
+	assert.Equal(t, 1, pausedState.CallsUsed)
 	assert.Equal(t, 1, pausedState.CompletedChunks)
-	assert.Equal(t, 2, calls)
+	assert.Equal(t, 1, calls)
 	before, err := model.GetErrorAnalysisRequestEvidence(task.TaskID, "current-error")
 	require.NoError(t, err)
 	require.NotNil(t, before)
@@ -1151,7 +1153,7 @@ func TestErrorAnalysisWorkflowResumesSavedResults(t *testing.T) {
 	completed, err := model.GetSystemTaskByTaskID(task.TaskID)
 	require.NoError(t, err)
 	assert.Equal(t, model.SystemTaskStatusSucceeded, completed.Status, completed.Error)
-	assert.Equal(t, 4, calls, "the successful finding and section must not call the model again")
+	assert.Equal(t, 2, calls, "the saved finding must not call the model again; one call writes the summary")
 	var result AnalysisResult
 	require.NoError(t, common.UnmarshalJsonStr(string(completed.Result), &result))
 	assert.True(t, result.Complete)
@@ -1401,6 +1403,9 @@ func TestErrorAnalysisWorkflowCollectionPassesLegacyLimit(t *testing.T) {
 	for i := range logs {
 		logs[i] = model.Log{RequestId: fmt.Sprintf("coverage-%05d", i), Type: model.LogTypeConsume, CreatedAt: start + 1, CompletionTokens: 1}
 	}
+	// The last request fails, so its evidence is kept; the 50,000 clean
+	// requests before it are only counted.
+	logs[50000].Type, logs[50000].Other = model.LogTypeError, `{"error_code":"timeout"}`
 	require.NoError(t, db.CreateInBatches(&logs, 250).Error)
 	task, err := model.CreateSystemTask(model.ErrorAnalysisTaskType, errorAnalysisPayload{ErrorAnalysisFilter: filter, WorkflowVersion: 2}, AnalysisState{Version: 2})
 	require.NoError(t, err)
@@ -1421,6 +1426,24 @@ func TestErrorAnalysisWorkflowCollectionPassesLegacyLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, last, "the request beyond the legacy limit must be retained")
 	assert.Equal(t, "coverage-50000", last.RequestID)
+	clean, err := model.GetErrorAnalysisRequestEvidence(task.TaskID, "coverage-00001")
+	require.NoError(t, err)
+	assert.Nil(t, clean, "a clean single-row request is counted, not stored")
+	var stored int64
+	require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("task_id = ? AND kind = ?", task.TaskID, "request").Count(&stored).Error)
+	assert.EqualValues(t, 1, stored)
+	for {
+		progress, err := model.AggregateErrorAnalysisPage(context.Background(), task.TaskID, "coverage-test", 500, 8)
+		require.NoError(t, err)
+		if progress.Done {
+			break
+		}
+	}
+	snapshot, err := model.LoadErrorAnalysisWorkflowSnapshot(task.TaskID)
+	require.NoError(t, err)
+	assert.Equal(t, len(logs), snapshot.Current.Requests)
+	assert.Equal(t, 1, snapshot.Current.Errors)
+	assert.Equal(t, 1, snapshot.Current.Affected)
 }
 
 func analysisWorkflowTestResponse(t *testing.T, request *http.Request, content any, finish string) (*http.Response, error) {
@@ -1730,7 +1753,7 @@ func TestErrorAnalysisWorkflowResumesFailedFinalSave(t *testing.T) {
 		} else {
 			require.Equal(t, model.SystemTaskStatusSucceeded, task.Status, task.Error)
 			assert.True(t, gjson.Get(string(task.Result), "complete").Bool())
-			assert.Equal(t, 3, calls, "retrying the final save reuses all completed narrative calls")
+			assert.Equal(t, 1, calls, "retrying the final save reuses the completed summary call")
 		}
 	}
 }

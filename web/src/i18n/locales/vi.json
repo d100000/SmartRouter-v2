@@ -8941,6 +8941,8 @@
     "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "Mô hình đã chọn chưa được nhận diện. Áp dụng giá trị mặc định thận trọng; hãy điều chỉnh theo nhà cung cấp.",
     "Parallel model calls (0 = preset)": "Số lệnh gọi song song (0 = theo cấu hình)",
     "Unable to fetch models. Check the endpoint and API key.": "Không lấy được mô hình. Hãy kiểm tra địa chỉ và API key.",
-    "Enter the API key for this endpoint": "Hãy nhập API key cho địa chỉ này"
+    "Enter the API key for this endpoint": "Hãy nhập API key cho địa chỉ này",
+    "Critical": "Nghiêm trọng",
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Mô hình {{model}} · {{calls}} lần gọi · {{tokens}} token đầu vào · {{seconds}} giây"
   }
 }

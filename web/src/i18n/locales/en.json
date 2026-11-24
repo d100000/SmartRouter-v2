@@ -8941,6 +8941,8 @@
     "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.",
     "Parallel model calls (0 = preset)": "Parallel model calls (0 = preset)",
     "Unable to fetch models. Check the endpoint and API key.": "Unable to fetch models. Check the endpoint and API key.",
-    "Enter the API key for this endpoint": "Enter the API key for this endpoint"
+    "Enter the API key for this endpoint": "Enter the API key for this endpoint",
+    "Critical": "Critical",
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s"
   }
 }

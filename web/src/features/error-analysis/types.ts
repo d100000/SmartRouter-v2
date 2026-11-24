@@ -95,6 +95,7 @@ export type AnalysisConfig = {
   max_concurrency?: number
   preset?: string
 }
+export type AnalysisSeverity = 'critical' | 'high' | 'medium' | 'low'
 export type AnalysisModelPreset = {
   id: string
   name: string
@@ -177,7 +178,19 @@ export type AnalysisTask = {
       title: string
       content: string
       evidence_ids?: string[]
+      severity?: AnalysisSeverity
+      affected?: number
+      previous_affected?: number
+      channels?: string[]
+      models?: string[]
     }[]
+    severity?: AnalysisSeverity | 'none'
+    run?: {
+      preset?: string
+      calls: number
+      input_tokens: number
+      duration_ms: number
+    }
     coverage?: {
       stable?: boolean
       complete?: boolean

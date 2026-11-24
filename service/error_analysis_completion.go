@@ -25,6 +25,13 @@ type AnalysisReportSection struct {
 	Title       string   `json:"title"`
 	Content     string   `json:"content"`
 	EvidenceIDs []string `json:"evidence_ids,omitempty"`
+	// Issue sections also carry the server-computed severity (critical, high,
+	// medium, low), affected requests in both periods and where they occur.
+	Severity string   `json:"severity,omitempty"`
+	Affected int      `json:"affected,omitempty"`
+	Previous int      `json:"previous_affected,omitempty"`
+	Channels []string `json:"channels,omitempty"`
+	Models   []string `json:"models,omitempty"`
 }
 
 // normalizeAnalysisBudgets keeps previously stored configurations readable.

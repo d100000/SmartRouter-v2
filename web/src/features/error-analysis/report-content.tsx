@@ -30,13 +30,39 @@ import { useTranslation } from 'react-i18next'
 
 import { StaticDataTable } from '@/components/data-table'
 import { LoadingState } from '@/components/loading-state'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber, formatTimestamp } from '@/lib/format'
 
 import { useAnalysisLabels } from './labels'
 import { RequestEvidenceDialog } from './request-evidence-dialog'
-import type { AnalysisTask, FailureCounts, FailureLog } from './types'
+import type {
+  AnalysisSeverity,
+  AnalysisTask,
+  FailureCounts,
+  FailureLog,
+} from './types'
+
+const severityClass: Record<AnalysisSeverity, string> = {
+  critical: 'bg-destructive/15 text-destructive',
+  high: 'bg-orange-500/15 text-orange-700 dark:text-orange-400',
+  medium: 'bg-amber-500/15 text-amber-700 dark:text-amber-400',
+  low: 'bg-muted text-muted-foreground',
+}
+
+function SeverityBadge(props: { severity?: string }) {
+  const { t } = useTranslation()
+  const severity = props.severity as AnalysisSeverity | undefined
+  if (!severity || !(severity in severityClass)) return null
+  const labels: Record<AnalysisSeverity, string> = {
+    critical: t('Critical'),
+    high: t('High'),
+    medium: t('Medium'),
+    low: t('Low'),
+  }
+  return <Badge className={severityClass[severity]}>{labels[severity]}</Badge>
+}
 
 const Markdown = lazy(() =>
   import('@/components/ui/markdown').then((module) => ({
@@ -90,10 +116,24 @@ export function ReportContent(props: { task: AnalysisTask }) {
           <h3 className='flex items-center gap-2 font-semibold'>
             <Pin aria-hidden className='size-4' />
             {t('Report summary')}
+            <SeverityBadge severity={result.severity} />
           </h3>
           <p className='text-sm leading-relaxed break-words whitespace-pre-line'>
             {result.summary}
           </p>
+          {result.run && result.run.calls > 0 && (
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s',
+                {
+                  model: result.model,
+                  calls: result.run.calls,
+                  tokens: formatNumber(result.run.input_tokens, locale),
+                  seconds: Math.round(result.run.duration_ms / 1000),
+                }
+              )}
+            </p>
+          )}
         </section>
       )}
       {versioned && !props.task.payload.request_id && (
@@ -216,7 +256,21 @@ export function ReportContent(props: { task: AnalysisTask }) {
                     <Icon aria-hidden className='size-4 shrink-0' />
                   )}
                   {section.title}
+                  <SeverityBadge severity={section.severity} />
                 </h3>
+                {section.id.startsWith('issue-') &&
+                  section.affected !== undefined && (
+                    <p className='text-muted-foreground text-xs'>
+                      {t('Affected requests')}:{' '}
+                      {formatNumber(section.affected, locale)}
+                      {(section.previous_affected ?? 0) > 0 &&
+                        ` (${t('Previous period')}: ${formatNumber(section.previous_affected ?? 0, locale)})`}
+                      {(section.channels?.length ?? 0) > 0 &&
+                        ` · ${t('Channels')}: ${section.channels?.join(', ')}`}
+                      {(section.models?.length ?? 0) > 0 &&
+                        ` · ${t('Models')}: ${section.models?.join(', ')}`}
+                    </p>
+                  )}
                 <Suspense fallback={<LoadingState />}>
                   <Markdown blockRemoteContent className='min-w-0 break-words'>
                     {section.content}

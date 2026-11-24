@@ -8941,6 +8941,8 @@
     "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "所選模型未識別，將使用保守的預設值，請依服務商的實際能力調整。",
     "Parallel model calls (0 = preset)": "並行模型呼叫數（0 = 依預設）",
     "Unable to fetch models. Check the endpoint and API key.": "無法取得模型，請檢查位址和 API Key。",
-    "Enter the API key for this endpoint": "請填寫該位址的 API Key"
+    "Enter the API key for this endpoint": "請填寫該位址的 API Key",
+    "Critical": "嚴重",
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "模型 {{model}} · {{calls}} 次呼叫 · 輸入 {{tokens}} token · {{seconds}} 秒"
   }
 }

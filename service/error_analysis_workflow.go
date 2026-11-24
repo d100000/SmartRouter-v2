@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -51,6 +52,9 @@ type analysisWorkflow struct {
 	client *http.Client
 	state  AnalysisState
 	result AnalysisResult
+	// mu guards state and result while evidence packs are analysed in parallel.
+	mu        sync.Mutex
+	lastSaved time.Time
 }
 
 // A group's request count is not a channel-wide denominator. Look up each
@@ -180,6 +184,9 @@ func (handler errorAnalysisHandler) runWorkflow(ctx context.Context, task *model
 		return
 	}
 	w.result.Model, w.result.Timezone, w.result.TimelineInterval = w.config.Model, w.config.Timezone, "day"
+	if preset := MatchAnalysisModelPreset(w.config.Model); preset != nil {
+		w.result.Run.Preset = preset.ID
+	}
 	if w.state.MaxCalls == 0 {
 		w.state.MaxCalls = w.config.MaxCalls
 	}
@@ -212,7 +219,41 @@ func (handler errorAnalysisHandler) runWorkflow(ctx context.Context, task *model
 
 func (w *analysisWorkflow) saveState() error {
 	w.state.UpdatedAt = time.Now().Unix()
+	w.lastSaved = time.Now()
 	return model.UpdateSystemTaskState(w.task.TaskID, w.runner, w.state)
+}
+
+// beginCall reserves one model call from the budget. Parallel analysis
+// workers share the state, so every change happens under the lock. Progress
+// is written at most every two seconds here; results are always written.
+func (w *analysisWorkflow) beginCall(phase string, number int) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.state.CallsUsed >= w.state.MaxCalls {
+		return 0, &analysisFailure{Code: "analysis_call_budget_exhausted"}
+	}
+	w.state.Phase, w.state.Attempt, w.state.NextRetryAt = phase, number, 0
+	w.state.CallsUsed++
+	if time.Since(w.lastSaved) < 2*time.Second {
+		return w.state.CallsUsed, nil
+	}
+	return w.state.CallsUsed, w.saveState()
+}
+
+func (w *analysisWorkflow) recordAttempt(attempt AnalysisAttempt, phase string, nextRetry int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.state.Attempts = append(w.state.Attempts, attempt)
+	if len(w.state.Attempts) > 100 {
+		w.state.Attempts = w.state.Attempts[len(w.state.Attempts)-100:]
+	}
+	w.result.Run.Calls++
+	w.result.Run.InputTokens += attempt.InputTokens
+	w.result.Run.DurationMs += attempt.DurationMs
+	if phase != "" {
+		w.state.Phase, w.state.NextRetryAt = phase, nextRetry
+	}
+	return w.saveState()
 }
 
 func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
@@ -220,10 +261,27 @@ func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
 	if err := w.saveState(); err != nil {
 		return err
 	}
+	rowsPerSecond := analysisScanRowsPerSecond()
 	for {
+		pageStarted := time.Now()
+		before := w.state.ScannedRows
 		progress, err := model.CollectErrorAnalysisPage(w.ctx, w.task.TaskID, w.runner, filter, 500)
 		if err != nil {
 			return err
+		}
+		// Reading logs is paced so an analysis never competes with live
+		// traffic for the log database.
+		if rowsPerSecond > 0 && progress.ScannedRows > before {
+			pace := time.Duration(progress.ScannedRows-before) * time.Second / time.Duration(rowsPerSecond)
+			if wait := pace - time.Since(pageStarted); wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-w.ctx.Done():
+					timer.Stop()
+					return w.ctx.Err()
+				case <-timer.C:
+				}
+			}
 		}
 		w.state.ScannedRows, w.state.TotalRows = progress.ScannedRows, progress.TotalRows
 		w.state.TotalKnown = progress.TotalKnown
@@ -262,66 +320,32 @@ func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
 	if err = w.saveState(); err != nil {
 		return err
 	}
-	var findings []analysisFinding
 	labels := analysisReportLabels(w.config.ReportLanguage)
-	var afterID int64
-	for {
-		groups, err := model.ListErrorAnalysisArtifacts(w.task.TaskID, "group", afterID, 50)
-		if err != nil {
-			return err
-		}
-		if len(groups) == 0 {
-			break
-		}
-		for _, artifact := range groups {
-			afterID = artifact.ID
-			var group model.ErrorAnalysisGroup
-			if err = common.UnmarshalJsonStr(string(artifact.Data), &group); err != nil {
-				return err
-			}
-			var finding analysisFinding
-			found, err := model.GetErrorAnalysisArtifact(w.task.TaskID, "finding", group.ID, &finding)
-			if err != nil {
-				return err
-			}
-			if !found {
-				w.state.CurrentStep = group.Reason
-				if err = w.saveState(); err != nil {
-					return err
-				}
-				finding, err = w.analyzeGroup(group, 0)
-				if err != nil {
-					return err
-				}
-				if err = model.SaveErrorAnalysisArtifact(w.task.TaskID, w.runner, "finding", group.ID, finding); err != nil {
-					return err
-				}
-			}
-			findings = append(findings, finding)
-			w.result.Sections = append(w.result.Sections, AnalysisReportSection{ID: fmt.Sprintf("issue-%d", len(findings)), Title: finding.Title, Content: renderAnalysisFinding(finding, labels), EvidenceIDs: finding.EvidenceIDs})
-			w.state.CompletedChunks++
-			w.result.SampleCount += len(group.Samples)
-			if err = w.saveState(); err != nil {
-				return err
-			}
-		}
+	groups, err := w.loadGroups()
+	if err != nil {
+		return err
+	}
+	findings, err := w.analyzeGroups(groups)
+	if err != nil {
+		return err
+	}
+	for i, group := range groups {
+		severity := analysisSeverity(group, dataset.Current.Requests)
+		w.result.Sections = append(w.result.Sections, AnalysisReportSection{
+			ID: fmt.Sprintf("issue-%d", i+1), Title: findings[i].Title, Content: renderAnalysisFinding(findings[i], labels), EvidenceIDs: findings[i].EvidenceIDs,
+			Severity: severity, Affected: group.Current.Affected, Previous: group.Previous.Affected, Channels: analysisShareNames(group.Channels), Models: analysisShareNames(group.Models),
+		})
+		w.result.SampleCount += len(group.Samples)
+		w.result.Severity = maxAnalysisSeverity(w.result.Severity, severity)
+	}
+	if w.result.Severity == "" {
+		w.result.Severity = "none"
 	}
 	if !dataset.Coverage.Complete {
 		return &analysisFailure{Code: "analysis_incomplete_coverage"}
 	}
-	w.state.Phase = "merging"
-	if err = w.saveState(); err != nil {
-		return err
-	}
-	digest, err := w.mergeFindings(findings, 0)
-	if err != nil {
-		return err
-	}
-	if len(findings) > 0 {
-		w.result.Sections = append([]AnalysisReportSection{{ID: "priority", Title: digest.Title, Content: renderAnalysisFinding(digest, labels), EvidenceIDs: digest.EvidenceIDs}}, w.result.Sections...)
-	}
-	// Each issue has its own durable finding. Narrative generation receives a
-	// bounded digest and exact statistics, never all raw evidence or all prose.
+	// Each issue has its own durable finding. The final call receives exact
+	// statistics and a short form of every finding, never raw evidence.
 	w.state.Phase = "writing"
 	location, _ := time.LoadLocation(w.config.Timezone)
 	type dailyCounts struct {
@@ -388,7 +412,8 @@ func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
 		ComparisonAvailable bool                        `json:"comparison_available"`
 		Filter              model.ErrorAnalysisFilter   `json:"range"`
 		Timezone            string                      `json:"timezone"`
-		Finding             analysisFinding             `json:"findings"`
+		Finding             *analysisFinding            `json:"findings,omitempty"`
+		Issues              []analysisIssueBrief        `json:"issues"`
 		Period              string                      `json:"period"`
 		Daily               []dailyCounts               `json:"daily"`
 		Warnings            []string                    `json:"coverage_warnings"`
@@ -402,7 +427,7 @@ func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
 	}{
 		Current: dataset.Current.FailureCounts, Previous: dataset.Previous.FailureCounts,
 		ComparisonAvailable: dataset.ComparisonAvailable, Filter: filter, Timezone: w.config.Timezone,
-		Finding: digest, Period: time.Unix(filter.Start, 0).In(location).Format("2006-01-02 15:04") + " — " + time.Unix(filter.End, 0).In(location).Format("2006-01-02 15:04"),
+		Issues: analysisIssueBriefs(groups, findings, dataset.Current.Requests), Period: time.Unix(filter.Start, 0).In(location).Format("2006-01-02 15:04") + " — " + time.Unix(filter.End, 0).In(location).Format("2006-01-02 15:04"),
 		Daily: days, Warnings: dataset.Coverage.Warnings, Metrics: metrics,
 		ConsumeLogsEnabled: dataset.Current.LogRecordingEnabled, ErrorLogsEnabled: dataset.Current.ErrorRecordingEnabled,
 		TopModels: dataset.Current.Models[:min(5, len(dataset.Current.Models))], TopChannels: dataset.Current.Channels[:min(5, len(dataset.Current.Channels))], TopReasons: dataset.Current.Reasons[:min(5, len(dataset.Current.Reasons))],
@@ -415,21 +440,39 @@ func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
 	if err != nil {
 		return err
 	}
-	for _, section := range []struct{ ID, Title, Instruction string }{
-		{"actions", labels[4], "Return ONLY 3-5 numbered investigation steps, ordered by priority. Each step must name the channel/model or evidence to inspect, the concrete check, and observations that would support or weaken the hypothesis. Use supplied channel_comparisons for channel denominators and rate changes. Preserve uncertainty. Write at most 600 Chinese characters when writing Chinese, or 250 words otherwise. Do not write a report, introduction, conclusion, headings, statistics table, repeated findings, or limitations section. Avoid routine billing disclaimers when no billing risk is indicated."},
-		{"limits", labels[5], "Write only 2-3 short sentences identifying missing evidence that materially affects the diagnosis and unresolved alternative explanations. Use at most 300 Chinese characters when writing Chinese, or 150 words otherwise. Do not repeat the summary, statistics, date range or investigation steps. Known period boundaries and supplied channel denominators are not missing evidence. Distinguish unobserved output from confirmed zero output only when relevant. Discuss billing evidence only if nonzero billing risk flags or a specific finding makes it relevant; do not append a generic settlement or refund disclaimer."},
-	} {
-		w.state.CurrentStep = section.ID
-		content, err := w.writeNarrative(section.ID, section.Instruction, string(input))
+	// The summary, overall priority, investigation steps and limits come from
+	// one call. When every finding does not fit, they are merged into one
+	// digest first.
+	if analysisTokenCount(w.config.Model, string(input)) > analysisEvidenceBudget(w.config, w.systemPrompt(analysisFinalInstruction)) && len(findings) > 1 {
+		w.setPhase("merging", "merge")
+		digest, err := w.mergeFindings(findings, 0)
 		if err != nil {
 			return err
 		}
-		w.result.Sections = append(w.result.Sections, AnalysisReportSection{ID: section.ID, Title: section.Title, Content: content})
+		stats.Finding, stats.Issues = &digest, nil
+		if input, err = common.Marshal(stats); err != nil {
+			return err
+		}
 	}
-	w.state.Phase, w.state.CurrentStep = "summarizing", "summary"
-	summary, err := w.writeNarrative("summary", "Write ONE natural paragraph of 4-5 short sentences, about 200-300 Chinese characters when writing Chinese. State the exact date range and analyzed request count, affected count/rate, dominant error and concentration, priority concern, previous-period increases/decreases if comparable, and the first concrete check. Use channel_comparisons to distinguish channel-wide rates from anomaly-group counts. Never invent a trend from just aggregate totals. Categories overlap. If previous data is unavailable explicitly say comparison is unavailable. Do not say 'past seven days' unless the supplied range is seven days. Do not use headings, bullet lists, or repeat the report introduction. Omit unrelated billing and refund disclaimers when no billing risk is indicated.", string(input))
+	w.setPhase("summarizing", "summary")
+	content, err := w.writeNarrative("final", analysisFinalInstruction, string(input))
 	if err != nil {
 		return err
+	}
+	final := decodeAnalysisFinal(content, analysisAllEvidenceIDs(findings))
+	summary := final.Summary
+	if final.Priority != nil && len(findings) > 1 {
+		w.result.Sections = append([]AnalysisReportSection{{ID: "priority", Title: final.Priority.Title, Content: renderAnalysisFinding(*final.Priority, labels), EvidenceIDs: final.Priority.EvidenceIDs, Severity: w.result.Severity}}, w.result.Sections...)
+	}
+	if len(final.Actions) > 0 {
+		var steps strings.Builder
+		for i, action := range final.Actions {
+			fmt.Fprintf(&steps, "%d. %s\n", i+1, action)
+		}
+		w.result.Sections = append(w.result.Sections, AnalysisReportSection{ID: "actions", Title: labels[4], Content: steps.String()})
+	}
+	if len(final.Limits) > 0 {
+		w.result.Sections = append(w.result.Sections, AnalysisReportSection{ID: "limits", Title: labels[5], Content: strings.Join(final.Limits, " ")})
 	}
 	w.result.Summary = summary
 	var report strings.Builder
@@ -495,6 +538,19 @@ func (w *analysisWorkflow) writeNarrative(step, instruction, input string) (stri
 				}
 				data[key] = values
 			}
+		}
+		if issues, ok := data["issues"].([]any); ok {
+			issues = issues[:min(len(issues), max(3, len(issues)/2))]
+			for i, issue := range issues {
+				if brief, ok := issue.(map[string]any); ok {
+					if facts, ok := brief["facts"].([]any); ok {
+						brief["facts"] = facts[:min(1, len(facts))]
+					}
+					delete(brief, "possible_causes")
+					issues[i] = brief
+				}
+			}
+			data["issues"], data["issues_truncated"] = issues, true
 		}
 		if finding, ok := data["findings"].(map[string]any); ok {
 			for key, value := range finding {
@@ -599,7 +655,9 @@ func (w *analysisWorkflow) call(step, system, input string, validate func(string
 		}
 		return saved.Content, nil
 	}
+	w.mu.Lock()
 	phase := w.state.Phase
+	w.mu.Unlock()
 	// Reasoning tokens count against the output limit, so a truncated answer
 	// asks for more room instead of a smaller input. The ceiling keeps input,
 	// output and the safety margin inside the configured context window.
@@ -611,30 +669,25 @@ func (w *analysisWorkflow) call(step, system, input string, validate func(string
 	resized := 0
 	rememberOutput := func() error {
 		saved.OutputTokens = config.MaxOutputTokens
-		return model.SaveErrorAnalysisArtifact(w.task.TaskID, w.runner, "completion", key, saved)
+		return w.saveArtifact("completion", key, saved)
 	}
 	for number := 1; number <= w.config.MaxAttempts; number++ {
-		if w.state.CallsUsed >= w.state.MaxCalls {
-			return "", &analysisFailure{Code: "analysis_call_budget_exhausted"}
-		}
-		w.state.Phase, w.state.Attempt, w.state.NextRetryAt = phase, number, 0
-		w.state.CallsUsed++
-		if err = w.saveState(); err != nil {
+		callNumber, err := w.beginCall(phase, number)
+		if err != nil {
 			return "", err
 		}
-		attempt := AnalysisAttempt{Number: w.state.CallsUsed, Step: step}
+		attempt := AnalysisAttempt{Number: callNumber, Step: step}
 		content, err := completeErrorAnalysis(w.ctx, w.client, config, w.key, system, input, &attempt)
 		if err == nil && validate != nil {
 			err = validate(content)
 		}
 		if err == nil {
 			attempt.Code = "completed"
-			w.state.Attempts = append(w.state.Attempts, attempt)
 			saved.Content = content
-			if err = model.SaveErrorAnalysisArtifact(w.task.TaskID, w.runner, "completion", key, saved); err != nil {
+			if err = w.saveArtifact("completion", key, saved); err != nil {
 				return "", err
 			}
-			if err = w.saveState(); err != nil {
+			if err = w.recordAttempt(attempt, "", 0); err != nil {
 				return "", err
 			}
 			return content, nil
@@ -644,10 +697,6 @@ func (w *analysisWorkflow) call(step, system, input string, validate func(string
 			return "", err
 		}
 		attempt.Code, attempt.Retryable = failure.Code, failure.Retryable
-		w.state.Attempts = append(w.state.Attempts, attempt)
-		if len(w.state.Attempts) > 100 {
-			w.state.Attempts = w.state.Attempts[len(w.state.Attempts)-100:]
-		}
 		// Output-size problems are fixed by resizing the output, at most twice
 		// per call, without consuming one of the transient-failure attempts.
 		if resized < 2 && attempt.FinishReason == "length" && outputCeiling > config.MaxOutputTokens {
@@ -657,7 +706,7 @@ func (w *analysisWorkflow) call(step, system, input string, validate func(string
 			if saveErr := rememberOutput(); saveErr != nil {
 				return "", saveErr
 			}
-			if saveErr := w.saveState(); saveErr != nil {
+			if saveErr := w.recordAttempt(attempt, "", 0); saveErr != nil {
 				return "", saveErr
 			}
 			continue
@@ -669,7 +718,7 @@ func (w *analysisWorkflow) call(step, system, input string, validate func(string
 			if saveErr := rememberOutput(); saveErr != nil {
 				return "", saveErr
 			}
-			if saveErr := w.saveState(); saveErr != nil {
+			if saveErr := w.recordAttempt(attempt, "", 0); saveErr != nil {
 				return "", saveErr
 			}
 			continue
@@ -683,20 +732,19 @@ func (w *analysisWorkflow) call(step, system, input string, validate func(string
 		// one-call budget would resend the same oversized parent on every resume.
 		if failure.Code == "analysis_context_limit" || attempt.FinishReason == "length" && config.MaxOutputTokens >= outputCeiling {
 			saved.Failure, saved.OutputTokens = failure.Code, config.MaxOutputTokens
-			if err := model.SaveErrorAnalysisArtifact(w.task.TaskID, w.runner, "completion", key, saved); err != nil {
+			if err := w.saveArtifact("completion", key, saved); err != nil {
 				return "", err
 			}
 		}
-		if saveErr := w.saveState(); saveErr != nil {
-			return "", saveErr
-		}
 		if !failure.Retryable || number == w.config.MaxAttempts {
+			if saveErr := w.recordAttempt(attempt, "", 0); saveErr != nil {
+				return "", saveErr
+			}
 			return "", err
 		}
 		delay := max(time.Duration(min(30, 1<<number))*time.Second, failure.RetryAfter)
-		w.state.Phase, w.state.NextRetryAt = "retrying", time.Now().Add(delay).Unix()
-		if err = w.saveState(); err != nil {
-			return "", err
+		if saveErr := w.recordAttempt(attempt, "retrying", time.Now().Add(delay).Unix()); saveErr != nil {
+			return "", saveErr
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -739,43 +787,36 @@ func decodeAnalysisFinding(content string, allowed []string) (analysisFinding, e
 	return finding, nil
 }
 
-func (w *analysisWorkflow) analyzeGroup(group model.ErrorAnalysisGroup, depth int) (analysisFinding, error) {
-	if depth == 0 {
-		for i := range group.Samples {
-			compactAnalysisEvidence(&group.Samples[i])
-		}
-		for i := range group.PreviousSamples {
-			compactAnalysisEvidence(&group.PreviousSamples[i])
-		}
-	}
-	var allowed []string
-	for _, entry := range append(slices.Clone(group.Samples), group.PreviousSamples...) {
-		if entry.RequestID != "" {
-			allowed = append(allowed, entry.RequestID)
-		}
-	}
+// analysisFindingRules apply to every anomaly-group finding, alone or packed.
+const analysisFindingRules = "Each array has at most 6 short items; cite at most 12 supplied request IDs. Explain where and when the problem occurs using human-readable local dates in the supplied timezone, never raw Unix timestamps. Label current/previous counts as belonging to this anomaly group, not as all requests through the channel. Only channel_comparison supplies channel-wide denominators within the report filters. channels and models show where the group occurs; a group spread over many channels points to the upstream provider or model rather than one channel. Supplied period windows, logging flags and channel denominators are not missing evidence. Causes must be hypotheses unless proven. Request up to 3 supplied request IDs in follow_up_request_ids only if their retained retry evidence is needed. Do not infer counts from samples. Do not add routine billing disclaimers when all billing-related risk counts are zero and no finding indicates a billing issue."
+
+type analysisPeriodWindow struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// analysisGroupInput is what the model sees for one anomaly group.
+type analysisGroupInput struct {
+	model.ErrorAnalysisGroup
+	Timezone            string                       `json:"timezone"`
+	CurrentWindow       *analysisPeriodWindow        `json:"current_window,omitempty"`
+	PreviousWindow      *analysisPeriodWindow        `json:"previous_window,omitempty"`
+	FirstSeenLocal      string                       `json:"first_seen_local,omitempty"`
+	LastSeenLocal       string                       `json:"last_seen_local,omitempty"`
+	CountScope          string                       `json:"count_scope"`
+	ComparisonAvailable bool                         `json:"comparison_available"`
+	ChannelComparison   *analysisChannelComparison   `json:"channel_comparison,omitempty"`
+	ConsumeLogsEnabled  *bool                        `json:"consume_logs_enabled_at_collection,omitempty"`
+	ErrorLogsEnabled    *bool                        `json:"error_logs_enabled_at_collection,omitempty"`
+	Coverage            *model.ErrorAnalysisCoverage `json:"coverage,omitempty"`
+}
+
+func (w *analysisWorkflow) groupInput(group model.ErrorAnalysisGroup) analysisGroupInput {
 	location, err := time.LoadLocation(w.config.Timezone)
 	if err != nil {
 		location = time.UTC
 	}
-	type periodWindow struct {
-		Start string `json:"start"`
-		End   string `json:"end"`
-	}
-	inputData := struct {
-		model.ErrorAnalysisGroup
-		Timezone            string                       `json:"timezone"`
-		CurrentWindow       *periodWindow                `json:"current_window,omitempty"`
-		PreviousWindow      *periodWindow                `json:"previous_window,omitempty"`
-		FirstSeenLocal      string                       `json:"first_seen_local,omitempty"`
-		LastSeenLocal       string                       `json:"last_seen_local,omitempty"`
-		CountScope          string                       `json:"count_scope"`
-		ComparisonAvailable bool                         `json:"comparison_available"`
-		ChannelComparison   *analysisChannelComparison   `json:"channel_comparison,omitempty"`
-		ConsumeLogsEnabled  *bool                        `json:"consume_logs_enabled_at_collection,omitempty"`
-		ErrorLogsEnabled    *bool                        `json:"error_logs_enabled_at_collection,omitempty"`
-		Coverage            *model.ErrorAnalysisCoverage `json:"coverage,omitempty"`
-	}{
+	inputData := analysisGroupInput{
 		ErrorAnalysisGroup: group, Timezone: location.String(),
 		CountScope:          "current and previous count only this anomaly group, including when samples are split; they are not all channel requests. channel_comparison contains channel totals and affected-request rates within the report filters. Samples are evidence excerpts, never denominators. Window start is inclusive and end is exclusive.",
 		ComparisonAvailable: w.result.ComparisonAvailable, ChannelComparison: w.channelComparison(strconv.Itoa(group.Channel)), Coverage: w.result.Coverage,
@@ -784,7 +825,7 @@ func (w *analysisWorkflow) analyzeGroup(group model.ErrorAnalysisGroup, depth in
 		if snapshot == nil || snapshot.Filter.RequestID != "" || snapshot.Filter.End <= snapshot.Filter.Start {
 			continue
 		}
-		window := &periodWindow{Start: time.Unix(snapshot.Filter.Start, 0).In(location).Format("2006-01-02 15:04"), End: time.Unix(snapshot.Filter.End, 0).In(location).Format("2006-01-02 15:04")}
+		window := &analysisPeriodWindow{Start: time.Unix(snapshot.Filter.Start, 0).In(location).Format("2006-01-02 15:04"), End: time.Unix(snapshot.Filter.End, 0).In(location).Format("2006-01-02 15:04")}
 		if period == 0 {
 			inputData.CurrentWindow = window
 		} else {
@@ -800,7 +841,37 @@ func (w *analysisWorkflow) analyzeGroup(group model.ErrorAnalysisGroup, depth in
 	if group.LastSeen > 0 {
 		inputData.LastSeenLocal = time.Unix(group.LastSeen, 0).In(location).Format("2006-01-02 15:04:05")
 	}
-	system := w.systemPrompt("Return ONLY a JSON object with title:string, facts:string[], possible_causes:string[], next_checks:string[], missing_evidence:string[], evidence_ids:string[], follow_up_request_ids:string[]. Each array has at most 6 short items; cite at most 12 supplied request IDs. Explain where and when the problem occurs using human-readable local dates in the supplied timezone, never raw Unix timestamps. Label current/previous counts as belonging to this anomaly group, not as all requests through the channel. Only channel_comparison supplies channel-wide denominators within the report filters. Supplied period windows, logging flags and channel denominators are not missing evidence. Causes must be hypotheses unless proven. Request up to 3 supplied request IDs in follow_up_request_ids only if their retained retry evidence is needed. Do not infer counts from samples. Do not add routine billing disclaimers when all billing-related risk counts are zero and no finding indicates a billing issue.")
+	return inputData
+}
+
+func compactAnalysisGroup(group *model.ErrorAnalysisGroup) {
+	group.Samples = slices.Clone(group.Samples)
+	group.PreviousSamples = slices.Clone(group.PreviousSamples)
+	for i := range group.Samples {
+		compactAnalysisEvidence(&group.Samples[i])
+	}
+	for i := range group.PreviousSamples {
+		compactAnalysisEvidence(&group.PreviousSamples[i])
+	}
+}
+
+func analysisGroupRequestIDs(group model.ErrorAnalysisGroup) []string {
+	var allowed []string
+	for _, entry := range append(slices.Clone(group.Samples), group.PreviousSamples...) {
+		if entry.RequestID != "" {
+			allowed = append(allowed, entry.RequestID)
+		}
+	}
+	return allowed
+}
+
+func (w *analysisWorkflow) analyzeGroup(group model.ErrorAnalysisGroup, depth int) (analysisFinding, error) {
+	if depth == 0 {
+		compactAnalysisGroup(&group)
+	}
+	allowed := analysisGroupRequestIDs(group)
+	inputData := w.groupInput(group)
+	system := w.systemPrompt("Return ONLY a JSON object with title:string, facts:string[], possible_causes:string[], next_checks:string[], missing_evidence:string[], evidence_ids:string[], follow_up_request_ids:string[]. " + analysisFindingRules)
 	input, err := common.Marshal(inputData)
 	if err != nil {
 		return analysisFinding{}, err
@@ -879,8 +950,13 @@ func (w *analysisWorkflow) analyzeGroup(group model.ErrorAnalysisGroup, depth in
 	if err != nil {
 		return finding, err
 	}
-	// Bounded follow-up is restricted to IDs already in this group and to the
-	// persisted evidence snapshot; it cannot run arbitrary SQL or fetch URLs.
+	return w.followUp(group, finding, depth)
+}
+
+// followUp resolves a finding's requests for fuller retry evidence. It is
+// restricted to IDs already in this group and to the persisted evidence
+// snapshot; it cannot run arbitrary SQL or fetch URLs.
+func (w *analysisWorkflow) followUp(group model.ErrorAnalysisGroup, finding analysisFinding, depth int) (analysisFinding, error) {
 	if len(finding.FollowUpIDs) > 0 && depth < 2 {
 		follow := group
 		follow.Samples = nil

@@ -8941,6 +8941,8 @@
     "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "選択したモデルは認識されていません。控えめな既定値を使います。プロバイダーに合わせて調整してください。",
     "Parallel model calls (0 = preset)": "並列モデル呼び出し数（0 = プリセット）",
     "Unable to fetch models. Check the endpoint and API key.": "モデルを取得できません。エンドポイントと API キーを確認してください。",
-    "Enter the API key for this endpoint": "このエンドポイントの API キーを入力してください"
+    "Enter the API key for this endpoint": "このエンドポイントの API キーを入力してください",
+    "Critical": "重大",
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "モデル {{model}} · 呼び出し {{calls}} 回 · 入力 {{tokens}} トークン · {{seconds}} 秒"
   }
 }

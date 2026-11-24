@@ -75,6 +75,17 @@ type AnalysisResult struct {
 	SampleCount         int                          `json:"sample_count"`
 	Attempts            []AnalysisAttempt            `json:"attempts"`
 	SnapshotOmitted     bool                         `json:"snapshot_omitted,omitempty"`
+	// Severity is the highest issue severity: critical, high, medium, low or
+	// none. Run summarises the model calls this report used.
+	Severity string      `json:"severity,omitempty"`
+	Run      AnalysisRun `json:"run"`
+}
+
+type AnalysisRun struct {
+	Preset      string `json:"preset,omitempty"`
+	Calls       int    `json:"calls"`
+	InputTokens int    `json:"input_tokens"`
+	DurationMs  int64  `json:"duration_ms"`
 }
 
 // compactAnalysisEvidence applies the same evidence bounds to every sampled
@@ -213,6 +224,17 @@ func analysisEvidenceRetention() time.Duration {
 		}
 	}
 	return time.Duration(days) * 24 * time.Hour
+}
+
+// analysisScanRowsPerSecond caps how fast an analysis reads the log
+// database. Override with ERROR_ANALYSIS_SCAN_ROWS_PER_SECOND; 0 disables it.
+func analysisScanRowsPerSecond() int {
+	if value := strings.TrimSpace(os.Getenv("ERROR_ANALYSIS_SCAN_ROWS_PER_SECOND")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed >= 0 {
+			return parsed
+		}
+	}
+	return 20_000
 }
 
 func (handler errorAnalysisHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {

@@ -104,6 +104,65 @@ type ErrorAnalysisGroup struct {
 	Samples            []FailureLog  `json:"samples"`
 	PreviousSamples    []FailureLog  `json:"previous_samples"`
 	EvidenceIncomplete bool          `json:"evidence_incomplete"`
+	// Template is the error text with variable parts (IDs, numbers, hashes)
+	// replaced, the key that groups the same failure across channels.
+	Template string `json:"template,omitempty"`
+	// Channels and Models show where the group occurs. Channel and Model above
+	// name the most affected of each.
+	Channels []ErrorAnalysisShare `json:"channels,omitempty"`
+	Models   []ErrorAnalysisShare `json:"models,omitempty"`
+}
+
+type ErrorAnalysisShare struct {
+	Name     string `json:"name"`
+	Current  int    `json:"current"`
+	Previous int    `json:"previous,omitempty"`
+}
+
+const errorAnalysisShareLimit = 20
+
+// addErrorAnalysisShare counts one request for name and returns the most
+// affected name. Beyond the limit, new names are added to "other".
+func addErrorAnalysisShare(shares []ErrorAnalysisShare, name string, previous bool) ([]ErrorAnalysisShare, string) {
+	index := slices.IndexFunc(shares, func(share ErrorAnalysisShare) bool { return share.Name == name })
+	if index < 0 && len(shares) >= errorAnalysisShareLimit {
+		index = slices.IndexFunc(shares, func(share ErrorAnalysisShare) bool { return share.Name == "other" })
+		if index < 0 {
+			shares[len(shares)-1].Name = "other"
+			index = len(shares) - 1
+		}
+	}
+	if index < 0 {
+		shares = append(shares, ErrorAnalysisShare{Name: name})
+		index = len(shares) - 1
+	}
+	if previous {
+		shares[index].Previous++
+	} else {
+		shares[index].Current++
+	}
+	slices.SortStableFunc(shares, func(a, b ErrorAnalysisShare) int {
+		if a.Current+a.Previous != b.Current+b.Previous {
+			return (b.Current + b.Previous) - (a.Current + a.Previous)
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+	top := shares[0].Name
+	if top == "other" && len(shares) > 1 {
+		top = shares[1].Name
+	}
+	return shares, top
+}
+
+// errorAnalysisTemplate replaces the variable parts of an error message so the
+// same failure groups together: UUIDs, long hex or mixed IDs, and numbers.
+func errorAnalysisTemplate(message string) string {
+	template := errorAnalysisVariablePattern.ReplaceAllString(message, "#")
+	template = strings.Join(strings.Fields(template), " ")
+	if runes := []rune(template); len(runes) > 300 {
+		template = string(runes[:300])
+	}
+	return template
 }
 
 type errorAnalysisRequestFact struct {
@@ -414,6 +473,7 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 		next.Stable = false
 		next.Warnings = append(next.Warnings, "source_rows_changed_during_scan")
 	}
+	var pendingClean map[string]*errorAnalysisCleanEntry
 	err := withErrorAnalysisLease(ctx, taskID, runnerID, func(tx *gorm.DB) error {
 		var stored ErrorAnalysisArtifact
 		if err := tx.Where("task_id = ? AND kind = ? AND name = ?", taskID, "scan", "checkpoint").Take(&stored).Error; err != nil {
@@ -440,6 +500,22 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 				facts[artifact.Name] = fact
 			}
 		}
+		// Clean single-row requests are only counted (see error_analysis_clean.go).
+		// ClickHouse rows arrive unordered, and an exact request lookup is tiny,
+		// so both keep every request.
+		countClean := scan.Source == "id_watermark" && next.Filter.RequestID == ""
+		location, err := time.LoadLocation(scan.Timezone)
+		if err != nil {
+			return err
+		}
+		window := errorAnalysisCleanWindowFor(scan.Generation)
+		tally := newErrorAnalysisCleanTally()
+		// The shared window changes only after this transaction commits.
+		pendingClean = map[string]*errorAnalysisCleanEntry{}
+		rowsPerKey := map[string]int{}
+		for _, key := range keys {
+			rowsPerKey[key]++
+		}
 		for i, log := range logs {
 			// SQL's candidate lookup can be case-insensitive on MySQL.
 			if next.Filter.RequestID != "" && next.Filter.RequestID != log.RequestId {
@@ -447,7 +523,32 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 			}
 			entry := ClassifyFailureLog(log)
 			compactErrorAnalysisEvidence(&entry)
-			fact := facts[keys[i]]
+			fact, stored := facts[keys[i]]
+			if countClean && !stored {
+				earlier, ok := window.entries[keys[i]]
+				if pending, staged := pendingClean[keys[i]]; staged {
+					earlier, ok = errorAnalysisCleanEntry{}, false
+					if pending != nil {
+						earlier, ok = *pending, true
+					}
+				}
+				if ok {
+					// A later row of a request counted as clean: withdraw the count
+					// and keep the request with both rows.
+					tally.add(earlier, -1)
+					pendingClean[keys[i]] = nil
+					mergeErrorAnalysisRequest(&fact, earlier.entry)
+				} else if rowsPerKey[keys[i]] == 1 && log.Type == LogTypeConsume && len(entry.Categories) == 0 {
+					period := "current"
+					if scan.Comparison && entry.CreatedAt < scan.Filter.Start {
+						period = "previous"
+					}
+					clean := errorAnalysisCleanEntry{entry: entry, period: period, dims: errorAnalysisDimensions(entry, location)}
+					tally.add(clean, 1)
+					pendingClean[keys[i]] = &clean
+					continue
+				}
+			}
 			mergeErrorAnalysisRequest(&fact, entry)
 			facts[keys[i]] = fact
 		}
@@ -459,6 +560,11 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 			}
 			artifacts = append(artifacts, artifact)
 		}
+		counted, err := tally.artifacts(tx, taskID)
+		if err != nil {
+			return err
+		}
+		artifacts = append(artifacts, counted...)
 		checkpoint, err := newErrorAnalysisArtifact(taskID, "scan", "checkpoint", next)
 		if err != nil {
 			return err
@@ -484,6 +590,18 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 	})
 	if err == nil {
 		*scan = next
+		if next.Done {
+			forgetErrorAnalysisCleanWindow(scan.Generation)
+		} else if len(pendingClean) > 0 {
+			window := errorAnalysisCleanWindowFor(scan.Generation)
+			for key, clean := range pendingClean {
+				if clean == nil {
+					delete(window.entries, key)
+				} else {
+					window.remember(key, *clean)
+				}
+			}
+		}
 	}
 	return err
 }
@@ -580,7 +698,7 @@ func GetErrorAnalysisRequestEvidence(taskID, requestID string) (*FailureLog, err
 	return &entry, nil
 }
 
-var errorAnalysisVariablePattern = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b[0-9]+\b`)
+var errorAnalysisVariablePattern = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b[a-z0-9_-]*\d[a-z0-9_-]*[a-z][a-z0-9_-]*\b|\b[a-z0-9_-]*[a-z][a-z0-9_-]*\d[a-z0-9_-]*\b|\b[0-9a-f]{12,}\b|\b\d+(\.\d+)?\b`)
 
 func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, batchSize, sampleLimit int) (*ErrorAnalysisAggregationProgress, error) {
 	batchSize = min(max(batchSize, 1), 500)
@@ -679,11 +797,12 @@ func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, ba
 			if len(entry.Categories) > 0 {
 				categories := slices.Clone(entry.Categories)
 				slices.Sort(categories)
-				fingerprint := errorAnalysisVariablePattern.ReplaceAllString(entry.ErrorMessage, "#")
-				fingerprint = strings.Join(strings.Fields(fingerprint), " ")
-				name := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s", entry.Model, entry.Channel, strings.Join(categories, ","), reason, fingerprint))))
+				// Channel and model are not part of the key: one failure seen on
+				// many channels is one group, and its spread is itself evidence.
+				template := errorAnalysisTemplate(entry.ErrorMessage)
+				name := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s", strings.Join(categories, ","), reason, template))))
 				if groups[name] == nil {
-					groups[name] = &ErrorAnalysisGroup{ID: name, Reason: reason, Model: entry.Model, Channel: entry.Channel, Categories: categories, FirstSeen: entry.CreatedAt, LastSeen: entry.CreatedAt, Samples: []FailureLog{}, PreviousSamples: []FailureLog{}}
+					groups[name] = &ErrorAnalysisGroup{ID: name, Reason: reason, Model: entry.Model, Channel: entry.Channel, Categories: categories, FirstSeen: entry.CreatedAt, LastSeen: entry.CreatedAt, Samples: []FailureLog{}, PreviousSamples: []FailureLog{}, Template: template}
 					var previous ErrorAnalysisArtifact
 					err := tx.Where("task_id = ? AND kind = ? AND name = ?", taskID, "group", name).Take(&previous).Error
 					if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -710,6 +829,13 @@ func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, ba
 						}
 					}
 				}
+				var topChannel, topModel string
+				group.Channels, topChannel = addErrorAnalysisShare(group.Channels, strconv.Itoa(entry.Channel), period == "previous")
+				group.Models, topModel = addErrorAnalysisShare(group.Models, entry.Model, period == "previous")
+				if channel, err := strconv.Atoi(topChannel); err == nil {
+					group.Channel = channel
+				}
+				group.Model = topModel
 				if period == "previous" {
 					group.Previous.add(entry)
 					group.PreviousSamples = retainErrorAnalysisSamples(group.PreviousSamples, entry, min(sampleLimit, 2))
@@ -757,6 +883,17 @@ func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, ba
 func retainErrorAnalysisSamples(samples []FailureLog, entry FailureLog, limit int) []FailureLog {
 	if len(samples) < limit {
 		return append(samples, entry)
+	}
+	// A channel not yet represented replaces a later sample of a channel that
+	// already has several, so a group spread over channels shows its spread.
+	if !slices.ContainsFunc(samples, func(sample FailureLog) bool { return sample.Channel == entry.Channel }) {
+		for i := len(samples) - 1; i > 0; i-- {
+			channel := samples[i].Channel
+			if slices.IndexFunc(samples, func(sample FailureLog) bool { return sample.Channel == channel }) < i {
+				samples[i] = entry
+				return samples
+			}
+		}
 	}
 	// Retain early examples and the latest example so a large repeated group
 	// cannot hide its current behavior behind only its oldest requests.

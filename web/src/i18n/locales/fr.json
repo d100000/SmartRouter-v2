@@ -8941,6 +8941,8 @@
     "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "Le modèle choisi n'est pas reconnu. Des valeurs prudentes s'appliquent ; ajustez-les à votre fournisseur.",
     "Parallel model calls (0 = preset)": "Appels de modèle en parallèle (0 = préréglage)",
     "Unable to fetch models. Check the endpoint and API key.": "Impossible de récupérer les modèles. Vérifiez le point d'accès et la clé API.",
-    "Enter the API key for this endpoint": "Saisissez la clé API de ce point d'accès"
+    "Enter the API key for this endpoint": "Saisissez la clé API de ce point d'accès",
+    "Critical": "Critique",
+    "Model {{model}} · {{calls}} calls · {{tokens}} input tokens · {{seconds}} s": "Modèle {{model}} · {{calls}} appels · {{tokens}} tokens en entrée · {{seconds}} s"
   }
 }
