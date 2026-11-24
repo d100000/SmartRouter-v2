@@ -8929,6 +8929,18 @@
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "このノードでは保存済みのキーを復号できません。追加ではなく置き換えてください",
     "channel credential cannot be decrypted on this node": "このノードではチャネルの認証情報を復号できません",
     "The refunded task completed later and was charged again": "返金済みのタスクが後で完了したため、再度課金されました",
-    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "要求した出力がモデルの出力上限を超えました。出力予算を自動で下げます。"
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "要求した出力がモデルの出力上限を超えました。出力予算を自動で下げます。",
+    "Model presets": "モデルプリセット",
+    "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.": "このエンドポイントのモデルを取得します。認識されたモデルはコンテキスト・入力・出力の設定を自動で入力します。",
+    "Fetch models": "モデルを取得",
+    "No models returned": "モデルが返されませんでした",
+    "Recognized": "認識済み",
+    "Not recognized": "未認識",
+    "Context {{value}} tokens": "コンテキスト {{value}} トークン",
+    "Recognized preset: {{name}}": "認識したプリセット：{{name}}",
+    "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "選択したモデルは認識されていません。控えめな既定値を使います。プロバイダーに合わせて調整してください。",
+    "Parallel model calls (0 = preset)": "並列モデル呼び出し数（0 = プリセット）",
+    "Unable to fetch models. Check the endpoint and API key.": "モデルを取得できません。エンドポイントと API キーを確認してください。",
+    "Enter the API key for this endpoint": "このエンドポイントの API キーを入力してください"
   }
 }

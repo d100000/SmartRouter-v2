@@ -193,6 +193,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/error-analysis":                           accessTokenSessionRule,
 	"GET /api/error-analysis/config":                    accessTokenSessionRule,
 	"PUT /api/error-analysis/config":                    accessTokenSessionRule,
+	"POST /api/error-analysis/models":                   accessTokenSessionRule,
 	"POST /api/error-analysis/reports":                  accessTokenSessionRule,
 	"GET /api/error-analysis/reports":                   accessTokenSessionRule,
 	"GET /api/error-analysis/reports/:task_id":          accessTokenSessionRule,

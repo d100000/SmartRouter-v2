@@ -38,6 +38,10 @@ type ErrorAnalysisConfig struct {
 	MaxOutputTokens     int    `json:"max_output_tokens"`
 	SafetyMarginTokens  int    `json:"safety_margin_tokens"`
 	MaxCalls            int    `json:"max_calls"`
+	// MaxConcurrency limits parallel model calls; 0 uses the model preset.
+	MaxConcurrency int `json:"max_concurrency"`
+	// Preset is the recognised model preset, recomputed on every save.
+	Preset string `json:"preset,omitempty"`
 	// DefaultsRevision records which built-in defaults a stored configuration
 	// has been upgraded to. Values still equal to an older default move to the
 	// current one once; values an operator changed are kept.
@@ -109,7 +113,7 @@ func validateErrorAnalysisConfig(config ErrorAnalysisConfig) error {
 	if strings.TrimSpace(config.Model) == "" || len(config.Model) > 200 || config.Hour < 0 || config.Hour > 23 || config.MaxAttempts < 1 || config.MaxAttempts > 5 || config.TimeoutSeconds < 30 || config.TimeoutSeconds > 600 || config.IdleSeconds < 10 || config.IdleSeconds > 600 || config.SampleLimit < 1 || config.SampleLimit > 200 {
 		return common.NewMessage("Invalid error analysis configuration")
 	}
-	if config.ContextWindowTokens < 4096 || config.ContextWindowTokens > 2000000 || config.ChunkInputTokens < 256 || config.ChunkInputTokens > 2000000 || config.MaxOutputTokens < 128 || config.MaxOutputTokens > 32768 || config.SafetyMarginTokens < 256 || config.SafetyMarginTokens >= config.ContextWindowTokens || config.MaxOutputTokens+config.SafetyMarginTokens+512 >= config.ContextWindowTokens || config.MaxCalls < 1 || config.MaxCalls > 1000 {
+	if config.ContextWindowTokens < 4096 || config.ContextWindowTokens > 2000000 || config.ChunkInputTokens < 256 || config.ChunkInputTokens > 2000000 || config.MaxOutputTokens < 128 || config.MaxOutputTokens > 32768 || config.SafetyMarginTokens < 256 || config.SafetyMarginTokens >= config.ContextWindowTokens || config.MaxOutputTokens+config.SafetyMarginTokens+512 >= config.ContextWindowTokens || config.MaxCalls < 1 || config.MaxCalls > 1000 || config.MaxConcurrency < 0 || config.MaxConcurrency > 8 {
 		return common.NewMessage("Invalid analysis token budget")
 	}
 	if _, err := time.LoadLocation(config.Timezone); err != nil {
@@ -189,6 +193,10 @@ func SaveErrorAnalysisConfig(config ErrorAnalysisConfig, key string, clearKey bo
 	}
 	config.Version++
 	config.DefaultsRevision = errorAnalysisDefaultsRevision
+	config.Preset = ""
+	if preset := MatchAnalysisModelPreset(config.Model); preset != nil {
+		config.Preset = preset.ID
+	}
 	config.APIKeyConfigured = config.EncryptedKey != ""
 	raw, err := common.Marshal(config)
 	if err != nil {

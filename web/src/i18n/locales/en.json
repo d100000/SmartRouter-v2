@@ -8929,6 +8929,18 @@
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "The stored keys cannot be decrypted on this node. Replace them instead of appending",
     "channel credential cannot be decrypted on this node": "channel credential cannot be decrypted on this node",
     "The refunded task completed later and was charged again": "The refunded task completed later and was charged again",
-    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "The requested output exceeded the model output limit. The output budget is reduced automatically."
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "The requested output exceeded the model output limit. The output budget is reduced automatically.",
+    "Model presets": "Model presets",
+    "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.": "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.",
+    "Fetch models": "Fetch models",
+    "No models returned": "No models returned",
+    "Recognized": "Recognized",
+    "Not recognized": "Not recognized",
+    "Context {{value}} tokens": "Context {{value}} tokens",
+    "Recognized preset: {{name}}": "Recognized preset: {{name}}",
+    "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.",
+    "Parallel model calls (0 = preset)": "Parallel model calls (0 = preset)",
+    "Unable to fetch models. Check the endpoint and API key.": "Unable to fetch models. Check the endpoint and API key.",
+    "Enter the API key for this endpoint": "Enter the API key for this endpoint"
   }
 }

@@ -17,19 +17,27 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
+import { useState } from 'react'
 import { Controller, useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { z } from 'zod'
 
 import { Dialog } from '@/components/dialog'
 import { PasswordInput } from '@/components/password-input'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Switch } from '@/components/ui/switch'
+import { getServerErrorMessage } from '@/lib/server-error-message'
+import { cn } from '@/lib/utils'
 
-import type { AnalysisConfig, ConfigInput } from './types'
+import { listModels } from './api'
+import type { AnalysisConfig, AnalysisModelOption, ConfigInput } from './types'
+
+const recognizedClass =
+  'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
 
 export function ConfigDialog(props: {
   config: AnalysisConfig
@@ -65,6 +73,7 @@ export function ConfigDialog(props: {
       max_output_tokens: z.number().int().min(128).max(32768),
       safety_margin_tokens: z.number().int().min(256).max(2000000),
       max_calls: z.number().int().min(1).max(1000),
+      max_concurrency: z.number().int().min(0).max(8),
       report_language: z.string(),
       enabled: z.boolean(),
       api_key: z.string().max(4096),
@@ -90,6 +99,7 @@ export function ConfigDialog(props: {
       max_output_tokens: props.config.max_output_tokens ?? 16384,
       safety_margin_tokens: props.config.safety_margin_tokens ?? 4096,
       max_calls: props.config.max_calls ?? 200,
+      max_concurrency: props.config.max_concurrency ?? 0,
       api_key: '',
       clear_key: false,
     },
@@ -154,7 +164,62 @@ export function ConfigDialog(props: {
       min: 1,
       max: 1000,
     },
+    {
+      name: 'max_concurrency',
+      label: t('Parallel model calls (0 = preset)'),
+      type: 'number',
+      min: 0,
+      max: 8,
+    },
   ] as const
+  const [models, setModels] = useState<AnalysisModelOption[] | null>(null)
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [modelError, setModelError] = useState('')
+  const currentModel = form.watch('model')
+  const currentOption = models?.find((option) => option.id === currentModel)
+  const currentPreset =
+    currentOption?.preset?.name ??
+    (props.config.preset && props.config.model === currentModel
+      ? props.config.preset
+      : '')
+  const fetchModels = async () => {
+    if (!(await form.trigger('endpoint'))) return
+    setLoadingModels(true)
+    setModelError('')
+    try {
+      const data = await listModels({
+        endpoint: form.getValues('endpoint'),
+        api_key: form.getValues('api_key'),
+      })
+      setModels(data.models)
+    } catch (error) {
+      setModels(null)
+      setModelError(
+        getServerErrorMessage(
+          error,
+          t('Unable to fetch models. Check the endpoint and API key.')
+        )
+      )
+    } finally {
+      setLoadingModels(false)
+    }
+  }
+  const applyModel = (option: AnalysisModelOption) => {
+    const update = { shouldDirty: true, shouldValidate: true }
+    form.setValue('model', option.id, update)
+    form.setValue(
+      'context_window_tokens',
+      option.suggested_context_window,
+      update
+    )
+    form.setValue('chunk_input_tokens', option.suggested_input_budget, update)
+    form.setValue(
+      'max_output_tokens',
+      Math.min(option.suggested_output_reserve, 32768),
+      update
+    )
+    form.setValue('max_concurrency', option.preset?.concurrency ?? 0, update)
+  }
   return (
     <Dialog
       open
@@ -192,6 +257,84 @@ export function ConfigDialog(props: {
             'Analysis uses non-streaming model requests. Set the context limit supported by your provider; oversized evidence is split automatically.'
           )}
         </p>
+        <div className='space-y-2 rounded-md border p-3'>
+          <div className='flex flex-wrap items-center justify-between gap-2'>
+            <div className='min-w-0 space-y-1'>
+              <p className='text-sm font-medium'>{t('Model presets')}</p>
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.'
+                )}
+              </p>
+            </div>
+            <Button
+              type='button'
+              variant='outline'
+              size='sm'
+              onClick={() => void fetchModels()}
+              disabled={props.pending || loadingModels}
+            >
+              {loadingModels ? t('Fetching...') : t('Fetch models')}
+            </Button>
+          </div>
+          {modelError && (
+            <p role='alert' className='text-destructive text-sm'>
+              {modelError}
+            </p>
+          )}
+          {models && models.length === 0 && (
+            <p className='text-muted-foreground text-sm'>
+              {t('No models returned')}
+            </p>
+          )}
+          {models && models.length > 0 && (
+            <ul className='max-h-56 space-y-1 overflow-y-auto'>
+              {models.map((option) => (
+                <li key={option.id}>
+                  <button
+                    type='button'
+                    onClick={() => applyModel(option)}
+                    disabled={props.pending}
+                    className={cn(
+                      'hover:bg-muted flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm',
+                      option.id === currentModel && 'bg-muted'
+                    )}
+                  >
+                    <span className='min-w-0 truncate font-mono text-xs'>
+                      {option.id}
+                    </span>
+                    {option.preset ? (
+                      <Badge className={recognizedClass}>
+                        {t('Recognized')} · {option.preset.name}
+                      </Badge>
+                    ) : (
+                      <span className='text-muted-foreground shrink-0 text-xs'>
+                        {option.context_length
+                          ? t('Context {{value}} tokens', {
+                              value: option.context_length,
+                            })
+                          : t('Not recognized')}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {currentPreset ? (
+            <p className='text-xs text-emerald-700 dark:text-emerald-400'>
+              {t('Recognized preset: {{name}}', { name: currentPreset })}
+            </p>
+          ) : (
+            models && (
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'The selected model is not recognized. Conservative defaults apply; adjust them to your provider.'
+                )}
+              </p>
+            )
+          )}
+        </div>
         <div className='grid gap-4 sm:grid-cols-2'>
           {fields.map((field) => (
             <div key={field.name} className='min-w-0 space-y-2'>

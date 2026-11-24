@@ -368,6 +368,7 @@ func SetApiRouter(router *gin.Engine) {
 			errorAnalysisRoute.GET("", controller.GetErrorAnalysis)
 			errorAnalysisRoute.GET("/config", controller.GetErrorAnalysisConfig)
 			errorAnalysisRoute.PUT("/config", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), controller.SaveErrorAnalysisConfig)
+			errorAnalysisRoute.POST("/models", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), controller.ListErrorAnalysisModels)
 			errorAnalysisRoute.POST("/reports", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), controller.StartErrorAnalysis)
 			errorAnalysisRoute.GET("/reports", controller.ListErrorAnalysisReports)
 			errorAnalysisRoute.GET("/reports/:task_id", controller.GetErrorAnalysisReport)

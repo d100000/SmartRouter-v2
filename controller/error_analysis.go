@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -87,6 +88,38 @@ func SaveErrorAnalysisConfig(c *gin.Context) {
 		return
 	}
 	GetErrorAnalysisConfig(c)
+}
+
+// ListErrorAnalysisModels fetches the model list of the endpoint being edited
+// and marks models that match a built-in preset. A blank key uses the saved
+// key, but only for the saved endpoint.
+func ListErrorAnalysisModels(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 8*1024)
+	var input struct {
+		Endpoint string `json:"endpoint"`
+		APIKey   string `json:"api_key"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		common.ApiErrorStatus(c, 400, common.NewMessage("Invalid error analysis configuration"))
+		return
+	}
+	options, err := service.ListAnalysisModels(c.Request.Context(), input.Endpoint, strings.TrimSpace(input.APIKey))
+	if err != nil {
+		common.ApiErrorStatus(c, 400, err)
+		return
+	}
+	type suggested struct {
+		service.AnalysisModelOption
+		SuggestedContext int `json:"suggested_context_window"`
+		SuggestedInput   int `json:"suggested_input_budget"`
+		SuggestedOutput  int `json:"suggested_output_reserve"`
+	}
+	items := make([]suggested, 0, len(options))
+	for _, option := range options {
+		contextWindow, budget, output := service.SuggestedAnalysisBudget(option)
+		items = append(items, suggested{AnalysisModelOption: option, SuggestedContext: contextWindow, SuggestedInput: budget, SuggestedOutput: output})
+	}
+	common.ApiSuccess(c, gin.H{"models": items, "presets": service.AnalysisModelPresets()})
 }
 
 func StartErrorAnalysis(c *gin.Context) {

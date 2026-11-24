@@ -92,6 +92,28 @@ export type AnalysisConfig = {
   max_output_tokens?: number
   safety_margin_tokens?: number
   max_calls?: number
+  max_concurrency?: number
+  preset?: string
+}
+export type AnalysisModelPreset = {
+  id: string
+  name: string
+  context_window: number
+  max_output: number
+  input_budget: number
+  output_reserve: number
+  concurrency: number
+  thinking: string
+  token_param: string
+}
+export type AnalysisModelOption = {
+  id: string
+  preset?: AnalysisModelPreset
+  context_length?: number
+  max_output?: number
+  suggested_context_window: number
+  suggested_input_budget: number
+  suggested_output_reserve: number
 }
 export type ConfigInput = AnalysisConfig & {
   api_key: string

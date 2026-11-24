@@ -8929,6 +8929,18 @@
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "Сохранённые ключи нельзя расшифровать на этом узле. Замените их вместо добавления",
     "channel credential cannot be decrypted on this node": "учётные данные канала нельзя расшифровать на этом узле",
     "The refunded task completed later and was charged again": "Возвращённая задача позже завершилась и была оплачена повторно",
-    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "Запрошенный вывод превышает лимит модели. Бюджет вывода уменьшается автоматически."
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "Запрошенный вывод превышает лимит модели. Бюджет вывода уменьшается автоматически.",
+    "Model presets": "Пресеты моделей",
+    "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.": "Получить модели этого адреса. Для распознанных моделей контекст, ввод и вывод заполняются автоматически.",
+    "Fetch models": "Получить модели",
+    "No models returned": "Модели не получены",
+    "Recognized": "Распознана",
+    "Not recognized": "Не распознана",
+    "Context {{value}} tokens": "Контекст {{value}} токенов",
+    "Recognized preset: {{name}}": "Распознанный пресет: {{name}}",
+    "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "Выбранная модель не распознана. Используются осторожные значения; настройте их под провайдера.",
+    "Parallel model calls (0 = preset)": "Параллельные вызовы модели (0 = пресет)",
+    "Unable to fetch models. Check the endpoint and API key.": "Не удалось получить модели. Проверьте адрес и API-ключ.",
+    "Enter the API key for this endpoint": "Введите API-ключ для этого адреса"
   }
 }

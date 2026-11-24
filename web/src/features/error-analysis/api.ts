@@ -22,6 +22,8 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 import type {
   AnalysisConfig,
   AnalysisFilter,
+  AnalysisModelOption,
+  AnalysisModelPreset,
   AnalysisTask,
   ConfigInput,
   FailureLog,
@@ -56,6 +58,15 @@ export async function saveConfig(input: ConfigInput): Promise<AnalysisConfig> {
     '/api/error-analysis/config',
     input
   )
+  return requireServerSuccess(response.data).data
+}
+export async function listModels(input: {
+  endpoint: string
+  api_key: string
+}) {
+  const response = await api.post<
+    Response<{ models: AnalysisModelOption[]; presets: AnalysisModelPreset[] }>
+  >('/api/error-analysis/models', input)
   return requireServerSuccess(response.data).data
 }
 export async function startAnalysis(filter: AnalysisFilter) {

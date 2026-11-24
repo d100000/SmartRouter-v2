@@ -8929,6 +8929,18 @@
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "此节点无法解密已保存的密钥，请改为替换密钥而不是追加",
     "channel credential cannot be decrypted on this node": "此节点无法解密渠道凭据",
     "The refunded task completed later and was charged again": "已退款的任务后来完成，已重新扣费",
-    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "请求的输出超过模型的输出上限，已自动降低输出预算。"
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "请求的输出超过模型的输出上限，已自动降低输出预算。",
+    "Model presets": "模型预设",
+    "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.": "获取该地址可用的模型。已识别的模型会自动填好上下文、输入和输出设置。",
+    "Fetch models": "获取模型",
+    "No models returned": "未返回任何模型",
+    "Recognized": "已识别",
+    "Not recognized": "未识别",
+    "Context {{value}} tokens": "上下文 {{value}} token",
+    "Recognized preset: {{name}}": "已识别预设：{{name}}",
+    "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "所选模型未识别，将使用保守的默认值，请按服务商的实际能力调整。",
+    "Parallel model calls (0 = preset)": "并发模型调用数（0 = 按预设）",
+    "Unable to fetch models. Check the endpoint and API key.": "无法获取模型，请检查地址和 API Key。",
+    "Enter the API key for this endpoint": "请填写该地址的 API Key"
   }
 }

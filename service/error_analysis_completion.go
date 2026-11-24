@@ -97,7 +97,7 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 	ctx, cancel := context.WithTimeout(parent, time.Duration(config.TimeoutSeconds)*time.Second)
 	defer cancel()
 	body, err := common.Marshal(map[string]any{
-		"model": config.Model, "stream": false, "max_tokens": config.MaxOutputTokens,
+		"model": config.Model, "stream": false, analysisTokenParam(config.Model): config.MaxOutputTokens,
 		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": input}},
 	})
 	if err != nil {

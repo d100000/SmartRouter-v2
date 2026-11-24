@@ -8929,6 +8929,18 @@
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "Nút này không thể giải mã các khóa đã lưu. Hãy thay thế khóa thay vì thêm vào",
     "channel credential cannot be decrypted on this node": "nút này không thể giải mã thông tin xác thực của kênh",
     "The refunded task completed later and was charged again": "Tác vụ đã hoàn tiền sau đó đã hoàn tất và được tính phí lại",
-    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "Đầu ra yêu cầu vượt giới hạn đầu ra của mô hình. Ngân sách đầu ra được tự động giảm."
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "Đầu ra yêu cầu vượt giới hạn đầu ra của mô hình. Ngân sách đầu ra được tự động giảm.",
+    "Model presets": "Cấu hình mô hình sẵn có",
+    "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.": "Lấy danh sách mô hình của địa chỉ này. Mô hình được nhận diện sẽ tự điền ngữ cảnh, đầu vào và đầu ra.",
+    "Fetch models": "Lấy mô hình",
+    "No models returned": "Không có mô hình nào được trả về",
+    "Recognized": "Đã nhận diện",
+    "Not recognized": "Chưa nhận diện",
+    "Context {{value}} tokens": "Ngữ cảnh {{value}} token",
+    "Recognized preset: {{name}}": "Cấu hình đã nhận diện: {{name}}",
+    "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "Mô hình đã chọn chưa được nhận diện. Áp dụng giá trị mặc định thận trọng; hãy điều chỉnh theo nhà cung cấp.",
+    "Parallel model calls (0 = preset)": "Số lệnh gọi song song (0 = theo cấu hình)",
+    "Unable to fetch models. Check the endpoint and API key.": "Không lấy được mô hình. Hãy kiểm tra địa chỉ và API key.",
+    "Enter the API key for this endpoint": "Hãy nhập API key cho địa chỉ này"
   }
 }

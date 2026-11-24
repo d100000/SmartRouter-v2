@@ -8929,6 +8929,18 @@
     "The stored keys cannot be decrypted on this node. Replace them instead of appending": "Les clés enregistrées ne peuvent pas être déchiffrées sur ce nœud. Remplacez-les au lieu d’en ajouter",
     "channel credential cannot be decrypted on this node": "les identifiants du canal ne peuvent pas être déchiffrés sur ce nœud",
     "The refunded task completed later and was charged again": "La tâche remboursée s’est terminée plus tard et a été facturée à nouveau",
-    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "La sortie demandée dépasse la limite du modèle. Le budget de sortie est réduit automatiquement."
+    "The requested output exceeded the model output limit. The output budget is reduced automatically.": "La sortie demandée dépasse la limite du modèle. Le budget de sortie est réduit automatiquement.",
+    "Model presets": "Préréglages de modèle",
+    "Fetch the models of this endpoint. Recognized models fill in context, input and output settings automatically.": "Récupère les modèles de ce point d'accès. Les modèles reconnus remplissent automatiquement le contexte, l'entrée et la sortie.",
+    "Fetch models": "Récupérer les modèles",
+    "No models returned": "Aucun modèle renvoyé",
+    "Recognized": "Reconnu",
+    "Not recognized": "Non reconnu",
+    "Context {{value}} tokens": "Contexte {{value}} tokens",
+    "Recognized preset: {{name}}": "Préréglage reconnu : {{name}}",
+    "The selected model is not recognized. Conservative defaults apply; adjust them to your provider.": "Le modèle choisi n'est pas reconnu. Des valeurs prudentes s'appliquent ; ajustez-les à votre fournisseur.",
+    "Parallel model calls (0 = preset)": "Appels de modèle en parallèle (0 = préréglage)",
+    "Unable to fetch models. Check the endpoint and API key.": "Impossible de récupérer les modèles. Vérifiez le point d'accès et la clé API.",
+    "Enter the API key for this endpoint": "Saisissez la clé API de ce point d'accès"
   }
 }
