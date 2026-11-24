@@ -129,6 +129,35 @@ beforeEach(() => {
           task.state.can_resume = false
         }
         data = { task, created: false }
+      } else if (request.url?.endsWith('/models')) {
+        data = {
+          models: [
+            {
+              id: 'deepseek-flash',
+              preset: {
+                id: 'deepseek-v4.1-flash',
+                name: 'DeepSeek V4.1 Flash',
+                context_window: 1000000,
+                max_output: 384000,
+                input_budget: 131072,
+                output_reserve: 16384,
+                concurrency: 4,
+                thinking: 'default_on',
+                token_param: 'max_tokens',
+              },
+              suggested_context_window: 1000000,
+              suggested_input_budget: 131072,
+              suggested_output_reserve: 16384,
+            },
+            {
+              id: 'private-model',
+              suggested_context_window: 65536,
+              suggested_input_budget: 32768,
+              suggested_output_reserve: 8192,
+            },
+          ],
+          presets: [],
+        }
       } else {
         const task: AnalysisTask = {
           task_id: 'new-report',
@@ -265,7 +294,7 @@ describe('Error analysis workflow', () => {
     const context = within(dialog).getByLabelText(
       'Model context limit (tokens)'
     )
-    expect(context).toHaveValue(32768)
+    expect(context).toHaveValue(131072)
     expect(
       within(dialog).queryByLabelText('No-token timeout (seconds)')
     ).not.toBeInTheDocument()
@@ -277,17 +306,72 @@ describe('Error analysis workflow', () => {
     )
     expect(writes).toHaveLength(0)
     await user.clear(context)
-    await user.type(context, '32768')
+    await user.type(context, '131072')
     await user.click(within(dialog).getByRole('button', { name: 'Save' }))
     await waitFor(() =>
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     )
     expect(writes[0].data).toMatchObject({
-      context_window_tokens: 32768,
-      chunk_input_tokens: 8000,
-      max_output_tokens: 2048,
+      context_window_tokens: 131072,
+      chunk_input_tokens: 65536,
+      max_output_tokens: 16384,
       safety_margin_tokens: 4096,
-      max_calls: 100,
+      max_calls: 200,
+      max_concurrency: 0,
+    })
+  })
+
+  test('fetching models marks recognized ones and fills their budgets', async () => {
+    const user = userEvent.setup()
+    render(<ErrorAnalysis />, { wrapper: Wrapper })
+    await screen.findByText('No requests in this time range')
+    await user.click(screen.getByRole('button', { name: 'Analysis settings' }))
+    const dialog = screen.getByRole('dialog')
+    await user.type(
+      within(dialog).getByLabelText('API Key'),
+      'test-analysis-key'
+    )
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Fetch models' })
+    )
+    const recognized = await within(dialog).findByRole('button', {
+      name: /deepseek-flash/,
+    })
+    expect(recognized).toHaveTextContent('Recognized · DeepSeek V4.1 Flash')
+    expect(
+      within(dialog).getByRole('button', { name: /private-model/ })
+    ).toHaveTextContent('Not recognized')
+    expect(writes[0]).toMatchObject({
+      url: '/api/error-analysis/models',
+      data: {
+        endpoint: 'https://example.com/v1/chat/completions',
+        api_key: 'test-analysis-key',
+      },
+    })
+
+    await user.click(recognized)
+    expect(within(dialog).getByLabelText('Model')).toHaveValue(
+      'deepseek-flash'
+    )
+    expect(
+      within(dialog).getByLabelText('Model context limit (tokens)')
+    ).toHaveValue(1000000)
+    expect(
+      within(dialog).getByLabelText('Segment input target (tokens)')
+    ).toHaveValue(131072)
+    expect(
+      within(dialog).getByLabelText('Parallel model calls (0 = preset)')
+    ).toHaveValue(4)
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    expect(writes[1].data).toMatchObject({
+      model: 'deepseek-flash',
+      context_window_tokens: 1000000,
+      chunk_input_tokens: 131072,
+      max_output_tokens: 16384,
+      max_concurrency: 4,
     })
   })
 

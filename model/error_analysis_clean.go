@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -18,57 +17,11 @@ import (
 // an anomaly or more than one log row are kept for aggregation and the
 // evidence dialog. This keeps main-database writes proportional to failures.
 //
-// A clean request is recognised when its single consume row arrives and no
-// earlier row of the same request exists. If a later row of that request
-// appears after all, the count is withdrawn and the request is stored with
-// both rows. Logs are scanned in ID order, so retries normally precede the
-// final consume row; the remembered window covers late rows within one run.
-
-const errorAnalysisCleanMemory = 50_000
-
-type errorAnalysisCleanEntry struct {
-	entry  FailureLog
-	period string
-	dims   map[string]string
-}
-
-type errorAnalysisCleanWindow struct {
-	order   []string
-	entries map[string]errorAnalysisCleanEntry
-}
-
-var errorAnalysisCleanWindows = struct {
-	sync.Mutex
-	byTask map[string]*errorAnalysisCleanWindow
-}{byTask: map[string]*errorAnalysisCleanWindow{}}
-
-func errorAnalysisCleanWindowFor(generation string) *errorAnalysisCleanWindow {
-	errorAnalysisCleanWindows.Lock()
-	defer errorAnalysisCleanWindows.Unlock()
-	window := errorAnalysisCleanWindows.byTask[generation]
-	if window == nil {
-		window = &errorAnalysisCleanWindow{entries: map[string]errorAnalysisCleanEntry{}}
-		errorAnalysisCleanWindows.byTask[generation] = window
-	}
-	return window
-}
-
-func forgetErrorAnalysisCleanWindow(generation string) {
-	errorAnalysisCleanWindows.Lock()
-	delete(errorAnalysisCleanWindows.byTask, generation)
-	errorAnalysisCleanWindows.Unlock()
-}
-
-func (w *errorAnalysisCleanWindow) remember(key string, value errorAnalysisCleanEntry) {
-	if _, exists := w.entries[key]; !exists {
-		w.order = append(w.order, key)
-	}
-	w.entries[key] = value
-	for len(w.order) > errorAnalysisCleanMemory {
-		delete(w.entries, w.order[0])
-		w.order = w.order[1:]
-	}
-}
+// A request is counted this way only when its single consume row has no
+// anomaly and the scan will not meet another row of the same request: the
+// collector asks the log database, by the request_id index, which requests of
+// the page have later rows inside the scan range. The decision therefore
+// depends on the logs alone and stays exact when a scan is resumed.
 
 func errorAnalysisReason(entry FailureLog) string {
 	reason := entry.Diagnostic.ErrorCode
@@ -81,14 +34,15 @@ func errorAnalysisReason(entry FailureLog) string {
 	return reason
 }
 
+// errorAnalysisDimensions names the distributions one request counts toward.
 func errorAnalysisDimensions(entry FailureLog, location *time.Location) map[string]string {
 	day := time.Unix(entry.CreatedAt, 0).In(location)
 	day = time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, location)
 	return map[string]string{"model": entry.Model, "channel": strconv.Itoa(entry.Channel), "reason": errorAnalysisReason(entry), "timeline": strconv.FormatInt(day.Unix(), 10)}
 }
 
-// errorAnalysisCleanTally collects request-count changes for one page and
-// writes them to the same count and distribution rows aggregation adds to.
+// errorAnalysisCleanTally collects the clean requests of one page and adds
+// them to the same count and distribution rows aggregation adds to.
 type errorAnalysisCleanTally struct {
 	counts map[string]int
 	dims   map[string]*errorAnalysisCleanDim
@@ -96,36 +50,32 @@ type errorAnalysisCleanTally struct {
 
 type errorAnalysisCleanDim struct {
 	kind, value string
-	delta       int
+	requests    int
 }
 
-func newErrorAnalysisCleanTally() *errorAnalysisCleanTally {
-	return &errorAnalysisCleanTally{counts: map[string]int{}, dims: map[string]*errorAnalysisCleanDim{}}
-}
-
-func (t *errorAnalysisCleanTally) add(clean errorAnalysisCleanEntry, delta int) {
-	t.counts[clean.period] += delta
-	for dimension, value := range clean.dims {
-		kind := "dist_" + clean.period + "_" + dimension
+func (t *errorAnalysisCleanTally) add(period string, dims map[string]string) {
+	if t.counts == nil {
+		t.counts, t.dims = map[string]int{}, map[string]*errorAnalysisCleanDim{}
+	}
+	t.counts[period]++
+	for dimension, value := range dims {
+		kind := "dist_" + period + "_" + dimension
 		identity := kind + "\x00" + value
 		if t.dims[identity] == nil {
 			t.dims[identity] = &errorAnalysisCleanDim{kind: kind, value: value}
 		}
-		t.dims[identity].delta += delta
+		t.dims[identity].requests++
 	}
 }
 
 func (t *errorAnalysisCleanTally) artifacts(tx *gorm.DB, taskID string) ([]ErrorAnalysisArtifact, error) {
-	result := []ErrorAnalysisArtifact{}
-	for period, delta := range t.counts {
-		if delta == 0 {
-			continue
-		}
+	result := make([]ErrorAnalysisArtifact, 0, len(t.counts)+len(t.dims))
+	for period, requests := range t.counts {
 		var counts FailureCounts
 		if err := loadErrorAnalysisArtifact(tx, taskID, "counts", period, &counts); err != nil {
 			return nil, err
 		}
-		counts.Requests += delta
+		counts.Requests += requests
 		artifact, err := newErrorAnalysisArtifact(taskID, "counts", period, counts)
 		if err != nil {
 			return nil, err
@@ -133,15 +83,12 @@ func (t *errorAnalysisCleanTally) artifacts(tx *gorm.DB, taskID string) ([]Error
 		result = append(result, artifact)
 	}
 	for _, dim := range t.dims {
-		if dim.delta == 0 {
-			continue
-		}
 		name := fmt.Sprintf("%x", sha256.Sum256([]byte(dim.value)))
 		distribution := FailureDistribution{Name: dim.value}
 		if err := loadErrorAnalysisArtifact(tx, taskID, dim.kind, name, &distribution); err != nil {
 			return nil, err
 		}
-		distribution.Requests += dim.delta
+		distribution.Requests += dim.requests
 		artifact, err := newErrorAnalysisArtifact(taskID, dim.kind, name, distribution)
 		if err != nil {
 			return nil, err

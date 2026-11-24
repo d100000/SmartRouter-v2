@@ -1157,6 +1157,7 @@ func TestErrorAnalysisWorkflowResumesSavedResults(t *testing.T) {
 	var result AnalysisResult
 	require.NoError(t, common.UnmarshalJsonStr(string(completed.Result), &result))
 	assert.True(t, result.Complete)
+	assert.Equal(t, 2, result.Run.Calls, "the run summary covers the paused run and the resumed one")
 	require.NotNil(t, result.Coverage)
 	assert.True(t, result.Coverage.Complete)
 	assert.Equal(t, 2, result.Snapshot.Requests)

@@ -259,10 +259,11 @@ export function ReportContent(props: { task: AnalysisTask }) {
                   <SeverityBadge severity={section.severity} />
                 </h3>
                 {section.id.startsWith('issue-') &&
-                  section.affected !== undefined && (
+                  (section.affected ?? 0) + (section.previous_affected ?? 0) >
+                    0 && (
                     <p className='text-muted-foreground text-xs'>
                       {t('Affected requests')}:{' '}
-                      {formatNumber(section.affected, locale)}
+                      {formatNumber(section.affected ?? 0, locale)}
                       {(section.previous_affected ?? 0) > 0 &&
                         ` (${t('Previous period')}: ${formatNumber(section.previous_affected ?? 0, locale)})`}
                       {(section.channels?.length ?? 0) > 0 &&

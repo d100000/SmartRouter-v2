@@ -3,8 +3,10 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -103,8 +105,25 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 	}()
 	ctx, cancel := context.WithTimeout(parent, time.Duration(config.TimeoutSeconds)*time.Second)
 	defer cancel()
+	// Providers disagree on the name of the output limit. A model without a
+	// preset starts with max_tokens; when the provider rejects the name
+	// itself, the same request is sent once more with the other one.
+	param := analysisTokenParam(config.Model)
+	content, err := postErrorAnalysis(parent, ctx, client, config, key, system, input, param, attempt)
+	var failure *analysisFailure
+	if errors.As(err, &failure) && failure.Code == "analysis_token_parameter" {
+		param = map[string]string{"max_tokens": "max_completion_tokens", "max_completion_tokens": "max_tokens"}[param]
+		content, err = postErrorAnalysis(parent, ctx, client, config, key, system, input, param, attempt)
+		if errors.As(err, &failure) && failure.Code == "analysis_token_parameter" {
+			failure.Code = "analysis_invalid_request"
+		}
+	}
+	return content, err
+}
+
+func postErrorAnalysis(parent, ctx context.Context, client *http.Client, config ErrorAnalysisConfig, key, system, input, tokenParam string, attempt *AnalysisAttempt) (string, error) {
 	body, err := common.Marshal(map[string]any{
-		"model": config.Model, "stream": false, analysisTokenParam(config.Model): config.MaxOutputTokens,
+		"model": config.Model, "stream": false, tokenParam: config.MaxOutputTokens,
 		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": input}},
 	})
 	if err != nil {
@@ -140,8 +159,10 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 		} `json:"choices"`
 	}
 	decodeErr := common.Unmarshal(data, &completion)
+	// Some gateways always send an "error" member; only one that says
+	// something marks a failed 200 response.
 	providerError := gjson.GetBytes(data, "error")
-	hasProviderError := providerError.Exists() && providerError.Type != gjson.Null
+	hasProviderError := providerError.Type == gjson.True || providerError.Type == gjson.String && providerError.String() != "" || providerError.IsObject() && len(providerError.Map()) > 0
 	if response.StatusCode != http.StatusOK || hasProviderError {
 		failure := &analysisFailure{Code: "analysis_http_error", Status: response.StatusCode, Retryable: response.StatusCode == 408 || response.StatusCode == 429 || response.StatusCode >= 500}
 		switch response.StatusCode {
@@ -152,11 +173,13 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 		case 400, 404, 422:
 			failure.Code = "analysis_invalid_request"
 		}
-		switch classifyAnalysisSizeError(response.StatusCode, data) {
+		switch classifyAnalysisRequestError(response.StatusCode, data, tokenParam) {
 		case "input":
 			failure.Code, failure.Retryable = "analysis_context_limit", false
 		case "output":
 			failure.Code, failure.Retryable = "analysis_output_limit", false
+		case "parameter":
+			failure.Code, failure.Retryable = "analysis_token_parameter", false
 		}
 		// Respect bounded Retry-After without retaining provider-controlled text.
 		if seconds, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && seconds > 0 {
@@ -192,44 +215,68 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 // error may be an object, a bare string or a top-level message. Only the
 // classification is kept; provider text never reaches diagnostics.
 var (
-	analysisOutputLimitMarkers = []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "maximum output", "output token"}
-	analysisInputLimitMarkers  = []string{
-		"context_length", "context length", "context_window", "context window", "maximum context",
-		"prompt is too long", "prompt too long", "prompt_too_long", "input is too long", "input too long", "input_too_long",
-		"too many tokens", "too_many_tokens", "too many input tokens", "request too large", "request_too_large",
-		"reduce the length", "exceeds the maximum", "token limit", "string_above_max_length",
+	// Unambiguous: accepted with any status that is not about credentials.
+	analysisContextLimitMarkers = []string{
+		"context_length", "context_window_exceeded", "maximum context length", "context window exceeded",
+		"prompt is too long", "prompt_too_long", "string_above_max_length", "request_too_large",
+	}
+	// Plausible wording of the same problem, accepted only on a client error.
+	analysisInputLimitMarkers = []string{
+		"context length", "context_window", "context window", "maximum context",
+		"prompt too long", "input is too long", "input too long", "input_too_long",
+		"too many tokens", "too_many_tokens", "too many input tokens", "request too large",
+		"reduce the length", "exceeds the maximum", "token limit",
 		"上下文", "超出最大", "过长", "太长",
 	}
+	analysisOutputLimitMarkers    = []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "maximum output", "output token"}
+	analysisTooLargeWords         = []string{"too large", "too high", "at most", "maximum", "exceed", "less than", "larger than", "greater than"}
+	analysisUnknownParameterMarks = []string{"unsupported parameter", "not supported", "unrecognized request argument", "unknown parameter", "unexpected keyword", "extra inputs are not permitted", "extra_forbidden"}
 )
 
-func classifyAnalysisSizeError(status int, data []byte) string {
-	if status == http.StatusTooManyRequests || status >= 500 {
-		return "" // Rate and capacity limits are retried, never split.
-	}
+// classifyAnalysisRequestError tells apart the failures a different request
+// can fix: "input" (send less), "output" (ask for less output) and
+// "parameter" (the provider rejects the name of the output limit itself).
+func classifyAnalysisRequestError(status int, data []byte, tokenParam string) string {
 	root := gjson.ParseBytes(data)
 	parts := []string{root.Get("message").String()}
 	if node := root.Get("error"); node.IsObject() {
-		parts = append(parts, node.Get("code").String(), node.Get("type").String(), node.Get("message").String())
+		parts = append(parts, node.Get("code").String(), node.Get("type").String(), node.Get("message").String(), node.Get("param").String())
 	} else if node.Exists() {
 		parts = append(parts, node.String())
 	}
-	if !root.Exists() || !root.IsObject() {
+	if !root.IsObject() {
 		// Proxies often answer an oversized body with plain text or HTML.
 		parts = append(parts, string(data[:min(len(data), 2048)]))
 	}
 	text := strings.ToLower(strings.Join(parts, " "))
-	for _, marker := range analysisOutputLimitMarkers {
-		if strings.Contains(text, marker) {
-			return "output"
-		}
+	contains := func(markers []string) bool {
+		return slices.ContainsFunc(markers, func(marker string) bool { return strings.Contains(text, marker) })
 	}
-	if status == http.StatusRequestEntityTooLarge {
-		return "input"
-	}
-	for _, marker := range analysisInputLimitMarkers {
-		if strings.Contains(text, marker) {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound:
+		return ""
+	case status == http.StatusTooManyRequests:
+		// A request above the per-minute token allowance never fits by
+		// waiting. Any other rate limit is retried, never split.
+		if strings.Contains(text, "request too large") || strings.Contains(text, "request_too_large") {
 			return "input"
 		}
+		return ""
+	case status >= 500:
+		if contains(analysisContextLimitMarkers) {
+			return "input"
+		}
+		return ""
+	case status == http.StatusRequestEntityTooLarge || contains(analysisContextLimitMarkers):
+		return "input"
+	case contains(analysisOutputLimitMarkers) && contains(analysisTooLargeWords):
+		return "output"
+	case strings.Contains(text, tokenParam) && contains(analysisUnknownParameterMarks):
+		return "parameter"
+	case contains(analysisOutputLimitMarkers):
+		return "output"
+	case contains(analysisInputLimitMarkers):
+		return "input"
 	}
 	return ""
 }

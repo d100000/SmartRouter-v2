@@ -100,6 +100,13 @@ func AnalysisModelPresets() []AnalysisModelPreset {
 	return slices.Clone(analysisModelPresets)
 }
 
+func analysisPresetName(modelName string) string {
+	if preset := MatchAnalysisModelPreset(modelName); preset != nil {
+		return preset.Name
+	}
+	return ""
+}
+
 func analysisTokenParam(modelName string) string {
 	if preset := MatchAnalysisModelPreset(modelName); preset != nil {
 		return preset.TokenParam

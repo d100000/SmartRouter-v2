@@ -56,14 +56,41 @@ func TestAnalysisSizeErrorsAreRecognised(t *testing.T) {
 		{"proxy rejects the body", 413, `<html><body>413 Request Entity Too Large</body></html>`, "input"},
 		{"Chinese gateway wording", 400, `{"error":{"message":"请求内容超出最大上下文长度"}}`, "input"},
 		{"output parameter too large", 400, `{"error":{"message":"max_tokens is too large: 65536. This model supports at most 32768 completion tokens"}}`, "output"},
+		{"output limit worded as unsupported", 400, `{"error":{"message":"max_tokens 65536 is not supported: the maximum is 32768"}}`, "output"},
+		{"output limit name rejected", 400, `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","param":"max_tokens"}}`, "parameter"},
 		{"rate limit mentioning tokens", 429, `{"error":{"message":"token limit per minute exceeded"}}`, ""},
+		{"request above the per-minute allowance", 429, `{"error":{"message":"Request too large for this model on tokens per min (TPM): Limit 30000, Requested 45000."}}`, "input"},
+		{"quota error mentioning a token limit", 403, `{"error":{"message":"You exceeded your current quota: token limit reached"}}`, ""},
+		{"gateway reports the overflow as a server error", 500, `{"error":{"code":"context_length_exceeded","message":"upstream error"}}`, "input"},
 		{"server error mentioning context", 503, `{"error":{"message":"context window service unavailable"}}`, ""},
 		{"unrelated invalid request", 400, `{"error":{"code":"invalid_model","message":"unknown model"}}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, classifyAnalysisSizeError(tc.status, []byte(tc.body)))
+			assert.Equal(t, tc.want, classifyAnalysisRequestError(tc.status, []byte(tc.body), "max_tokens"))
 		})
 	}
+}
+
+func TestAnalysisCompletionSwitchesTheOutputLimitName(t *testing.T) {
+	var sent []string
+	client := &http.Client{Transport: analysisTestTransport(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		reply, status := `{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"error":{}}`, 200
+		if gjson.GetBytes(body, "max_tokens").Exists() {
+			sent = append(sent, "max_tokens")
+			reply, status = `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}`, 400
+		} else {
+			require.EqualValues(t, 4096, gjson.GetBytes(body, "max_completion_tokens").Int())
+			sent = append(sent, "max_completion_tokens")
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(reply)), Request: request}, nil
+	})}
+	config := ErrorAnalysisConfig{Endpoint: "https://analysis.example/v1/chat/completions", Model: "unlisted-reasoning-model", TimeoutSeconds: 30, MaxOutputTokens: 4096}
+	content, err := completeErrorAnalysis(context.Background(), client, config, "key", "system", "input", &AnalysisAttempt{})
+	require.NoError(t, err)
+	assert.Equal(t, "done", content, "an empty error member on a successful answer is not a failure")
+	assert.Equal(t, []string{"max_tokens", "max_completion_tokens"}, sent, "a model without a preset is retried once with the other name")
 }
 
 func TestAnalysisCompletionMapsSizeErrors(t *testing.T) {
@@ -99,6 +126,9 @@ func TestAnalysisDefaultsUpgradeOnlyUntouchedValues(t *testing.T) {
 	assert.Equal(t, defaultAnalysisTimezone, upgraded.Timezone)
 	assert.Equal(t, errorAnalysisDefaultsRevision, upgraded.DefaultsRevision)
 	require.NoError(t, validateErrorAnalysisConfig(ErrorAnalysisConfig{Endpoint: "https://a.example/v1/chat/completions", Model: "m", Timezone: upgraded.Timezone, MaxAttempts: 1, TimeoutSeconds: 60, IdleSeconds: 60, SampleLimit: 10, ReportLanguage: "zh", ContextWindowTokens: upgraded.ContextWindowTokens, ChunkInputTokens: upgraded.ChunkInputTokens, MaxOutputTokens: defaultAnalysisMaxOutput, SafetyMarginTokens: upgraded.SafetyMarginTokens, MaxCalls: upgraded.MaxCalls}))
+
+	small := upgradeAnalysisDefaults(ErrorAnalysisConfig{ContextWindowTokens: 16384, ChunkInputTokens: 8000, MaxOutputTokens: 2048, SafetyMarginTokens: 4096, MaxCalls: 100, Timezone: "UTC"})
+	assert.Equal(t, []int{16384, 8000, 2048}, []int{small.ContextWindowTokens, small.ChunkInputTokens, small.MaxOutputTokens}, "budgets that would no longer fit an operator's own context window stay as they are")
 
 	again := upgradeAnalysisDefaults(ErrorAnalysisConfig{DefaultsRevision: errorAnalysisDefaultsRevision, ContextWindowTokens: 32768, Timezone: "Asia/Shanghai"})
 	assert.Equal(t, 32768, again.ContextWindowTokens, "a value chosen after the upgrade is never changed again")
@@ -234,6 +264,8 @@ func TestAnalysisPresetsFitTheConfigurationLimits(t *testing.T) {
 		assert.Contains(t, []string{"max_tokens", "max_completion_tokens"}, preset.TokenParam)
 		assert.LessOrEqual(t, preset.InputBudget, preset.ContextWindow/4, "%s keeps to the effective part of its window", preset.ID)
 	}
+	assert.Equal(t, "Kimi K3.1 Pro", analysisPresetName("moonshot/kimi-k3.1-pro-highspeed"), "the settings page shows the preset by name")
+	assert.Empty(t, analysisPresetName("some-private-model"))
 	assert.Equal(t, "max_completion_tokens", analysisTokenParam("gpt-6.2-sol"))
 	assert.Equal(t, "max_tokens", analysisTokenParam("some-private-model"))
 	assert.Equal(t, 4, analysisConcurrency(ErrorAnalysisConfig{Model: "deepseek-flash"}))
@@ -283,6 +315,8 @@ type packTestProvider struct {
 	finals    int
 	// breakPacks returns a pack answer that omits one group.
 	breakPacks bool
+	// refuse answers a single group of this reason with a server error.
+	refuse string
 }
 
 func (p *packTestProvider) client(t *testing.T) *http.Client {
@@ -313,6 +347,9 @@ func (p *packTestProvider) client(t *testing.T) *http.Client {
 			}
 			return analysisWorkflowTestResponse(t, request, map[string]any{"findings": out}, "stop")
 		case input.Get("samples").IsArray():
+			if p.refuse != "" && input.Get("reason").String() == p.refuse {
+				return &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+			}
 			p.groupSent[input.Get("reason").String()]++
 			result := finding(input)
 			delete(result, "group_id")
@@ -348,6 +385,9 @@ func runPackTestAnalysis(t *testing.T, db *gorm.DB, configure func(*ErrorAnalysi
 	(errorAnalysisHandler{client: provider.client(t)}).Run(context.Background(), claimed, "pack-worker")
 	done, err := model.GetSystemTaskByTaskID(task.TaskID)
 	require.NoError(t, err)
+	if provider.refuse != "" {
+		return done, AnalysisResult{}
+	}
 	require.Equal(t, model.SystemTaskStatusSucceeded, done.Status, done.Error)
 	var result AnalysisResult
 	require.NoError(t, common.UnmarshalJsonStr(string(done.Result), &result))
@@ -419,6 +459,43 @@ func TestAnalysisPackThatLosesAGroupIsSplit(t *testing.T) {
 	})
 }
 
+func TestAnalysisFindingsOfASplitPackSurviveALaterFailure(t *testing.T) {
+	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
+		seedPackTestLogs(t, db)
+		// The pack of three loses a group and is split. The timeout group
+		// then gets its finding; the provider fails the rate-limit group.
+		provider := &packTestProvider{groupSent: map[string]int{}, breakPacks: true, refuse: "rate_limited"}
+		paused, _ := runPackTestAnalysis(t, db, nil, provider)
+		require.Equal(t, model.SystemTaskStatusFailed, paused.Status)
+		var state AnalysisState
+		require.NoError(t, paused.DecodeState(&state))
+		require.True(t, state.CanResume)
+		assert.GreaterOrEqual(t, state.CompletedChunks, 1, "the finished group counts as progress")
+
+		provider.refuse = ""
+		_, err := ResumeErrorAnalysis(paused.TaskID)
+		require.NoError(t, err)
+		claimed, ok, err := model.ClaimSystemTask(paused.ID, model.ErrorAnalysisTaskType, "pack-resume", time.Now().Unix()+600)
+		require.NoError(t, err)
+		require.True(t, ok)
+		(errorAnalysisHandler{client: provider.client(t)}).Run(context.Background(), claimed, "pack-resume")
+		done, err := model.GetSystemTaskByTaskID(paused.TaskID)
+		require.NoError(t, err)
+		require.Equal(t, model.SystemTaskStatusSucceeded, done.Status, done.Error)
+		assert.Equal(t, 1, provider.groupSent["timeout"], "the stored finding is not asked for again")
+		threes := 0
+		for _, size := range provider.packSizes {
+			if size == 3 {
+				threes++
+			}
+		}
+		assert.Equal(t, 1, threes, "the resumed run packs only the groups still missing a finding")
+		var result AnalysisResult
+		require.NoError(t, common.UnmarshalJsonStr(string(done.Result), &result))
+		assert.Greater(t, result.Run.Calls, state.CallsUsed, "the run summary counts the calls of both runs")
+	})
+}
+
 func TestAnalysisLargeGroupsRunInParallel(t *testing.T) {
 	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
 		seedPackTestLogs(t, db)
@@ -434,14 +511,16 @@ func TestAnalysisLargeGroupsRunInParallel(t *testing.T) {
 	})
 }
 
-func TestAnalysisCleanCountIsWithdrawnForALateRetryRow(t *testing.T) {
+func TestAnalysisRequestWithALaterRowIsStoredNotCounted(t *testing.T) {
 	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
 		start := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
 		logs := []model.Log{{RequestId: "late", Type: model.LogTypeConsume, CreatedAt: start + 1, ModelName: "m", ChannelId: 1, CompletionTokens: 3}}
 		for i := range 4 {
 			logs = append(logs, model.Log{RequestId: "fill-" + string(rune('a'+i)), Type: model.LogTypeConsume, CreatedAt: start + 2, ModelName: "m", ChannelId: 1, CompletionTokens: 1})
 		}
-		// The failed attempt of "late" is written after its successful row.
+		// The failed attempt of "late" is written after its successful row,
+		// several pages later. Its first row must be stored, not counted, so
+		// the two rows end up as one request whatever happens in between.
 		logs = append(logs, model.Log{RequestId: "late", Type: model.LogTypeError, CreatedAt: start + 3, ModelName: "m", ChannelId: 2, Other: `{"error_code":"timeout"}`})
 		require.NoError(t, db.Create(&logs).Error)
 		task, err := model.CreateSystemTask(model.ErrorAnalysisTaskType, errorAnalysisPayload{ErrorAnalysisFilter: model.ErrorAnalysisFilter{Start: start, End: start + 86400}, WorkflowVersion: 2}, AnalysisState{Version: 2})
@@ -467,6 +546,9 @@ func TestAnalysisCleanCountIsWithdrawnForALateRetryRow(t *testing.T) {
 		snapshot, err := model.LoadErrorAnalysisWorkflowSnapshot(task.TaskID)
 		require.NoError(t, err)
 		assert.Equal(t, 5, snapshot.Current.Requests, "the late row joins its request instead of adding one")
+		var stored int64
+		require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("task_id = ? AND kind = ?", task.TaskID, "request").Count(&stored).Error)
+		assert.EqualValues(t, 1, stored, "the four clean requests are only counted")
 		assert.Equal(t, 1, snapshot.Current.Recovered)
 		evidence, err := model.GetErrorAnalysisRequestEvidence(task.TaskID, "late")
 		require.NoError(t, err)

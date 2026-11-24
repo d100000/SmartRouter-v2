@@ -247,9 +247,8 @@ func (w *analysisWorkflow) recordAttempt(attempt AnalysisAttempt, phase string, 
 	if len(w.state.Attempts) > 100 {
 		w.state.Attempts = w.state.Attempts[len(w.state.Attempts)-100:]
 	}
-	w.result.Run.Calls++
-	w.result.Run.InputTokens += attempt.InputTokens
-	w.result.Run.DurationMs += attempt.DurationMs
+	w.state.InputTokensUsed += attempt.InputTokens
+	w.state.CallMillis += attempt.DurationMs
 	if phase != "" {
 		w.state.Phase, w.state.NextRetryAt = phase, nextRetry
 	}
@@ -475,6 +474,8 @@ func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
 		w.result.Sections = append(w.result.Sections, AnalysisReportSection{ID: "limits", Title: labels[5], Content: strings.Join(final.Limits, " ")})
 	}
 	w.result.Summary = summary
+	// Totals across every run of this analysis, including resumed ones.
+	w.result.Run.Calls, w.result.Run.InputTokens, w.result.Run.DurationMs = w.state.CallsUsed, w.state.InputTokensUsed, w.state.CallMillis
 	var report strings.Builder
 	report.WriteString("## 📌 " + labels[0] + "\n\n" + summary + "\n\n")
 	report.WriteString("## 📊 " + labels[1] + "\n\n")

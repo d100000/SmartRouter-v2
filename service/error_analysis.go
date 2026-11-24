@@ -40,16 +40,19 @@ type AnalysisAttempt struct {
 }
 
 type AnalysisState struct {
-	Version         int               `json:"version,omitempty"`
-	ScannedRows     int64             `json:"scanned_rows,omitempty"`
-	TotalRows       int64             `json:"total_rows,omitempty"`
-	TotalKnown      bool              `json:"total_known"`
-	CompletedChunks int               `json:"completed_chunks,omitempty"`
-	TotalChunks     int               `json:"total_chunks,omitempty"`
-	CurrentStep     string            `json:"current_step,omitempty"`
-	CanResume       bool              `json:"can_resume,omitempty"`
-	CallsUsed       int               `json:"calls_used,omitempty"`
-	MaxCalls        int               `json:"max_calls,omitempty"`
+	Version         int    `json:"version,omitempty"`
+	ScannedRows     int64  `json:"scanned_rows,omitempty"`
+	TotalRows       int64  `json:"total_rows,omitempty"`
+	TotalKnown      bool   `json:"total_known"`
+	CompletedChunks int    `json:"completed_chunks,omitempty"`
+	TotalChunks     int    `json:"total_chunks,omitempty"`
+	CurrentStep     string `json:"current_step,omitempty"`
+	CanResume       bool   `json:"can_resume,omitempty"`
+	CallsUsed       int    `json:"calls_used,omitempty"`
+	MaxCalls        int    `json:"max_calls,omitempty"`
+	// Input tokens sent and time spent in model calls, across resumed runs.
+	InputTokensUsed int               `json:"input_tokens_used,omitempty"`
+	CallMillis      int64             `json:"call_ms,omitempty"`
 	Phase           string            `json:"phase"`
 	Attempt         int               `json:"attempt"`
 	MaxAttempts     int               `json:"max_attempts"`
@@ -239,7 +242,12 @@ func analysisScanRowsPerSecond() int {
 
 func (handler errorAnalysisHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	if retention := analysisEvidenceRetention(); retention > 0 {
-		if _, err := model.PruneErrorAnalysisEvidence(ctx, time.Now().Add(-retention).Unix()); err != nil {
+		// Expired evidence is removed for at most half a minute per run, so a
+		// large backlog shrinks over several runs without delaying this one.
+		pruning, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, err := model.PruneErrorAnalysisEvidence(pruning, time.Now().Add(-retention).Unix())
+		cancel()
+		if err != nil && ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) {
 			logger.LogError(ctx, common.LogText("error analysis evidence pruning failed: %v", err))
 		}
 	}

@@ -141,9 +141,13 @@ func addErrorAnalysisShare(shares []ErrorAnalysisShare, name string, previous bo
 	} else {
 		shares[index].Current++
 	}
+	// The current period decides which channel or model leads the group.
 	slices.SortStableFunc(shares, func(a, b ErrorAnalysisShare) int {
-		if a.Current+a.Previous != b.Current+b.Previous {
-			return (b.Current + b.Previous) - (a.Current + a.Previous)
+		if a.Current != b.Current {
+			return b.Current - a.Current
+		}
+		if a.Previous != b.Previous {
+			return b.Previous - a.Previous
 		}
 		return strings.Compare(a.Name, b.Name)
 	})
@@ -473,8 +477,39 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 		next.Stable = false
 		next.Warnings = append(next.Warnings, "source_rows_changed_during_scan")
 	}
-	var pendingClean map[string]*errorAnalysisCleanEntry
-	err := withErrorAnalysisLease(ctx, taskID, runnerID, func(tx *gorm.DB) error {
+	// Clean single-row requests are only counted (see error_analysis_clean.go).
+	// ClickHouse rows arrive unordered, and an exact request lookup is tiny,
+	// so both keep every request.
+	countClean := scan.Source == "id_watermark" && next.Filter.RequestID == ""
+	location, err := time.LoadLocation(scan.Timezone)
+	if err != nil {
+		return err
+	}
+	rowsPerKey := make(map[string]int, len(keys))
+	for _, key := range keys {
+		rowsPerKey[key]++
+	}
+	// Requests of this page that the scan will meet again must be stored, so
+	// their later rows find them.
+	seenAgain := map[string]bool{}
+	if countClean {
+		var candidates []string
+		for i := range logs {
+			if logs[i].Type == LogTypeConsume && logs[i].RequestId != "" && rowsPerKey[keys[i]] == 1 {
+				candidates = append(candidates, logs[i].RequestId)
+			}
+		}
+		if len(candidates) > 0 {
+			var later []string
+			if err := errorAnalysisLogQuery(ctx, *scan).Where("request_id IN ? AND id > ? AND id <= ?", candidates, next.CursorID, scan.HighWaterID).Pluck("request_id", &later).Error; err != nil {
+				return err
+			}
+			for _, id := range later {
+				seenAgain[id] = true
+			}
+		}
+	}
+	err = withErrorAnalysisLease(ctx, taskID, runnerID, func(tx *gorm.DB) error {
 		var stored ErrorAnalysisArtifact
 		if err := tx.Where("task_id = ? AND kind = ? AND name = ?", taskID, "scan", "checkpoint").Take(&stored).Error; err != nil {
 			return err
@@ -500,22 +535,7 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 				facts[artifact.Name] = fact
 			}
 		}
-		// Clean single-row requests are only counted (see error_analysis_clean.go).
-		// ClickHouse rows arrive unordered, and an exact request lookup is tiny,
-		// so both keep every request.
-		countClean := scan.Source == "id_watermark" && next.Filter.RequestID == ""
-		location, err := time.LoadLocation(scan.Timezone)
-		if err != nil {
-			return err
-		}
-		window := errorAnalysisCleanWindowFor(scan.Generation)
-		tally := newErrorAnalysisCleanTally()
-		// The shared window changes only after this transaction commits.
-		pendingClean = map[string]*errorAnalysisCleanEntry{}
-		rowsPerKey := map[string]int{}
-		for _, key := range keys {
-			rowsPerKey[key]++
-		}
+		var tally errorAnalysisCleanTally
 		for i, log := range logs {
 			// SQL's candidate lookup can be case-insensitive on MySQL.
 			if next.Filter.RequestID != "" && next.Filter.RequestID != log.RequestId {
@@ -524,30 +544,13 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 			entry := ClassifyFailureLog(log)
 			compactErrorAnalysisEvidence(&entry)
 			fact, stored := facts[keys[i]]
-			if countClean && !stored {
-				earlier, ok := window.entries[keys[i]]
-				if pending, staged := pendingClean[keys[i]]; staged {
-					earlier, ok = errorAnalysisCleanEntry{}, false
-					if pending != nil {
-						earlier, ok = *pending, true
-					}
+			if countClean && !stored && rowsPerKey[keys[i]] == 1 && log.Type == LogTypeConsume && len(entry.Categories) == 0 && !seenAgain[log.RequestId] {
+				period := "current"
+				if scan.Comparison && entry.CreatedAt < scan.Filter.Start {
+					period = "previous"
 				}
-				if ok {
-					// A later row of a request counted as clean: withdraw the count
-					// and keep the request with both rows.
-					tally.add(earlier, -1)
-					pendingClean[keys[i]] = nil
-					mergeErrorAnalysisRequest(&fact, earlier.entry)
-				} else if rowsPerKey[keys[i]] == 1 && log.Type == LogTypeConsume && len(entry.Categories) == 0 {
-					period := "current"
-					if scan.Comparison && entry.CreatedAt < scan.Filter.Start {
-						period = "previous"
-					}
-					clean := errorAnalysisCleanEntry{entry: entry, period: period, dims: errorAnalysisDimensions(entry, location)}
-					tally.add(clean, 1)
-					pendingClean[keys[i]] = &clean
-					continue
-				}
+				tally.add(period, errorAnalysisDimensions(entry, location))
+				continue
 			}
 			mergeErrorAnalysisRequest(&fact, entry)
 			facts[keys[i]] = fact
@@ -590,18 +593,6 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 	})
 	if err == nil {
 		*scan = next
-		if next.Done {
-			forgetErrorAnalysisCleanWindow(scan.Generation)
-		} else if len(pendingClean) > 0 {
-			window := errorAnalysisCleanWindowFor(scan.Generation)
-			for key, clean := range pendingClean {
-				if clean == nil {
-					delete(window.entries, key)
-				} else {
-					window.remember(key, *clean)
-				}
-			}
-		}
 	}
 	return err
 }
@@ -766,16 +757,8 @@ func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, ba
 				}
 			}
 			counts[period].add(entry)
-			reason := entry.Diagnostic.ErrorCode
-			if reason == "" {
-				reason = entry.Diagnostic.EndReason
-			}
-			if reason == "" {
-				reason = strconv.Itoa(entry.Diagnostic.StatusCode)
-			}
-			day := time.Unix(entry.CreatedAt, 0).In(location)
-			day = time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, location)
-			for dimension, value := range map[string]string{"model": entry.Model, "channel": strconv.Itoa(entry.Channel), "reason": reason, "timeline": strconv.FormatInt(day.Unix(), 10)} {
+			reason := errorAnalysisReason(entry)
+			for dimension, value := range errorAnalysisDimensions(entry, location) {
 				kind := "dist_" + period + "_" + dimension
 				name := fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
 				identity := kind + ":" + name

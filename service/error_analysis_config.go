@@ -40,7 +40,8 @@ type ErrorAnalysisConfig struct {
 	MaxCalls            int    `json:"max_calls"`
 	// MaxConcurrency limits parallel model calls; 0 uses the model preset.
 	MaxConcurrency int `json:"max_concurrency"`
-	// Preset is the recognised model preset, recomputed on every save.
+	// Preset is the display name of the model preset the configured model is
+	// recognised as. It is derived from the model, never stored as a choice.
 	Preset string `json:"preset,omitempty"`
 	// DefaultsRevision records which built-in defaults a stored configuration
 	// has been upgraded to. Values still equal to an older default move to the
@@ -66,18 +67,18 @@ func upgradeAnalysisDefaults(config ErrorAnalysisConfig) ErrorAnalysisConfig {
 	if config.DefaultsRevision >= errorAnalysisDefaultsRevision {
 		return config
 	}
-	for _, field := range []struct {
-		value     *int
-		old, next int
-	}{
-		{&config.ContextWindowTokens, 32768, defaultAnalysisContextWindow},
-		{&config.ChunkInputTokens, 8000, defaultAnalysisChunkInput},
-		{&config.MaxOutputTokens, 2048, defaultAnalysisMaxOutput},
-		{&config.MaxCalls, 100, defaultAnalysisMaxCalls},
-	} {
-		if *field.value == field.old {
-			*field.value = field.next
-		}
+	if config.ContextWindowTokens == 32768 {
+		config.ContextWindowTokens = defaultAnalysisContextWindow
+	}
+	// A context an operator set for a smaller model keeps budgets that fit it.
+	if config.ChunkInputTokens == 8000 && defaultAnalysisChunkInput < config.ContextWindowTokens {
+		config.ChunkInputTokens = defaultAnalysisChunkInput
+	}
+	if config.MaxOutputTokens == 2048 && defaultAnalysisMaxOutput+config.SafetyMarginTokens+512 < config.ContextWindowTokens {
+		config.MaxOutputTokens = defaultAnalysisMaxOutput
+	}
+	if config.MaxCalls == 100 {
+		config.MaxCalls = defaultAnalysisMaxCalls
 	}
 	if config.Timezone == "Asia/Shanghai" {
 		config.Timezone = defaultAnalysisTimezone
@@ -91,6 +92,7 @@ func GetErrorAnalysisConfig() (ErrorAnalysisConfig, error) {
 	var option model.Option
 	err := model.DB.Where(map[string]any{"key": errorAnalysisConfigOption}).Take(&option).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
+		config.Preset = analysisPresetName(config.Model)
 		return config, nil
 	}
 	if err != nil {
@@ -101,6 +103,7 @@ func GetErrorAnalysisConfig() (ErrorAnalysisConfig, error) {
 	}
 	config = upgradeAnalysisDefaults(normalizeAnalysisBudgets(config))
 	config.APIKeyConfigured = config.EncryptedKey != ""
+	config.Preset = analysisPresetName(config.Model)
 	return config, nil
 }
 
@@ -193,10 +196,7 @@ func SaveErrorAnalysisConfig(config ErrorAnalysisConfig, key string, clearKey bo
 	}
 	config.Version++
 	config.DefaultsRevision = errorAnalysisDefaultsRevision
-	config.Preset = ""
-	if preset := MatchAnalysisModelPreset(config.Model); preset != nil {
-		config.Preset = preset.ID
-	}
+	config.Preset = analysisPresetName(config.Model)
 	config.APIKeyConfigured = config.EncryptedKey != ""
 	raw, err := common.Marshal(config)
 	if err != nil {

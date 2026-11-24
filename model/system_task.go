@@ -365,7 +365,8 @@ func GetLatestSystemTasks(taskTypes []string) (map[string]*SystemTask, error) {
 
 // DeleteFinishedSystemTasks deletes, in batches, the succeeded and failed rows
 // last updated before cutoff. Error analysis reports keep their explicit
-// manual retention policy, including their checkpoint and evidence artifacts.
+// manual retention policy; only their per-request evidence expires on its own
+// (PruneErrorAnalysisEvidence).
 // The newest row of every type stays: the
 // scheduler and the node sync read it. A row that becomes the newest later is
 // newer than cutoff.

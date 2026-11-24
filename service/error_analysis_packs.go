@@ -98,22 +98,7 @@ func (w *analysisWorkflow) analyzeGroups(groups []model.ErrorAnalysisGroup) ([]a
 						err = &analysisFailure{Code: "analysis_internal_error"}
 					}
 				}()
-				results, err := w.analyzePack(groups, pack)
-				if err != nil {
-					return err
-				}
-				for _, index := range pack {
-					if err := w.saveArtifact("finding", groups[index].ID, results[index]); err != nil {
-						return err
-					}
-				}
-				w.mu.Lock()
-				defer w.mu.Unlock()
-				for _, index := range pack {
-					findings[index] = results[index]
-					w.state.CompletedChunks++
-				}
-				return w.saveState()
+				return w.analyzePack(groups, pack, findings)
 			}()
 			if err != nil {
 				failedMu.Lock()
@@ -170,18 +155,29 @@ type analysisPackFinding struct {
 	analysisFinding
 }
 
-// analyzePack returns a finding for every group of the pack. A pack the model
-// cannot complete is split; a single group falls back to analyzeGroup.
-func (w *analysisWorkflow) analyzePack(groups []model.ErrorAnalysisGroup, pack []int) (map[int]analysisFinding, error) {
-	results := map[int]analysisFinding{}
+// finishGroup stores one group's finding as soon as it is known, so a run
+// that stops later, also in the middle of a split pack, does not repeat it.
+func (w *analysisWorkflow) finishGroup(findings []analysisFinding, index int, id string, finding analysisFinding) error {
+	if err := w.saveArtifact("finding", id, finding); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	findings[index] = finding
+	w.state.CompletedChunks++
+	return w.saveState()
+}
+
+// analyzePack produces a finding for every group of the pack. A pack the
+// model cannot complete is split; a single group falls back to analyzeGroup.
+func (w *analysisWorkflow) analyzePack(groups []model.ErrorAnalysisGroup, pack []int, findings []analysisFinding) error {
 	if len(pack) == 1 {
 		w.setPhase("analyzing", groups[pack[0]].Reason)
 		finding, err := w.analyzeGroup(groups[pack[0]], 0)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		results[pack[0]] = finding
-		return results, nil
+		return w.finishGroup(findings, pack[0], groups[pack[0]].ID, finding)
 	}
 	w.setPhase("analyzing", fmt.Sprintf("%d groups", len(pack)))
 	inputs := make([]analysisGroupInput, 0, len(pack))
@@ -198,7 +194,7 @@ func (w *analysisWorkflow) analyzePack(groups []model.ErrorAnalysisGroup, pack [
 	}
 	input, err := common.Marshal(map[string]any{"groups": inputs})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	decode := func(text string) (map[string]analysisFinding, error) {
 		text = strings.TrimSpace(text)
@@ -234,40 +230,39 @@ func (w *analysisWorkflow) analyzePack(groups []model.ErrorAnalysisGroup, pack [
 	if err != nil {
 		var failure *analysisFailure
 		if !errors.As(err, &failure) || !slices.Contains([]string{"analysis_context_limit", "analysis_incomplete_report", "analysis_invalid_finding"}, failure.Code) {
-			return nil, err
+			return err
 		}
 		// The pack is too large or the model could not keep the groups apart:
 		// analyse the halves separately.
 		middle := len(pack) / 2
 		for _, half := range [][]int{pack[:middle], pack[middle:]} {
-			partial, err := w.analyzePack(groups, half)
-			if err != nil {
-				return nil, err
-			}
-			for index, finding := range partial {
-				results[index] = finding
+			if err := w.analyzePack(groups, half, findings); err != nil {
+				return err
 			}
 		}
-		return results, nil
+		return nil
 	}
 	decoded, err := decode(content)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	for id, finding := range decoded {
-		index := byID[id]
+	for _, index := range pack {
 		group := groups[index]
 		compactAnalysisGroup(&group)
-		if finding, err = w.followUp(group, finding, 0); err != nil {
-			return nil, err
+		finding, err := w.followUp(group, decoded[group.ID], 0)
+		if err != nil {
+			return err
 		}
-		results[index] = finding
+		if err := w.finishGroup(findings, index, group.ID, finding); err != nil {
+			return err
+		}
 	}
-	return results, nil
+	return nil
 }
 
-// analysisSeverity rates a group from its share of all requests and whether
-// it touches billing. A model cannot change it.
+// analysisSeverity rates a group from the share of all requests it affects.
+// Any billing risk is at least high, and critical from ten requests on. A
+// model cannot change the rating.
 func analysisSeverity(group model.ErrorAnalysisGroup, requests int) string {
 	affected := group.Current.Affected
 	if affected == 0 {
@@ -279,9 +274,9 @@ func analysisSeverity(group model.ErrorAnalysisGroup, requests int) string {
 		share = float64(affected) / float64(requests)
 	}
 	switch {
-	case billing > 0 || share >= 0.05:
+	case billing >= 10 || share >= 0.05:
 		return "critical"
-	case share >= 0.01 || affected >= 50:
+	case billing > 0 || share >= 0.01 || affected >= 50:
 		return "high"
 	case share >= 0.001 || affected >= 5:
 		return "medium"
@@ -359,8 +354,11 @@ type analysisFinal struct {
 // the format becomes the summary rather than failing the report. A priority
 // citing unknown evidence is dropped.
 func decodeAnalysisFinal(content string, allowed []string) analysisFinal {
-	text := strings.TrimSpace(content)
-	text = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "```json"), "```"))
+	// Models wrap the object in a code fence or a sentence of their own.
+	text := content
+	if start, end := strings.Index(content, "{"), strings.LastIndex(content, "}"); start >= 0 && end > start {
+		text = content[start : end+1]
+	}
 	var final analysisFinal
 	if err := common.UnmarshalJsonStr(text, &final); err != nil || strings.TrimSpace(final.Summary) == "" {
 		return analysisFinal{Summary: content}
