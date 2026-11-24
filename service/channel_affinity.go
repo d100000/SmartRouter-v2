@@ -34,9 +34,9 @@ const (
 	ginKeyChannelAffinityTouch       = "channel_affinity_touch"
 
 	// channelAffinitySeenPrefix marks the entry that records when a session
-	// bound below the best healthy priority tier last used its binding. The
-	// session key is hashed so no caller-chosen value can name another
-	// session's entry.
+	// bound below another priority tier last used its binding to that
+	// channel. The session key is hashed so no caller-chosen value can name
+	// another session's entry.
 	channelAffinitySeenPrefix = "#seen:"
 	// defaultChannelAffinityReturnIdle is how long such a session must be
 	// idle before it returns to the higher tier.
@@ -788,29 +788,26 @@ func channelAffinityReturnIdle() time.Duration {
 	return time.Duration(setting.ReturnToPriorityIdleSeconds) * time.Second
 }
 
-func channelAffinitySeenKey(cacheKey string) string {
-	return channelAffinitySeenPrefix + common.Sha1([]byte(cacheKey))
+// The clock belongs to one binding: a session bound to another channel later
+// never reads the time recorded for this one.
+func channelAffinitySeenKey(cacheKey string, channelID int) string {
+	return channelAffinitySeenPrefix + common.Sha1([]byte(cacheKey+"\x00"+strconv.Itoa(channelID)))
 }
 
 // channelAffinityIdle reports whether the current session's binding has been
-// unused for the return interval. It is asked only for a session whose bound
-// channel sits below a healthy higher priority tier. The first such request
-// starts the clock: a successful request then records its time.
-func channelAffinityIdle(c *gin.Context) bool {
+// unused for the return interval. It is asked for every request of a session
+// whose bound channel sits below another priority tier, whether or not that
+// tier is healthy at the moment, and marks the request so that its success
+// records the time of this use. The first such request starts the clock.
+func channelAffinityIdle(c *gin.Context, boundChannelID int) bool {
 	idle := channelAffinityReturnIdle()
 	cacheKey, _, ok := getChannelAffinityContext(c)
 	if idle <= 0 || !ok {
 		return false
 	}
-	seen, found, err := getChannelAffinityCache().Get(channelAffinitySeenKey(cacheKey))
-	if err != nil {
-		return false
-	}
-	if found && time.Since(time.Unix(int64(seen), 0)) > idle {
-		return true
-	}
 	c.Set(ginKeyChannelAffinityTouch, true)
-	return false
+	seen, found, err := getChannelAffinityCache().Get(channelAffinitySeenKey(cacheKey, boundChannelID))
+	return err == nil && found && time.Since(time.Unix(int64(seen), 0)) > idle
 }
 
 // releaseChannelAffinity lets this request rebind its session to the channel
@@ -826,8 +823,8 @@ type ChannelAffinityWrite struct {
 	cacheKey            string
 	ttl                 time.Duration
 	observed, channelID int
-	// touch records the use of a binding that sits below a healthy higher
-	// priority tier. A binding that moves starts without that record.
+	// touch records the use of a binding that sits below another priority
+	// tier. A binding that moves starts without that record.
 	touch bool
 }
 
@@ -868,7 +865,7 @@ func PrepareChannelAffinityWrite(c *gin.Context, channelID int) *ChannelAffinity
 		cacheKey: cacheKey, ttl: time.Duration(ttlSeconds) * time.Second, observed: observed, channelID: channelID,
 		// A return that ended on the old channel after all waits another
 		// full interval before it is tried again.
-		touch: c.GetBool(ginKeyChannelAffinityTouch) || released,
+		touch: c.GetBool(ginKeyChannelAffinityTouch),
 	}
 }
 
@@ -890,12 +887,12 @@ func (w *ChannelAffinityWrite) Commit() bool {
 	case w.observed > 0 && w.channelID != w.observed:
 		// The idle clock belongs to the previous channel. A session that is
 		// demoted again later must start a new one.
-		if _, err := cache.DeleteMany([]string{channelAffinitySeenKey(w.cacheKey)}); err != nil {
+		if _, err := cache.DeleteMany([]string{channelAffinitySeenKey(w.cacheKey, w.observed)}); err != nil {
 			common.SysError(common.LogText("channel affinity seen delete failed: key=%s, err=%v", w.cacheKey, err))
 		}
 	case w.touch:
-		// Only a session still using its lower-tier binding keeps the clock.
-		if err := cache.SetWithTTL(channelAffinitySeenKey(w.cacheKey), int(time.Now().Unix()), w.ttl); err != nil {
+		// A session still using its lower-tier binding restarts the clock.
+		if err := cache.SetWithTTL(channelAffinitySeenKey(w.cacheKey, w.channelID), int(time.Now().Unix()), w.ttl); err != nil {
 			common.SysError(common.LogText("channel affinity seen set failed: key=%s, err=%v", w.cacheKey, err))
 		}
 	}

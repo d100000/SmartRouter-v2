@@ -417,17 +417,25 @@ func (e *Engine) evaluate(key Key, s *keyState, candidates []Candidate, now time
 		}
 	}
 	if active && result[top].probability > 0.9 {
+		// The cap keeps healthy peers observed. With strict priority a lower
+		// tier is not a peer: its share is the spill computed above and
+		// nothing more, or a slightly degraded top tier would hand it a flat
+		// tenth of the traffic.
+		alternative := func(i int) bool {
+			item := result[i]
+			return i != top && item.healthy && !item.rampLimited && (!strict || item.candidate.Priority >= result[top].candidate.Priority)
+		}
 		healthyAlternativeWeight := 0.0
-		for i, item := range result {
-			if i != top && item.healthy && !item.rampLimited {
-				healthyAlternativeWeight += item.weight
+		for i := range result {
+			if alternative(i) {
+				healthyAlternativeWeight += result[i].weight
 			}
 		}
 		if healthyAlternativeWeight > 0 {
 			excess := result[top].probability - 0.9
 			result[top].probability = 0.9
 			for i := range result {
-				if i != top && result[i].healthy && !result[i].rampLimited {
+				if alternative(i) {
 					result[i].probability += excess * result[i].weight / healthyAlternativeWeight
 				}
 			}

@@ -58,14 +58,22 @@ func TestDemotedSessionReturnsToHigherPriorityAfterIdle(t *testing.T) {
 		require.True(t, found)
 		cacheKey, _, ok := getChannelAffinityContext(c)
 		require.True(t, ok)
-		require.NoError(t, getChannelAffinityCache().SetWithTTL(channelAffinitySeenKey(cacheKey), int(time.Now().Add(-by).Unix()), time.Hour))
+		require.NoError(t, getChannelAffinityCache().SetWithTTL(channelAffinitySeenKey(cacheKey, backup), int(time.Now().Add(-by).Unix()), time.Hour))
 	}
 
-	t.Run("stays while the higher tier has no recent success", func(t *testing.T) {
+	t.Run("a session in use through a higher-tier outage is not idle when it ends", func(t *testing.T) {
+		// The primary has no recent success yet, as after an outage.
 		newRequest := bindRoutingTestSession(t, name, "prefer", backup)
 		assert.Equal(t, backup, route(newRequest))
+		age(newRequest, 6*time.Minute)
+		assert.Equal(t, backup, route(newRequest), "nothing healthy to return to")
+		// The primary recovers. The session was used a moment ago, so it
+		// keeps the channel that holds its cache.
+		succeed(primary)
+		assert.Equal(t, backup, route(newRequest), "the request during the outage restarted the idle clock")
+		age(newRequest, 6*time.Minute)
+		assert.Equal(t, primary, route(newRequest), "once really idle it returns")
 	})
-	succeed(primary)
 
 	t.Run("an active session keeps its channel and an idle one returns", func(t *testing.T) {
 		newRequest := bindRoutingTestSession(t, name, "prefer", backup)
@@ -139,7 +147,7 @@ func TestDemotedSessionReturnsToHigherPriorityAfterIdle(t *testing.T) {
 		_, found := GetPreferredChannelByAffinity(c, name, "default")
 		require.True(t, found)
 		cacheKey, _, _ := getChannelAffinityContext(c)
-		_, seen, err := getChannelAffinityCache().Get(channelAffinitySeenKey(cacheKey))
+		_, seen, err := getChannelAffinityCache().Get(channelAffinitySeenKey(cacheKey, primary))
 		require.NoError(t, err)
 		assert.False(t, seen, "no bookkeeping for sessions that are where priority wants them")
 	})

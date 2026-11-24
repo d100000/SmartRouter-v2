@@ -460,6 +460,15 @@ func TestRepeatedStatusReportsPublishRoutingMetadataOnce(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 				assert.Greater(t, RoutingMetadataVersion(), changed, "bringing a stale cache in line is published")
+
+				// The same holds for a key another node disabled while the
+				// channel's own status stayed the same.
+				info := ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyStatusList: map[int]int{1: common.ChannelStatusAutoDisabled}}
+				require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{"key": "key\nother", "channel_info": info}).Error)
+				require.False(t, EnableChannelAutomatically(channel.Id, ""))
+				stored, err = CacheGetChannel(channel.Id)
+				require.NoError(t, err)
+				assert.Equal(t, map[int]int{1: common.ChannelStatusAutoDisabled}, stored.ChannelInfo.MultiKeyStatusList)
 			}
 		})
 	}

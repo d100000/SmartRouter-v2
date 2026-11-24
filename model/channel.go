@@ -1420,11 +1420,12 @@ func updateChannelStatus(channelId int, usingKey string, status int, reason stri
 		// their own failures or the periodic sync find it.
 		bumpChannelsCoalesced()
 	}
-	if !changed && cachedChannelStatusIs(channelId, channel.Status) {
+	if !changed && cachedChannelStatusMatches(channel) {
 		// Nothing was written and this node already routes by the stored
-		// status. During an outage every failing in-flight request reports
-		// the same channel; republishing the routing membership for each of
-		// them would stall selection for no new information.
+		// channel and key statuses. During an outage every failing in-flight
+		// request reports the same channel; republishing the routing
+		// membership for each of them would stall selection for no new
+		// information.
 		return false
 	}
 	CacheUpdateChannel(channel)

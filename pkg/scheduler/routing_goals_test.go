@@ -289,20 +289,67 @@ func TestHigherPriorityAlternativesForDemotedBinding(t *testing.T) {
 	candidates := []Candidate{primary, backup, peer}
 	s := newTrafficSim()
 	s.engine.RegisterCandidates(goalsKey, candidates)
-	assert.Empty(t, s.engine.HigherPriorityAlternatives(goalsKey, backup.ID), "a tier without recent successes is not a target")
+	healthy, demoted := s.engine.HigherPriorityAlternatives(goalsKey, backup.ID)
+	assert.Empty(t, healthy, "a tier without recent successes is not a target")
+	assert.True(t, demoted, "but the binding is below it all the same")
 	s.run(goalsKey, candidates, 200, 0, 200*time.Millisecond, never)
-	assert.Equal(t, map[int]bool{1: true}, s.engine.HigherPriorityAlternatives(goalsKey, backup.ID), "peers of the same tier are not a reason to move")
-	assert.Empty(t, s.engine.HigherPriorityAlternatives(goalsKey, primary.ID))
-	assert.Empty(t, s.engine.HigherPriorityAlternatives(goalsKey, 99))
+	healthy, demoted = s.engine.HigherPriorityAlternatives(goalsKey, backup.ID)
+	assert.Equal(t, map[int]bool{1: true}, healthy, "peers of the same tier are not a reason to move")
+	assert.True(t, demoted)
+	healthy, demoted = s.engine.HigherPriorityAlternatives(goalsKey, primary.ID)
+	assert.Empty(t, healthy)
+	assert.False(t, demoted, "the highest tier has nothing above it")
+	healthy, demoted = s.engine.HigherPriorityAlternatives(goalsKey, 99)
+	assert.Empty(t, healthy)
+	assert.False(t, demoted)
 
 	cooling := primary
 	cooling.CooldownUntil = s.now.Add(time.Minute)
 	s.engine.RegisterCandidates(goalsKey, []Candidate{cooling, backup, peer})
-	assert.Empty(t, s.engine.HigherPriorityAlternatives(goalsKey, backup.ID), "a cooling tier is not a target")
+	healthy, demoted = s.engine.HigherPriorityAlternatives(goalsKey, backup.ID)
+	assert.Empty(t, healthy, "a cooling tier is not a target")
+	assert.True(t, demoted, "a cooling tier is still above the binding")
 	s.engine.RegisterCandidates(goalsKey, candidates)
 
 	config := DefaultConfig()
 	config.SoftPriority = true
 	require.NoError(t, s.engine.SetConfig(goalsKey, config))
-	assert.Empty(t, s.engine.HigherPriorityAlternatives(goalsKey, backup.ID), "soft priority never moves a session for priority")
+	healthy, demoted = s.engine.HigherPriorityAlternatives(goalsKey, backup.ID)
+	assert.Empty(t, healthy, "soft priority never moves a session for priority")
+	assert.False(t, demoted)
+}
+
+func TestStrictPriorityCapGivesALowerTierOnlyItsSpill(t *testing.T) {
+	candidates := []Candidate{{ID: 1, Status: 1, Priority: 10, Weight: 1}, {ID: 2, Status: 1, Priority: 0, Weight: 1}}
+	s := newTrafficSim()
+	s.engine.RegisterCandidates(goalsKey, candidates)
+	s.run(goalsKey, candidates, 2000, 0, 200*time.Millisecond, never)
+	require.True(t, s.engine.IsActive(goalsKey))
+
+	// The top tier fails one request in ten: mostly healthy, at times just
+	// below the level at which the backup starts to receive its spill.
+	smallSpills := 0
+	for range 6000 {
+		s.now = s.now.Add(200 * time.Millisecond)
+		s.request(goalsKey, candidates, func(id int) bool { return id == 1 && s.random() < 0.10 })
+		s.engine.mu.Lock()
+		evaluated, _ := s.engine.evaluate(goalsKey, s.engine.state(goalsKey, s.now), candidates, s.now, false, nil)
+		s.engine.mu.Unlock()
+		total, backup := 0.0, evaluatedCandidate{}
+		for _, item := range evaluated {
+			total += item.weight
+			if item.candidate.ID == 2 {
+				backup = item
+			}
+		}
+		if len(evaluated) < 2 || total <= 0 {
+			continue // The top tier is cooling: the backup carries everything.
+		}
+		share := backup.weight / total
+		if share > 0 && share < 0.1 {
+			smallSpills++
+		}
+		require.InDelta(t, share, backup.probability, 1e-9, "the 90%% cap must not hand a lower tier more than its spill")
+	}
+	assert.Positive(t, smallSpills, "the scenario must include spills smaller than the cap's tenth")
 }

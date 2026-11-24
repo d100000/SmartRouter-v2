@@ -511,8 +511,10 @@ func reserveAffinityChannel(c *gin.Context, modelName, usingGroup string, filter
 		if len(healthy) == 0 && preferred.OwnerSupplierID == "" {
 			// A session that failed over to a lower priority tier goes back
 			// to a healthy higher tier once it has been idle long enough
-			// for the upstream prompt cache to have expired anyway.
-			if higher := scheduler.Default.HigherPriorityAlternatives(key, id); len(higher) > 0 && channelAffinityIdle(c) {
+			// for the upstream prompt cache to have expired anyway. The idle
+			// clock runs for every demoted binding, also while the higher
+			// tier is unhealthy.
+			if higher, demoted := scheduler.Default.HigherPriorityAlternatives(key, id); demoted && channelAffinityIdle(c, id) && len(higher) > 0 {
 				healthy, returning = higher, true
 			}
 		}

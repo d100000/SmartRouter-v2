@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"sort"
@@ -455,16 +456,18 @@ func advanceCachedPollingIndex(id int, advance func(cursor int) int) bool {
 	return true
 }
 
-// cachedChannelStatusIs reports whether routing on this node already uses
-// status for the channel. Without the memory cache routing reads the database.
-func cachedChannelStatusIs(id int, status int) bool {
+// cachedChannelStatusMatches reports whether routing on this node already
+// uses the stored status of the channel and of each of its keys. Without the
+// memory cache routing reads the database.
+func cachedChannelStatusMatches(stored *Channel) bool {
 	if !common.MemoryCacheEnabled {
 		return true
 	}
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
-	channel, ok := channelsIDM[id]
-	return ok && channel.Status == status
+	cached, ok := channelsIDM[stored.Id]
+	return ok && cached.Status == stored.Status &&
+		maps.Equal(cached.ChannelInfo.MultiKeyStatusList, stored.ChannelInfo.MultiKeyStatusList)
 }
 
 func CacheUpdateChannelStatus(id int, status int) {

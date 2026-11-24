@@ -315,31 +315,35 @@ func (e *Engine) healthyBindingTarget(s *keyState, ch *channelState, now time.Ti
 	return candidate, short.Successes > 0 && ch.baseSuccess >= s.config.SuccessTarget && shortSuccess >= s.config.SuccessTarget
 }
 
-// HigherPriorityAlternatives identifies healthy members of a higher priority
-// tier than a session's bound channel. A session that failed over to a lower
-// tier may return to them once the host decides its binding has gone idle.
+// HigherPriorityAlternatives reports whether a session's bound channel sits
+// below another routable priority tier (demoted) and which members of higher
+// tiers are healthy right now. A session that failed over to a lower tier may
+// return to them once the host decides its binding has gone idle. The host
+// tracks that idle time for every demoted binding, also while no higher tier
+// is healthy, so a session in use through an outage is not mistaken for an
+// idle one when the higher tier recovers.
 // Dimensions with soft priority never ask a session to move for priority.
-func (e *Engine) HigherPriorityAlternatives(key Key, channelID int) map[int]bool {
+func (e *Engine) HigherPriorityAlternatives(key Key, channelID int) (healthy map[int]bool, demoted bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.now()
 	s := e.state(key, now)
 	ch := s.channels[channelID]
 	if ch == nil || !ch.registered || s.config.SoftPriority {
-		return nil
+		return nil, false
 	}
-	bound := e.configuredCandidate(s, ch, ch.candidate, now).Priority
-	var higher map[int]bool
+	bound := ch.candidate.Priority
 	for id, other := range s.channels {
-		if id == channelID || !other.registered || other.candidate.Priority <= bound {
+		if id == channelID || !other.registered || other.candidate.Excluded || other.candidate.Priority <= bound {
 			continue
 		}
-		if candidate, ok := e.healthyBindingTarget(s, other, now); ok && candidate.Priority > bound {
-			if higher == nil {
-				higher = make(map[int]bool)
+		demoted = true
+		if _, ok := e.healthyBindingTarget(s, other, now); ok {
+			if healthy == nil {
+				healthy = make(map[int]bool)
 			}
-			higher[id] = true
+			healthy[id] = true
 		}
 	}
-	return higher
+	return healthy, demoted
 }
