@@ -79,6 +79,6 @@ The error analysis changes (`83b4503`, `db4fa2f`, `e5a5891`, `a50e83e` and later
      go test -race -count=1 -p 1 -run 'ErrorAnalysis|TestAnalysis' ./service/
    ```
 
-Points that differ on MySQL and deserve a look: request IDs compare case-insensitively under the default collation (the exact request lookup filters again in Go); upserts into `error_analysis_artifacts` use `ON DUPLICATE KEY UPDATE`; the look-ahead for later rows of a request uses `idx_logs_request_id` with up to 1,000 IDs per page.
+Points that differ on MySQL and deserve a look: request IDs compare case-insensitively under the default collation (the exact request lookup filters again in Go); upserts into `error_analysis_artifacts` use `ON DUPLICATE KEY UPDATE`; the look-ahead for later rows of a request uses `idx_logs_request_id` with up to 1,000 IDs per page; reports are assembled from per-day segments (`model/error_analysis_segments.go`), which count and take the newest ID of each day's log rows and merge artifacts with `task_id IN (...) ORDER BY name`. Run a second analysis the next day as well and check that it reports reused days.
 
 Record the MySQL version, the commands and the results in the handoff, as AGENTS.md requires.

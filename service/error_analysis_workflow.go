@@ -255,53 +255,108 @@ func (w *analysisWorkflow) recordAttempt(attempt AnalysisAttempt, phase string, 
 	return w.saveState()
 }
 
-func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
-	w.state.Phase = "collecting"
-	if err := w.saveState(); err != nil {
+// collect reads and aggregates the logs of the report. Whole days already
+// held by an earlier report are not read again.
+func (w *analysisWorkflow) collect(filter model.ErrorAnalysisFilter) error {
+	taskID, sampleLimit := w.task.TaskID, min(w.config.SampleLimit, 8)
+	plan, err := model.PrepareErrorAnalysisSegments(w.ctx, taskID, w.runner, filter)
+	if err != nil {
 		return err
 	}
-	rowsPerSecond := analysisScanRowsPerSecond()
-	for {
-		pageStarted := time.Now()
-		before := w.state.ScannedRows
-		progress, err := model.CollectErrorAnalysisPage(w.ctx, w.task.TaskID, w.runner, filter, 500)
+	if plan == nil {
+		// A task that started collecting before reports had segments.
+		if _, err := w.scan(0, nil, func() (*model.ErrorAnalysisScanProgress, error) {
+			return model.CollectErrorAnalysisPage(w.ctx, taskID, w.runner, filter, 500)
+		}); err != nil {
+			return err
+		}
+		return w.aggregate(func() (*model.ErrorAnalysisAggregationProgress, error) {
+			return model.AggregateErrorAnalysisPage(w.ctx, taskID, w.runner, 500, sampleLimit)
+		})
+	}
+	var scanned int64
+	for i := range plan.Segments {
+		// A segment that is already complete answers at once. Asking every
+		// one also reads again a day that was removed while the task waited.
+		rows, err := w.scan(scanned, plan, func() (*model.ErrorAnalysisScanProgress, error) {
+			return model.CollectErrorAnalysisSegmentPage(w.ctx, taskID, w.runner, plan, i, 500, scanned)
+		})
 		if err != nil {
 			return err
 		}
+		scanned += rows
+		err = w.aggregate(func() (*model.ErrorAnalysisAggregationProgress, error) {
+			return model.AggregateErrorAnalysisSegmentPage(w.ctx, taskID, w.runner, plan, i, 500, sampleLimit)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return model.MergeErrorAnalysisSegments(w.ctx, taskID, w.runner, sampleLimit)
+}
+
+// scan reads log pages until one scan is complete and returns the rows it
+// holds. before counts the rows of the report's earlier segments.
+func (w *analysisWorkflow) scan(before int64, plan *model.ErrorAnalysisPlan, page func() (*model.ErrorAnalysisScanProgress, error)) (int64, error) {
+	rowsPerSecond := analysisScanRowsPerSecond()
+	held := int64(-1)
+	for {
+		pageStarted := time.Now()
+		progress, err := page()
+		if err != nil {
+			return 0, err
+		}
 		// Reading logs is paced so an analysis never competes with live
-		// traffic for the log database.
-		if rowsPerSecond > 0 && progress.ScannedRows > before {
-			pace := time.Duration(progress.ScannedRows-before) * time.Second / time.Duration(rowsPerSecond)
+		// traffic for the log database. The first answer may only report
+		// rows read earlier, so pacing starts with the second.
+		if rowsPerSecond > 0 && held >= 0 && progress.ScannedRows > held {
+			pace := time.Duration(progress.ScannedRows-held) * time.Second / time.Duration(rowsPerSecond)
 			if wait := pace - time.Since(pageStarted); wait > 0 {
 				timer := time.NewTimer(wait)
 				select {
 				case <-w.ctx.Done():
 					timer.Stop()
-					return w.ctx.Err()
+					return 0, w.ctx.Err()
 				case <-timer.C:
 				}
 			}
 		}
-		w.state.ScannedRows, w.state.TotalRows = progress.ScannedRows, progress.TotalRows
-		w.state.TotalKnown = progress.TotalKnown
+		held = progress.ScannedRows
+		w.state.ScannedRows, w.state.TotalRows, w.state.TotalKnown = progress.ScannedRows, progress.TotalRows, progress.TotalKnown
+		if plan != nil {
+			w.state.ScannedRows, w.state.TotalRows, w.state.TotalKnown = before+progress.ScannedRows, plan.TotalRows, plan.TotalKnown
+		}
 		if err = w.saveState(); err != nil {
-			return err
+			return 0, err
 		}
 		if progress.Done {
-			break
+			return progress.ScannedRows, nil
 		}
 	}
+}
+
+func (w *analysisWorkflow) aggregate(page func() (*model.ErrorAnalysisAggregationProgress, error)) error {
 	for {
-		progress, err := model.AggregateErrorAnalysisPage(w.ctx, w.task.TaskID, w.runner, 500, min(w.config.SampleLimit, 8))
+		progress, err := page()
 		if err != nil {
 			return err
 		}
 		if progress.Done {
-			break
+			return nil
 		}
 		if err = w.saveState(); err != nil {
 			return err
 		}
+	}
+}
+
+func (w *analysisWorkflow) execute(filter model.ErrorAnalysisFilter) error {
+	w.state.Phase = "collecting"
+	if err := w.saveState(); err != nil {
+		return err
+	}
+	if err := w.collect(filter); err != nil {
+		return err
 	}
 	dataset, err := model.LoadErrorAnalysisWorkflowSnapshot(w.task.TaskID)
 	if err != nil {

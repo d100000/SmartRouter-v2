@@ -241,11 +241,21 @@ func analysisScanRowsPerSecond() int {
 }
 
 func (handler errorAnalysisHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	if retention := analysisEvidenceRetention(); retention > 0 {
+	{
 		// Expired evidence is removed for at most half a minute per run, so a
 		// large backlog shrinks over several runs without delaying this one.
 		pruning, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, err := model.PruneErrorAnalysisEvidence(pruning, time.Now().Add(-retention).Unix())
+		var cutoff int64
+		var err error
+		if retention := analysisEvidenceRetention(); retention > 0 {
+			cutoff = time.Now().Add(-retention).Unix()
+			_, err = model.PruneErrorAnalysisEvidence(pruning, cutoff)
+		}
+		if err == nil {
+			// Days collected for reports follow the same retention; without
+			// one they go when the last report that uses them is deleted.
+			_, err = model.PruneErrorAnalysisScopes(pruning, cutoff)
+		}
 		cancel()
 		if err != nil && ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) {
 			logger.LogError(ctx, common.LogText("error analysis evidence pruning failed: %v", err))

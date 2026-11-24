@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -64,6 +63,9 @@ type ErrorAnalysisScanProgress struct {
 }
 
 type ErrorAnalysisCoverage struct {
+	// ReusedDays is the number of whole days this report took from earlier
+	// reports instead of reading the logs again.
+	ReusedDays  int      `json:"reused_days,omitempty"`
 	ScannedRows int64    `json:"scanned_rows"`
 	TotalRows   int64    `json:"total_rows"`
 	TotalKnown  bool     `json:"total_known"`
@@ -302,6 +304,13 @@ func errorAnalysisLogQuery(ctx context.Context, scan ErrorAnalysisScanProgress) 
 // ID, so one streaming SELECT owns its read snapshot; an interrupted collection
 // restarts only collection, never resumes by an ambiguous timestamp/request ID.
 func CollectErrorAnalysisPage(ctx context.Context, taskID, runnerID string, filter ErrorAnalysisFilter, batchSize int) (*ErrorAnalysisScanProgress, error) {
+	return collectErrorAnalysisPage(ctx, errorAnalysisScope{Task: taskID, ID: taskID}, runnerID, filter, batchSize)
+}
+
+func collectErrorAnalysisPage(ctx context.Context, scope errorAnalysisScope, runnerID string, filter ErrorAnalysisFilter, batchSize int) (*ErrorAnalysisScanProgress, error) {
+	// Artifacts live under the scope; the lease and the configuration belong
+	// to the task.
+	taskID := scope.ID
 	batchSize = min(max(batchSize, 1), 1000)
 	var scan ErrorAnalysisScanProgress
 	found, err := GetErrorAnalysisArtifact(taskID, "scan", "checkpoint", &scan)
@@ -311,17 +320,7 @@ func CollectErrorAnalysisPage(ctx context.Context, taskID, runnerID string, filt
 	if found && scan.Done {
 		return &scan, nil
 	}
-	// Match InitLogDB/chooseDB's configuration precedence. Only the digest is
-	// persisted: DSNs can contain credentials and must never enter task state,
-	// error messages or logs. Completed snapshots no longer need their source.
-	source := os.Getenv("LOG_SQL_DSN")
-	if source == "" {
-		source = os.Getenv("SQL_DSN")
-	}
-	if source == "" || strings.HasPrefix(source, "local") {
-		source = common.SQLitePath
-	}
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(string(common.LogDatabaseType())+"\x00"+source)))
+	fingerprint := errorAnalysisSourceFingerprint()
 	if found && scan.SourceFingerprint != fingerprint {
 		return nil, ErrErrorAnalysisSourceChanged
 	}
@@ -333,33 +332,14 @@ func CollectErrorAnalysisPage(ctx context.Context, taskID, runnerID string, filt
 			return nil, err
 		}
 		scan = ErrorAnalysisScanProgress{Version: ErrorAnalysisWorkflowVersion, Filter: filter, StartedAt: common.GetTimestamp(), Generation: common.GetRandomString(24), Stable: true, Source: "id_watermark", SourceFingerprint: fingerprint, Timezone: "UTC", Warnings: []string{}, LogRecordingEnabled: common.LogConsumeEnabled, ErrorRecordingEnabled: constant.ErrorLogEnabled}
-		configs, err := ListErrorAnalysisArtifacts(taskID, "config", 0, 1)
-		if err != nil {
+		if scan.Timezone, err = errorAnalysisTaskTimezone(scope.Task); err != nil {
 			return nil, err
 		}
-		if len(configs) > 0 {
-			if timezone := gjson.Get(string(configs[0].Data), "timezone").String(); timezone != "" {
-				if _, err := time.LoadLocation(timezone); err != nil {
-					return nil, errors.New("analysis_invalid_timezone")
-				}
-				scan.Timezone = timezone
-			}
-		}
-		if filter.RequestID == "" {
-			previousStart := filter.Start - (filter.End - filter.Start)
+		// A segment of a report is one range; the report compares periods
+		// when it merges its segments.
+		if filter.RequestID == "" && !scope.Whole {
 			location, _ := time.LoadLocation(scan.Timezone)
-			start, end := time.Unix(filter.Start, 0).In(location), time.Unix(filter.End, 0).In(location)
-			startDay := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, location)
-			endDay := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, location)
-			if start.Equal(startDay) && end.Equal(endDay) {
-				// Whole-day windows compare the same number of calendar days.
-				// A DST transition can make seven days differ from 7*24 hours.
-				startDate := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, time.UTC)
-				endDate := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, time.UTC)
-				days := int(endDate.Sub(startDate) / (24 * time.Hour))
-				previousStart = start.AddDate(0, 0, -days).Unix()
-			}
-			if previousStart >= 0 {
+			if previousStart := errorAnalysisPreviousStart(filter, location); previousStart >= 0 {
 				scan.Comparison = true
 				scan.PreviousFilter = filter
 				scan.PreviousFilter.Start, scan.PreviousFilter.End = previousStart, filter.Start
@@ -388,7 +368,7 @@ func CollectErrorAnalysisPage(ctx context.Context, taskID, runnerID string, filt
 		if err != nil {
 			return nil, err
 		}
-		err = withErrorAnalysisLease(ctx, taskID, runnerID, func(tx *gorm.DB) error {
+		err = withErrorAnalysisLease(ctx, scope.Task, runnerID, func(tx *gorm.DB) error {
 			// No aggregation runs before collection is complete. A ClickHouse
 			// restart replaces only the uncompleted source snapshot and facts.
 			if clickHouse {
@@ -422,7 +402,7 @@ func CollectErrorAnalysisPage(ctx context.Context, taskID, runnerID string, filt
 		page = append(page, log)
 		pageBytes += len(log.Content) + len(log.Other)
 		if clickHouse && (len(page) >= batchSize || pageBytes >= 4*1024*1024) {
-			if err := persistErrorAnalysisLogPage(ctx, taskID, runnerID, &scan, page, false); err != nil {
+			if err := persistErrorAnalysisLogPage(ctx, scope, runnerID, &scan, page, false); err != nil {
 				return nil, err
 			}
 			page, pageBytes = page[:0], 0
@@ -438,13 +418,14 @@ func CollectErrorAnalysisPage(ctx context.Context, taskID, runnerID string, filt
 		return nil, err
 	}
 	done := clickHouse || !byteLimited && len(page) < batchSize
-	if err := persistErrorAnalysisLogPage(ctx, taskID, runnerID, &scan, page, done); err != nil {
+	if err := persistErrorAnalysisLogPage(ctx, scope, runnerID, &scan, page, done); err != nil {
 		return nil, err
 	}
 	return &scan, nil
 }
 
-func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, scan *ErrorAnalysisScanProgress, logs []Log, done bool) error {
+func persistErrorAnalysisLogPage(ctx context.Context, scope errorAnalysisScope, runnerID string, scan *ErrorAnalysisScanProgress, logs []Log, done bool) error {
+	taskID := scope.ID
 	next := *scan
 	next.Warnings = slices.Clone(scan.Warnings)
 	keys := make([]string, len(logs))
@@ -509,7 +490,7 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 			}
 		}
 	}
-	err = withErrorAnalysisLease(ctx, taskID, runnerID, func(tx *gorm.DB) error {
+	err = withErrorAnalysisLease(ctx, scope.Task, runnerID, func(tx *gorm.DB) error {
 		var stored ErrorAnalysisArtifact
 		if err := tx.Where("task_id = ? AND kind = ? AND name = ?", taskID, "scan", "checkpoint").Take(&stored).Error; err != nil {
 			return err
@@ -576,14 +557,19 @@ func persistErrorAnalysisLogPage(ctx context.Context, taskID, runnerID string, s
 			return err
 		}
 		var task SystemTask
-		if err := tx.Where("task_id = ?", taskID).Take(&task).Error; err != nil {
+		if err := tx.Where("task_id = ?", scope.Task).Take(&task).Error; err != nil {
 			return err
 		}
 		state := map[string]any{}
 		if err := task.DecodeState(&state); err != nil {
 			return err
 		}
-		state["version"], state["scanned_rows"], state["total_rows"], state["total_known"] = ErrorAnalysisWorkflowVersion, next.ScannedRows, next.TotalRows, next.TotalKnown
+		scanned, total, known := next.ScannedRows, next.TotalRows, next.TotalKnown
+		if scope.Whole {
+			// The task shows the progress of the whole report.
+			scanned, total, known = scope.ScannedBefore+next.ScannedRows, scope.TotalRows, scope.TotalKnown
+		}
+		state["version"], state["scanned_rows"], state["total_rows"], state["total_known"] = ErrorAnalysisWorkflowVersion, scanned, total, known
 		state["updated_at"] = common.GetTimestamp()
 		encoded, err := common.Marshal(state)
 		if err != nil {
@@ -682,16 +668,48 @@ func GetErrorAnalysisRequestEvidence(taskID, requestID string) (*FailureLog, err
 	name := fmt.Sprintf("%x", sha256.Sum256([]byte("request:"+requestID)))
 	var fact errorAnalysisRequestFact
 	found, err := GetErrorAnalysisArtifact(taskID, "request", name, &fact)
-	if err != nil || !found {
+	if err != nil {
 		return nil, err
 	}
-	entry := finalizedErrorAnalysisRequest(fact)
-	return &entry, nil
+	if found {
+		entry := finalizedErrorAnalysisRequest(fact)
+		return &entry, nil
+	}
+	// A report assembled from segments keeps its evidence with each segment.
+	var plan ErrorAnalysisPlan
+	if found, err = GetErrorAnalysisArtifact(taskID, "plan", "segments", &plan); err != nil || !found {
+		return nil, err
+	}
+	scopes := make([]string, len(plan.Segments))
+	for i, segment := range plan.Segments {
+		scopes[i] = segment.Scope
+	}
+	var stored []ErrorAnalysisArtifact
+	if err := DB.Where("task_id IN ? AND kind = ? AND name = ?", scopes, "request", name).Find(&stored).Error; err != nil {
+		return nil, err
+	}
+	// A request that crosses midnight has a part in each day; show the later.
+	var latest *FailureLog
+	for _, artifact := range stored {
+		var fact errorAnalysisRequestFact
+		if err := common.UnmarshalJsonStr(string(artifact.Data), &fact); err != nil {
+			return nil, err
+		}
+		if entry := finalizedErrorAnalysisRequest(fact); latest == nil || entry.CreatedAt > latest.CreatedAt {
+			latest = &entry
+		}
+	}
+	return latest, nil
 }
 
 var errorAnalysisVariablePattern = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b[a-z0-9_-]*\d[a-z0-9_-]*[a-z][a-z0-9_-]*\b|\b[a-z0-9_-]*[a-z][a-z0-9_-]*\d[a-z0-9_-]*\b|\b[0-9a-f]{12,}\b|\b\d+(\.\d+)?\b`)
 
 func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, batchSize, sampleLimit int) (*ErrorAnalysisAggregationProgress, error) {
+	return aggregateErrorAnalysisPage(ctx, errorAnalysisScope{Task: taskID, ID: taskID}, runnerID, batchSize, sampleLimit)
+}
+
+func aggregateErrorAnalysisPage(ctx context.Context, scope errorAnalysisScope, runnerID string, batchSize, sampleLimit int) (*ErrorAnalysisAggregationProgress, error) {
+	taskID := scope.ID
 	batchSize = min(max(batchSize, 1), 500)
 	sampleLimit = min(max(sampleLimit, 1), 8)
 	var scan ErrorAnalysisScanProgress
@@ -721,7 +739,7 @@ func AggregateErrorAnalysisPage(ctx context.Context, taskID, runnerID string, ba
 		return nil, err
 	}
 	beforeCursor := progress.CursorID
-	err = withErrorAnalysisLease(ctx, taskID, runnerID, func(tx *gorm.DB) error {
+	err = withErrorAnalysisLease(ctx, scope.Task, runnerID, func(tx *gorm.DB) error {
 		var stored ErrorAnalysisArtifact
 		err := tx.Where("task_id = ? AND kind = ? AND name = ?", taskID, "aggregate", "checkpoint").Take(&stored).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -900,6 +918,15 @@ func LoadErrorAnalysisWorkflowSnapshot(taskID string) (*ErrorAnalysisWorkflowSna
 		Timezone:   scan.Timezone,
 		Coverage:   ErrorAnalysisCoverage{ScannedRows: scan.ScannedRows, TotalRows: scan.TotalRows, TotalKnown: scan.TotalKnown, Complete: scan.Done && aggregation.Done && scan.Stable, Stable: scan.Stable, Source: scan.Source, Warnings: slices.Clone(scan.Warnings)},
 		GroupCount: aggregation.GroupCount,
+	}
+	var plan ErrorAnalysisPlan
+	if _, err := GetErrorAnalysisArtifact(taskID, "plan", "segments", &plan); err != nil {
+		return nil, err
+	}
+	for _, segment := range plan.Segments {
+		if segment.Reused {
+			result.Coverage.ReusedDays++
+		}
 	}
 	location, err := time.LoadLocation(scan.Timezone)
 	if err != nil {

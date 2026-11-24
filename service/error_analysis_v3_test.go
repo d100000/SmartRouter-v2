@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -368,6 +370,12 @@ func (p *packTestProvider) client(t *testing.T) *http.Client {
 
 func runPackTestAnalysis(t *testing.T, db *gorm.DB, configure func(*ErrorAnalysisConfig), provider *packTestProvider) (*model.SystemTask, AnalysisResult) {
 	t.Helper()
+	start := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
+	return runPackTestRange(t, configure, provider, start, start+86400)
+}
+
+func runPackTestRange(t *testing.T, configure func(*ErrorAnalysisConfig), provider *packTestProvider, start, end int64) (*model.SystemTask, AnalysisResult) {
+	t.Helper()
 	t.Setenv("CRYPTO_SECRET", "pack-test-secret-not-for-production")
 	config, err := GetErrorAnalysisConfig()
 	require.NoError(t, err)
@@ -376,8 +384,7 @@ func runPackTestAnalysis(t *testing.T, db *gorm.DB, configure func(*ErrorAnalysi
 		configure(&config)
 	}
 	require.NoError(t, SaveErrorAnalysisConfig(config, "pack-key", false))
-	start := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
-	task, _, err := StartErrorAnalysis(model.ErrorAnalysisFilter{Start: start, End: start + 86400})
+	task, _, err := StartErrorAnalysis(model.ErrorAnalysisFilter{Start: start, End: end})
 	require.NoError(t, err)
 	claimed, ok, err := model.ClaimSystemTask(task.ID, model.ErrorAnalysisTaskType, "pack-worker", time.Now().Unix()+600)
 	require.NoError(t, err)
@@ -438,9 +445,7 @@ func TestAnalysisGroupsTheSameFailureAcrossChannels(t *testing.T) {
 		assert.Contains(t, result.Report, "No upstream status page was available.")
 		assert.Equal(t, 25, result.Snapshot.Requests)
 
-		var stored int64
-		require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("task_id = ? AND kind = ?", done.TaskID, "request").Count(&stored).Error)
-		assert.EqualValues(t, 5, stored, "only failed requests are stored; the 20 clean ones are counted")
+		assert.EqualValues(t, 5, len(analysisTestEvidence(t, db, done.TaskID)), "only failed requests are stored; the 20 clean ones are counted")
 	})
 }
 
@@ -554,5 +559,273 @@ func TestAnalysisRequestWithALaterRowIsStoredNotCounted(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, evidence)
 		assert.Equal(t, 2, evidence.Attempts)
+	})
+}
+
+// analysisTestPlan returns the segments a report was assembled from.
+func analysisTestPlan(t *testing.T, taskID string) model.ErrorAnalysisPlan {
+	t.Helper()
+	var plan model.ErrorAnalysisPlan
+	found, err := model.GetErrorAnalysisArtifact(taskID, "plan", "segments", &plan)
+	require.NoError(t, err)
+	require.True(t, found, "the report has a plan")
+	return plan
+}
+
+// analysisTestEvidence lists the stored request evidence a report can show,
+// by artifact ID.
+func analysisTestEvidence(t *testing.T, db *gorm.DB, taskID string) []int64 {
+	t.Helper()
+	scopes := []string{taskID}
+	for _, segment := range analysisTestPlan(t, taskID).Segments {
+		scopes = append(scopes, segment.Scope)
+	}
+	var ids []int64
+	require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("task_id IN ? AND kind = ?", scopes, "request").Order("id").Pluck("id", &ids).Error)
+	return ids
+}
+
+// analysisTestAggregates is what a report was computed from: counts,
+// distributions and groups. Samples are reduced to their sorted request IDs,
+// because their order depends on the order in which requests were read.
+func analysisTestAggregates(t *testing.T, db *gorm.DB, taskID string) map[string]string {
+	t.Helper()
+	var artifacts []model.ErrorAnalysisArtifact
+	require.NoError(t, db.Where("task_id = ? AND (kind IN ? OR kind LIKE ?)", taskID, []string{"counts", "group"}, "dist%").Find(&artifacts).Error)
+	result := map[string]string{}
+	for _, artifact := range artifacts {
+		value := string(artifact.Data)
+		if artifact.Kind == "group" {
+			var group model.ErrorAnalysisGroup
+			require.NoError(t, common.UnmarshalJsonStr(value, &group))
+			ids := func(samples []model.FailureLog) []string {
+				out := []string{}
+				for _, sample := range samples {
+					out = append(out, sample.RequestID)
+				}
+				slices.Sort(out)
+				return out
+			}
+			current, previous := ids(group.Samples), ids(group.PreviousSamples)
+			group.Samples, group.PreviousSamples = nil, nil
+			encoded, err := common.Marshal(map[string]any{"group": group, "samples": current, "previous_samples": previous})
+			require.NoError(t, err)
+			value = string(encoded)
+		}
+		result[artifact.Kind+"/"+artifact.Name] = value
+	}
+	return result
+}
+
+// analysisTestSingleScan reads the range in one scan, the way reports were
+// computed before they were assembled from days.
+func analysisTestSingleScan(t *testing.T, start, end int64) string {
+	t.Helper()
+	task, err := model.CreateSystemTask(model.ErrorAnalysisTaskType, errorAnalysisPayload{ErrorAnalysisFilter: model.ErrorAnalysisFilter{Start: start, End: end}, WorkflowVersion: 2}, AnalysisState{Version: 2})
+	require.NoError(t, err)
+	_, ok, err := model.ClaimSystemTask(task.ID, model.ErrorAnalysisTaskType, "single-scan", time.Now().Unix()+600)
+	require.NoError(t, err)
+	require.True(t, ok)
+	for {
+		progress, err := model.CollectErrorAnalysisPage(context.Background(), task.TaskID, "single-scan", model.ErrorAnalysisFilter{Start: start, End: end}, 3)
+		require.NoError(t, err)
+		if progress.Done {
+			break
+		}
+	}
+	for {
+		progress, err := model.AggregateErrorAnalysisPage(context.Background(), task.TaskID, "single-scan", 2, 8)
+		require.NoError(t, err)
+		if progress.Done {
+			break
+		}
+	}
+	require.NoError(t, model.FinishSystemTask(task.TaskID, "single-scan", model.SystemTaskStatusSucceeded, nil, ""))
+	return task.TaskID
+}
+
+// seedAnalysisDay writes failed and clean requests into one day. Failures
+// alternate between two channels and two error codes.
+func seedAnalysisDay(t *testing.T, db *gorm.DB, day int64, tag string, failures, clean int) {
+	t.Helper()
+	logs := []model.Log{}
+	for i := range failures {
+		code := []string{"timeout", "rate_limited"}[i%2]
+		logs = append(logs, model.Log{RequestId: fmt.Sprintf("%s-fail-%d", tag, i), Type: model.LogTypeError, CreatedAt: day + 100 + int64(i), ModelName: "m", ChannelId: 1 + i%2, Other: `{"error_code":"` + code + `"}`, Content: fmt.Sprintf("%s after %d ms", code, 30000+i)})
+	}
+	for i := range clean {
+		logs = append(logs, model.Log{RequestId: fmt.Sprintf("%s-ok-%d", tag, i), Type: model.LogTypeConsume, CreatedAt: day + 1000 + int64(i), ModelName: "m", ChannelId: 1, CompletionTokens: 5})
+	}
+	require.NoError(t, db.Create(&logs).Error)
+}
+
+func TestAnalysisSecondReportReadsOnlyTheNewDay(t *testing.T) {
+	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
+		day := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
+		seedAnalysisDay(t, db, day, "mon", 2, 3)
+		seedAnalysisDay(t, db, day+86400, "tue", 3, 4)
+		seedAnalysisDay(t, db, day+2*86400, "wed", 2, 5)
+		provider := &packTestProvider{groupSent: map[string]int{}}
+
+		first, result := runPackTestRange(t, nil, provider, day+86400, day+2*86400)
+		assert.Equal(t, 7, result.Snapshot.Requests)
+		assert.Equal(t, 5, result.Comparison.Requests, "Monday is the comparison day")
+		assert.Zero(t, result.Coverage.ReusedDays)
+		plan := analysisTestPlan(t, first.TaskID)
+		require.Len(t, plan.Segments, 2)
+		tuesday := plan.Segments[1]
+		require.True(t, tuesday.Shared)
+		var before model.ErrorAnalysisScanProgress
+		_, err := model.GetErrorAnalysisArtifact(tuesday.Scope, "scan", "checkpoint", &before)
+		require.NoError(t, err)
+
+		second, result := runPackTestRange(t, nil, provider, day+2*86400, day+3*86400)
+		assert.Equal(t, 7, result.Snapshot.Requests)
+		assert.Equal(t, 2, result.Snapshot.Affected)
+		assert.Equal(t, 7, result.Comparison.Requests, "Tuesday is now the comparison day")
+		assert.Equal(t, 3, result.Comparison.Affected)
+		assert.Equal(t, 1, result.Coverage.ReusedDays)
+		assert.EqualValues(t, 14, result.Coverage.ScannedRows, "coverage counts the reused day's rows too")
+		plan = analysisTestPlan(t, second.TaskID)
+		require.Len(t, plan.Segments, 2)
+		assert.Equal(t, tuesday.Scope, plan.Segments[0].Scope, "the same day has the same name in both reports")
+		assert.True(t, plan.Segments[0].Reused)
+		assert.False(t, plan.Segments[1].Reused)
+		var after model.ErrorAnalysisScanProgress
+		_, err = model.GetErrorAnalysisArtifact(tuesday.Scope, "scan", "checkpoint", &after)
+		require.NoError(t, err)
+		assert.Equal(t, before.Generation, after.Generation, "Tuesday was not read again")
+
+		// Evidence of the reused day is shown, and every failed request of
+		// the three days is stored once.
+		evidence, err := model.GetErrorAnalysisRequestEvidence(second.TaskID, "tue-fail-0")
+		require.NoError(t, err)
+		require.NotNil(t, evidence)
+		var stored int64
+		require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("kind = ?", "request").Count(&stored).Error)
+		assert.EqualValues(t, 7, stored)
+
+		// The report assembled from days equals one scan of the same range.
+		single := analysisTestSingleScan(t, day+2*86400, day+3*86400)
+		assert.Equal(t, analysisTestAggregates(t, db, single), analysisTestAggregates(t, db, second.TaskID))
+	})
+}
+
+func TestAnalysisDayIsReadAgainWhenItsLogsChange(t *testing.T) {
+	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
+		day := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
+		seedAnalysisDay(t, db, day, "mon", 2, 3)
+		seedAnalysisDay(t, db, day+86400, "tue", 3, 4)
+		provider := &packTestProvider{groupSent: map[string]int{}}
+		_, result := runPackTestRange(t, nil, provider, day, day+2*86400)
+		assert.Equal(t, 12, result.Snapshot.Requests)
+
+		// A row arrives late for Monday and one of Tuesday's is removed.
+		require.NoError(t, db.Create(&model.Log{RequestId: "mon-late", Type: model.LogTypeError, CreatedAt: day + 5000, ModelName: "m", ChannelId: 2, Other: `{"error_code":"timeout"}`, Content: "timeout after 30100 ms"}).Error)
+		require.NoError(t, db.Where("request_id = ?", "tue-ok-0").Delete(&model.Log{}).Error)
+		again, result := runPackTestRange(t, nil, provider, day, day+2*86400)
+		assert.Equal(t, 12, result.Snapshot.Requests, "one request more on Monday, one less on Tuesday")
+		assert.Equal(t, 6, result.Snapshot.Affected)
+		assert.Equal(t, 2, result.Coverage.ReusedDays, "only the two empty comparison days are unchanged")
+		for _, segment := range analysisTestPlan(t, again.TaskID).Segments {
+			assert.Equal(t, segment.Previous, segment.Reused)
+		}
+		assert.Len(t, analysisTestEvidence(t, db, again.TaskID), 6, "the days were replaced, not added to")
+
+		// Nothing changed since: all four days are reused.
+		_, result = runPackTestRange(t, nil, provider, day, day+2*86400)
+		assert.Equal(t, 4, result.Coverage.ReusedDays)
+		assert.Equal(t, 12, result.Snapshot.Requests)
+	})
+}
+
+func TestAnalysisPartOfADayIsNotShared(t *testing.T) {
+	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
+		day := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
+		seedAnalysisDay(t, db, day, "mon", 2, 3)
+		seedAnalysisDay(t, db, day+86400, "tue", 3, 4)
+		seedAnalysisDay(t, db, day+2*86400, "wed", 2, 5)
+		provider := &packTestProvider{groupSent: map[string]int{}}
+		// From Monday 00:10 to Wednesday 00:10: failures are written at
+		// 00:01 and clean requests at 00:16 of each day.
+		start, end := day+600, day+2*86400+600
+		done, result := runPackTestRange(t, nil, provider, start, end)
+		shared := []bool{}
+		for _, segment := range analysisTestPlan(t, done.TaskID).Segments {
+			if !segment.Previous {
+				shared = append(shared, segment.Shared)
+			}
+		}
+		assert.Equal(t, []bool{false, true, false}, shared, "only whole Tuesday can serve another report")
+		assert.Equal(t, 3+7+2, result.Snapshot.Requests, "Monday's failures are before the range, Wednesday's clean requests after it")
+		single := analysisTestSingleScan(t, start, end)
+		assert.Equal(t, analysisTestAggregates(t, db, single), analysisTestAggregates(t, db, done.TaskID))
+	})
+}
+
+func TestAnalysisRequestAcrossMidnightIsCountedInEachDay(t *testing.T) {
+	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
+		day := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
+		// A failed attempt one second before midnight, the successful retry
+		// one second after it.
+		require.NoError(t, db.Create(&[]model.Log{
+			{RequestId: "night", Type: model.LogTypeError, CreatedAt: day + 86399, ModelName: "m", ChannelId: 1, Other: `{"error_code":"timeout"}`, Content: "timeout after 30000 ms"},
+			{RequestId: "night", Type: model.LogTypeConsume, CreatedAt: day + 86401, ModelName: "m", ChannelId: 2, CompletionTokens: 5},
+		}).Error)
+		provider := &packTestProvider{groupSent: map[string]int{}}
+		_, result := runPackTestRange(t, nil, provider, day, day+2*86400)
+		assert.Equal(t, 2, result.Snapshot.Requests, "each day sees its own row of the request")
+		assert.Equal(t, 1, result.Snapshot.Affected)
+		assert.Zero(t, result.Snapshot.Recovered, "the retry is in the next day")
+
+		single, err := model.LoadErrorAnalysisWorkflowSnapshot(analysisTestSingleScan(t, day, day+2*86400))
+		require.NoError(t, err)
+		assert.Equal(t, 1, single.Current.Requests, "one scan of both days joins the rows")
+		assert.Equal(t, 1, single.Current.Recovered)
+	})
+}
+
+func TestAnalysisDaysNoReportUsesAreRemoved(t *testing.T) {
+	forEachAnalysisDatabase(t, func(t *testing.T, db *gorm.DB) {
+		day := time.Date(2024, 1, 8, 0, 0, 0, 0, time.UTC).Unix()
+		seedAnalysisDay(t, db, day, "mon", 2, 3)
+		provider := &packTestProvider{groupSent: map[string]int{}}
+		done, _ := runPackTestRange(t, nil, provider, day, day+86400)
+		require.Len(t, analysisTestEvidence(t, db, done.TaskID), 2)
+		scopes := func() int64 {
+			var count int64
+			require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("kind = ? AND name = ? AND task_id <> ?", "scan", "checkpoint", done.TaskID).Count(&count).Error)
+			return count
+		}
+		require.EqualValues(t, 2, scopes(), "the day and its comparison day")
+		now := time.Now().Unix()
+
+		// With a retention, a day stays while a report used it since the cutoff.
+		removed, err := model.PruneErrorAnalysisScopes(context.Background(), now-30*86400)
+		require.NoError(t, err)
+		assert.Zero(t, removed)
+		// Without one, it stays while a report that refers to it exists.
+		require.NoError(t, db.Model(&model.ErrorAnalysisArtifact{}).Where("kind = ?", "scope").Update("updated_at", now-40*86400).Error)
+		removed, err = model.PruneErrorAnalysisScopes(context.Background(), 0)
+		require.NoError(t, err)
+		assert.Zero(t, removed)
+		assert.EqualValues(t, 2, scopes())
+
+		// Unused since before the cutoff: the days go, the report stays.
+		removed, err = model.PruneErrorAnalysisScopes(context.Background(), now-30*86400)
+		require.NoError(t, err)
+		assert.Positive(t, removed)
+		assert.Zero(t, scopes())
+		evidence, err := model.GetErrorAnalysisRequestEvidence(done.TaskID, "mon-fail-0")
+		require.NoError(t, err)
+		assert.Nil(t, evidence, "evidence expires with the day")
+		snapshot, err := model.LoadErrorAnalysisWorkflowSnapshot(done.TaskID)
+		require.NoError(t, err)
+		assert.Equal(t, 5, snapshot.Current.Requests, "the report keeps its numbers")
+
+		// A later report over the same day reads it again.
+		_, result := runPackTestRange(t, nil, provider, day, day+86400)
+		assert.Equal(t, 5, result.Snapshot.Requests)
+		assert.Zero(t, result.Coverage.ReusedDays)
 	})
 }
