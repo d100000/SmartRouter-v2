@@ -60,6 +60,9 @@ func TestAnalysisSizeErrorsAreRecognised(t *testing.T) {
 		{"output parameter too large", 400, `{"error":{"message":"max_tokens is too large: 65536. This model supports at most 32768 completion tokens"}}`, "output"},
 		{"output limit worded as unsupported", 400, `{"error":{"message":"max_tokens 65536 is not supported: the maximum is 32768"}}`, "output"},
 		{"output limit name rejected", 400, `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","param":"max_tokens"}}`, "parameter"},
+		{"JSON output mode rejected", 400, `{"error":{"type":"invalid_request_error","message":"response_format: only json_schema with strict: true is accepted"}}`, "format"},
+		{"JSON output mode unknown to a gateway", 422, `{"error":{"message":"Extra inputs are not permitted","param":"response_format"}}`, "format"},
+		{"credentials error never blames the format", 401, `{"error":{"message":"invalid key; response_format ignored"}}`, ""},
 		{"rate limit mentioning tokens", 429, `{"error":{"message":"token limit per minute exceeded"}}`, ""},
 		{"request above the per-minute allowance", 429, `{"error":{"message":"Request too large for this model on tokens per min (TPM): Limit 30000, Requested 45000."}}`, "input"},
 		{"quota error mentioning a token limit", 403, `{"error":{"message":"You exceeded your current quota: token limit reached"}}`, ""},
@@ -93,6 +96,46 @@ func TestAnalysisCompletionSwitchesTheOutputLimitName(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "done", content, "an empty error member on a successful answer is not a failure")
 	assert.Equal(t, []string{"max_tokens", "max_completion_tokens"}, sent, "a model without a preset is retried once with the other name")
+}
+
+func TestAnalysisAsksForJSONOutputWhereThePresetAllows(t *testing.T) {
+	// refuse makes the provider reject the JSON output mode.
+	run := func(model string, refuse bool) (formats []string, err error) {
+		client := &http.Client{Transport: analysisTestTransport(func(request *http.Request) (*http.Response, error) {
+			body, readErr := io.ReadAll(request.Body)
+			require.NoError(t, readErr)
+			format := gjson.GetBytes(body, "response_format.type").String()
+			formats = append(formats, format)
+			reply, status := `{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`, 200
+			if format != "" && refuse {
+				reply, status = `{"error":{"type":"invalid_request_error","message":"response_format: json_object is not accepted"}}`, 400
+			}
+			return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(reply)), Request: request}, nil
+		})}
+		// One endpoint per model and case: refusals are remembered per endpoint.
+		config := ErrorAnalysisConfig{Endpoint: "https://" + model + fmt.Sprint(refuse) + ".example/v1/chat/completions", Model: model, TimeoutSeconds: 30, MaxOutputTokens: 4096}
+		for range 2 {
+			if _, err = completeErrorAnalysis(context.Background(), client, config, "key", "Return ONLY a JSON object.", "input", &AnalysisAttempt{}); err != nil {
+				return formats, err
+			}
+		}
+		return formats, nil
+	}
+	formats, err := run("deepseek-flash", false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"json_object", "json_object"}, formats)
+
+	formats, err = run("claude-opus-5-5", false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"", ""}, formats, "its OpenAI-compatible endpoint rejects json_object")
+
+	formats, err = run("some-private-model", false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"", ""}, formats, "a model without a preset relies on the instruction")
+
+	formats, err = run("kimi-k3", true)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"json_object", "", ""}, formats, "a refusal is retried without the mode, and the next call does not ask again")
 }
 
 func TestAnalysisCompletionMapsSizeErrors(t *testing.T) {

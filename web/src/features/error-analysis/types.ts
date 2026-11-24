@@ -106,6 +106,7 @@ export type AnalysisModelPreset = {
   concurrency: number
   thinking: string
   token_param: string
+  json_mode?: boolean
 }
 export type AnalysisModelOption = {
   id: string

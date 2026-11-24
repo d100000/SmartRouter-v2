@@ -109,23 +109,41 @@ func completeErrorAnalysis(parent context.Context, client *http.Client, config E
 	// preset starts with max_tokens; when the provider rejects the name
 	// itself, the same request is sent once more with the other one.
 	param := analysisTokenParam(config.Model)
-	content, err := postErrorAnalysis(parent, ctx, client, config, key, system, input, param, attempt)
+	// JSON output is requested where the model's preset says the provider
+	// accepts it. A gateway in between may not: on a refusal of the
+	// parameter the same request goes out once more without it, and the
+	// endpoint is remembered.
+	jsonMode := analysisJSONMode(config)
+	content, err := postErrorAnalysis(parent, ctx, client, config, key, system, input, param, jsonMode, attempt)
 	var failure *analysisFailure
+	if jsonMode && errors.As(err, &failure) && failure.Code == "analysis_response_format" {
+		analysisJSONModeRejected.Store(config.Endpoint+"\x00"+config.Model, true)
+		jsonMode = false
+		content, err = postErrorAnalysis(parent, ctx, client, config, key, system, input, param, jsonMode, attempt)
+	}
 	if errors.As(err, &failure) && failure.Code == "analysis_token_parameter" {
 		param = map[string]string{"max_tokens": "max_completion_tokens", "max_completion_tokens": "max_tokens"}[param]
-		content, err = postErrorAnalysis(parent, ctx, client, config, key, system, input, param, attempt)
+		content, err = postErrorAnalysis(parent, ctx, client, config, key, system, input, param, jsonMode, attempt)
 		if errors.As(err, &failure) && failure.Code == "analysis_token_parameter" {
 			failure.Code = "analysis_invalid_request"
 		}
 	}
+	// Internal codes never leave this function.
+	if errors.As(err, &failure) && failure.Code == "analysis_response_format" {
+		failure.Code = "analysis_invalid_request"
+	}
 	return content, err
 }
 
-func postErrorAnalysis(parent, ctx context.Context, client *http.Client, config ErrorAnalysisConfig, key, system, input, tokenParam string, attempt *AnalysisAttempt) (string, error) {
-	body, err := common.Marshal(map[string]any{
+func postErrorAnalysis(parent, ctx context.Context, client *http.Client, config ErrorAnalysisConfig, key, system, input, tokenParam string, jsonMode bool, attempt *AnalysisAttempt) (string, error) {
+	payload := map[string]any{
 		"model": config.Model, "stream": false, tokenParam: config.MaxOutputTokens,
 		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": input}},
-	})
+	}
+	if jsonMode {
+		payload["response_format"] = map[string]string{"type": "json_object"}
+	}
+	body, err := common.Marshal(payload)
 	if err != nil {
 		return "", &analysisFailure{Code: "analysis_input_error"}
 	}
@@ -180,6 +198,10 @@ func postErrorAnalysis(parent, ctx context.Context, client *http.Client, config 
 			failure.Code, failure.Retryable = "analysis_output_limit", false
 		case "parameter":
 			failure.Code, failure.Retryable = "analysis_token_parameter", false
+		case "format":
+			if jsonMode {
+				failure.Code, failure.Retryable = "analysis_response_format", false
+			}
 		}
 		// Respect bounded Retry-After without retaining provider-controlled text.
 		if seconds, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && seconds > 0 {
@@ -234,8 +256,9 @@ var (
 )
 
 // classifyAnalysisRequestError tells apart the failures a different request
-// can fix: "input" (send less), "output" (ask for less output) and
-// "parameter" (the provider rejects the name of the output limit itself).
+// can fix: "input" (send less), "output" (ask for less output), "parameter"
+// (the provider rejects the name of the output limit itself) and "format"
+// (the provider rejects the JSON output mode).
 func classifyAnalysisRequestError(status int, data []byte, tokenParam string) string {
 	root := gjson.ParseBytes(data)
 	parts := []string{root.Get("message").String()}
@@ -269,6 +292,10 @@ func classifyAnalysisRequestError(status int, data []byte, tokenParam string) st
 		return ""
 	case status == http.StatusRequestEntityTooLarge || contains(analysisContextLimitMarkers):
 		return "input"
+	case strings.Contains(text, "response_format") || strings.Contains(text, "json_object") || strings.Contains(text, "json mode"):
+		// Whatever the wording, a client error that names the output format
+		// is about the one optional field the request can drop.
+		return "format"
 	case contains(analysisOutputLimitMarkers) && contains(analysisTooLargeWords):
 		return "output"
 	case strings.Contains(text, tokenParam) && contains(analysisUnknownParameterMarks):

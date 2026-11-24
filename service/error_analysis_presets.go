@@ -37,20 +37,23 @@ type AnalysisModelPreset struct {
 	Thinking      string `json:"thinking"`
 	// TokenParam is the request field that limits output for this model.
 	TokenParam string `json:"token_param"`
-	pattern    *regexp.Regexp
+	// JSONMode: the provider's chat completions accept
+	// response_format {"type":"json_object"} for this model.
+	JSONMode bool `json:"json_mode"`
+	pattern  *regexp.Regexp
 }
 
 // Ordered from specific to general: kimi-k3.1-pro must match before kimi-k3.
 var analysisModelPresets = []AnalysisModelPreset{
-	{ID: "deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", ContextWindow: 1_000_000, MaxOutput: 384_000, InputBudget: 131_072, OutputReserve: 16_384, Concurrency: 4, Thinking: "default_on", TokenParam: "max_tokens",
+	{ID: "deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", ContextWindow: 1_000_000, MaxOutput: 384_000, InputBudget: 131_072, OutputReserve: 16_384, Concurrency: 4, Thinking: "default_on", TokenParam: "max_tokens", JSONMode: true,
 		pattern: regexp.MustCompile(`^deepseek-(flash|v4[.-]1-flash|v4-flash)(\b|[-.]|$)`)},
-	{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextWindow: 1_000_000, MaxOutput: 384_000, InputBudget: 163_840, OutputReserve: 16_384, Concurrency: 2, Thinking: "default_on", TokenParam: "max_tokens",
+	{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextWindow: 1_000_000, MaxOutput: 384_000, InputBudget: 163_840, OutputReserve: 16_384, Concurrency: 2, Thinking: "default_on", TokenParam: "max_tokens", JSONMode: true,
 		pattern: regexp.MustCompile(`^deepseek-v4-pro(\b|[-.]|$)`)},
-	{ID: "kimi-k3.1-pro", Name: "Kimi K3.1 Pro", ContextWindow: 1_048_576, InputBudget: 163_840, OutputReserve: 16_384, Concurrency: 2, Thinking: "effort", TokenParam: "max_completion_tokens",
+	{ID: "kimi-k3.1-pro", Name: "Kimi K3.1 Pro", ContextWindow: 1_048_576, InputBudget: 163_840, OutputReserve: 16_384, Concurrency: 2, Thinking: "effort", TokenParam: "max_completion_tokens", JSONMode: true,
 		pattern: regexp.MustCompile(`^kimi-k3[.-]1-pro(\b|[-.]|$)`)},
-	{ID: "kimi-k3", Name: "Kimi K3", ContextWindow: 1_048_576, MaxOutput: 131_072, InputBudget: 131_072, OutputReserve: 16_384, Concurrency: 2, Thinking: "always", TokenParam: "max_completion_tokens",
+	{ID: "kimi-k3", Name: "Kimi K3", ContextWindow: 1_048_576, MaxOutput: 131_072, InputBudget: 131_072, OutputReserve: 16_384, Concurrency: 2, Thinking: "always", TokenParam: "max_completion_tokens", JSONMode: true,
 		pattern: regexp.MustCompile(`^kimi-k3($|-)`)},
-	{ID: "gpt-6.2-sol", Name: "GPT-6.2 Sol", ContextWindow: 1_050_000, MaxOutput: 128_000, InputBudget: 204_800, OutputReserve: 16_384, Concurrency: 2, Thinking: "reasoning", TokenParam: "max_completion_tokens",
+	{ID: "gpt-6.2-sol", Name: "GPT-6.2 Sol", ContextWindow: 1_050_000, MaxOutput: 128_000, InputBudget: 204_800, OutputReserve: 16_384, Concurrency: 2, Thinking: "reasoning", TokenParam: "max_completion_tokens", JSONMode: true,
 		pattern: regexp.MustCompile(`^gpt-6[.-]2-sol(\b|[-.]|$)`)},
 	{ID: "claude-opus-5.5", Name: "Claude Opus 5.5", ContextWindow: 1_000_000, MaxOutput: 128_000, InputBudget: 204_800, OutputReserve: 16_384, Concurrency: 2, Thinking: "adaptive", TokenParam: "max_tokens",
 		pattern: regexp.MustCompile(`^claude-opus-5[.-]5(\b|[-.]|$)`)},
@@ -99,6 +102,23 @@ func MatchAnalysisModelPreset(id string) *AnalysisModelPreset {
 func AnalysisModelPresets() []AnalysisModelPreset {
 	return slices.Clone(analysisModelPresets)
 }
+
+// analysisJSONMode reports whether to ask for JSON output. Every analysis
+// call asks for one JSON object, so the mode only makes the answer more
+// reliable. Models without a preset rely on the instruction alone, as do
+// endpoints that rejected the parameter earlier in this process.
+func analysisJSONMode(config ErrorAnalysisConfig) bool {
+	preset := MatchAnalysisModelPreset(config.Model)
+	if preset == nil || !preset.JSONMode {
+		return false
+	}
+	_, rejected := analysisJSONModeRejected.Load(config.Endpoint + "\x00" + config.Model)
+	return !rejected
+}
+
+// analysisJSONModeRejected remembers endpoint and model pairs that refused
+// response_format, so later calls do not pay for the same refusal.
+var analysisJSONModeRejected sync.Map
 
 func analysisPresetName(modelName string) string {
 	if preset := MatchAnalysisModelPreset(modelName); preset != nil {
