@@ -17,10 +17,10 @@
   <a href="./LICENSE"><img src="./assets/readme/license.svg" alt="AGPL-3.0 license"></a>
 </p>
 
-[![Current build](./assets/readme/build.svg)](https://github.com/d100000/SmartRouter-v2/commit/a50e83e5a49284bbc11fc68a5bc04e802bea5cdf)
+[![Current build](./assets/readme/build.svg)](https://github.com/d100000/SmartRouter-v2/commit/7ebbfd7ceced451c4b8920015087079a685aae2b)
 [main 最新提交](https://github.com/d100000/SmartRouter-v2/commits/main/)
 
-**当前功能版本：`a50e83e5a` · 功能提交时间：2026-11-25 01:34:59（北京时间 / UTC+8）**
+**当前功能版本：`7ebbfd7ce` · 功能提交时间：2026-11-25 04:50:01（北京时间 / UTC+8）**
 
 <p>
   <a href="#sr-start"><img src="./assets/readme/quick-start.svg" alt="快速开始"></a>
