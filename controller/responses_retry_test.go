@@ -250,7 +250,8 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 				{name: "channel defaults off", disabled: true, wantAttempts: 1},
 				{name: "global retries disabled", noGlobalRetry: true, wantAttempts: 1},
 				{name: "local channel limit does not spend an upstream retry", localLimit: true, noGlobalRetry: true, wantAttempts: 1, wantQuota: 500},
-				{name: "no fallback preserves original overload and refunds", noFallback: true, wantAttempts: 1},
+				{name: "without another channel the retry returns to the same one", noFallback: true, wantAttempts: 2, wantQuota: 500},
+				{name: "second overload on the only channel preserves the overload and refunds", noFallback: true, failAgain: true, wantAttempts: 2},
 				{name: "plain EOF never retries", failure: "EOF", wantAttempts: 1},
 				{name: "message alone is insufficient", failure: strings.ReplaceAll(retryOverloadEvent, "server_is_overloaded", "server_error"), wantAttempts: 1},
 				{name: "usage on failed event prevents replay", failure: strings.ReplaceAll(retryOverloadEvent, `"usage":null`, `"usage":{"input_tokens":7,"output_tokens":0}`), expression: `tier("manual", p * 26 + c * 136)`, wantAttempts: 1, wantQuota: 91},
@@ -380,7 +381,7 @@ func TestResponsesSafeRetryBillingDatabaseMatrix(t *testing.T) {
 						require.NoError(t, err)
 						assert.Equal(t, int64(1), state.RPMUsed)
 					}
-					if tc.noFallback {
+					if tc.noFallback && tc.failAgain {
 						assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 						assert.Contains(t, recorder.Body.String(), "server_is_overloaded")
 					}

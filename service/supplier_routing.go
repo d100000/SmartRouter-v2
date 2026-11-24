@@ -152,8 +152,9 @@ func ReleaseSupplierRequestSent(c *gin.Context, channel *model.Channel) {
 // health/latency/load scoring and capacity reservation semantics.
 func selectSupplierPoolChannel(c *gin.Context, state *schedulingRequest, request *scheduler.Request, channels []*model.Channel, stream, retry bool) (*model.Channel, error) {
 	pools := make(map[int]*supplierRoutingPool)
+	again, _ := state.retryState(request.Key)
 	for _, channel := range channels {
-		if !supplierChannelEligible(c, channel) || slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
+		if !supplierChannelEligible(c, channel) || !again[channel.Id] && slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
 			continue
 		}
 		pool, err := supplierRoutingPoolForChannel(channel)

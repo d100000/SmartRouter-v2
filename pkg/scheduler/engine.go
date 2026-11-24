@@ -974,9 +974,50 @@ func (e *Engine) StartAttempt(a *Attempt, stream ...bool) {
 	a.started = true
 	a.StartedAt = e.now()
 	a.request.attempted[a.Candidate.ID] = true
+	a.request.dispatched, a.request.lastPriority = true, a.Candidate.Priority
 	if !a.request.businessAt.IsZero() {
 		e.states[a.request.Key].channels[a.Candidate.ID].dispatches[a.StartedAt.Unix()]++
 	}
+}
+
+// RetrySameTier lets the request use again the candidates it already tried in
+// the priority tier of its latest attempt, and returns their IDs. The host
+// calls it when no untried candidate is eligible: with nowhere else to go,
+// the remaining retries stay in that tier instead of ending the request.
+// Every candidate of the tier is then tried once more before any is tried a
+// third time.
+func (e *Engine) RetrySameTier(r *Request, candidates []Candidate) []int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if r == nil || r.engine != e || r.ended || !r.dispatched {
+		return nil
+	}
+	var again []int
+	for _, candidate := range candidates {
+		if r.attempted[candidate.ID] && candidate.Priority == r.lastPriority {
+			delete(r.attempted, candidate.ID)
+			again = append(again, candidate.ID)
+		}
+	}
+	return again
+}
+
+// RetryAgain lets the request use the given candidates again and returns
+// those it had tried.
+func (e *Engine) RetryAgain(r *Request, ids []int) []int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if r == nil || r.engine != e || r.ended {
+		return nil
+	}
+	var again []int
+	for _, id := range ids {
+		if r.attempted[id] {
+			delete(r.attempted, id)
+			again = append(again, id)
+		}
+	}
+	return again
 }
 
 func (e *Engine) FinishAttempt(a *Attempt, outcome Outcome) {

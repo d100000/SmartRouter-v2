@@ -800,6 +800,7 @@ func (p *RetryParam) ClientErrorAfterRefusal(final *types.NewAPIError) (*types.N
 func (p *RetryParam) TryAnotherChannelAfterRefusal(channelID int, locked bool, apiErr *types.NewAPIError) bool {
 	c := p.Ctx
 	PreserveChannelAffinityAfterLocalRefusal(c, channelID)
+	schedulingState(c).refusedBeforeDispatch(channelID)
 	refusals := c.GetInt("channel_local_refusals") + 1
 	c.Set("channel_local_refusals", refusals)
 	var limited *model.ChannelLimitError

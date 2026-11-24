@@ -353,3 +353,30 @@ func TestStrictPriorityCapGivesALowerTierOnlyItsSpill(t *testing.T) {
 	}
 	assert.Positive(t, smallSpills, "the scenario must include spills smaller than the cap's tenth")
 }
+
+func TestRetrySameTierReopensOnlyTheTierOfTheLatestAttempt(t *testing.T) {
+	s := newTrafficSim()
+	key := Key{Group: "default", Model: "same-tier"}
+	candidates := []Candidate{{ID: 1, Status: 1, Priority: 10, Weight: 1}, {ID: 2, Status: 1, Priority: 0, Weight: 1}, {ID: 3, Status: 1, Priority: 0, Weight: 1}}
+	s.engine.RegisterCandidates(key, candidates)
+	r := s.engine.BeginRequest(key, "retry", true)
+	defer s.engine.EndRequest(r)
+	assert.Empty(t, s.engine.RetrySameTier(r, candidates), "nothing was sent yet")
+	fail := func(candidates []Candidate) int {
+		a, err := s.engine.SelectAndReserve(r, candidates, false, true)
+		require.NoError(t, err)
+		s.engine.StartAttempt(a)
+		s.engine.FinishAttempt(a, Outcome{ChannelFailure: true, CooldownFailure: true})
+		return a.Candidate.ID
+	}
+	// Cold routing offers one tier at a time, highest first.
+	assert.Equal(t, 1, fail(candidates[:1]))
+	assert.ElementsMatch(t, []int{2, 3}, []int{fail(candidates[1:]), fail(candidates[1:])})
+	_, err := s.engine.SelectAndReserve(r, candidates, false, true)
+	require.ErrorIs(t, err, ErrNoEligibleChannel)
+
+	assert.ElementsMatch(t, []int{2, 3}, s.engine.RetrySameTier(r, candidates), "the tier left earlier stays closed")
+	assert.Empty(t, s.engine.RetrySameTier(r, candidates), "reopening is not repeated without a new attempt")
+	assert.ElementsMatch(t, []int{2, 3}, []int{fail(candidates), fail(candidates)})
+	assert.Equal(t, []int{1}, s.engine.RetryAgain(r, []int{1, 99}), "the host may reopen named channels")
+}

@@ -251,6 +251,10 @@ func TestCapacityCountsFinalRoutingOutcomeAcrossRetries(t *testing.T) {
 			assert.Zero(t, scheduler.Default.Snapshot(key, nil, false).Summary.CapacitySkips30m, "an intermediate selection cannot settle the request")
 			if succeeds {
 				EndSchedulingRequest(lastLease)
+			} else {
+				// Another request takes the channel that just failed, so the
+				// retry cannot return to it either.
+				require.NoError(t, ReserveSchedulingChannel(routingTestContext(t), channel, "default", name))
 			}
 			param.IncreaseRetry()
 			channel, _, selectErr = SelectChannelForRequest(request, name, param)
@@ -1523,4 +1527,138 @@ func TestRealtimeConnectionDoesNotHoldGenerationCapacity(t *testing.T) {
 	assert.ErrorIs(t, ReserveSchedulingChannel(routingTestContext(t), channel, "default", name), scheduler.ErrNoEligibleChannel, "a concurrent generation respects capacity")
 	EndSchedulingRequest(generation)
 	require.NoError(t, ReserveSchedulingChannel(routingTestContext(t), channel, "default", name))
+}
+
+// With retries left and no untried channel to send them to, a request goes
+// back to the channels of the tier it tried last, in both routing modes.
+func TestSchedulingRetriesStayInTheTierWhenNothingElseIsLeft(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		mode := map[bool]string{false: "cold", true: "active"}[active]
+		// setup creates channels with the given priorities and returns a
+		// function that runs one failed upstream attempt, or nil when no
+		// channel is offered.
+		setup := func(t *testing.T, modelName string, priorities ...int64) (*gin.Context, func(retry int) *model.Channel) {
+			db := setupChannelSelectAutoGroupsTest(t)
+			common.RetryTimes = 5
+			setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: true, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 4}})
+			for i, priority := range priorities {
+				createChannelSelectAutoGroupsChannel(t, db, 4701+i, "default", modelName)
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 4701+i).Update("priority", priority).Error)
+			}
+			model.InitChannelCache()
+			key := scheduler.Key{Group: "default", Model: modelName}
+			if active {
+				for index := range 60 {
+					scheduler.Default.EndRequest(scheduler.Default.BeginRequest(key, fmt.Sprintf("activation-%d", index), false))
+				}
+			}
+			require.Equal(t, active, scheduler.Default.IsActive(key))
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			t.Cleanup(func() { EndSchedulingRequest(c) })
+			return c, func(retry int) *model.Channel {
+				channel, err := schedulerSelectChannel(c, "default", modelName, retry, nil)
+				require.NoError(t, err)
+				if channel == nil {
+					return nil
+				}
+				info := &relaycommon.RelayInfo{UsingGroup: "default", OriginModelName: modelName}
+				StartSchedulingAttempt(c, info)
+				AppendUsedChannel(c, channel.Id)
+				FinishSchedulingAttempt(c, info, types.NewOpenAIError(errors.New("upstream unavailable"), types.ErrorCodeBadResponseStatusCode, 502))
+				return channel
+			}
+		}
+		t.Run(mode+"/the only channel is tried again", func(t *testing.T) {
+			_, attempt := setup(t, "retry-single-"+mode, 0)
+			for retry := range 4 {
+				channel := attempt(retry)
+				require.NotNil(t, channel, "attempt %d", retry+1)
+				assert.Equal(t, 4701, channel.Id)
+			}
+		})
+		t.Run(mode+"/each channel of the tier is tried again before any is tried a third time", func(t *testing.T) {
+			_, attempt := setup(t, "retry-pair-"+mode, 0, 0)
+			var tried []int
+			for retry := range 4 {
+				channel := attempt(retry)
+				require.NotNil(t, channel, "attempt %d", retry+1)
+				tried = append(tried, channel.Id)
+			}
+			assert.ElementsMatch(t, []int{4701, 4702}, tried[:2])
+			assert.ElementsMatch(t, []int{4701, 4702}, tried[2:])
+		})
+		t.Run(mode+"/a lower tier is used first, then retried", func(t *testing.T) {
+			_, attempt := setup(t, "retry-tiers-"+mode, 100, 50)
+			var tried []int
+			for retry := range 4 {
+				channel := attempt(retry)
+				require.NotNil(t, channel, "attempt %d", retry+1)
+				tried = append(tried, channel.Id)
+			}
+			assert.Equal(t, []int{4701, 4702, 4702, 4702}, tried, "the request does not return to the tier it already left")
+		})
+		t.Run(mode+"/a channel that refused before dispatch is not asked again", func(t *testing.T) {
+			modelName := "retry-refused-" + mode
+			c, attempt := setup(t, modelName, 0, 0)
+			refuse := func() int {
+				channel, err := schedulerSelectChannel(c, "default", modelName, 0, nil)
+				require.NoError(t, err)
+				require.NotNil(t, channel)
+				AppendUsedChannel(c, channel.Id)
+				retry := &RetryParam{Ctx: c, TokenGroup: "default", ModelName: modelName, Retry: common.GetPointer(0)}
+				retry.TryAnotherChannelAfterRefusal(channel.Id, false, types.NewOpenAIError(errors.New("local limit"), types.ErrorCodeBadResponseStatusCode, 429))
+				return channel.Id
+			}
+			refused := refuse()
+			sent := attempt(0)
+			require.NotNil(t, sent)
+			require.NotEqual(t, refused, sent.Id)
+			again := attempt(1)
+			require.NotNil(t, again)
+			assert.Equal(t, sent.Id, again.Id, "only the channel that was sent to is retried")
+			// The retried channel now declines locally as well: nothing is left.
+			assert.Equal(t, sent.Id, refuse())
+			assert.Nil(t, attempt(2))
+		})
+	}
+}
+
+// A supplier receives a request at most once. When retries stay in the
+// latest tier, only platform channels are tried again.
+func TestSupplierChannelIsNotRetriedWhenRetriesStayInTheTier(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	common.RetryTimes = 6
+	require.NoError(t, db.AutoMigrate(&model.SupplierAccount{}))
+	const modelName = "supplier-same-tier-model"
+	setSchedulingTestConfig(t, []SchedulingConfig{{Group: "default", Model: modelName, Enabled: false, TargetSuccessRate: .95, TargetTTFTMS: 3000, DefaultCapacity: 100}})
+	require.NoError(t, db.Create(&model.SupplierAccount{SupplierID: "supplier-a", SupplyEnabled: true, AllowedTypes: "[1]", AllowedModels: modelName, Group: "default", PoolPriority: 20, PoolWeight: 1}).Error)
+	createChannelSelectAutoGroupsChannel(t, db, 7301, "default", modelName)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 7301).Updates(map[string]any{"owner_supplier_id": "supplier-a", "supplier_validated": true}).Error)
+	for _, id := range []int{7302, 7303} {
+		createChannelSelectAutoGroupsChannel(t, db, id, "default", modelName)
+		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", id).Update("priority", 10).Error)
+	}
+	model.InitChannelCache()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	defer EndSchedulingRequest(c)
+	var tried []int
+	for retry := range 6 {
+		channel, err := schedulerSelectChannel(c, "default", modelName, retry, nil)
+		require.NoError(t, err)
+		if channel == nil {
+			break
+		}
+		require.True(t, MarkSupplierRequestSent(c, channel), "attempt %d on channel %d", retry+1, channel.Id)
+		StartSchedulingAttempt(c, &relaycommon.RelayInfo{})
+		AppendUsedChannel(c, channel.Id)
+		FinishSchedulingAttempt(c, &relaycommon.RelayInfo{}, types.NewErrorWithStatusCode(errors.New("upstream failed"), types.ErrorCodeBadResponse, http.StatusBadGateway))
+		tried = append(tried, channel.Id)
+	}
+	require.Len(t, tried, 6)
+	assert.Equal(t, 7301, tried[0], "the supplier pool has the higher platform priority")
+	assert.ElementsMatch(t, []int{7302, 7303}, tried[1:3])
+	assert.ElementsMatch(t, []int{7302, 7303}, tried[3:5], "both platform channels are tried again")
+	assert.NotEqual(t, 7301, tried[5], "the supplier is sent the request once")
 }

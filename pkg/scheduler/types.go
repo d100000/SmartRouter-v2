@@ -74,6 +74,9 @@ type Request struct {
 	ended      bool
 	attempted  map[int]bool
 	attempts   map[*Attempt]bool
+	// The priority of the latest attempt sent upstream, for RetrySameTier.
+	dispatched   bool
+	lastPriority int64
 	// The host combines both engines' capacity observations after each
 	// selection. Only it knows whether other groups ultimately served it.
 	capacityBlocked atomic.Bool

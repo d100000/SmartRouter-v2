@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -40,10 +41,15 @@ type schedulingRequest struct {
 	capacityUnresolved bool
 	sentSuppliers      map[string]bool
 	coldPriorities     map[scheduler.Key]int64
-	currentRequest     *scheduler.Request
-	attempt            *scheduler.Attempt
-	confirmed          bool
-	started            bool
+	// retryAgain holds channels the request may use again although it already
+	// tried them; sameTier marks keys whose retries stay in the tier of the
+	// latest attempt. See retrySameTier.
+	retryAgain     map[int]bool
+	sameTier       map[scheduler.Key]bool
+	currentRequest *scheduler.Request
+	attempt        *scheduler.Attempt
+	confirmed      bool
+	started        bool
 	// dispatched counts attempts actually sent upstream. Only after one does
 	// selection rank candidates as a retry; a local refusal is not a retry.
 	dispatched                int
@@ -123,9 +129,25 @@ func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, fi
 	retried := state.dispatched > 0
 	state.mu.Unlock()
 	stream := common.GetContextKeyBool(c, constant.ContextKeyIsStream)
-	if withSuppliers {
-		return selectSupplierPoolChannel(c, state, request, channels, stream, retried)
+	for {
+		if withSuppliers {
+			selected, err = selectSupplierPoolChannel(c, state, request, channels, stream, retried)
+		} else {
+			selected, err = selectChannelRound(c, state, request, channels, retry, stream, retried, credentialRetryChannel)
+		}
+		// With no untried channel left, the remaining retries go back to the
+		// tier of the latest attempt. A restricted choice among healthy
+		// alternatives of a session binding never does.
+		if selected != nil || err != nil || allowed != nil || !state.retrySameTier(c, request, channels, withSuppliers) {
+			return selected, err
+		}
 	}
+}
+
+// selectChannelRound chooses among the channels the request has not used.
+func selectChannelRound(c *gin.Context, state *schedulingRequest, request *scheduler.Request, channels []*model.Channel, retry int, stream, retried bool, credentialRetryChannel int) (*model.Channel, error) {
+	var err error
+	again, sameTier := state.retryState(request.Key)
 	active := scheduler.Default.IsActive(request.Key)
 	priorities := make([]int64, 0, len(channels))
 	tiers := make(map[int64][]scheduler.Candidate)
@@ -140,7 +162,7 @@ func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, fi
 			tiers[priority] = nil
 			priorities = append(priorities, priority)
 		}
-		if channel.Id != credentialRetryChannel && slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
+		if channel.Id != credentialRetryChannel && !again[channel.Id] && slices.Contains(c.GetStringSlice("use_channel"), fmt.Sprint(channel.Id)) {
 			continue
 		}
 		candidate := SchedulerCandidate(channel)
@@ -167,7 +189,8 @@ func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, fi
 			// engine and request trail still exclude already attempted IDs.
 			next := len(priorities) - 1
 			for index, priority := range priorities {
-				if priority < previous {
+				// Once retries stay in the latest tier, it is not skipped.
+				if priority < previous || sameTier && priority == previous {
 					next = index
 					break
 				}
@@ -195,6 +218,87 @@ func selectSchedulingCandidates(c *gin.Context, key scheduler.Key, retry int, fi
 	state.currentRequest = request
 	state.mu.Unlock()
 	return byID[attempt.Candidate.ID], nil
+}
+
+// retryState returns the channels the request may use again and whether the
+// retries of this key stay in the tier of its latest attempt.
+func (state *schedulingRequest) retryState(key scheduler.Key) (map[int]bool, bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return maps.Clone(state.retryAgain), state.sameTier[key]
+}
+
+// retrySameTier is called when no untried channel can take the request. The
+// request then has retries left but nowhere new to send them: every channel
+// of the current tier was tried and no lower tier can take it. The channels
+// already tried in the tier of the latest attempt become selectable again, so
+// the configured number of retries is used instead of the request ending
+// early. A single channel is retried; several are each tried again before any
+// is tried a third time. It reports whether any channel was made selectable.
+//
+// Channels refused before dispatch (a local limit) are not included: they
+// were never sent to, and asking again would only repeat the refusal.
+func (state *schedulingRequest) retrySameTier(c *gin.Context, request *scheduler.Request, channels []*model.Channel, withSuppliers bool) bool {
+	var again []int
+	if withSuppliers {
+		// The platform engine chooses a supplier pool, the channel engine a
+		// channel inside it. The tier is the one of the latest pool.
+		state.mu.Lock()
+		poolEngine, poolRequest := state.poolEngine, state.poolRequests[request.Key]
+		state.mu.Unlock()
+		if poolEngine == nil || poolRequest == nil {
+			return false
+		}
+		members := map[int][]int{}
+		var pools []scheduler.Candidate
+		for _, channel := range channels {
+			if !supplierChannelEligible(c, channel) {
+				continue
+			}
+			pool, err := supplierRoutingPoolForChannel(channel)
+			if err != nil {
+				continue
+			}
+			if _, seen := members[pool.candidate.ID]; !seen {
+				pools = append(pools, pool.candidate)
+			}
+			members[pool.candidate.ID] = append(members[pool.candidate.ID], channel.Id)
+		}
+		var tried []int
+		for _, id := range poolEngine.RetrySameTier(poolRequest, pools) {
+			tried = append(tried, members[id]...)
+		}
+		again = scheduler.Default.RetryAgain(request, tried)
+	} else {
+		candidates := make([]scheduler.Candidate, 0, len(channels))
+		for _, channel := range channels {
+			if supplierChannelEligible(c, channel) {
+				candidates = append(candidates, SchedulerCandidate(channel))
+			}
+		}
+		again = scheduler.Default.RetrySameTier(request, candidates)
+	}
+	if len(again) == 0 {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retryAgain == nil {
+		state.retryAgain, state.sameTier = map[int]bool{}, map[scheduler.Key]bool{}
+	}
+	for _, id := range again {
+		state.retryAgain[id] = true
+	}
+	state.sameTier[request.Key] = true
+	return true
+}
+
+// refusedBeforeDispatch withdraws a channel from the ones the request may use
+// again: it declined the request locally and was not sent to.
+func (state *schedulingRequest) refusedBeforeDispatch(channelID int) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	delete(state.retryAgain, channelID)
 }
 
 // releaseUnstartedLease returns a reservation that was never dispatched.
