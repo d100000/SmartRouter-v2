@@ -11,6 +11,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
@@ -774,4 +776,45 @@ func TestProcessHeaderOverride_RequestSuppliedValuesAreNotTemplates(t *testing.T
 			}
 		})
 	}
+}
+
+// The headers a parameter override builds belong to the channel that built
+// them: a retry on another channel sends that channel's own overrides.
+func TestProcessHeaderOverride_RetryOnAnotherChannelUsesItsOwnOverrides(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("X-Client", "{api_key}")
+	info := &relaycommon.RelayInfo{
+		UserId:          12,
+		OriginModelName: "my-gpt",
+		RequestHeaders:  map[string]string{"X-Client": "{api_key}"},
+	}
+	attempt := func(channelID int, key string, paramOverride, headerOverride map[string]any) map[string]string {
+		common.SetContextKey(ctx, constant.ContextKeyChannelId, channelID)
+		common.SetContextKey(ctx, constant.ContextKeyChannelKey, key)
+		common.SetContextKey(ctx, constant.ContextKeyChannelParamOverride, paramOverride)
+		common.SetContextKey(ctx, constant.ContextKeyChannelHeaderOverride, headerOverride)
+		info.InitChannelMeta(ctx)
+		_, err := relaycommon.ApplyParamOverrideWithRelayInfo([]byte(`{"model":"my-gpt"}`), info)
+		require.NoError(t, err)
+		headers, err := processHeaderOverride(info, ctx)
+		require.NoError(t, err)
+		return headers
+	}
+
+	first := attempt(1, "sk-A",
+		map[string]any{"operations": []any{map[string]any{"mode": "pass_headers", "value": []any{"X-Client"}}}},
+		map[string]any{"X-Only-A": "secret-of-A", "X-Channel": "{channel_id}"})
+	assert.Equal(t, map[string]string{"x-only-a": "secret-of-A", "x-channel": "1", "x-client": "{api_key}"}, first)
+
+	// No parameter override on the second channel: only its own header overrides.
+	second := attempt(2, "sk-B", map[string]any{}, map[string]any{"X-Only-B": "b", "X-Channel": "{channel_id}", "X-Client": "{api_key}"})
+	assert.Equal(t, map[string]string{"x-only-b": "b", "x-channel": "2", "x-client": "sk-B"}, second)
+
+	// A parameter override on the third starts from the third channel's own headers.
+	third := attempt(3, "sk-C",
+		map[string]any{"operations": []any{map[string]any{"mode": "set_header", "path": "X-Set", "value": "c{channel_id}"}}},
+		map[string]any{"X-Only-C": "c"})
+	assert.Equal(t, map[string]string{"x-only-c": "c", "x-set": "c3"}, third)
 }

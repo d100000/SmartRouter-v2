@@ -476,6 +476,12 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	info.ClaudeToChatStreamState = nil
 	info.ChatToGeminiStreamState = nil
 	info.RequestPluginHeaders = nil
+	// The headers a parameter override built belong to the channel that built
+	// them. Kept, a retry on another channel would send them in place of that
+	// channel's own header overrides.
+	info.RuntimeHeadersOverride = nil
+	info.UseRuntimeHeadersOverride = false
+	info.LiteralHeaderOverrides = nil
 	info.RequestPluginRecord = info.RequestPluginRecord[:min(info.requestPluginIngressRecord, len(info.RequestPluginRecord))]
 	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	paramOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)
