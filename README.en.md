@@ -206,10 +206,11 @@ A daily budget needs valid purchase-cost rules. The cost the platform accounts m
 | --- | --- |
 | Scheduling center | Recent performance per group and model, channel weights, time to first output, cooldown and capacity use; routing policy configuration |
 | Channel overview | Channel calls, usage, cache and cost, compared along the available dimensions |
+| Channel management | Maintain channels, models, priorities and weights; set request header overrides, which can carry the user ID, the channel ID, the model name and the request time; Details beside a channel's health shows its success rate, first-token time, RPM and latest 20 requests, with a failures-only view and a link to the usage logs |
 | Supplier management | Create supplier identities, set authorization scope, supply state and platform pool policy, see which supplier owns a channel |
 | Supplier workspace | Maintain own channels, model verification, internal order and limits; view own overview, stability and supply logs |
 | Error analysis | Administrators pick a period and generate a failure report; after entering the analysis model's address and key the model list can be fetched, and common models get a matching context budget |
-| Logs and audit | Authorized call records, abnormal states and management events; suppliers only get the permitted redacted fields |
+| Logs and audit | Authorized call records, abnormal states and management events; in the usage logs an administrator sees the retry chain of a request and the channel affinity it followed (rule, group, affinity ID) in the channel column; suppliers only get the permitted redacted fields |
 
 For asynchronous tasks, "submitted" and "completed" are recorded separately; completion state, duration and media usage depend on verifiable upstream results. A realtime connection that was established does not mean later generations succeed; each new generation goes through admission and metering on its own.
 
