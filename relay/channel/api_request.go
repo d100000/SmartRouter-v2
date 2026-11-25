@@ -208,7 +208,9 @@ func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey str
 //
 // {client_header:<name>} must be the whole value; the others may stand anywhere
 // in it. A header that names a request value the request does not have is left
-// out.
+// out. Placeholders are resolved in the values the channel's administrator
+// wrote; a value the request supplied (a passthrough rule, or a parameter
+// override that copies a client header or a body field) is sent as it is.
 //
 // Header passthrough rules (keys only; values are ignored):
 //   - "*": passthrough all incoming headers by name (excluding unsafe headers)
@@ -322,6 +324,13 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		str, ok := v.(string)
 		if !ok {
 			return nil, types.NewError(nil, types.ErrorCodeChannelHeaderOverrideInvalid)
+		}
+		// A value the request supplied is not a template.
+		if info.LiteralHeaderOverrides[key] {
+			if value := strings.TrimSpace(str); value != "" {
+				headerOverride[key] = value
+			}
+			continue
 		}
 		if !hasClientRequest && strings.HasPrefix(strings.TrimSpace(str), clientHeaderPlaceholderPrefix) {
 			continue

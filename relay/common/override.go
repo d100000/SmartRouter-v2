@@ -40,6 +40,8 @@ func getParamOverrideRegex(pattern string) (*regexp.Regexp, error) {
 const (
 	paramOverrideContextRequestHeaders = "request_headers"
 	paramOverrideContextHeaderOverride = "header_override"
+	// The names in header_override whose value the request supplied.
+	paramOverrideContextLiteralHeaders = "__param_override_literal_headers"
 	paramOverrideContextAuditRecorder  = "__param_override_audit_recorder"
 )
 
@@ -1236,7 +1238,19 @@ func marshalContextJSON(context map[string]any) (string, error) {
 	return string(ctxBytes), nil
 }
 
+// setHeaderOverrideInContext writes a value the channel's administrator gave.
+// A token mapping edits the header's current value, so tokens edited on a
+// header the request supplied are still the request's.
 func setHeaderOverrideInContext(context map[string]any, headerName string, value any, keepOrigin bool) error {
+	fromRequest := false
+	switch value.(type) {
+	case map[string]any, map[string]string:
+		_, fromRequest, _ = headerValueWithOrigin(context, headerName)
+	}
+	return writeHeaderOverrideInContext(context, headerName, value, keepOrigin, fromRequest)
+}
+
+func writeHeaderOverrideInContext(context map[string]any, headerName string, value any, keepOrigin bool, fromRequest bool) error {
 	headerName = normalizeHeaderContextKey(headerName)
 	if headerName == "" {
 		return fmt.Errorf("header name is required")
@@ -1256,12 +1270,19 @@ func setHeaderOverrideInContext(context map[string]any, headerName string, value
 	if err != nil {
 		return err
 	}
+	literal := literalHeadersInContext(context)
 	if !hasValue {
 		delete(rawHeaders, headerName)
+		delete(literal, headerName)
 		return nil
 	}
 
 	rawHeaders[headerName] = headerValue
+	if fromRequest {
+		literal[headerName] = true
+	} else {
+		delete(literal, headerName)
+	}
 	return nil
 }
 
@@ -1405,11 +1426,11 @@ func copyHeaderInContext(context map[string]any, fromHeader, toHeader string, ke
 	if fromHeader == "" || toHeader == "" {
 		return fmt.Errorf("copy_header from/to is required")
 	}
-	value, exists := getHeaderValueFromContext(context, fromHeader)
+	value, fromRequest, exists := headerValueWithOrigin(context, fromHeader)
 	if !exists {
 		return fmt.Errorf("%w: %s", errSourceHeaderNotFound, fromHeader)
 	}
-	return setHeaderOverrideInContext(context, toHeader, value, keepOrigin)
+	return writeHeaderOverrideInContext(context, toHeader, value, keepOrigin, fromRequest)
 }
 
 func moveHeaderInContext(context map[string]any, fromHeader, toHeader string, keepOrigin bool) error {
@@ -1434,6 +1455,7 @@ func deleteHeaderOverrideInContext(context map[string]any, headerName string) er
 	}
 	rawHeaders := ensureMapKeyInContext(context, paramOverrideContextHeaderOverride)
 	delete(rawHeaders, headerName)
+	delete(literalHeadersInContext(context), headerName)
 	return nil
 }
 
@@ -1592,13 +1614,23 @@ func readSyncTargetValue(doc *ojson.Doc, context map[string]any, target syncTarg
 	}
 }
 
-func writeSyncTargetValue(doc *ojson.Doc, context map[string]any, target syncTarget, value any) error {
+// syncTargetIsFromRequest reports whether a target's value is the request's:
+// a body field, or a header the request supplied.
+func syncTargetIsFromRequest(context map[string]any, target syncTarget) bool {
+	if target.kind != "header" {
+		return true
+	}
+	_, fromRequest, _ := headerValueWithOrigin(context, target.key)
+	return fromRequest
+}
+
+func writeSyncTargetValue(doc *ojson.Doc, context map[string]any, target syncTarget, value any, fromRequest bool) error {
 	switch target.kind {
 	case "json":
 		path := processNegativeIndex(doc, target.key)
 		return doc.Set(path, value)
 	case "header":
-		return setHeaderOverrideInContext(context, target.key, value, false)
+		return writeHeaderOverrideInContext(context, target.key, value, false, fromRequest)
 	default:
 		return fmt.Errorf("unsupported sync_fields target kind: %s", target.kind)
 	}
@@ -1625,10 +1657,10 @@ func syncFieldsBetweenTargets(doc *ojson.Doc, context map[string]any, fromSpec s
 
 	// If one side exists and the other side is missing, sync the missing side.
 	if fromExists && !toExists {
-		return writeSyncTargetValue(doc, context, toTarget, fromValue)
+		return writeSyncTargetValue(doc, context, toTarget, fromValue, syncTargetIsFromRequest(context, fromTarget))
 	}
 	if toExists && !fromExists {
-		return writeSyncTargetValue(doc, context, fromTarget, toValue)
+		return writeSyncTargetValue(doc, context, fromTarget, toValue, syncTargetIsFromRequest(context, toTarget))
 	}
 	return nil
 }
@@ -1648,9 +1680,16 @@ func ensureMapKeyInContext(context map[string]any, key string) map[string]any {
 }
 
 func getHeaderValueFromContext(context map[string]any, headerName string) (string, bool) {
+	value, _, exists := headerValueWithOrigin(context, headerName)
+	return value, exists
+}
+
+// headerValueWithOrigin returns a header's current value, an override before
+// the client's own header, and whether the request supplied it.
+func headerValueWithOrigin(context map[string]any, headerName string) (value string, fromRequest bool, exists bool) {
 	headerName = normalizeHeaderContextKey(headerName)
 	if headerName == "" {
-		return "", false
+		return "", false, false
 	}
 	for _, key := range []string{paramOverrideContextHeaderOverride, paramOverrideContextRequestHeaders} {
 		source := ensureMapKeyInContext(context, key)
@@ -1659,11 +1698,27 @@ func getHeaderValueFromContext(context map[string]any, headerName string) (strin
 			continue
 		}
 		value := strings.TrimSpace(fmt.Sprintf("%v", raw))
-		if value != "" {
-			return value, true
+		if value == "" {
+			continue
 		}
+		if key == paramOverrideContextRequestHeaders {
+			return value, true, true
+		}
+		return value, literalHeadersInContext(context)[headerName], true
 	}
-	return "", false
+	return "", false, false
+}
+
+func literalHeadersInContext(context map[string]any) map[string]bool {
+	if context == nil {
+		return map[string]bool{}
+	}
+	if literal, ok := context[paramOverrideContextLiteralHeaders].(map[string]bool); ok {
+		return literal
+	}
+	literal := make(map[string]bool)
+	context[paramOverrideContextLiteralHeaders] = literal
+	return literal
 }
 
 func normalizeHeaderContextKey(key string) string {
@@ -1702,6 +1757,16 @@ func syncRuntimeHeaderOverrideFromContext(info *RelayInfo, context map[string]an
 	}
 	info.RuntimeHeadersOverride = sanitizeHeaderOverrideMap(rawMap)
 	info.UseRuntimeHeadersOverride = true
+	info.LiteralHeaderOverrides = nil
+	for name := range literalHeadersInContext(context) {
+		if _, ok := info.RuntimeHeadersOverride[name]; !ok {
+			continue
+		}
+		if info.LiteralHeaderOverrides == nil {
+			info.LiteralHeaderOverrides = make(map[string]bool)
+		}
+		info.LiteralHeaderOverrides[name] = true
+	}
 }
 
 // moveValue and copyValue write the source's raw bytes: a decoded value
@@ -2236,6 +2301,12 @@ func BuildParamOverrideContext(info *RelayInfo) map[string]any {
 
 	headerOverrideSource := GetEffectiveHeaderOverride(info)
 	ctx[paramOverrideContextHeaderOverride] = sanitizeHeaderOverrideMap(headerOverrideSource)
+	if info.UseRuntimeHeadersOverride && len(info.LiteralHeaderOverrides) > 0 {
+		literal := literalHeadersInContext(ctx)
+		for name := range info.LiteralHeaderOverrides {
+			literal[name] = true
+		}
+	}
 
 	ctx["retry_index"] = info.RetryIndex
 	ctx["is_retry"] = info.RetryIndex > 0

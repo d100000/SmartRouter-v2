@@ -569,3 +569,209 @@ func TestProcessHeaderOverride_RequestPlaceholders(t *testing.T) {
 		assert.LessOrEqual(t, millis, after)
 	})
 }
+
+func TestProcessHeaderOverride_RequestPlaceholderEdges(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Parallel()
+
+	resolve := func(t *testing.T, info *relaycommon.RelayInfo, background bool) map[string]string {
+		t.Helper()
+		var ctx *gin.Context
+		if !background {
+			ctx, _ = gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		}
+		headers, err := processHeaderOverride(info, ctx)
+		require.NoError(t, err)
+		return headers
+	}
+
+	t.Run("a background call has the time and the key but no user or model", func(t *testing.T) {
+		// What task polling and the model list build: a key and the overrides.
+		headers := resolve(t, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+			ApiKey: "sk-test",
+			HeadersOverride: map[string]any{
+				"Authorization": "Bearer {api_key}",
+				"X-User-Id":     "{user_id}",
+				"X-Model":       "{model}",
+				"X-Channel-Id":  "{channel_id}",
+				"X-Timestamp":   "{timestamp}",
+				"X-Copied":      "{client_header:X-Client-Tag}",
+				"X-Static":      "fixed",
+			},
+		}}, true)
+
+		assert.Regexp(t, `^\d{10}$`, headers["x-timestamp"])
+		delete(headers, "x-timestamp")
+		assert.Equal(t, map[string]string{"authorization": "Bearer sk-test", "x-static": "fixed"}, headers)
+	})
+
+	t.Run("model names: blank and control characters are left out, other scripts are sent", func(t *testing.T) {
+		for model, want := range map[string]map[string]string{
+			"   ":       {},
+			"gpt\t4o":   {},
+			"gpt\x7f4o": {},
+			"模型-甲":      {"x-model": "模型-甲", "x-original-model": "模型-甲"},
+		} {
+			headers := resolve(t, &relaycommon.RelayInfo{
+				OriginModelName: model,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					UpstreamModelName: model,
+					HeadersOverride:   map[string]any{"X-Model": "{model}", "X-Original-Model": "{original_model}"},
+				},
+			}, false)
+			assert.Equal(t, want, headers, "model %q", model)
+		}
+	})
+
+	t.Run("the two timestamps do not overlap when written side by side", func(t *testing.T) {
+		headers := resolve(t, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+			HeadersOverride: map[string]any{
+				"X-Both":    "{timestamp_ms}{timestamp}",
+				"X-Seconds": "{timestamp}_ms",
+			},
+		}}, false)
+
+		assert.Regexp(t, `^\d{13}\d{10}$`, headers["x-both"])
+		assert.Equal(t, headers["x-both"][:10], headers["x-both"][13:], "both come from one instant")
+		assert.Regexp(t, `^\d{10}_ms$`, headers["x-seconds"])
+	})
+
+	t.Run("every attempt resolves its own channel and model", func(t *testing.T) {
+		overrides := map[string]any{"X-Trace": "c{channel_id}-{model}-{original_model}-u{user_id}"}
+		info := &relaycommon.RelayInfo{
+			UserId:          12,
+			OriginModelName: "my-gpt",
+			ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 37, UpstreamModelName: "gpt-4o", HeadersOverride: overrides},
+		}
+		assert.Equal(t, map[string]string{"x-trace": "c37-gpt-4o-my-gpt-u12"}, resolve(t, info, false))
+
+		info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 41, UpstreamModelName: "gpt-4o-mini", HeadersOverride: overrides}
+		assert.Equal(t, map[string]string{"x-trace": "c41-gpt-4o-mini-my-gpt-u12"}, resolve(t, info, false))
+	})
+}
+
+// A parameter override can copy a client header or a body field into the
+// upstream headers. Those values are the request's, not templates: a client
+// must not be able to have the channel key or an internal ID written into one.
+func TestProcessHeaderOverride_RequestSuppliedValuesAreNotTemplates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		clientHeaders map[string]string
+		body          string
+		overrides     map[string]any
+		operations    []any
+		want          map[string]string
+	}{
+		{
+			name:          "pass_headers sends the client's value as it is",
+			clientHeaders: map[string]string{"X-A": "{user_id}", "X-B": "key={api_key}", "X-T": "{timestamp}"},
+			operations: []any{
+				map[string]any{"mode": "pass_headers", "value": []any{"X-A", "X-B", "X-T"}},
+			},
+			want: map[string]string{"x-a": "{user_id}", "x-b": "key={api_key}", "x-t": "{timestamp}"},
+		},
+		{
+			name:          "copy_header and move_header of a client header",
+			clientHeaders: map[string]string{"X-C": "{channel_id}/{model}", "X-D": "{client_header:Authorization}"},
+			operations: []any{
+				map[string]any{"mode": "copy_header", "from": "X-C", "to": "X-C2"},
+				map[string]any{"mode": "move_header", "from": "X-D", "to": "X-D2"},
+			},
+			want: map[string]string{"x-c2": "{channel_id}/{model}", "x-d2": "{client_header:Authorization}"},
+		},
+		{
+			name: "sync_fields from the request body",
+			body: `{"model":"my-gpt","session":"{api_key}"}`,
+			operations: []any{
+				map[string]any{"mode": "sync_fields", "from": "json:session", "to": "header:X-Session"},
+			},
+			want: map[string]string{"x-session": "{api_key}"},
+		},
+		{
+			name:          "tokens edited on a client header stay the client's",
+			clientHeaders: map[string]string{"Anthropic-Beta": "a,{api_key}"},
+			operations: []any{
+				map[string]any{"mode": "set_header", "path": "anthropic-beta", "value": map[string]any{"$append": []any{"b"}}},
+			},
+			want: map[string]string{"anthropic-beta": "a,{api_key},b"},
+		},
+		{
+			name:          "what the administrator wrote is still a template",
+			clientHeaders: map[string]string{"X-A": "{api_key}"},
+			overrides:     map[string]any{"X-Legacy": "u{user_id}"},
+			operations: []any{
+				// Set after the passthrough, the administrator's value replaces the client's.
+				map[string]any{"mode": "pass_headers", "value": []any{"X-A"}},
+				map[string]any{"mode": "set_header", "path": "X-A", "value": "c{channel_id}"},
+				map[string]any{"mode": "set_header", "path": "X-Set", "value": "{model}"},
+				// A copy of an administrator's value is one too.
+				map[string]any{"mode": "copy_header", "from": "X-Legacy", "to": "X-Legacy-Copy"},
+				map[string]any{"mode": "set_header", "path": "X-List", "value": map[string]any{"$append": []any{"{user_id}"}}},
+			},
+			want: map[string]string{
+				"x-a":           "c37",
+				"x-set":         "gpt-4o",
+				"x-legacy":      "u12",
+				"x-legacy-copy": "u12",
+				"x-list":        "12",
+			},
+		},
+		{
+			name:          "keep_origin leaves the administrator's value in place",
+			clientHeaders: map[string]string{"X-A": "{api_key}"},
+			overrides:     map[string]any{"X-A": "u{user_id}"},
+			operations: []any{
+				map[string]any{"mode": "pass_headers", "value": []any{"X-A"}, "keep_origin": true},
+			},
+			want: map[string]string{"x-a": "u12"},
+		},
+		{
+			name:          "a deleted passthrough leaves nothing behind",
+			clientHeaders: map[string]string{"X-A": "{api_key}"},
+			operations: []any{
+				map[string]any{"mode": "pass_headers", "value": []any{"X-A"}},
+				map[string]any{"mode": "delete_header", "path": "X-A"},
+				map[string]any{"mode": "set_header", "path": "X-A", "value": "u{user_id}", "keep_origin": true},
+			},
+			want: map[string]string{"x-a": "u12"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			for name, value := range tt.clientHeaders {
+				ctx.Request.Header.Set(name, value)
+			}
+			info := &relaycommon.RelayInfo{
+				UserId:          12,
+				OriginModelName: "my-gpt",
+				RequestHeaders:  tt.clientHeaders,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelId:         37,
+					ApiKey:            "sk-secret",
+					UpstreamModelName: "gpt-4o",
+					HeadersOverride:   tt.overrides,
+					ParamOverride:     map[string]any{"operations": tt.operations},
+				},
+			}
+			body := tt.body
+			if body == "" {
+				body = `{"model":"my-gpt"}`
+			}
+
+			// Twice: a second pass over the request starts from the first one's headers.
+			for pass := 1; pass <= 2; pass++ {
+				_, err := relaycommon.ApplyParamOverrideWithRelayInfo([]byte(body), info)
+				require.NoError(t, err)
+				headers, err := processHeaderOverride(info, ctx)
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, headers, "pass %d", pass)
+			}
+		})
+	}
+}

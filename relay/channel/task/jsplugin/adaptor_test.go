@@ -3033,3 +3033,22 @@ export function buildContentRequest(ctx) {
 		})
 	}
 }
+
+// The requests a plugin makes for a submission carry its header overrides.
+// A value the request supplied stays as it is there too.
+func TestTaskAdaptorKeepsRequestSuppliedHeadersLiteral(t *testing.T) {
+	adaptor := &TaskAdaptor{info: &relaycommon.RelayInfo{
+		UseRuntimeHeadersOverride: true,
+		RuntimeHeadersOverride:    map[string]any{"x-client": "{api_key}", "x-admin": "Bearer {api_key}"},
+		LiteralHeaderOverrides:    map[string]bool{"x-client": true},
+	}}
+
+	headers, err := channel.ResolveHeaderOverride(adaptor.headerOverrideInfo("sk-task"), nil)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"x-client": "{api_key}", "x-admin": "Bearer sk-task"}, headers)
+
+	// Polling builds the same info without a submission behind it.
+	headers, err = channel.ResolveHeaderOverride((&TaskAdaptor{}).headerOverrideInfo("sk-task"), nil)
+	require.NoError(t, err)
+	assert.Empty(t, headers)
+}

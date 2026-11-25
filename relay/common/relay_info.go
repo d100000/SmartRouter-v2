@@ -273,7 +273,12 @@ type RelayInfo struct {
 	LastError                             *types.NewAPIError
 	RuntimeHeadersOverride                map[string]any
 	UseRuntimeHeadersOverride             bool
-	ParamOverrideAudit                    []string
+	// LiteralHeaderOverrides names the overridden headers whose value the
+	// request supplied: a parameter override copied it from a client header
+	// or from the request body. They are sent as they are; placeholders are
+	// resolved only in values the channel's administrator wrote.
+	LiteralHeaderOverrides map[string]bool
+	ParamOverrideAudit     []string
 	// RequestPluginSteps is the audit of the request plugin runs, every
 	// stage and attempt in order.
 	RequestPluginSteps []RequestPluginStep

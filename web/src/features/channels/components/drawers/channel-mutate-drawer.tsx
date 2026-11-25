@@ -228,6 +228,7 @@ import {
   PassthroughWarningDialog,
   type PassthroughKind,
 } from '../dialogs/passthrough-warning-dialog'
+import { HeaderOverrideVariables } from '../header-override-variables'
 import { PluginLoginDialog } from '../dialogs/plugin-login-dialog'
 import { StatusCodeRiskDialog } from '../dialogs/status-code-risk-dialog'
 import {
@@ -3072,43 +3073,7 @@ export function ChannelMutateDrawer({
                 />
               </FormControl>
               <FormDescription className='text-xs'>
-                {t('Supported variables')}:{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{api_key}'}
-                </code>{' '}
-                — {t('Channel key')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{client_header:NAME}'}
-                </code>{' '}
-                — {t('Client header value')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{user_id}'}
-                </code>{' '}
-                — {t('User ID')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{model}'}
-                </code>{' '}
-                — {t('Upstream Model Name')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{original_model}'}
-                </code>{' '}
-                — {t('Request Model Name')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{channel_id}'}
-                </code>{' '}
-                — {t('Channel ID')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{timestamp}'}
-                </code>{' '}
-                — {t('Unix timestamp (seconds)')},{' '}
-                <code className='bg-muted rounded px-1 py-0.5'>
-                  {'{timestamp_ms}'}
-                </code>{' '}
-                — {t('Unix timestamp (milliseconds)')}
-                <br />
-                {t(
-                  'A header is not sent when one of its variables has no value for the request.'
-                )}
+                <HeaderOverrideVariables />
               </FormDescription>
               <FormMessage />
             </FormItem>

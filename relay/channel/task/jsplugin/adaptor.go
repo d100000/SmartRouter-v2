@@ -1578,10 +1578,14 @@ func (a *TaskAdaptor) BuildContentRequest(ctx context.Context, task *model.Task,
 // headerOverrideInfo carries the channel's Request Header Override for a
 // request built outside the client request, with {api_key} set to key.
 func (a *TaskAdaptor) headerOverrideInfo(key string) *relaycommon.RelayInfo {
-	return &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
 		ApiKey:          key,
 		HeadersOverride: relaycommon.GetEffectiveHeaderOverride(a.info),
 	}}
+	if a.info != nil && a.info.UseRuntimeHeadersOverride {
+		info.LiteralHeaderOverrides = a.info.LiteralHeaderOverrides
+	}
+	return info
 }
 
 func taskArtifactContext(task *model.Task) (map[string]any, error) {
