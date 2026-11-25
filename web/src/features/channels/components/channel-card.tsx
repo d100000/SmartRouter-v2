@@ -200,7 +200,9 @@ function ChannelCardComponent({
               <span className='text-muted-foreground text-sm'>-</span>
             )}
           </div>
-          <div className='flex shrink-0 items-center gap-1.5'>
+          {/* The button sits under the figures: beside them it would take the
+            groups' width on a narrow screen. */}
+          <div className='flex shrink-0 flex-col items-end gap-1'>
             <ChannelRecentStatsCell channel={row.original} placement='footer' />
             <ChannelDetailsButton channel={row.original} />
           </div>
