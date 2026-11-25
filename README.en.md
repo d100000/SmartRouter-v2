@@ -14,10 +14,11 @@ Self-hosted AI gateway and LLM router built on new-api · adaptive multi-channel
   <a href="./web/package.json"><img src="./assets/readme/typescript.svg" alt="TypeScript"></a>
   <a href="./Dockerfile"><img src="./assets/readme/docker.svg" alt="Docker"></a>
   <a href="./LICENSE"><img src="./assets/readme/license.svg" alt="AGPL-3.0 license"></a>
-  <a href="https://github.com/d100000/SmartRouter-v2/commits/main/"><img src="./assets/readme/build.svg" alt="Current build"></a>
 </p>
 
-[Features](#sr-purpose) · [Quick start](#sr-start) · [Routing](#sr-routing) · [Suppliers](#sr-suppliers) · [Channel limits](#sr-channel-limits) · [Configuration](#sr-config) · [Development](#sr-development) · [Contributing](#sr-contributing) · [Upstream and license](#sr-upstream)
+**Latest update 2026-11-25**: same-tier retries, per-day reuse and JSON output in error analysis · [Changelog](#sr-changelog) · [All commits](https://github.com/d100000/SmartRouter-v2/commits/main/)
+
+[Features](#sr-purpose) · [Quick start](#sr-start) · [Routing](#sr-routing) · [Suppliers](#sr-suppliers) · [Channel limits](#sr-channel-limits) · [Configuration](#sr-config) · [Changelog](#sr-changelog) · [FAQ](#sr-faq) · [Development](#sr-development) · [Contributing](#sr-contributing) · [Upstream and license](#sr-upstream)
 
 </div>
 
@@ -252,6 +253,53 @@ See [.env.example](./.env.example) and the [authentication and session guide](./
 - **Roles**: in this first phase a supplier uses a dedicated account. There is no supplier self-registration, multi-employee organization or switching between consumer and supplier identities, and the purchase budget is not a supplier payment system.
 
 Supplier permissions, limits and recovery rules are defined in the [channel supplier product plan](./design-plans/channel-supplier-role-product-plan.md) (Chinese). Scheduling background is in [SCHEDULING.md](./SCHEDULING.md); check algorithm details against the current source.
+
+<a id="sr-changelog"></a>
+
+## Changelog
+
+Newest first, limited to changes you notice when using the gateway. The full record is the [commit history](https://github.com/d100000/SmartRouter-v2/commits/main/).
+
+### 2026-11-25
+
+- **Routing**: with no other channel available, the remaining retries go to the channels already tried in the current priority tier, up to the configured retry count. A supplier still receives a request at most once.
+- **Routing**: fixed a lower tier receiving a flat tenth of the traffic under strict priority; a session in use during a higher-tier outage is no longer treated as idle and moved when the outage ends; a status change of one key of a multi-key channel is no longer skipped.
+- **Error analysis**: each calendar day is collected once and reused between reports, so the daily report reads one new day of logs; the DeepSeek, Kimi and GPT presets request JSON output; issues in a report can be filtered by severity, channel and model.
+- **Error analysis**: fixed clean-request counts drifting after a restart, authentication and rate-limit errors being taken for oversized requests, findings lost when a split analysis failed later, and incomplete call statistics after resuming.
+- **Docs**: English README, use cases, Security and Getting help sections, contributing guide.
+
+### 2026-11-24
+
+- **Error analysis**: presets for DeepSeek V4.1 Flash, DeepSeek V4 Pro, Kimi K3, Kimi K3.1 Pro, GPT-6.2 Sol and Claude Opus 5.5; after entering the analysis model's address and key, the model list can be fetched and recognized models get a matching context budget.
+- **Error analysis**: the same failure across channels and models becomes one issue, analyzed in packs sized to the model's context and in parallel; the report states severity, affected requests and the channels and models involved; clean requests are counted, not stored one by one.
+- **Error analysis**: no more failures because the request is too long: more oversize errors are recognized and split automatically, a truncated answer is retried with a larger output limit, and an interrupted analysis can continue.
+
+### 2026-11-23
+
+- **Routing**: priority tiers are strict by default, and a lower tier only receives what the higher tier cannot carry; inside a tier traffic follows the configured weights, and retries use the same weighted draw as first attempts.
+- **Routing**: cooldown counts consecutive failed requests, so a failing channel also cools down for low-traffic models.
+- **Session stickiness**: a session yields only while its bound channel keeps failing; a session that moved to a lower tier returns to the higher tier after 5 idle minutes.
+- **Routing and suppliers**: stability improvements for smart routing and the supplier channel workflow.
+
+### 2026-11-17
+
+- Merged upstream new-api v1.0.0-rc.51, keeping this project's routing and supplier extensions.
+
+<a id="sr-faq"></a>
+
+## FAQ
+
+**How does this relate to new-api?**
+The project is built on new-api. It keeps new-api's channels, tokens, billing and console, and adds adaptive scheduling, the supplier workspace, channel limits and error analysis. The latest merged upstream version is v1.0.0-rc.51.
+
+**Can I use the upstream image?**
+No. The upstream image does not contain this project's extensions; build the image from this repository as described in [Quick start](#sr-start).
+
+**Which databases are supported?**
+SQLite, MySQL ≥ 5.7.8 and PostgreSQL ≥ 9.6 for the main database; the log database additionally supports ClickHouse.
+
+**What should I know about running several instances?**
+Scheduling statistics, cooldown and shared capacity pools work inside one instance; channel RPM, TPM and daily budget are coordinated between instances through the main database. See [Current boundaries](#sr-limits).
 
 <a id="sr-development"></a>
 

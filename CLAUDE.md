@@ -65,6 +65,10 @@ This repo is new-api plus local routing and supplier extensions (see the merge c
 
 `.local-tests/` holds ad-hoc local verification artifacts and logs, not part of the test suite.
 
+## README changelog
+
+The READMEs carry a dated changelog instead of a commit-hash marker. When a change is visible to people who use or operate the gateway, add an entry under today's date to `更新日志` in `README.md` and `README.zh_CN.md` (their SmartRouter parts are identical) and to `Changelog` in `README.en.md`, and update the "最近更新" / "Latest update" line near the top of each. Describe what changed for the user, not which files changed; internal refactors and test-only changes get no entry. Keep the upstream README text at the end of each file untouched.
+
 ## Open item: MySQL verification of error analysis (run after go-live)
 
 Status: **OPEN**, recorded 2026-11-25 at the owner's request. Delete this section once both steps are done and the result is recorded.

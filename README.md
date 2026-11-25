@@ -17,10 +17,7 @@
   <a href="./LICENSE"><img src="./assets/readme/license.svg" alt="AGPL-3.0 license"></a>
 </p>
 
-[![Current build](./assets/readme/build.svg)](https://github.com/d100000/SmartRouter-v2/commit/7ebbfd7ceced451c4b8920015087079a685aae2b)
-[main 最新提交](https://github.com/d100000/SmartRouter-v2/commits/main/)
-
-**当前功能版本：`7ebbfd7ce` · 功能提交时间：2026-11-25 04:50:01（北京时间 / UTC+8）**
+**最近更新 2026-11-25**：同优先级重试、错误分析按天汇总与 JSON 输出 · [更新日志](#sr-changelog) · [全部提交](https://github.com/d100000/SmartRouter-v2/commits/main/)
 
 <p>
   <a href="#sr-start"><img src="./assets/readme/quick-start.svg" alt="快速开始"></a>
@@ -28,7 +25,7 @@
   <a href="#sr-suppliers"><img src="./assets/readme/supplier-guide.svg" alt="供应商指南"></a>
 </p>
 
-[功能介绍](#sr-purpose) · [快速开始](#sr-start) · [调度方式](#sr-routing) · [供应商与权限](#sr-suppliers) · [渠道限额](#sr-channel-limits) · [部署配置](#sr-config) · [本地开发](#sr-development) · [参与贡献](#sr-contributing) · [来源与许可证](#sr-upstream)
+[功能介绍](#sr-purpose) · [快速开始](#sr-start) · [调度方式](#sr-routing) · [供应商与权限](#sr-suppliers) · [渠道限额](#sr-channel-limits) · [部署配置](#sr-config) · [更新日志](#sr-changelog) · [常见问题](#sr-faq) · [本地开发](#sr-development) · [参与贡献](#sr-contributing) · [来源与许可证](#sr-upstream)
 
 </div>
 
@@ -263,6 +260,53 @@ SUPPLIER_CREDENTIAL_ACTIVE_KEY=v1
 - **角色范围**：首期供应商采用专用账号，不提供供应商自助注册、多员工组织或消费者/供应商双身份切换；采购预算不是供应商付款结算系统。
 
 供应商权限、限额和恢复规则的详细定义见[渠道供应商产品规划](./design-plans/channel-supplier-role-product-plan.md)。调度背景见 [SCHEDULING.md](./SCHEDULING.md)；其中部分算法细节仍需结合当前源码核对。
+
+<a id="sr-changelog"></a>
+
+## 更新日志
+
+按日期倒序，只列出使用时能感受到的变化；完整记录见[提交历史](https://github.com/d100000/SmartRouter-v2/commits/main/)。
+
+### 2026-11-25
+
+- **调度**：没有其他渠道可用时，剩余的重试次数用在当前优先级内已尝试过的渠道上，直到用完“失败重试次数”；供应商渠道仍然每个请求只派发一次。
+- **调度**：修复严格优先级下低优先级渠道固定多拿约 10% 流量；高优先级故障期间一直在用的会话，恢复后不再被当成空闲切走；多 Key 渠道中单个 Key 的状态变化不再被忽略。
+- **错误分析**：每个自然日只采集一次并在报告之间复用，每日报告只读取新增一天的日志；DeepSeek、Kimi、GPT 预设启用 JSON 输出；报告中的问题可按严重程度、渠道、模型筛选。
+- **错误分析**：修复重启后正常请求计数偏差、认证失败和限流被误判为“请求过大”、拆分分析时丢失已得出的结论、续跑后调用统计不全。
+- **文档**：README 新增英文版、适用场景、安全与获取帮助；新增贡献指南。
+
+### 2026-11-24
+
+- **错误分析**：内置 DeepSeek V4.1 Flash、DeepSeek V4 Pro、Kimi K3、Kimi K3.1 Pro、GPT-6.2 Sol、Claude Opus 5.5 预设；填写分析模型的地址和 Key 后可获取模型列表，识别出的模型自动填入上下文预算。
+- **错误分析**：同一种错误跨渠道、跨模型归并为一个问题，按模型上下文打包并发分析；报告给出严重程度、受影响请求数和涉及的渠道与模型；正常请求只计数，不再逐条入库。
+- **错误分析**：不再因“请求内容过长”失败：识别更多超长报错并自动拆分，输出被截断时加大输出上限重试，中断的分析可以继续。
+
+### 2026-11-23
+
+- **调度**：渠道优先级默认严格分层，低优先级只承接高优先级带不动的份额；同一优先级内按配置权重分配，重试与首次分配使用相同的按权重抽签。
+- **调度**：冷却按连续失败的请求计数，低流量的模型也能及时冷却故障渠道。
+- **会话粘性**：绑定渠道连续失败时才让位；因故障落到低优先级的会话，空闲 5 分钟后回到高优先级。
+- **调度与供应商**：改进智能路由稳定性与供应商渠道工作流。
+
+### 2026-11-17
+
+- 合并上游 new-api v1.0.0-rc.51，保留本项目的调度与供应商扩展。
+
+<a id="sr-faq"></a>
+
+## 常见问题
+
+**和 new-api 是什么关系？**
+本项目基于 new-api 开发，保留其渠道、令牌、计费和控制台，增加了自适应调度、供应商工作台、渠道限额和错误分析。最近一次合并的上游版本是 v1.0.0-rc.51。
+
+**可以直接使用上游镜像吗？**
+不可以。上游镜像不包含本项目的扩展，请按[快速开始](#sr-start)从本仓库构建镜像。
+
+**支持哪些数据库？**
+主数据库支持 SQLite、MySQL ≥ 5.7.8 和 PostgreSQL ≥ 9.6；日志数据库另外支持 ClickHouse。
+
+**多实例部署要注意什么？**
+调度统计、冷却和共享容量池只在单个实例内生效；渠道 RPM、TPM 和每日预算通过主数据库在实例之间协调。详见[当前能力边界](#sr-limits)。
 
 <a id="sr-development"></a>
 
