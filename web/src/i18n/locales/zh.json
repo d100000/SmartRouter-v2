@@ -8975,6 +8975,7 @@
     "Hide details": "收起明细",
     "Error message": "错误信息",
     "Open this request in usage logs": "在使用日志中打开这条请求",
-    "First attempt": "首次尝试"
+    "First attempt": "首次尝试",
+    "Affinity ID": "亲和性 ID"
   }
 }

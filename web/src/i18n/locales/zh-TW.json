@@ -8975,6 +8975,7 @@
     "Hide details": "收合明細",
     "Error message": "錯誤訊息",
     "Open this request in usage logs": "在使用日誌中開啟這筆請求",
-    "First attempt": "首次嘗試"
+    "First attempt": "首次嘗試",
+    "Affinity ID": "親和性 ID"
   }
 }

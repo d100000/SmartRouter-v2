@@ -8975,6 +8975,7 @@
     "Hide details": "Masquer les détails",
     "Error message": "Message d'erreur",
     "Open this request in usage logs": "Ouvrir cette requête dans les journaux d'utilisation",
-    "First attempt": "Première tentative"
+    "First attempt": "Première tentative",
+    "Affinity ID": "ID d'affinité"
   }
 }

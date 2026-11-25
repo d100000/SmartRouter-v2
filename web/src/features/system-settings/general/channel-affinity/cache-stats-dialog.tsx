@@ -102,7 +102,7 @@ export function CacheStatsDialog(props: Props) {
     }
     if (s.key_fp || props.target?.key_fp) {
       data.push({
-        key: t('Key Fingerprint'),
+        key: t('Affinity ID'),
         value: (s.key_fp || props.target?.key_fp || '') as string,
       })
     }

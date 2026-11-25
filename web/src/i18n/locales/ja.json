@@ -8975,6 +8975,7 @@
     "Hide details": "詳細を隠す",
     "Error message": "エラーメッセージ",
     "Open this request in usage logs": "このリクエストを利用履歴で開く",
-    "First attempt": "初回の試行"
+    "First attempt": "初回の試行",
+    "Affinity ID": "アフィニティID"
   }
 }

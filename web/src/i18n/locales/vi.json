@@ -8975,6 +8975,7 @@
     "Hide details": "Ẩn chi tiết",
     "Error message": "Thông báo lỗi",
     "Open this request in usage logs": "Mở yêu cầu này trong nhật ký sử dụng",
-    "First attempt": "Lần thử đầu tiên"
+    "First attempt": "Lần thử đầu tiên",
+    "Affinity ID": "ID ưu tiên kênh"
   }
 }

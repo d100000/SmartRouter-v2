@@ -531,6 +531,14 @@ export function useCommonLogsColumns(
                       {affinity && (
                         <div className='border-t pt-1 text-xs'>
                           <p className='font-medium'>{t('Channel Affinity')}</p>
+                          {affinity.key_fp && (
+                            <p>
+                              {t('Affinity ID')}:{' '}
+                              <span className='font-mono'>
+                                {affinity.key_fp}
+                              </span>
+                            </p>
+                          )}
                           <p>
                             {t('Rule')}: {affinity.rule_name || '-'}
                           </p>

@@ -8975,6 +8975,7 @@
     "Hide details": "Скрыть детали",
     "Error message": "Сообщение об ошибке",
     "Open this request in usage logs": "Открыть этот запрос в журнале использования",
-    "First attempt": "Первая попытка"
+    "First attempt": "Первая попытка",
+    "Affinity ID": "ID привязки"
   }
 }

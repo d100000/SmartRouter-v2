@@ -259,6 +259,23 @@ func TestGetPreferredChannelByAffinity_RequestHeaderKeySource(t *testing.T) {
 	require.Equal(t, "request_header", meta.KeySourceType)
 	require.Equal(t, "X-Affinity-Key", meta.KeySourceKey)
 	require.Equal(t, buildChannelAffinityKeyHint(affinityValue), meta.KeyHint)
+
+	// The usage log identifies the affinity by its fingerprint, which the log
+	// list shows as the affinity ID. It keeps no part of the session value.
+	MarkChannelAffinityUsed(ctx, "default", channelID)
+	other := model.NewLogOther()
+	AppendChannelAffinityAdminInfo(ctx, other)
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	logged, ok := adminInfo["channel_affinity"].(map[string]any)
+	require.True(t, ok)
+	fingerprint := affinityFingerprint(affinityValue)
+	require.Len(t, fingerprint, 8)
+	assert.Equal(t, fingerprint, logged["key_fp"])
+	assert.Equal(t, "header-affinity", logged["rule_name"])
+	assert.Equal(t, "default", logged["using_group"])
+	assert.NotContains(t, logged, "key_hint")
+	assert.NotContains(t, other.JSONString(), affinityValue)
 }
 
 func TestClearCurrentChannelAffinityCache(t *testing.T) {
