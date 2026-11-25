@@ -17,7 +17,7 @@
   <a href="./LICENSE"><img src="./assets/readme/license.svg" alt="AGPL-3.0 license"></a>
 </p>
 
-**最近更新 2026-11-25**：渠道详情与最近请求、同优先级重试、错误分析按天汇总与 JSON 输出 · [更新日志](#sr-changelog) · [全部提交](https://github.com/d100000/SmartRouter-v2/commits/main/)
+**最近更新 2026-11-25**：渠道详情与最近请求、请求头覆盖变量、同优先级重试、错误分析按天汇总与 JSON 输出 · [更新日志](#sr-changelog) · [全部提交](https://github.com/d100000/SmartRouter-v2/commits/main/)
 
 <p>
   <a href="#sr-start"><img src="./assets/readme/quick-start.svg" alt="快速开始"></a>
@@ -270,6 +270,7 @@ SUPPLIER_CREDENTIAL_ACTIVE_KEY=v1
 ### 2026-11-25
 
 - **渠道**：渠道列表的“渠道健康”旁新增“详情”，弹窗显示该渠道的成功率、首字时间、RPM 和最近 20 条请求，可只看失败、展开查看错误信息与重试链路，并一键跳到使用日志查看该渠道的全部请求。
+- **渠道**：请求头覆盖新增变量 `{user_id}`、`{channel_id}`、`{model}`、`{original_model}`、`{timestamp}`、`{timestamp_ms}`，可以把用户 ID、渠道 ID、模型名称和时间戳写进发给上游的请求头；当前请求没有对应的值时，不发送该请求头。
 - **调度**：没有其他渠道可用时，剩余的重试次数用在当前优先级内已尝试过的渠道上，直到用完“失败重试次数”；供应商渠道仍然每个请求只派发一次。
 - **调度**：修复严格优先级下低优先级渠道固定多拿约 10% 流量；高优先级故障期间一直在用的会话，恢复后不再被当成空闲切走；多 Key 渠道中单个 Key 的状态变化不再被忽略。
 - **错误分析**：每个自然日只采集一次并在报告之间复用，每日报告只读取新增一天的日志；DeepSeek、Kimi、GPT 预设启用 JSON 输出；报告中的问题可按严重程度、渠道、模型筛选。

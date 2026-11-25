@@ -3080,7 +3080,35 @@ export function ChannelMutateDrawer({
                 <code className='bg-muted rounded px-1 py-0.5'>
                   {'{client_header:NAME}'}
                 </code>{' '}
-                — {t('Client header value')}
+                — {t('Client header value')},{' '}
+                <code className='bg-muted rounded px-1 py-0.5'>
+                  {'{user_id}'}
+                </code>{' '}
+                — {t('User ID')},{' '}
+                <code className='bg-muted rounded px-1 py-0.5'>
+                  {'{model}'}
+                </code>{' '}
+                — {t('Upstream Model Name')},{' '}
+                <code className='bg-muted rounded px-1 py-0.5'>
+                  {'{original_model}'}
+                </code>{' '}
+                — {t('Request Model Name')},{' '}
+                <code className='bg-muted rounded px-1 py-0.5'>
+                  {'{channel_id}'}
+                </code>{' '}
+                — {t('Channel ID')},{' '}
+                <code className='bg-muted rounded px-1 py-0.5'>
+                  {'{timestamp}'}
+                </code>{' '}
+                — {t('Unix timestamp (seconds)')},{' '}
+                <code className='bg-muted rounded px-1 py-0.5'>
+                  {'{timestamp_ms}'}
+                </code>{' '}
+                — {t('Unix timestamp (milliseconds)')}
+                <br />
+                {t(
+                  'A header is not sent when one of its variables has no value for the request.'
+                )}
               </FormDescription>
               <FormMessage />
             </FormItem>

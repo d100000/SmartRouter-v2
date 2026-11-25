@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
 
 	"github.com/MoeForge/moego/regexp"
 	common2 "github.com/QuantumNous/new-api/common"
@@ -148,7 +151,10 @@ func shouldSkipPassthroughHeader(name string) bool {
 	return false
 }
 
-func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey string) (string, bool, error) {
+// applyHeaderOverridePlaceholders resolves one header override value.
+// requestValues holds the value of each request placeholder, empty when the
+// request has none; a value that names an empty one yields no header.
+func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey string, requestValues map[string]string) (string, bool, error) {
 	trimmed := strings.TrimSpace(template)
 	if strings.HasPrefix(trimmed, clientHeaderPlaceholderPrefix) {
 		afterPrefix := trimmed[len(clientHeaderPlaceholderPrefix):]
@@ -172,8 +178,19 @@ func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey str
 		return clientHeaderValue, true, nil
 	}
 
-	if strings.Contains(template, "{api_key}") {
-		template = strings.ReplaceAll(template, "{api_key}", apiKey)
+	if strings.Contains(template, "{") {
+		replacements := []string{"{api_key}", apiKey}
+		for placeholder, value := range requestValues {
+			if !strings.Contains(template, placeholder) {
+				continue
+			}
+			if value == "" {
+				return "", false, nil
+			}
+			replacements = append(replacements, placeholder, value)
+		}
+		// A single pass: a value that reads like a placeholder is not resolved.
+		template = strings.NewReplacer(replacements...).Replace(template)
 	}
 	if strings.TrimSpace(template) == "" {
 		return "", false, nil
@@ -185,6 +202,13 @@ func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey str
 // Supported placeholders:
 //   - {api_key}: resolved to the channel API key
 //   - {client_header:<name>}: resolved to the incoming request header value
+//   - {user_id}, {channel_id}: the user of the request and the channel of the attempt
+//   - {model}, {original_model}: the model name sent upstream and the one the client asked for
+//   - {timestamp}, {timestamp_ms}: the Unix time of this call, in seconds and in milliseconds
+//
+// {client_header:<name>} must be the whole value; the others may stand anywhere
+// in it. A header that names a request value the request does not have is left
+// out.
 //
 // Header passthrough rules (keys only; values are ignored):
 //   - "*": passthrough all incoming headers by name (excluding unsafe headers)
@@ -260,6 +284,32 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 		}
 	}
 
+	// A value the request does not have is empty, and so is a model name with
+	// a control character, which no header value may hold.
+	now := time.Now()
+	requestValues := map[string]string{
+		"{user_id}":        "",
+		"{channel_id}":     "",
+		"{model}":          info.OriginModelName,
+		"{original_model}": info.OriginModelName,
+		"{timestamp}":      strconv.FormatInt(now.Unix(), 10),
+		"{timestamp_ms}":   strconv.FormatInt(now.UnixMilli(), 10),
+	}
+	if info.UserId > 0 {
+		requestValues["{user_id}"] = strconv.Itoa(info.UserId)
+	}
+	if info.ChannelMeta != nil && info.ChannelId > 0 {
+		requestValues["{channel_id}"] = strconv.Itoa(info.ChannelId)
+	}
+	if info.ChannelMeta != nil && info.UpstreamModelName != "" {
+		requestValues["{model}"] = info.UpstreamModelName
+	}
+	for _, placeholder := range []string{"{model}", "{original_model}"} {
+		if strings.ContainsFunc(requestValues[placeholder], unicode.IsControl) {
+			requestValues[placeholder] = ""
+		}
+	}
+
 	for k, v := range headerOverrideSource {
 		if isHeaderPassthroughRuleKey(k) {
 			continue
@@ -277,7 +327,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			continue
 		}
 
-		value, include, err := applyHeaderOverridePlaceholders(str, c, info.ApiKey)
+		value, include, err := applyHeaderOverridePlaceholders(str, c, info.ApiKey, requestValues)
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeChannelHeaderOverrideInvalid)
 		}
@@ -296,7 +346,7 @@ func ResolveHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 
 // ApplyHeaderOverride applies the request plugins' header changes, then the
 // channel overrides, after the adaptor's headers. Without a client request,
-// only static values and {api_key} are resolved.
+// passthrough rules and {client_header:<name>} values are left out.
 func ApplyHeaderOverride(info *common.RelayInfo, c *gin.Context, req *http.Request) error {
 	headers, err := processHeaderOverride(info, c)
 	if err != nil {

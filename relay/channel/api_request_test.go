@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -392,4 +393,179 @@ func TestDoRequestLeavesEarlyResponseBodyOwnedByTransport(t *testing.T) {
 	require.NoError(t, err, "early response headers must not close the transport's ongoing upload")
 	require.NoError(t, <-written)
 	assert.Equal(t, "still uploading", string(remaining))
+}
+
+func TestProcessHeaderOverride_RequestPlaceholders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		userID        int
+		channelID     int
+		upstreamModel string
+		originModel   string
+		runtime       bool
+		clientHeaders map[string]string
+		overrides     map[string]any
+		want          map[string]string
+	}{
+		{
+			name:          "request values stand alone and inside text",
+			userID:        12,
+			channelID:     37,
+			upstreamModel: "gpt-4o",
+			originModel:   "my-gpt",
+			overrides: map[string]any{
+				"X-User-Id":        "{user_id}",
+				"X-Channel-Id":     "{channel_id}",
+				"X-Model":          "{model}",
+				"X-Original-Model": "{original_model}",
+				"X-Trace":          "u{user_id}-c{channel_id}-u{user_id}",
+				"Authorization":    "Bearer {api_key}",
+				"X-Unknown":        "{unknown}",
+			},
+			want: map[string]string{
+				"x-user-id":        "12",
+				"x-channel-id":     "37",
+				"x-model":          "gpt-4o",
+				"x-original-model": "my-gpt",
+				"x-trace":          "u12-c37-u12",
+				"authorization":    "Bearer sk-test",
+				"x-unknown":        "{unknown}",
+			},
+		},
+		{
+			name:        "model is the requested model when none is mapped",
+			userID:      12,
+			channelID:   37,
+			originModel: "my-gpt",
+			overrides:   map[string]any{"X-Model": "{model}"},
+			want:        map[string]string{"x-model": "my-gpt"},
+		},
+		{
+			name: "a header naming a value the request lacks is left out",
+			overrides: map[string]any{
+				"X-User-Id":        "{user_id}",
+				"X-Channel-Id":     "{channel_id}",
+				"X-Model":          "{model}",
+				"X-Original-Model": "{original_model}",
+				"X-Mixed":          "u{user_id}-fixed",
+				"X-Static":         "fixed",
+			},
+			want: map[string]string{"x-static": "fixed"},
+		},
+		{
+			name:          "a model name with a control character is left out",
+			userID:        12,
+			channelID:     37,
+			upstreamModel: "gpt-4o\r\nX-Injected: 1",
+			originModel:   "gpt-4o\r\nX-Injected: 1",
+			overrides: map[string]any{
+				"X-User-Id":        "{user_id}",
+				"X-Model":          "{model}",
+				"X-Original-Model": "{original_model}",
+			},
+			want: map[string]string{"x-user-id": "12"},
+		},
+		{
+			name:          "a value that reads like a placeholder is not resolved",
+			userID:        12,
+			channelID:     37,
+			upstreamModel: "{user_id}",
+			originModel:   "{api_key}",
+			overrides: map[string]any{
+				"X-Model":          "{model}",
+				"X-Original-Model": "{original_model}",
+			},
+			want: map[string]string{
+				"x-model":          "{user_id}",
+				"x-original-model": "{api_key}",
+			},
+		},
+		{
+			name:          "client header values are not resolved",
+			userID:        12,
+			channelID:     37,
+			clientHeaders: map[string]string{"X-Client-Tag": "{user_id}"},
+			overrides: map[string]any{
+				"*":        true,
+				"X-Copied": "{client_header:X-Client-Tag}",
+			},
+			want: map[string]string{
+				"x-client-tag": "{user_id}",
+				"x-copied":     "{user_id}",
+			},
+		},
+		{
+			name:          "headers the parameter override sets are resolved",
+			userID:        12,
+			channelID:     37,
+			upstreamModel: "gpt-4o",
+			originModel:   "my-gpt",
+			runtime:       true,
+			overrides: map[string]any{
+				"x-user-id": "{user_id}",
+				"x-model":   "{model}",
+			},
+			want: map[string]string{
+				"x-user-id": "12",
+				"x-model":   "gpt-4o",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			for name, value := range tt.clientHeaders {
+				ctx.Request.Header.Set(name, value)
+			}
+			info := &relaycommon.RelayInfo{
+				UserId:          tt.userID,
+				OriginModelName: tt.originModel,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelId:         tt.channelID,
+					ApiKey:            "sk-test",
+					UpstreamModelName: tt.upstreamModel,
+					HeadersOverride:   tt.overrides,
+				},
+			}
+			if tt.runtime {
+				info.ChannelMeta.HeadersOverride = nil
+				info.UseRuntimeHeadersOverride = true
+				info.RuntimeHeadersOverride = tt.overrides
+			}
+
+			headers, err := processHeaderOverride(info, ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, headers)
+		})
+	}
+
+	t.Run("both timestamps are the instant of the call", func(t *testing.T) {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		info := &relaycommon.RelayInfo{
+			ChannelMeta: &relaycommon.ChannelMeta{
+				HeadersOverride: map[string]any{
+					"X-Timestamp":    "{timestamp}",
+					"X-Timestamp-Ms": "{timestamp_ms}",
+				},
+			},
+		}
+
+		before := time.Now().UnixMilli()
+		headers, err := processHeaderOverride(info, ctx)
+		after := time.Now().UnixMilli()
+		require.NoError(t, err)
+
+		seconds, err := strconv.ParseInt(headers["x-timestamp"], 10, 64)
+		require.NoError(t, err)
+		millis, err := strconv.ParseInt(headers["x-timestamp-ms"], 10, 64)
+		require.NoError(t, err)
+		assert.Equal(t, millis/1000, seconds)
+		assert.GreaterOrEqual(t, millis, before)
+		assert.LessOrEqual(t, millis, after)
+	})
 }
