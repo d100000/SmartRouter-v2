@@ -286,6 +286,7 @@ test('a channel shows its latest requests and opens the usage log filtered by it
   const rows = within(dialog).getAllByRole('row').slice(1)
   expect(rows).toHaveLength(2)
   expect(rows[0]).toHaveTextContent('Failed 429')
+  expect(rows[0]).toHaveTextContent('<1s / —')
   expect(rows[1]).toHaveTextContent('Success')
   expect(rows[1]).toHaveTextContent('4.0s / 0.7s')
   expect(rows[1]).toHaveTextContent('1,204 / 356')

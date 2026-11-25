@@ -150,6 +150,8 @@ function RecentRequestRow(props: {
   const status = other?.status_code
   let result = t('Success')
   if (failed) result = status ? `${t('Failed')} ${status}` : t('Failed')
+  // Durations are logged in whole seconds, first-token times in milliseconds.
+  const duration = log.use_time > 0 ? formatUseTime(log.use_time) : '<1s'
   const firstToken =
     log.is_stream && other?.frt != null && other.frt > 0
       ? formatUseTime(other.frt / 1000)
@@ -197,7 +199,7 @@ function RecentRequestRow(props: {
           </span>
         </TableCell>
         <TableCell>
-          {formatUseTime(log.use_time)} / {firstToken}
+          {duration} / {firstToken}
         </TableCell>
         <TableCell>{tokens}</TableCell>
         <TableCell>
