@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/scheduler"
@@ -101,7 +103,16 @@ func GetChannelRecentStats(c *gin.Context) {
 	data := struct {
 		scheduler.RecentChannelStats
 		RPM map[int]*channelRPMUsage `json:"rpm_by_channel,omitempty"`
-	}{RecentChannelStats: scheduler.Default.FreshRecentChannelStats(channelIDs...)}
+		// Whether this node writes successful and failed requests to the log.
+		// The channel's recent requests are read from the log, so the page
+		// says which of them cannot appear there.
+		LogRecordingEnabled   bool `json:"log_recording_enabled"`
+		ErrorRecordingEnabled bool `json:"error_recording_enabled"`
+	}{
+		RecentChannelStats:    scheduler.Default.FreshRecentChannelStats(channelIDs...),
+		LogRecordingEnabled:   common.LogConsumeEnabled,
+		ErrorRecordingEnabled: constant.ErrorLogEnabled,
+	}
 	if len(channelIDs) > 0 {
 		var err error
 		data.RPM, err = channelRPMForPage(c.Request.Context(), channelIDs, time.Time{})

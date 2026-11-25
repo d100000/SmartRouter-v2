@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
+import type { TFunction } from 'i18next'
 import { AlertTriangle, Clock } from 'lucide-react'
 import {
   createContext,
@@ -59,6 +60,84 @@ const RecentStatsContext = createContext<RecentStatsState>({
   refreshedAt: 0,
   byChannel: new Map(),
 })
+
+type RecentHistoryBucket = {
+  offsetSeconds: number
+  start_time: number
+  end_time: number
+  requests: number
+  successes: number
+}
+
+// The figures of one row: a channel, or the channels of a tag added together.
+function collectRecentStats(
+  stats: RecentStatsState,
+  channels: readonly Channel[]
+) {
+  const items = channels.map((channel) => stats.byChannel.get(channel.id))
+  let requests = 0
+  let successes = 0
+  let ttftSamples = 0
+  let ttftSum = 0
+  let responseSamples = 0
+  let responseSum = 0
+  for (const item of items) {
+    requests += item?.requests_1h ?? 0
+    successes += item?.successes_1h ?? 0
+    ttftSamples += item?.ttft_samples_5m ?? 0
+    ttftSum += item?.ttft_sum_ms_5m ?? 0
+    responseSamples += item?.response_samples_5m ?? 0
+    responseSum += item?.response_sum_ms_5m ?? 0
+  }
+  const reference = items.find((item) => item?.history?.length === 6)?.history
+  const history = HISTORY_OFFSETS_SECONDS.map(
+    (offsetSeconds, index): RecentHistoryBucket => {
+      const end = stats.refreshedAt - offsetSeconds
+      const bucket = {
+        offsetSeconds,
+        start_time: reference?.[index]?.start_time ?? end - 600,
+        end_time: reference?.[index]?.end_time ?? end,
+        requests: 0,
+        successes: 0,
+      }
+      for (const item of items) {
+        bucket.requests += item?.history?.[index]?.requests ?? 0
+        bucket.successes += item?.history?.[index]?.successes ?? 0
+      }
+      return bucket
+    }
+  )
+  return {
+    requests,
+    successes,
+    ttftSamples,
+    ttftSum,
+    responseSamples,
+    responseSum,
+    history,
+  }
+}
+
+function formatSuccessRate(
+  successes: number,
+  requests: number,
+  locale: Intl.LocalesArgument
+): string {
+  return requests > 0
+    ? `${formatNumber((successes / requests) * 100, locale)}%`
+    : '—'
+}
+
+function formatLatency(
+  ms: number | null,
+  t: TFunction,
+  locale: Intl.LocalesArgument
+) {
+  if (ms === null) return '—'
+  return ms < 1000
+    ? t('{{value}}ms', { value: formatNumber(ms, locale) })
+    : t('{{value}}s', { value: formatNumber(ms / 1000, locale) })
+}
 
 // One independent query for the page: table loading and row identity never
 // depend on statistics, and memoized cards receive updates through context.
@@ -156,6 +235,90 @@ export function ChannelRPMCell({ channel }: { channel: Channel }) {
   )
 }
 
+// Six ten-minute blocks, oldest first, each coloured by its success rate.
+function RecentHistoryBlocks(props: {
+  history: readonly RecentHistoryBucket[]
+  /** What every block says while statistics are loading or unavailable. */
+  description: string
+}) {
+  const { t, i18n } = useTranslation()
+  const stats = useContext(RecentStatsContext)
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const collectedSince = stats.snapshot?.collected_since ?? 0
+  const unavailable = stats.status !== 'ready'
+  return (
+    <span className='flex items-center gap-0.5'>
+      {props.history.map((bucket) => {
+        const notCollected =
+          bucket.requests === 0 &&
+          (collectedSince === 0 || bucket.end_time <= collectedSince)
+        const partial = !notCollected && bucket.start_time < collectedSince
+        let collectionDescription = ''
+        if (unavailable) collectionDescription = props.description
+        else if (notCollected) collectionDescription = t('Not collected yet')
+        const bucketRate =
+          bucket.requests > 0 ? bucket.successes / bucket.requests : null
+        const label = unavailable
+          ? props.description
+          : t('{{start}}–{{end}}: {{rate}}', {
+              start: formatTimestampToDate(bucket.start_time),
+              end: formatTimestampToDate(bucket.end_time),
+              rate:
+                bucketRate === null
+                  ? '—'
+                  : `${formatNumber(bucketRate * 100, locale)}%`,
+            })
+        let color = 'bg-muted-foreground/25'
+        if (!unavailable && !notCollected && bucketRate !== null) {
+          if (bucketRate >= 0.99) color = 'bg-success'
+          else if (bucketRate >= 0.95) color = 'bg-warning'
+          else color = 'bg-destructive'
+        }
+        return (
+          <Tooltip key={bucket.offsetSeconds}>
+            <TooltipTrigger
+              render={<span role='img' tabIndex={0} />}
+              aria-label={label}
+              className={cn(
+                'block h-3 w-1.5 shrink-0 rounded-[2px] outline-offset-2',
+                color,
+                !unavailable &&
+                  notCollected &&
+                  'border-muted-foreground/50 border border-dashed bg-transparent',
+                !unavailable &&
+                  partial &&
+                  'ring-muted-foreground/40 ring-1 ring-inset'
+              )}
+            />
+            <TooltipContent className='block space-y-1'>
+              <p>{label}</p>
+              {collectionDescription ? (
+                <p>{collectionDescription}</p>
+              ) : (
+                <>
+                  <p>
+                    {t('Successful attempts: {{successes}} / {{requests}}', {
+                      successes: formatNumber(bucket.successes, locale),
+                      requests: formatNumber(bucket.requests, locale),
+                    })}
+                  </p>
+                  {bucket.requests === 0 && (
+                    <p>{t('No requests in this interval')}</p>
+                  )}
+                  {partial && <p>{t('Partially collected interval')}</p>}
+                </>
+              )}
+              {!unavailable && stats.delayed && (
+                <p>{t('Statistics are delayed; showing the last snapshot.')}</p>
+              )}
+            </TooltipContent>
+          </Tooltip>
+        )
+      })}
+    </span>
+  )
+}
+
 export function ChannelRecentStatsCell(props: {
   channel: Channel
   placement?: 'column' | 'footer'
@@ -166,54 +329,26 @@ export function ChannelRecentStatsCell(props: {
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   if (props.placement === 'column' && layout === 'card') return null
 
-  const channels = isTagAggregateRow(props.channel)
-    ? props.channel.children
-    : [props.channel]
-  const items = channels.map((channel) => stats.byChannel.get(channel.id))
-  let requests = 0
-  let successes = 0
-  let ttftSamples = 0
-  let ttftSum = 0
-  let responseSamples = 0
-  let responseSum = 0
-  for (const item of items) {
-    requests += item?.requests_1h ?? 0
-    successes += item?.successes_1h ?? 0
-    ttftSamples += item?.ttft_samples_5m ?? 0
-    ttftSum += item?.ttft_sum_ms_5m ?? 0
-    responseSamples += item?.response_samples_5m ?? 0
-    responseSum += item?.response_sum_ms_5m ?? 0
-  }
+  const {
+    requests,
+    successes,
+    ttftSamples,
+    ttftSum,
+    responseSamples,
+    responseSum,
+    history,
+  } = collectRecentStats(
+    stats,
+    isTagAggregateRow(props.channel) ? props.channel.children : [props.channel]
+  )
   const collectedSince = stats.snapshot?.collected_since ?? 0
-  const reference = items.find((item) => item?.history?.length === 6)?.history
-  const history = HISTORY_OFFSETS_SECONDS.map((offsetSeconds, index) => {
-    const end = stats.refreshedAt - offsetSeconds
-    const bucket = {
-      offsetSeconds,
-      start_time: reference?.[index]?.start_time ?? end - 600,
-      end_time: reference?.[index]?.end_time ?? end,
-      requests: 0,
-      successes: 0,
-    }
-    for (const item of items) {
-      bucket.requests += item?.history?.[index]?.requests ?? 0
-      bucket.successes += item?.history?.[index]?.successes ?? 0
-    }
-    return bucket
-  })
-  const rate =
-    requests > 0
-      ? `${formatNumber((successes / requests) * 100, locale)}%`
-      : '—'
-  const ttftMs = ttftSamples > 0 ? ttftSum / ttftSamples : null
+  const rate = formatSuccessRate(successes, requests, locale)
   const responseMs = responseSamples > 0 ? responseSum / responseSamples : null
-  let ttft = '—'
-  if (ttftMs !== null) {
-    ttft =
-      ttftMs < 1000
-        ? t('{{value}}ms', { value: formatNumber(ttftMs, locale) })
-        : t('{{value}}s', { value: formatNumber(ttftMs / 1000, locale) })
-  }
+  const ttft = formatLatency(
+    ttftSamples > 0 ? ttftSum / ttftSamples : null,
+    t,
+    locale
+  )
   const response =
     responseMs === null
       ? '—'
@@ -256,77 +391,7 @@ export function ChannelRecentStatsCell(props: {
         props.placement === 'column' ? 'w-full min-w-50' : 'w-50'
       )}
     >
-      <span className='flex items-center gap-0.5'>
-        {history.map((bucket) => {
-          const notCollected =
-            bucket.requests === 0 &&
-            (collectedSince === 0 || bucket.end_time <= collectedSince)
-          const partial = !notCollected && bucket.start_time < collectedSince
-          let collectionDescription = ''
-          if (unavailable) collectionDescription = description
-          else if (notCollected) collectionDescription = t('Not collected yet')
-          const bucketRate =
-            bucket.requests > 0 ? bucket.successes / bucket.requests : null
-          const label = unavailable
-            ? description
-            : t('{{start}}–{{end}}: {{rate}}', {
-                start: formatTimestampToDate(bucket.start_time),
-                end: formatTimestampToDate(bucket.end_time),
-                rate:
-                  bucketRate === null
-                    ? '—'
-                    : `${formatNumber(bucketRate * 100, locale)}%`,
-              })
-          let color = 'bg-muted-foreground/25'
-          if (!unavailable && !notCollected && bucketRate !== null) {
-            if (bucketRate >= 0.99) color = 'bg-success'
-            else if (bucketRate >= 0.95) color = 'bg-warning'
-            else color = 'bg-destructive'
-          }
-          return (
-            <Tooltip key={bucket.offsetSeconds}>
-              <TooltipTrigger
-                render={<span role='img' tabIndex={0} />}
-                aria-label={label}
-                className={cn(
-                  'block h-3 w-1.5 shrink-0 rounded-[2px] outline-offset-2',
-                  color,
-                  !unavailable &&
-                    notCollected &&
-                    'border-muted-foreground/50 border border-dashed bg-transparent',
-                  !unavailable &&
-                    partial &&
-                    'ring-muted-foreground/40 ring-1 ring-inset'
-                )}
-              />
-              <TooltipContent className='block space-y-1'>
-                <p>{label}</p>
-                {collectionDescription ? (
-                  <p>{collectionDescription}</p>
-                ) : (
-                  <>
-                    <p>
-                      {t('Successful attempts: {{successes}} / {{requests}}', {
-                        successes: formatNumber(bucket.successes, locale),
-                        requests: formatNumber(bucket.requests, locale),
-                      })}
-                    </p>
-                    {bucket.requests === 0 && (
-                      <p>{t('No requests in this interval')}</p>
-                    )}
-                    {partial && <p>{t('Partially collected interval')}</p>}
-                  </>
-                )}
-                {!unavailable && stats.delayed && (
-                  <p>
-                    {t('Statistics are delayed; showing the last snapshot.')}
-                  </p>
-                )}
-              </TooltipContent>
-            </Tooltip>
-          )
-        })}
-      </span>
+      <RecentHistoryBlocks history={history} description={description} />
       <Tooltip>
         <TooltipTrigger
           render={<span tabIndex={0} />}
@@ -451,5 +516,142 @@ export function ChannelRecentStatsCell(props: {
         </TooltipContent>
       </Tooltip>
     </span>
+  )
+}
+
+function OverviewFigure(props: {
+  label: string
+  value: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <div className='flex min-w-0 flex-col gap-1 rounded-lg border p-3'>
+      <dt className='text-muted-foreground text-xs'>{props.label}</dt>
+      <dd className='text-xl font-semibold tabular-nums'>{props.value}</dd>
+      <dd className='text-muted-foreground min-h-4 text-xs'>
+        {props.children}
+      </dd>
+    </div>
+  )
+}
+
+/**
+ * The figures of a channel's row, laid out for the channel details dialog.
+ * They come from the list's statistics, so the dialog and the row agree.
+ */
+export function ChannelHealthOverview(props: { channel: Channel }) {
+  const { t, i18n } = useTranslation()
+  const stats = useContext(RecentStatsContext)
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const figures = collectRecentStats(stats, [props.channel])
+  const unavailable = stats.status !== 'ready'
+  const placeholder = stats.status === 'loading' ? '…' : '—'
+  let description = t('Channel health (1h)')
+  if (stats.status === 'loading') {
+    description = t('Channel statistics are loading')
+  } else if (stats.status === 'unavailable') {
+    description = t('Channel statistics are unavailable')
+  }
+  const attempts = t('Successful attempts: {{successes}} / {{requests}}', {
+    successes: formatNumber(figures.successes, locale),
+    requests: formatNumber(figures.requests, locale),
+  })
+  const firstToken = formatLatency(
+    figures.ttftSamples > 0 ? figures.ttftSum / figures.ttftSamples : null,
+    t,
+    locale
+  )
+  const response = formatLatency(
+    figures.responseSamples > 0
+      ? figures.responseSum / figures.responseSamples
+      : null,
+    t,
+    locale
+  )
+
+  return (
+    <div className='flex flex-col gap-2'>
+      <dl className='grid grid-cols-2 gap-2 sm:grid-cols-4'>
+        <OverviewFigure
+          label={t('Success rate (1h)')}
+          value={
+            unavailable
+              ? placeholder
+              : formatSuccessRate(figures.successes, figures.requests, locale)
+          }
+        >
+          <span className='flex items-center gap-2'>
+            <RecentHistoryBlocks
+              history={figures.history}
+              description={description}
+            />
+            {!unavailable && (
+              <span title={attempts} className='min-w-0 truncate tabular-nums'>
+                <span aria-hidden='true'>
+                  {formatNumber(figures.successes, locale)} /{' '}
+                  {formatNumber(figures.requests, locale)}
+                </span>
+                <span className='sr-only'>{attempts}</span>
+              </span>
+            )}
+          </span>
+        </OverviewFigure>
+        <OverviewFigure
+          label={t('First token (5m)')}
+          value={unavailable ? placeholder : firstToken}
+        >
+          {t('Streaming requests')}
+        </OverviewFigure>
+        <OverviewFigure
+          label={t('Response time (5m)')}
+          value={unavailable ? placeholder : response}
+        >
+          {t('Non-streaming requests')}
+        </OverviewFigure>
+        <OverviewFigure
+          label={t('RPM')}
+          value={<ChannelRPMCell channel={props.channel} />}
+        >
+          {t('Used / limit')}
+        </OverviewFigure>
+      </dl>
+      {(unavailable || stats.delayed) && (
+        <p role='status' className='text-muted-foreground text-xs'>
+          {unavailable
+            ? description
+            : t('Statistics are delayed; showing the last snapshot.')}
+        </p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * A channel's recent requests are read from the log. This says which of them
+ * the gateway does not write there.
+ */
+export function ChannelLogRecordingNotice() {
+  const { t } = useTranslation()
+  const snapshot = useContext(RecentStatsContext).snapshot
+  const successesMissing = snapshot?.log_recording_enabled === false
+  const failuresMissing = snapshot?.error_recording_enabled === false
+  if (!successesMissing && !failuresMissing) return null
+  return (
+    <div role='status' className='bg-muted rounded-lg p-3 text-sm'>
+      {successesMissing && (
+        <p>
+          {t(
+            'Consumption logging is disabled, so successful requests are not listed here.'
+          )}
+        </p>
+      )}
+      {failuresMissing && (
+        <p>
+          {t(
+            'Request error logging is disabled, so ordinary failed requests are not listed here. Enable ERROR_LOG_ENABLED on gateway nodes to record them.'
+          )}
+        </p>
+      )}
+    </div>
   )
 }

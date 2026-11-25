@@ -273,6 +273,11 @@ export interface LogOtherData {
   login_method?: string
   user_agent?: string
   request_path?: string
+  // Set on error logs (type=5): how the failed attempt was classified and the
+  // HTTP status it ended with.
+  error_type?: string
+  error_code?: string
+  status_code?: number
   request_conversion?: string[]
   ws?: boolean
   audio?: boolean

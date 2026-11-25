@@ -83,6 +83,7 @@ import { ChannelTypeLogo } from './channel-type-badge'
 import { useChannelsColumns } from './channels-columns'
 import { useChannels } from './channels-provider'
 import { DataTableBulkActions } from './data-table-bulk-actions'
+import { ChannelDetailsDialog } from './dialogs/channel-details-dialog'
 
 const route = getRouteApi('/_authenticated/channels/')
 const CHANNELS_COLUMN_VISIBILITY_STORAGE_KEY = 'channels:column-visibility'
@@ -111,6 +112,9 @@ export function ChannelsTable() {
   const statsFetching =
     useIsFetching({ queryKey: CHANNEL_RECENT_STATS_QUERY_KEY }) > 0
   const {
+    open,
+    setOpen,
+    currentRow,
     enableTagMode,
     sorting,
     setSorting,
@@ -732,6 +736,14 @@ export function ChannelsTable() {
           />
         </div>
       </ChannelPriorityContext.Provider>
+      {/* Inside the statistics provider, so it shows the row's own figures. */}
+      {open === 'channel-details' && currentRow && (
+        <ChannelDetailsDialog
+          key={currentRow.id}
+          channel={currentRow}
+          onClose={() => setOpen(null)}
+        />
+      )}
     </ChannelRecentStatsProvider>
   )
 }

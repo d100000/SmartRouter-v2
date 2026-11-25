@@ -50,6 +50,7 @@ type DialogType =
   | 'copy-channel'
   | 'cost-settings'
   | 'upstream-metadata'
+  | 'channel-details'
   | null
 
 type UpstreamUpdateState = ReturnType<typeof useChannelUpstreamUpdates>

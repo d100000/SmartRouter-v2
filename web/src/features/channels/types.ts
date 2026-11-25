@@ -179,6 +179,10 @@ export interface ChannelRecentStats {
   history_window_seconds: number
   bucket_seconds: number
   latency_window_seconds: number
+  /** Whether the gateway writes successful requests to the log. */
+  log_recording_enabled?: boolean
+  /** Whether the gateway writes ordinary failed requests to the log. */
+  error_recording_enabled?: boolean
 }
 
 // ============================================================================

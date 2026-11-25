@@ -280,3 +280,25 @@ it('restores the health column width and saves keyboard width changes independen
     ).toEqual(expect.objectContaining({ channel_health: 290, name: 280 }))
   })
 })
+
+it("opens a channel's latest requests from its health column", async () => {
+  localStorage.setItem('channels:view-mode', 'table')
+  const get = await renderChannelsPage(async () => {})
+
+  await userEvent.click(screen.getByRole('button', { name: 'Details of prod' }))
+
+  const dialog = await screen.findByRole('dialog', { name: 'Channel details' })
+  expect(within(dialog).getByText('prod')).toBeVisible()
+  // Successful and failed requests of this channel are read separately.
+  await waitFor(() =>
+    expect(
+      get.mock.calls
+        .map(([url]) => String(url))
+        .filter((url) => url.startsWith('/api/log?'))
+        .map((url) => new URLSearchParams(url.split('?')[1]).get('channel'))
+    ).toEqual(['3', '3'])
+  )
+  expect(
+    await within(dialog).findByText('No requests in this time range')
+  ).toBeVisible()
+})

@@ -102,6 +102,7 @@ import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelBalanceDetails } from './channel-balance-details'
 import { ChannelCostCell } from './channel-cost-cell'
+import { ChannelDetailsButton } from './channel-details-button'
 import { ChannelFundingBadge, FundingStatusBadge } from './channel-funding'
 import { ChannelRecentStatsCell, ChannelRPMCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
@@ -377,6 +378,23 @@ function TagWeightCell({ channel }: { channel: TagRow }) {
  */
 const MAX_INLINE_BALANCE_CHARS = 8
 const SENSITIVE_MASK = '••••'
+
+/**
+ * Recent health of a channel with the button that opens its latest requests.
+ * The card layout shows both in its footer instead.
+ */
+function ChannelHealthCell({ channel }: { channel: Channel }) {
+  const layout = useContext(ChannelRowActionsLayoutContext)
+  if (layout === 'card') return null
+  return (
+    <div className='flex items-center gap-2'>
+      <div className='min-w-50 flex-1'>
+        <ChannelRecentStatsCell channel={channel} placement='column' />
+      </div>
+      <ChannelDetailsButton channel={channel} />
+    </div>
+  )
+}
 
 /**
  * Balance cell component with click to update
@@ -907,12 +925,10 @@ export function useChannelsColumns(
         id: 'channel_health',
         accessorFn: (channel) => channel.id,
         header: t('Channel health (1h)'),
-        cell: ({ row }) => (
-          <ChannelRecentStatsCell channel={row.original} placement='column' />
-        ),
+        cell: ({ row }) => <ChannelHealthCell channel={row.original} />,
         enableSorting: false,
-        size: 240,
-        minSize: 220,
+        size: 300,
+        minSize: 280,
       },
 
       {

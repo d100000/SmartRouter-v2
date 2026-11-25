@@ -26,6 +26,7 @@ import { StatusBadgeTypeContext } from '@/components/status-badge'
 import { CHANNEL_STATUS } from '../constants'
 import { isTagAggregateRow, parseGroupsList } from '../lib'
 import type { Channel } from '../types'
+import { ChannelDetailsButton } from './channel-details-button'
 import { ChannelRecentStatsCell } from './channel-recent-stats'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { useChannels } from './channels-provider'
@@ -201,6 +202,7 @@ function ChannelCardComponent({
           </div>
           <div className='flex shrink-0 items-center gap-1.5'>
             <ChannelRecentStatsCell channel={row.original} placement='footer' />
+            <ChannelDetailsButton channel={row.original} />
           </div>
         </div>
       </div>

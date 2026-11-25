@@ -16,7 +16,7 @@ Self-hosted AI gateway and LLM router built on new-api · adaptive multi-channel
   <a href="./LICENSE"><img src="./assets/readme/license.svg" alt="AGPL-3.0 license"></a>
 </p>
 
-**Latest update 2026-11-25**: same-tier retries, per-day reuse and JSON output in error analysis · [Changelog](#sr-changelog) · [All commits](https://github.com/d100000/SmartRouter-v2/commits/main/)
+**Latest update 2026-11-25**: channel details with recent requests, same-tier retries, per-day reuse and JSON output in error analysis · [Changelog](#sr-changelog) · [All commits](https://github.com/d100000/SmartRouter-v2/commits/main/)
 
 [Features](#sr-purpose) · [Quick start](#sr-start) · [Routing](#sr-routing) · [Suppliers](#sr-suppliers) · [Channel limits](#sr-channel-limits) · [Configuration](#sr-config) · [Changelog](#sr-changelog) · [FAQ](#sr-faq) · [Development](#sr-development) · [Contributing](#sr-contributing) · [Upstream and license](#sr-upstream)
 
@@ -262,6 +262,7 @@ Newest first, limited to changes you notice when using the gateway. The full rec
 
 ### 2026-11-25
 
+- **Channels**: a Details button beside a channel's health opens its success rate, first-token time, RPM and latest 20 requests. The list can show failures only, a request expands to its error message and retry chain, and one click opens the usage logs filtered by the channel.
 - **Routing**: with no other channel available, the remaining retries go to the channels already tried in the current priority tier, up to the configured retry count. A supplier still receives a request at most once.
 - **Routing**: fixed a lower tier receiving a flat tenth of the traffic under strict priority; a session in use during a higher-tier outage is no longer treated as idle and moved when the outage ends; a status change of one key of a multi-key channel is no longer skipped.
 - **Error analysis**: each calendar day is collected once and reused between reports, so the daily report reads one new day of logs; the DeepSeek, Kimi and GPT presets request JSON output; issues in a report can be filtered by severity, channel and model.
