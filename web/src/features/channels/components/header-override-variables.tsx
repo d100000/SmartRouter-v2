@@ -43,7 +43,8 @@ export function HeaderOverrideVariables() {
           {index > 0 && ', '}
           <code className='bg-muted rounded px-1 py-0.5'>
             {variable}
-          </code> — {t(meaning)}
+          </code> —{' '}
+          {t(meaning)}
         </Fragment>
       ))}
       <br />

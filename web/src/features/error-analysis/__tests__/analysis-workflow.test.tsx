@@ -350,9 +350,7 @@ describe('Error analysis workflow', () => {
     })
 
     await user.click(recognized)
-    expect(within(dialog).getByLabelText('Model')).toHaveValue(
-      'deepseek-flash'
-    )
+    expect(within(dialog).getByLabelText('Model')).toHaveValue('deepseek-flash')
     expect(
       within(dialog).getByLabelText('Model context limit (tokens)')
     ).toHaveValue(1000000)
@@ -655,10 +653,7 @@ describe('Error analysis workflow', () => {
     expect(heading(/Timeouts on two channels/)).toBeVisible()
     expect(heading(/Rate limited on one channel/)).not.toBeInTheDocument()
 
-    await user.selectOptions(
-      within(filters).getByLabelText('Model'),
-      'model-b'
-    )
+    await user.selectOptions(within(filters).getByLabelText('Model'), 'model-b')
     expect(within(filters).getByText('0 of 2 issues')).toBeVisible()
     expect(heading(/Next steps/)).toBeVisible()
   })

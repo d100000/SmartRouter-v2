@@ -228,9 +228,9 @@ import {
   PassthroughWarningDialog,
   type PassthroughKind,
 } from '../dialogs/passthrough-warning-dialog'
-import { HeaderOverrideVariables } from '../header-override-variables'
 import { PluginLoginDialog } from '../dialogs/plugin-login-dialog'
 import { StatusCodeRiskDialog } from '../dialogs/status-code-risk-dialog'
+import { HeaderOverrideVariables } from '../header-override-variables'
 import {
   ModelMappingBatchDialog,
   type ModelMappingBatchResult,
